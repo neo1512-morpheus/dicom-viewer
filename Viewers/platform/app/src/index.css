@@ -1,0 +1,19 @@
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden; /* Prevents double scrollbars */
+}
+
+:root {
+  /* Primary Brand Colors (Teal) */
+  --default-color: #0d9488 !important;
+  --active-color: #0f766e !important;
+  --primary-background-color: #0d9488 !important; /* Header Background */
+  --ui-border-color-active: #0d9488 !important;
+}
+/* Force Header Background */
+.OHIFHeader {
+  background-color: #0d9488 !important;
+}

@@ -100,7 +100,7 @@ export default function DicomUploader() {
     
     // Construct the OHIF Viewer URL
     // Add '&hangingProtocolId=mpr' to the end
-const viewerUrl = `https://viewer.ohif.org/viewer/dicomjson?url=${encodeURIComponent(sourceUrl)}&hangingProtocolId=mpr&prefetch=false`;
+    const viewerUrl = `${window.location.origin}/viewer/index.html?url=${encodeURIComponent(sourceUrl)}&hangingProtocolId=mpr&prefetch=false`;
     
     window.open(viewerUrl, '_blank');
   };

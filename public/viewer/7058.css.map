@@ -1,0 +1,1 @@
+{"version":3,"file":"7058.css","mappings":"AAAA,eACE,4BACF,C","sources":["webpack:///../../../extensions/cornerstone-dicom-seg/src/panels/colorPickerDialog.css"],"sourcesContent":[".chrome-picker {\r\n  background: #090c29 !important;\r\n}\r\n"],"names":[],"sourceRoot":""}

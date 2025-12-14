@@ -46,9 +46,14 @@ function usePatientInfo(servicesManager: AppTypes.ServicesManager) {
     if (!instance) {
       return;
     }
+
+    // Handle PatientName whether it's a string or an object with Alphabetic property
+    const rawName = instance.PatientName;
+    const nameToFormat = (typeof rawName === 'object' && rawName !== null) ? rawName.Alphabetic : rawName;
+
     setPatientInfo({
       PatientID: instance.PatientID || null,
-      PatientName: instance.PatientName ? formatPN(instance.PatientName.Alphabetic) : null,
+      PatientName: nameToFormat ? formatPN(nameToFormat) : null,
       PatientSex: instance.PatientSex || null,
       PatientDOB: formatDate(instance.PatientBirthDate) || null,
     });

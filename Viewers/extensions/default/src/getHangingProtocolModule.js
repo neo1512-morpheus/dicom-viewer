@@ -4,6 +4,7 @@ import hpMNCompare from './hpCompare';
 const defaultProtocol = {
   id: 'default',
   locked: true,
+  imageLoadStrategy: 'default',
   // Don't store this hanging protocol as it applies to the currently active
   // display set by default
   // cacheId: null,

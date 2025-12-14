@@ -1,5 +1,5 @@
 import React from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { ErrorBoundary } from '@ohif/ui';
 
 // Route Components
@@ -102,7 +102,7 @@ const createRoutes = ({
   const { customizationService } = servicesManager.services;
 
   const WorkListRoute = {
-    path: '/',
+    path: '/studylist', // Moved away from root - Viewer is now at '/'
     children: DataSourceWrapper,
     private: true,
     props: { children: WorkList, servicesManager, extensionManager },
@@ -138,12 +138,19 @@ const createRoutes = ({
 
   const { userAuthenticationService } = servicesManager.services;
 
+  // Helper to redirect /index.html to Root (/) while keeping query params (?url=...)
+  const IndexRedirect = () => {
+    const location = useLocation();
+    // Redirect to Root (which is the Viewer Mode) keeping query params
+    return <Navigate to={`/${location.search}`} replace />;
+  };
+
   // Note: PrivateRoutes in react-router-dom 6.x should be defined within
   // a Route element
   return (
     <Routes>
-      {/* Redirect /index.html to / to fix black screen when router doesn't recognize the path */}
-      <Route path="/index.html" element={<Navigate to="/" replace />} />
+      {/* Smart redirect: /index.html -> Root (/), preserving query params */}
+      <Route path="/index.html" element={<IndexRedirect />} />
       {allRoutes.map((route, i) => {
         return route.private === true ? (
           <Route

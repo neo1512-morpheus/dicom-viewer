@@ -65,7 +65,8 @@ export default function buildModeRoutes({
 
     // Add active DataSource route.
     // This is the DataSource route for the active data source defined in ExtensionManager.getActiveDataSource
-    const path = `/${mode.routeName}`;
+    // Hack: Force the 'viewer' mode to be the default route ('/')
+    const path = mode.routeName === 'viewer' ? '/' : `/${mode.routeName}`;
 
     // TODO move up.
     const children = () => (

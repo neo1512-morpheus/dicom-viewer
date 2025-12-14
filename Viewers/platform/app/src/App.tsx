@@ -4,7 +4,7 @@ import PropTypes from 'prop-types';
 import './index.css';
 import i18n from '@ohif/i18n';
 import { I18nextProvider } from 'react-i18next';
-import { BrowserRouter } from 'react-router-dom';
+import { BrowserRouter, useLocation } from 'react-router-dom';
 import Compose from './routes/Mode/Compose';
 import {
   ExtensionManager,
@@ -131,9 +131,17 @@ function App({ config, defaultExtensions, defaultModes }) {
     );
   }
 
+  // Router Spy for debugging
+  const RouterSpy = () => {
+    const location = useLocation();
+    console.warn("📍 ROUTER SPY: Path is", location.pathname, "| Search is", location.search);
+    return null; // Render nothing, just log
+  };
+
   return (
     <CombinedProviders>
       <BrowserRouter basename={routerBasename}>
+        <RouterSpy />
         {authRoutes}
         {appRoutes}
       </BrowserRouter>

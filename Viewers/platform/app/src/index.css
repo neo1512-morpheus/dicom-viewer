@@ -1,19 +1,114 @@
-html, body, #root {
+html,
+body,
+#root {
   height: 100%;
   width: 100%;
   margin: 0;
   padding: 0;
-  overflow: hidden; /* Prevents double scrollbars */
+  overflow: hidden;
 }
 
-:root {
-  /* Primary Brand Colors (Teal) */
-  --default-color: #0d9488 !important;
-  --active-color: #0f766e !important;
-  --primary-background-color: #0d9488 !important; /* Header Background */
-  --ui-border-color-active: #0d9488 !important;
+/* ============================================
+   OROSCAN TEAL THEME - BLACK BACKGROUND STYLE
+   Competitor-style: black background with teal accents
+   ============================================ */
+
+/* Main app background - BLACK */
+body {
+  background-color: #000000 !important;
 }
-/* Force Header Background */
-.OHIFHeader {
-  background-color: #0d9488 !important;
+
+#root {
+  background-color: #000000 !important;
+}
+
+/* Main Header/NavBar - Darker Teal */
+.bg-secondary-dark {
+  background-color: #0f766e !important;
+}
+
+/* Left Sidebar Panel - Very Dark (near black) */
+.bg-primary-dark {
+  background-color: #0a0a0a !important;
+}
+
+/* Secondary dark areas (inner panels) - Dark gray */
+.bg-secondary-main {
+  background-color: #0f0f0f !important;
+}
+
+/* Viewport background */
+.bg-black {
+  background-color: #000000 !important;
+}
+
+/* Active/Selected items - Teal */
+.bg-primary-active {
+  background-color: #0f766e !important;
+}
+
+.bg-primary-main {
+  background-color: #0f766e !important;
+}
+
+/* Text colors - Teal for accents */
+.text-primary-active {
+  color: #14b8a6 !important;
+}
+
+.text-primary-main {
+  color: #14b8a6 !important;
+}
+
+/* Hover states - Slightly darker teal */
+.hover\:bg-primary-dark:hover {
+  background-color: #115e59 !important;
+}
+
+/* Border colors */
+.border-primary-dark {
+  border-color: #0f766e !important;
+}
+
+.border-primary-active {
+  border-color: #14b8a6 !important;
+}
+
+/* Input focus states */
+.focus\:border-inputfield-focus:focus {
+  border-color: #14b8a6 !important;
+}
+
+/* Tool buttons */
+.bg-customblue-50 {
+  background-color: #0f766e !important;
+}
+
+/* Common active background */
+.bg-common-active {
+  background-color: #115e59 !important;
+}
+
+/* Indigo dark backgrounds (sometimes used for panels) */
+.bg-indigo-dark {
+  background-color: #0a0a0a !important;
+}
+
+/* Overlay backgrounds */
+.bg-overlay {
+  background-color: rgba(0, 0, 0, 0.9) !important;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar-thumb {
+  background-color: #0f766e !important;
+}
+
+::-webkit-scrollbar-track {
+  background-color: #0a0a0a !important;
+}
+
+/* Viewport panel backgrounds */
+.ohif-scrollbar {
+  background-color: #000000 !important;
 }

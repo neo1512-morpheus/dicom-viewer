@@ -63,7 +63,7 @@ export default async function init({
 
   await cs3DInit({
     rendering: {
-      preferSizeOverAccuracy: Boolean(appConfig.preferSizeOverAccuracy),
+      preferSizeOverAccuracy: false, // Force high quality for better MPR rendering
       useNorm16Texture: Boolean(appConfig.useNorm16Texture),
     },
   });

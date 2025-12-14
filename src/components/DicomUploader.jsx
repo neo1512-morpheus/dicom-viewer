@@ -6,10 +6,11 @@ import { parseDicomFiles } from '../utils/dicomParser';
 const EDGE_FUNCTION_URL = "https://qwcezedtdjurtyelbeeg.supabase.co/functions/v1/serve-dicom-json";
 
 export default function DicomUploader() {
+  console.log("🚨 TRACER: DicomUploader component rendered");
   const [status, setStatus] = useState('idle'); // idle, parsing, uploading, complete, error
   const [progress, setProgress] = useState(0);
   const [message, setMessage] = useState('');
-  const [patientId, setPatientId] = useState(null); 
+  const [patientId, setPatientId] = useState(null);
 
   const handleFolderSelect = async (event) => {
     const files = Array.from(event.target.files);
@@ -18,17 +19,17 @@ export default function DicomUploader() {
     try {
       setStatus('parsing');
       setMessage('Parsing DICOM files... This happens locally in your browser.');
-      
+
       // 1. Parse Files locally
       const { manifest, parsedFiles } = await parseDicomFiles(files);
-      
+
       if (parsedFiles.length === 0) {
         throw new Error('No valid DICOM files found.');
       }
 
       // Capture the ID locally (Fix for the bug)
       const pid = parsedFiles[0].patientId;
-      setPatientId(pid); 
+      setPatientId(pid);
 
       setStatus('uploading');
       setMessage(`Uploading ${parsedFiles.length} files for Patient: ${pid}...`);
@@ -47,7 +48,7 @@ export default function DicomUploader() {
           });
 
         if (error) throw error;
-        
+
         completedUploads++;
         setProgress(Math.round((completedUploads / (parsedFiles.length + 1)) * 100));
       };
@@ -70,7 +71,7 @@ export default function DicomUploader() {
 
       const manifestPath = `${pid}/dicom_manifest.json`;
       const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' });
-      
+
       const { error: manifestError } = await supabase.storage
         .from('scans')
         .upload(manifestPath, blob, {
@@ -94,14 +95,14 @@ export default function DicomUploader() {
 
   const handleOpenViewer = () => {
     if (!patientId) return;
-    
+
     // Construct the inner URL (Your Edge Function + Patient ID)
     const sourceUrl = `${EDGE_FUNCTION_URL}?patientId=${patientId}`;
-    
+
     // Construct the OHIF Viewer URL
-    // Add '&hangingProtocolId=mpr' to the end
-    const viewerUrl = `${window.location.origin}/viewer/index.html?url=${encodeURIComponent(sourceUrl)}&hangingProtocolId=mpr&prefetch=false`;
-    
+    // Add '/dicomjson' as placeholder ID to satisfy the router's /viewer/:id pattern
+    const viewerUrl = `${window.location.origin}/viewer/dicomjson?url=${encodeURIComponent(sourceUrl)}&hangingProtocolId=mpr&prefetch=false`;
+
     window.open(viewerUrl, '_blank');
   };
 
@@ -116,15 +117,15 @@ export default function DicomUploader() {
         <label htmlFor="dropzone-file" className="flex flex-col items-center justify-center w-full h-64 border-2 border-gray-300 border-dashed rounded-lg cursor-pointer bg-gray-50 hover:bg-gray-100">
           <div className="flex flex-col items-center justify-center pt-5 pb-6">
             <svg className="w-8 h-8 mb-4 text-gray-500" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 20 16">
-                <path stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167M10 15V6m0 0L8 8m2-2 2 2"/>
+              <path stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 13h3a3 3 0 0 0 0-6h-.025A5.56 5.56 0 0 0 16 6.5 5.5 5.5 0 0 0 5.207 5.021C5.137 5.017 5.071 5 5 5a4 4 0 0 0 0 8h2.167M10 15V6m0 0L8 8m2-2 2 2" />
             </svg>
             <p className="mb-2 text-sm text-gray-500"><span className="font-semibold">Click to upload Zip</span></p>
             <p className="text-xs text-gray-500">DICOM Zip (.zip)</p>
           </div>
-          <input 
-            id="dropzone-file" 
-            type="file" 
-            className="hidden" 
+          <input
+            id="dropzone-file"
+            type="file"
+            className="hidden"
             accept=".zip"
             onChange={handleFolderSelect}
             disabled={status === 'parsing' || status === 'uploading'}
@@ -139,21 +140,21 @@ export default function DicomUploader() {
             <span>{progress}%</span>
           </div>
           <div className="w-full bg-gray-200 rounded-full h-2.5">
-            <div 
-              className={`bg-blue-600 h-2.5 rounded-full transition-all duration-300 ${status === 'error' ? 'bg-red-600' : ''}`} 
+            <div
+              className={`bg-blue-600 h-2.5 rounded-full transition-all duration-300 ${status === 'error' ? 'bg-red-600' : ''}`}
               style={{ width: `${progress}%` }}
             ></div>
           </div>
           <p className="text-sm text-gray-500">{message}</p>
-          
+
           {/* Real View Button */}
           {status === 'complete' && (
-             <button
-               onClick={handleOpenViewer}
-               className="mt-4 px-4 py-2 bg-green-600 text-white font-bold rounded hover:bg-green-700 w-full shadow-lg transition-transform transform hover:scale-105"
-             >
-               Open 3D Viewer
-             </button>
+            <button
+              onClick={handleOpenViewer}
+              className="mt-4 px-4 py-2 bg-green-600 text-white font-bold rounded hover:bg-green-700 w-full shadow-lg transition-transform transform hover:scale-105"
+            >
+              Open 3D Viewer
+            </button>
           )}
         </div>
       )}

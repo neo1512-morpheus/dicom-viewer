@@ -86,6 +86,10 @@ export const mpr: Types.HangingProtocol.Protocol = {
           displaySets: [
             {
               id: 'activeDisplaySet',
+              options: {
+                blendMode: 'avg',
+                slabThickness: 0.5,
+              },
             },
           ],
         },
@@ -113,6 +117,10 @@ export const mpr: Types.HangingProtocol.Protocol = {
           displaySets: [
             {
               id: 'activeDisplaySet',
+              options: {
+                blendMode: 'avg',
+                slabThickness: 0.5,
+              },
             },
           ],
         },
@@ -140,6 +148,10 @@ export const mpr: Types.HangingProtocol.Protocol = {
           displaySets: [
             {
               id: 'activeDisplaySet',
+              options: {
+                blendMode: 'avg',
+                slabThickness: 0.5,
+              },
             },
           ],
         },

@@ -1,5 +1,8 @@
-# Serve OHIF viewer for /viewer/* routes
-/viewer/*  /viewer/index.html  200
+# Viewer SPA routing - only for paths WITHOUT file extensions
+/viewer  /viewer/index.html  200
+/viewer/  /viewer/index.html  200
+/viewer/dicomjson  /viewer/index.html  200
+/viewer/local  /viewer/index.html  200
 
-# Serve main app for everything else
-/*  /index.html  200
+# Main app SPA routing
+/  /index.html  200

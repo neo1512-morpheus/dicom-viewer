@@ -71,25 +71,7 @@ function Header({
               appConfig={appConfig}
             />
           )}
-          <div className="border-primary-dark mx-1.5 h-[25px] border-r"></div>
-          <div className="flex-shrink-0">
-            <Dropdown
-              id="options"
-              showDropdownIcon={false}
-              list={menuOptions}
-              alignment="right"
-            >
-              <IconButton
-                id={'options-settings-icon'}
-                variant="text"
-                color="inherit"
-                size="initial"
-                className="text-primary-active hover:bg-primary-dark h-full w-full"
-              >
-                <Icon name="icon-settings" />
-              </IconButton>
-            </Dropdown>
-          </div>
+          {/* Settings gear icon removed for clean branding */}
         </div>
       </div>
     </NavBar>

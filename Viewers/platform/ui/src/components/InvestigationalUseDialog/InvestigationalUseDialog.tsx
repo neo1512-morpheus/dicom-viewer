@@ -67,15 +67,14 @@ const InvestigationalUseDialog = ({ dialogConfiguration }) => {
           />
           <div className="flex flex-col">
             <div className="text-[19px] text-white">
-              OHIF Viewer is{' '}
-              <span className="text-primary-light">for investigational use only</span>
+              OROSCAN Viewer
             </div>
             <div className="text-[13px] text-white">
               <span
                 className="text-primary-active cursor-pointer"
                 onClick={() => window.open('https://ohif.org/', '_blank')}
               >
-                Learn more about OHIF Viewer
+                Learn more about OROSCAN Viewer
               </span>
             </div>
           </div>

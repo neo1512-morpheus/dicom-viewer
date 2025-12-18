@@ -1,8 +1,5 @@
-# Viewer SPA routing - only for paths WITHOUT file extensions
-/viewer  /viewer/index.html  200
-/viewer/  /viewer/index.html  200
-/viewer/dicomjson  /viewer/index.html  200
-/viewer/local  /viewer/index.html  200
+# Viewer SPA routing for all viewer paths
+/viewer/*  /viewer/index.html  200
 
 # Main app SPA routing
-/  /index.html  200
+/*  /index.html  200

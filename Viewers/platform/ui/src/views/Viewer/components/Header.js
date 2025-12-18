@@ -16,18 +16,17 @@ const Header = () => {
               href="#"
               className="ml-4"
             >
-              <Svg name="logo-ohif" />
+              <Svg name="logo-oroscan" />
             </a>
           </div>
         </div>
         <div className="flex items-center"></div>
         <div className="flex items-center">
-          <span className="text-common-light mr-3 text-lg">FOR INVESTIGATIONAL USE ONLY</span>
           <IconButton
             variant="text"
             color="inherit"
             className="text-primary-active"
-            onClick={() => {}}
+            onClick={() => { }}
           >
             <React.Fragment>
               <Icon name="settings" /> <Icon name="chevron-down" />

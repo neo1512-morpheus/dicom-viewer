@@ -4,9 +4,9 @@ import { withTranslation } from 'react-i18next';
 
 import { IconButton, Icon, NavBar } from '../../../components';
 
-import OHIFLogo from './OHIFLogo';
+import OroscanLogo from './OHIFLogo';
 
-function Header({ appLogo = OHIFLogo(), children, t }) {
+function Header({ appLogo = OroscanLogo(), children, t }) {
   const showSettingsDropdown = () => {
     // TODO: Update once dropdown component is created
   };
@@ -21,7 +21,6 @@ function Header({ appLogo = OHIFLogo(), children, t }) {
         <div>{children}</div>
       </div>
       <div className="flex items-center">
-        <span className="text-common-light mr-3 text-lg">{t('FOR INVESTIGATIONAL USE ONLY')}</span>
         <IconButton
           variant="text"
           color="inherit"

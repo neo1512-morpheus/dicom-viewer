@@ -343,30 +343,30 @@ function WorkList({
           seriesTableDataSource={
             seriesInStudiesMap.has(studyInstanceUid)
               ? seriesInStudiesMap.get(studyInstanceUid).map(s => {
-                  return {
-                    description: s.description || '(empty)',
-                    seriesNumber: s.seriesNumber ?? '',
-                    modality: s.modality || '',
-                    instances: s.numSeriesInstances || '',
-                  };
-                })
+                return {
+                  description: s.description || '(empty)',
+                  seriesNumber: s.seriesNumber ?? '',
+                  modality: s.modality || '',
+                  instances: s.numSeriesInstances || '',
+                };
+              })
               : []
           }
         >
           <div className="flex flex-row gap-2">
             {(appConfig.groupEnabledModesFirst
               ? appConfig.loadedModes.sort((a, b) => {
-                  const isValidA = a.isValidMode({
-                    modalities: modalities.replaceAll('/', '\\'),
-                    study,
-                  }).valid;
-                  const isValidB = b.isValidMode({
-                    modalities: modalities.replaceAll('/', '\\'),
-                    study,
-                  }).valid;
+                const isValidA = a.isValidMode({
+                  modalities: modalities.replaceAll('/', '\\'),
+                  study,
+                }).valid;
+                const isValidB = b.isValidMode({
+                  modalities: modalities.replaceAll('/', '\\'),
+                  study,
+                }).valid;
 
-                  return isValidB - isValidA;
-                })
+                return isValidB - isValidA;
+              })
               : appConfig.loadedModes
             ).map((mode, i) => {
               const modalitiesToCheck = modalities.replaceAll('/', '\\');
@@ -391,9 +391,8 @@ function WorkList({
                   <Link
                     className={isValidMode ? '' : 'cursor-not-allowed'}
                     key={i}
-                    to={`${dataPath ? '../../' : ''}${mode.routeName}${
-                      dataPath || ''
-                    }?${query.toString()}`}
+                    to={`${dataPath ? '../../' : ''}${mode.routeName}${dataPath || ''
+                      }?${query.toString()}`}
                     onClick={event => {
                       // In case any event bubbles up for an invalid mode, prevent the navigation.
                       // For example, the event bubbles up when the icon embedded in the disabled button is clicked.
@@ -401,7 +400,7 @@ function WorkList({
                         event.preventDefault();
                       }
                     }}
-                    // to={`${mode.routeName}/dicomweb?StudyInstanceUIDs=${studyInstanceUid}`}
+                  // to={`${mode.routeName}/dicomweb?StudyInstanceUIDs=${studyInstanceUid}`}
                   >
                     {/* TODO revisit the completely rounded style of buttons used for launching a mode from the worklist later - for now use LegacyButton*/}
                     <Button
@@ -421,7 +420,7 @@ function WorkList({
                           name={isValidMode ? 'launch-arrow' : 'launch-info'}
                         />
                       } // launch-arrow | launch-info
-                      onClick={() => {}}
+                      onClick={() => { }}
                       dataCY={`mode-${mode.routeName}-${studyInstanceUid}`}
                       className={isValidMode ? 'text-[13px]' : 'bg-[#222d44] text-[13px]'}
                     >
@@ -451,7 +450,7 @@ function WorkList({
       onClick: () =>
         show({
           content: AboutModal,
-          title: t('AboutModal:About OHIF Viewer'),
+          title: t('AboutModal:About OROSCAN Viewer'),
           contentProps: { versionNumber, commitHash },
           containerDimensions: 'max-w-4xl max-h-4xl',
         }),
@@ -500,25 +499,25 @@ function WorkList({
   const uploadProps =
     dicomUploadComponent && dataSource.getConfig()?.dicomUploadEnabled
       ? {
-          title: 'Upload files',
-          closeButton: true,
-          shouldCloseOnEsc: false,
-          shouldCloseOnOverlayClick: false,
-          content: dicomUploadComponent.bind(null, {
-            dataSource,
-            onComplete: () => {
-              hide();
-              onRefresh();
-            },
-            onStarted: () => {
-              show({
-                ...uploadProps,
-                // when upload starts, hide the default close button as closing the dialogue must be handled by the upload dialogue itself
-                closeButton: false,
-              });
-            },
-          }),
-        }
+        title: 'Upload files',
+        closeButton: true,
+        shouldCloseOnEsc: false,
+        shouldCloseOnOverlayClick: false,
+        content: dicomUploadComponent.bind(null, {
+          dataSource,
+          onComplete: () => {
+            hide();
+            onRefresh();
+          },
+          onStarted: () => {
+            show({
+              ...uploadProps,
+              // when upload starts, hide the default close button as closing the dialogue must be handled by the upload dialogue itself
+              closeButton: false,
+            });
+          },
+        }),
+      }
       : undefined;
 
   const { component: dataSourceConfigurationComponent } =

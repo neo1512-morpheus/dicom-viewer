@@ -3,7 +3,13 @@ import React from 'react';
 import logoOhif from './../../assets/svgs/ohif-logo.svg';
 
 const SVGS = {
-  'logo-ohif': logoOhif,
+  'logo-oroscan': () => (
+    <img
+      src="./assets/oroscan-logo.png"
+      alt="OROSCAN"
+      style={{ height: '32px', width: 'auto' }}
+    />
+  ),
 };
 
 /**

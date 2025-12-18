@@ -17,6 +17,11 @@ const config = {
   groupEnabledModesFirst: true,
   useSharedArrayBuffer: 'AUTO',
 
+  // DISABLE the investigational use disclaimer popup
+  investigationalUseDialog: {
+    option: 'never',
+  },
+
   // CRITICAL CHANGE 1: Disable Prefetching
   // This prevents the "RAM Explosion" by loading images only when they appear on screen.
   studyPrefetcher: {
@@ -165,25 +170,20 @@ const config = {
     // Could use services manager here to bring up a dialog/modal if needed.
     console.warn('test, navigate to https://ohif.org/');
   },
-  // whiteLabeling: {
-  //   /* Optional: Should return a React component to be rendered in the "Logo" section of the application's Top Navigation bar */
-  //   createLogoComponentFn: function (React) {
-  //     return React.createElement(
-  //       'a',
-  //       {
-  //         target: '_self',
-  //         rel: 'noopener noreferrer',
-  //         className: 'text-purple-600 line-through',
-  //         href: '/',
-  //       },
-  //       React.createElement('img',
-  //         {
-  //           src: './assets/customLogo.svg',
-  //           className: 'w-8 h-8',
-  //         }
-  //       ))
-  //   },
-  // },
+  whiteLabeling: {
+    /* Optional: Should return a React component to be rendered in the "Logo" section of the application's Top Navigation bar */
+    createLogoComponentFn: function (React) {
+      return React.createElement('img', {
+        src: './assets/oroscan-logo.png',
+        alt: 'Oroscan',
+        style: {
+          height: '32px',
+          width: 'auto',
+          marginLeft: '16px',
+        },
+      });
+    },
+  },
   hotkeys: [
     {
       commandName: 'incrementActiveViewport',

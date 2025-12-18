@@ -42,7 +42,11 @@ export default function buildModeRoutes({
   modes.forEach(mode => {
     // todo: for each route. add route to path.
     dataSourceNames.forEach(dataSourceName => {
-      const path = `/${mode.routeName}/${dataSourceName}`;
+      // If mode is 'viewer', we omit it from the path to support basename='/viewer'
+      // This prevents the /viewer/viewer/ redundant path issue.
+      const path = mode.routeName === 'viewer'
+        ? `/${dataSourceName}`
+        : `/${mode.routeName}/${dataSourceName}`;
 
       // TODO move up.
       const children = () => (

@@ -1,12 +1,12 @@
 import React from 'react';
 import { Svg } from '../../../components';
 
-function OHIFLogo() {
+function OroscanLogo() {
   return (
     <React.Fragment>
-      <Svg name="logo-ohif" />
+      <Svg name="logo-oroscan" />
     </React.Fragment>
   );
 }
 
-export default OHIFLogo;
+export default OroscanLogo;

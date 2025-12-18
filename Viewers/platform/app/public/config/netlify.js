@@ -11,6 +11,11 @@ window.config = {
   showLoadingIndicator: true,
   strictZSpacingForVolumeViewport: true,
   groupEnabledModesFirst: true,
+
+  // DISABLE the investigational use disclaimer popup
+  investigationalUseDialog: {
+    option: 'never',
+  },
   // filterQueryParam: false,
   defaultDataSourceName: 'dicomweb',
   dataSources: [
@@ -85,6 +90,20 @@ window.config = {
       },
     },
   ],
+  whiteLabeling: {
+    /* Optional: Should return a React component to be rendered in the "Logo" section of the application's Top Navigation bar */
+    createLogoComponentFn: function (React) {
+      return React.createElement('img', {
+        src: './assets/oroscan-logo.png',
+        alt: 'Oroscan',
+        style: {
+          height: '32px',
+          width: 'auto',
+          marginLeft: '16px',
+        },
+      });
+    },
+  },
   httpErrorHandler: error => {
     // This is 429 when rejected from the public idc sandbox too often.
     console.warn(error.status);

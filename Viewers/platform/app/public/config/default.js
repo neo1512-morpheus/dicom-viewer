@@ -7,21 +7,41 @@ const config = {
   modes: [],
   customizationService: {},
   showStudyList: true,
-  // some windows systems have issues with more than 3 web workers
-  maxNumberOfWebWorkers: 3,
+  // Reduced from 3 to 2 to free up CPU core for UI responsiveness
+  maxNumberOfWebWorkers: 2,
   // below flag is for performance reasons, but it might not work for all servers
   showWarningMessageForCrossOrigin: true,
   showCPUFallbackMessage: true,
   showLoadingIndicator: true,
   strictZSpacingForVolumeViewport: true,
   groupEnabledModesFirst: true,
+  useSharedArrayBuffer: 'AUTO',
+
+  // CRITICAL CHANGE 1: Disable Prefetching
+  // This prevents the "RAM Explosion" by loading images only when they appear on screen.
+  studyPrefetcher: {
+    enabled: false,
+  },
+
+  // CRITICAL CHANGE 2: Request Throttling
+  // Prioritize user interaction (scrolling) over background tasks.
   maxNumRequests: {
     interaction: 100,
-    thumbnail: 75,
-    // Prefetch number is dependent on the http protocol. For http 2 or
-    // above, the number of requests can be go a lot higher.
-    prefetch: 25,
+    thumbnail: 5,
+    prefetch: 0, // Ensure background prefetching is dead
   },
+
+  // CRITICAL CHANGE 3: Memory Safety - 1GB cache for primary dataset + comparison headroom
+  cornerstoneExtensionConfig: {
+    maxCacheSize: 1024 * 1024 * 1024,
+  },
+
+  // Tier 2: Rendering Optimization
+  rendering: {
+    useNorm16Texture: true,
+    preferSizeOverAccuracy: true,
+  },
+
   // filterQueryParam: false,
   defaultDataSourceName: 'dicomweb',
   /* Dynamic config allows user to pass "configUrl" query string this allows to load config without recompiling application. The regex will ensure valid configuration source */
@@ -60,6 +80,30 @@ const config = {
           relativeResolution: 'studies',
         },
         omitQuotationForMultipartRequest: true,
+        // Tier 3: Progressive Loading - The Lag Killer
+        retrieve: {
+          stages: [
+            {
+              id: 'initialImages',
+              positions: [0.5, 0, -1], // Middle, first, last
+              priority: 10,
+              requestType: 'INTERACTION',
+            },
+            {
+              id: 'quarterResolution',
+              decimate: 4, // Load every 4th slice first
+              offset: 3,
+              priority: 9,
+              retrieveType: 'multipleFast',
+            },
+            {
+              id: 'fullResolution',
+              decimate: 1, // Fill in the rest later
+              priority: 8,
+              retrieveType: 'default',
+            },
+          ],
+        },
       },
     },
     {

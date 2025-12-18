@@ -53,6 +53,7 @@ const typeForTS = {
   '1.2.840.10008.1.2.4.91': 'image/jp2',
   '1.2.840.10008.1.2.4.92': 'image/jpx',
   '1.2.840.10008.1.2.4.93': 'image/jpx',
+  '1.2.840.10008.1.2.4.201': 'image/jphc', // HTJ2K Lossless
 };
 
 export default generateAcceptHeader;

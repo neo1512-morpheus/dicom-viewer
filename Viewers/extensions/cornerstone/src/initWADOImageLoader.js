@@ -21,7 +21,7 @@ function initWebWorkers(appConfig) {
     startWebWorkersOnDemand: true,
     taskConfiguration: {
       decodeTask: {
-        initializeCodecsOnStartup: false,
+        initializeCodecsOnStartup: true, // Pre-load WASM binaries to avoid decode lag
         usePDFJS: false,
         strict: false,
       },

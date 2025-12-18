@@ -11,6 +11,7 @@ import {
   cache,
   Enums as csEnums,
   BaseVolumeViewport,
+  eventTarget,
 } from '@cornerstonejs/core';
 
 import { utilities as csToolsUtils, Enums as csToolsEnums } from '@cornerstonejs/tools';
@@ -25,6 +26,7 @@ import JumpPresets from '../../utils/JumpPresets';
 const EVENTS = {
   VIEWPORT_DATA_CHANGED: 'event::cornerstoneViewportService:viewportDataChanged',
   VIEWPORT_VOLUMES_CHANGED: 'event::cornerstoneViewportService:viewportVolumesChanged',
+  VOLUME_LOADING_PROGRESS: 'event::cornerstoneViewportService:volumeLoadingProgress',
 };
 
 /**
@@ -59,11 +61,53 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
   gridResizeDelay = 50;
   gridResizeTimeOut = null;
 
+  // Strict hydration queue to prevent memory spikes for large volumes
+  private static _hydrationQueue: Promise<void> = Promise.resolve();
+
+  // Track volume loading progress for UI feedback
+  volumeLoadingProgress: Map<string, {
+    percentComplete: number,
+    totalImages: number,
+    loadedImages: number
+  }> = new Map();
+
   constructor(servicesManager: AppTypes.ServicesManager) {
     super(EVENTS);
     this.renderingEngine = null;
     this.viewportGridResizeObserver = null;
     this.servicesManager = servicesManager;
+
+    // Global listener for volume loading progress
+    eventTarget.addEventListener('IMAGE_VOLUME_LOADING_PROGRESS', (evt: any) => {
+      const { volumeId, framesLoaded, totalFrames } = evt.detail;
+      const percentComplete = Math.round((framesLoaded / totalFrames) * 100);
+
+      const prevProgress = this.volumeLoadingProgress.get(volumeId);
+      const prevPercent = prevProgress ? prevProgress.percentComplete : -1;
+
+      // Throttle: only update if percent changed and is a multiple of 25 (or first/last)
+      if (percentComplete !== prevPercent && (percentComplete % 25 === 0 || percentComplete === 100)) {
+        this.volumeLoadingProgress.set(volumeId, {
+          percentComplete,
+          loadedImages: framesLoaded,
+          totalImages: totalFrames
+        });
+
+        this._broadcastEvent(EVENTS.VOLUME_LOADING_PROGRESS, {
+          volumeId,
+          percentComplete,
+          loadedImages: framesLoaded,
+          totalImages: totalFrames
+        });
+      }
+    });
+
+    // Clear progress on completion
+    eventTarget.addEventListener('IMAGE_VOLUME_LOADING_COMPLETED', (evt: any) => {
+      const { volumeId } = evt.detail;
+      this.volumeLoadingProgress.delete(volumeId);
+      this._broadcastEvent(EVENTS.VOLUME_LOADING_PROGRESS, { volumeId, percentComplete: 100 });
+    });
   }
 
   /**
@@ -75,6 +119,19 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const viewportInfo = new ViewportInfo(viewportId);
     viewportInfo.setElement(elementRef);
     this.viewportsById.set(viewportId, viewportInfo);
+
+    // Listen for WebGL context loss to provide user feedback
+    elementRef.addEventListener('webglcontextlost', (event) => {
+      event.preventDefault();
+      console.error('[GPU] WebGL Context Lost! Device memory limits exceeded.');
+      const { uiNotificationService } = this.servicesManager.services;
+      uiNotificationService.show({
+        title: 'GPU Memory Overload',
+        message: 'Your graphics card has crashed because the 3D volume is too large. Please refresh or try a simpler layout.',
+        type: 'error',
+        duration: 8000
+      });
+    }, false);
   }
 
   public getViewportIds(): string[] {
@@ -483,6 +540,11 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         viewportData,
         viewportId,
       });
+
+      // Batch render after viewport is fully initialized - allows progressive loading
+      requestAnimationFrame(() => {
+        renderingEngine.render();
+      });
     });
   }
 
@@ -710,26 +772,42 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
 
     this.viewportsDisplaySets.set(viewport.id, displaySetInstanceUIDs);
 
-    const volumesNotLoaded = volumeToLoad.filter(volume => !volume.loadStatus.loaded);
+    // Set volumes and allow progressive rendering as slices arrive
+    // Use the hydration queue to ensure viewports are initialized one by one
+    // This is the "Crash Killer" for large 600-slice volumes.
+    CornerstoneViewportService._hydrationQueue = CornerstoneViewportService._hydrationQueue.then(async () => {
+      console.log(`[Hydration] Queue starting for viewport: ${viewport.id}`);
 
-    if (volumesNotLoaded.length) {
-      if (hangingProtocolService.getShouldPerformCustomImageLoad()) {
-        // delegate the volume loading to the hanging protocol service if it has a custom image load strategy
-        return hangingProtocolService.runImageLoadStrategy({
-          viewportId: viewport.id,
-          volumeInputArray,
-        });
+      // Small "breathing room" (micro-task) before starting the next viewport
+      // This allows the browser to run Garbage Collection and update the UI/Progress Bar.
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      const volumesNotLoaded = volumeToLoad.filter(volume => !volume.loadStatus.loaded);
+
+      if (volumesNotLoaded.length) {
+        if (hangingProtocolService.getShouldPerformCustomImageLoad()) {
+          console.log(`[Hydration] Running custom image load strategy for: ${viewport.id}`);
+          await hangingProtocolService.runImageLoadStrategy({
+            viewportId: viewport.id,
+            volumeInputArray,
+          });
+        } else {
+          // Start loading volumes sequentially within this viewport's turn
+          volumesNotLoaded.forEach(volume => {
+            if (!volume.loadStatus.loading) {
+              console.log(`[Hydration] Triggering volume.load() for: ${volume.volumeId}`);
+              volume.load();
+            }
+          });
+        }
       }
 
-      volumesNotLoaded.forEach(volume => {
-        if (!volume.loadStatus.loading) {
-          volume.load();
-        }
-      });
-    }
+      return this.setVolumesForViewport(viewport, volumeInputArray, presentations);
+    }).catch(err => {
+      console.error(`[Hydration] Error in queue for viewport ${viewport.id}:`, err);
+    });
 
-    // This returns the async continuation only
-    return this.setVolumesForViewport(viewport, volumeInputArray, presentations);
+    return CornerstoneViewportService._hydrationQueue;
   }
 
   public async setVolumesForViewport(viewport, volumeInputArray, presentations) {
@@ -737,6 +815,8 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       this.servicesManager.services;
 
     const viewportInfo = this.getViewportInfo(viewport.id);
+    const viewportId = viewport.id;
+
     const displaySetOptions = viewportInfo.getDisplaySetOptions();
     const displaySetUIDs = viewportGridService.getDisplaySetsUIDsForViewport(viewport.id);
     const displaySet = displaySetService.getDisplaySetByUID(displaySetUIDs[0]);
@@ -747,7 +827,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       const { volumeId } = volumeInput;
       const displaySetOption = displaySetOptions[index];
       const { voi, voiInverted, colormap, displayPreset } = displaySetOption;
-      const properties = {};
+      const properties: any = {};
 
       if (voi && (voi.windowWidth || voi.windowCenter)) {
         const { lower, upper } = csUtils.windowLevel.toLowHighRange(
@@ -772,7 +852,14 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       return { properties, volumeId };
     });
 
-    await viewport.setVolumes(volumeInputArray);
+    try {
+      await viewport.setVolumes(volumeInputArray);
+    } catch (err) {
+      console.error(`Error setting volumes for viewport ${viewportId}:`, err);
+    } finally {
+      console.timeEnd(`VolumeSetup-${viewportId}`);
+    }
+
     volumesProperties.forEach(({ properties, volumeId }) => {
       viewport.setProperties(properties, volumeId);
     });
@@ -792,7 +879,52 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       });
     }
 
-    viewport.render();
+    // Stage 1: Initial render after volume assignment (shows viewport structure)
+    requestAnimationFrame(() => {
+      viewport.render();
+    });
+
+    // Final render logic
+    const triggerFinalRender = () => {
+      requestAnimationFrame(() => {
+        viewport.render();
+      });
+    };
+
+    // Stage 2: Final render when volume data fully loads (fixes black screens)
+    const onVolumeLoadComplete = (evt) => {
+      const { volumeId } = evt.detail;
+
+      // Check if this event is for one of our volumes
+      const isOurVolume = volumeInputArray.some(v => v.volumeId === volumeId);
+
+      if (isOurVolume) {
+        triggerFinalRender();
+
+        // Cleanup: Remove listener after first successful render
+        eventTarget.removeEventListener(
+          csEnums.Events.IMAGE_VOLUME_LOADING_COMPLETED,
+          onVolumeLoadComplete
+        );
+      }
+    };
+
+    // Check if ALL volumes are already loaded (Cache hit)
+    const allLoaded = volumeInputArray.every(v => {
+      const vol = cache.getVolume(v.volumeId);
+      return vol?.loadStatus?.loaded;
+    });
+
+    if (allLoaded) {
+      // Already loaded, just trigger final render
+      triggerFinalRender();
+    } else {
+      // Attach listener to global eventTarget for future completion
+      eventTarget.addEventListener(
+        csEnums.Events.IMAGE_VOLUME_LOADING_COMPLETED,
+        onVolumeLoadComplete
+      );
+    }
 
     this._broadcastEvent(this.EVENTS.VIEWPORT_VOLUMES_CHANGED, {
       viewportInfo,
@@ -993,8 +1125,8 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       const { dimensions } = imageVolume;
       const slabThickness = Math.sqrt(
         dimensions[0] * dimensions[0] +
-          dimensions[1] * dimensions[1] +
-          dimensions[2] * dimensions[2]
+        dimensions[1] * dimensions[1] +
+        dimensions[2] * dimensions[2]
       );
 
       return slabThickness;
@@ -1060,20 +1192,25 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         this.beforeResizePositionPresentations.set(id, presentation);
       });
 
-      // Resize the rendering engine and render.
+      // Batch resize operations to prevent main thread blocking
       const renderingEngine = this.renderingEngine;
-      renderingEngine.resize(isImmediate);
-      renderingEngine.render();
 
-      // Reset the camera for viewports that should reset their camera on resize,
-      // which means only those viewports that have a zoom level of 1.
-      this.beforeResizePositionPresentations.forEach((positionPresentation, viewportId) => {
-        this.setPresentations(viewportId, { positionPresentation });
+      // Use requestAnimationFrame to move heavy render operations off main thread
+      requestAnimationFrame(() => {
+        renderingEngine.resize(isImmediate);
+
+        // Reset the camera for viewports that should reset their camera on resize,
+        // which means only those viewports that have a zoom level of 1.
+        this.beforeResizePositionPresentations.forEach((positionPresentation, viewportId) => {
+          this.setPresentations(viewportId, { positionPresentation });
+        });
+
+        // Single render after resize and presentation updates
+        requestAnimationFrame(() => {
+          renderingEngine.resize(isImmediate);
+          renderingEngine.render();
+        });
       });
-
-      // Resize and render the rendering engine again.
-      renderingEngine.resize(isImmediate);
-      renderingEngine.render();
     } catch (e) {
       // This can happen if the resize is too close to navigation or shutdown
       console.warn('Caught resize exception', e);

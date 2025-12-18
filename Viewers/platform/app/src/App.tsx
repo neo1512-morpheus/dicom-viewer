@@ -66,7 +66,11 @@ function App({ config, defaultExtensions, defaultModes }) {
   const canvas = document.createElement('canvas');
   const gl = canvas.getContext('webgl2');
 
-  const max3DTextureSize = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
+  // Safety: Handle case where WebGL2 context creation fails (GPU crashed or unsupported)
+  const max3DTextureSize = gl ? gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) : 256;
+  if (!gl) {
+    console.error('[GPU] WebGL2 context creation failed. 3D rendering will be limited.');
+  }
   appConfigState.max3DTextureSize = max3DTextureSize;
 
   const {

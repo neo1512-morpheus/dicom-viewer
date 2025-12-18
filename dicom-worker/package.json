@@ -1,0 +1,16 @@
+{
+    "name": "dicom-worker",
+    "version": "1.0.0",
+    "description": "DICOM transcoding worker for JPEG 2000 compression",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "@supabase/supabase-js": "^2.39.0",
+        "adm-zip": "^0.5.10",
+        "dcmjs": "^0.30.0",
+        "dotenv": "^16.3.1"
+    }
+}

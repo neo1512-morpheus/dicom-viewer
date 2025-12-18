@@ -27,6 +27,32 @@ import { useAppConfig } from '@state';
 
 import { LutPresentation, PositionPresentation } from '../types/Presentation';
 
+function VolumeLoadingOverlay({ progress }) {
+  if (!progress || progress.percentComplete >= 100) {
+    return null;
+  }
+
+  return (
+    <div className="volume-loading-overlay">
+      <div className="loading-content">
+        <div className="loading-spinner"></div>
+        <div className="loading-text">
+          Loading Volume: {progress.percentComplete}%
+        </div>
+        <div className="loading-subtext">
+          {progress.loadedImages} / {progress.totalImages} slices
+        </div>
+        <div className="loading-bar-container">
+          <div
+            className="loading-bar-fill"
+            style={{ width: `${progress.percentComplete}%` }}
+          ></div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const STACK = 'stack';
 
 /**
@@ -156,6 +182,7 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     viewportActionCornersService,
   } = servicesManager.services;
 
+  const [loadingProgress, setLoadingProgress] = useState(null);
   const [viewportDialogState] = useViewportDialog();
   // useCallback for scroll bar height calculation
   const setImageScrollBarHeight = useCallback(() => {
@@ -248,7 +275,37 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
 
       eventTarget.removeEventListener(Enums.Events.ELEMENT_ENABLED, elementEnabledHandler);
     };
-  }, []);
+  }, [viewportId, elementEnabledHandler, cornerstoneViewportService]);
+
+  // Listen for volume loading progress
+  useEffect(() => {
+    const VOLUME_LOADING_PROGRESS = 'event::cornerstoneViewportService:volumeLoadingProgress';
+
+    const onProgress = (evt) => {
+      if (!evt || !evt.detail) return;
+      const { volumeId, percentComplete, loadedImages, totalImages } = evt.detail;
+
+      // Check if this volume belongs to our displaySets
+      if (!displaySets || !displaySets.length) return;
+
+      const displaySetInstanceUIDs = displaySets.map(ds => ds.displaySetInstanceUID);
+      // Robust matching: Check if any of our displaySetUIDs are part of the volumeId
+      const isOurVolume = displaySetInstanceUIDs.some(uid => volumeId.includes(uid));
+
+      if (isOurVolume) {
+        setLoadingProgress({ percentComplete, loadedImages, totalImages });
+      }
+    };
+
+    const unsubscribe = cornerstoneViewportService.subscribe(
+      VOLUME_LOADING_PROGRESS,
+      onProgress
+    );
+
+    return () => {
+      unsubscribe();
+    };
+  }, [displaySets, cornerstoneViewportService]);
 
   // subscribe to displaySet metadata invalidation (updates)
   // Currently, if the metadata changes we need to re-render the display set
@@ -334,13 +391,17 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
         viewportOptions.needsRerendering = false;
       }
 
-      cornerstoneViewportService.setViewportData(
-        viewportId,
-        viewportData,
-        viewportOptions,
-        displaySetOptions,
-        presentations
-      );
+      // Defer the heavy setViewportData call to allow React to finish the mount
+      // and keep the UI responsive (e.g. allow the layout menu to close)
+      setTimeout(() => {
+        cornerstoneViewportService.setViewportData(
+          viewportId,
+          viewportData,
+          viewportOptions,
+          displaySetOptions,
+          presentations
+        );
+      }, 0);
       if (measurement) {
         cs3DTools.annotation.selection.setAnnotationSelected(measurement.uid);
       }
@@ -443,6 +504,7 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
           viewportId={viewportId}
           servicesManager={servicesManager}
         />
+        <VolumeLoadingOverlay progress={loadingProgress} />
       </div>
       {/* top offset of 24px to account for ViewportActionCorners. */}
       <div className="absolute top-[24px] w-full">

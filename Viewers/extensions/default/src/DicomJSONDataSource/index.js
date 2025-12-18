@@ -82,6 +82,10 @@ function createDicomJSONApi(dicomJsonConfig) {
 
       let StudyInstanceUID;
       let SeriesInstanceUID;
+
+      // Track seen instances to prevent duplicates (fixes 732/600 slice issue)
+      const seenSOPInstanceUIDs = new Set();
+
       data.studies.forEach(study => {
         StudyInstanceUID = study.StudyInstanceUID;
 
@@ -91,11 +95,23 @@ function createDicomJSONApi(dicomJsonConfig) {
           series.instances.forEach(instance => {
             const { url: imageId, metadata: naturalizedDicom } = instance;
 
+            // Deduplicate: Skip if we've already processed this instance
+            const sopUID = naturalizedDicom.SOPInstanceUID;
+            if (seenSOPInstanceUIDs.has(sopUID)) {
+              console.warn(`[DicomJSON] Skipping duplicate instance: ${sopUID}`);
+              return;
+            }
+            seenSOPInstanceUIDs.add(sopUID);
+
+            // FIX: Extract TransferSyntaxUID safely for correct decoder selection
+            const TransferSyntaxUID = naturalizedDicom.TransferSyntaxUID || naturalizedDicom['00020010']?.Value?.[0];
+
             // Add imageId specific mapping to this data as the URL isn't necessarliy WADO-URI.
             metadataProvider.addImageIdToUIDs(imageId, {
               StudyInstanceUID,
               SeriesInstanceUID,
               SOPInstanceUID: naturalizedDicom.SOPInstanceUID,
+              TransferSyntaxUID: TransferSyntaxUID,
             });
           });
         });
@@ -112,7 +128,7 @@ function createDicomJSONApi(dicomJsonConfig) {
     },
     query: {
       studies: {
-        mapParams: () => {},
+        mapParams: () => { },
         search: async param => {
           const [key, value] = Object.entries(param)[0];
           const mappedParam = mappings[key];

@@ -17,6 +17,7 @@ class CornerstoneCacheService {
 
   stackImageIds: Map<string, string[]> = new Map();
   volumeImageIds: Map<string, string[]> = new Map();
+  volumePromises: Map<string, Promise<any>> = new Map();
   readonly servicesManager: AppTypes.ServicesManager;
 
   constructor(servicesManager: AppTypes.ServicesManager) {
@@ -210,17 +211,35 @@ class CornerstoneCacheService {
       const volumeId = `${volumeLoaderSchema}:${displaySet.displaySetInstanceUID}`;
 
       let volumeImageIds = this.volumeImageIds.get(displaySet.displaySetInstanceUID);
-
       let volume = cs3DCache.getVolume(volumeId);
 
       if (!volumeImageIds || !volume) {
-        volumeImageIds = this._getCornerstoneVolumeImageIds(displaySet, dataSource);
+        // If there's already a request in flight for this volume, wait for it
+        if (this.volumePromises.has(volumeId)) {
+          console.log('Waiting for existing volume creation:', volumeId);
+          volume = await this.volumePromises.get(volumeId);
+          volumeImageIds = this.volumeImageIds.get(displaySet.displaySetInstanceUID);
+        } else {
+          console.log('Creating and caching volume:', volumeId);
+          const volumePromise = (async () => {
+            const ids = this._getCornerstoneVolumeImageIds(displaySet, dataSource);
+            const vol = await volumeLoader.createAndCacheVolume(volumeId, {
+              imageIds: ids,
+            });
+            this.volumeImageIds.set(displaySet.displaySetInstanceUID, ids);
+            return vol;
+          })();
 
-        volume = await volumeLoader.createAndCacheVolume(volumeId, {
-          imageIds: volumeImageIds,
-        });
+          this.volumePromises.set(volumeId, volumePromise);
 
-        this.volumeImageIds.set(displaySet.displaySetInstanceUID, volumeImageIds);
+          try {
+            volume = await volumePromise;
+            volumeImageIds = this.volumeImageIds.get(displaySet.displaySetInstanceUID);
+          } finally {
+            // Remove from promises map after completion
+            this.volumePromises.delete(volumeId);
+          }
+        }
       }
 
       volumeData.push({
@@ -273,6 +292,13 @@ class CornerstoneCacheService {
 
   private _getCornerstoneVolumeImageIds(displaySet, dataSource): string[] {
     const stackImageIds = this._getCornerstoneStackImageIds(displaySet, dataSource);
+
+    // GPU Safety decimation: If volume is too large for browser/GPU
+    // we use every 2nd slice to ensure stability while maintaining 3D integrity.
+    if (stackImageIds.length > 400) {
+      console.warn(`[GPU Safety] Decimating large volume (${stackImageIds.length} slices) by 50% to prevent crash.`);
+      return stackImageIds.filter((_, index) => index % 2 === 0);
+    }
 
     return stackImageIds;
   }

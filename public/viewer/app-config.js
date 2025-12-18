@@ -10,11 +10,18 @@ window.config = {
     showLoadingIndicator: true,
     useNorm16Texture: true,
     strictZSpacingForVolumeViewport: false,
+    preferSizeOverAccuracy: true, // Enable memory-efficient 16-bit textures
     groupEnabledModesFirst: true,
+    maxCacheSize: 1.5 * 1024 * 1024 * 1024, // 1.5GB - Safer limit for integrated GPUs with shared VRAM
+    studyPrefetcher: {
+        enabled: true,
+        displaySetCount: 1,
+        maxNumPrefetchRequests: 3, // Further reduced to prevent main thread/memory saturation
+    },
     maxNumRequests: {
         interaction: 100,
-        thumbnail: 75,
-        prefetch: 25
+        thumbnail: 50,
+        prefetch: 3 // Tightened to give priority to interaction requests
     },
     defaultDataSourceName: "dicomweb",
     // DISABLE the investigational use disclaimer popup
@@ -57,7 +64,35 @@ window.config = {
                     enabled: true,
                     relativeResolution: "studies"
                 },
-                omitQuotationForMultipartRequest: true
+                omitQuotationForMultipartRequest: true,
+                retrieve: {
+                    stages: [
+                        {
+                            id: 'initialImages',
+                            positions: [0.5, 0, -1], // Middle, first, last slice
+                            priority: 10,
+                            requestType: 'INTERACTION',
+                        },
+                        {
+                            id: 'quarterResolution',
+                            decimate: 4, // Every 4th slice
+                            offset: 3,
+                            priority: 9,
+                            retrieveType: 'multipleFast',
+                        },
+                        // ---------------------------------------------------------
+                        // 🛑 DISABLED: fullResolution stage was causing GPU memory crash
+                        // This was the "Silent Killer" - loading ALL 600 slices at once
+                        // Now high-res slices load on-demand when scrolling stops
+                        // ---------------------------------------------------------
+                        // {
+                        //     id: 'fullResolution',
+                        //     decimate: 1, // Fill gaps
+                        //     priority: 8,
+                        //     retrieveType: 'default',
+                        // },
+                    ],
+                }
             }
         },
         {

@@ -102,13 +102,89 @@ function ToolbarLayoutSelectorWithServices({
     setIsDisabled(true);
   }, []);
 
-  const onSelectionPreset = useCallback(props => {
+  // =====================================================
+  // LARGE SCAN WARNING for 3D layouts
+  // =====================================================
+  const LARGE_SCAN_THRESHOLD = 300;
+  // These are the actual protocol IDs from the hanging protocols folder
+  const VOLUME_PROTOCOLS = [
+    'mpr', '3d', 'volume', 'axial', 'sagittal', 'coronal', // general terms
+    'fourup', 'fourUp', // 3D four up
+    'only3d', // 3D only
+    'main3d', // 3D main
+    'primary3d', // 3D primary
+    'primaryaxial', // Axial primary
+    'mprand3dvolumeviewport', // MPR and 3D volume
+  ];
+
+  const onSelectionPreset = useCallback(presetProps => {
+    const { displaySetService, viewportGridService, uiModalService } =
+      servicesManager.services;
+
+    const protocolId = presetProps.protocolId?.toLowerCase() || '';
+    const isVolumeLayout = VOLUME_PROTOCOLS.some(vp => protocolId.includes(vp));
+
+    // Get current displaySets to check slice count
+    const viewportId = viewportGridService.getActiveViewportId();
+    let totalSlices = 0;
+
+    if (viewportId) {
+      const displaySetUIDs = viewportGridService.getDisplaySetsUIDsForViewport(viewportId);
+      if (displaySetUIDs) {
+        displaySetUIDs.forEach(uid => {
+          const ds = displaySetService.getDisplaySetByUID(uid);
+          if (ds) {
+            totalSlices += ds.numImageFrames || ds.instances?.length || 0;
+          }
+        });
+      }
+    }
+
+    console.log(`[Layout] Selected: ${protocolId}, isVolume: ${isVolumeLayout}, slices: ${totalSlices}`);
+
+    // If 3D layout AND large scan, show warning
+    if (isVolumeLayout && totalSlices > LARGE_SCAN_THRESHOLD) {
+      console.log('[Layout] LARGE SCAN - Showing warning modal');
+
+      uiModalService.show({
+        content: LargeScanWarningModal,
+        contentProps: {
+          totalSlices,
+          onProceed: () => {
+            console.log('[Layout] User clicked PROCEED');
+            uiModalService.hide();
+            commandsManager.run({
+              commandName: 'setHangingProtocol',
+              commandOptions: { ...presetProps },
+            });
+            setIsDisabled(true);
+          },
+          onUse2D: () => {
+            console.log('[Layout] User clicked STAY IN 2D');
+            uiModalService.hide();
+            // DO NOTHING - stay in current layout
+            setIsDisabled(true);
+          },
+        },
+        title: '',
+        shouldCloseOnEsc: false,
+        shouldCloseOnOverlayClick: false,
+        closeButton: false,
+        containerDimensions: 'max-w-lg',
+        // Style outer wrapper with border/shadow, content will override inner background
+        customClassName: 'border-2 border-slate-500 shadow-2xl rounded-xl overflow-hidden',
+      });
+      return;
+    }
+
+    // Normal case - no warning needed
+    console.log('[Layout] Small scan or 2D layout - proceeding normally');
     commandsManager.run({
       commandName: 'setHangingProtocol',
-      commandOptions: { ...props },
+      commandOptions: { ...presetProps },
     });
     setIsDisabled(true);
-  }, []);
+  }, [servicesManager, commandsManager]);
 
   return (
     <div onMouseEnter={handleMouseEnter}>
@@ -122,6 +198,67 @@ function ToolbarLayoutSelectorWithServices({
     </div>
   );
 }
+
+// Warning modal component for large scans
+function LargeScanWarningModal({ totalSlices, onProceed, onUse2D }) {
+  return (
+    <div style={{
+      backgroundColor: '#1e293b',
+      padding: '24px',
+      margin: '-8px -20px -20px -20px',
+      display: 'flex',
+      flexDirection: 'column' as const,
+      textAlign: 'center' as const,
+    }}>
+      <h3 style={{ color: '#fbbf24', marginBottom: '15px', fontSize: '18px' }}>
+        ⚠️ Large 3D Scan Detected
+      </h3>
+      <p style={{ marginBottom: '10px', color: '#f1f5f9' }}>
+        This scan has <strong style={{ color: '#ff5722' }}>{totalSlices} slices</strong> which requires significant GPU memory.
+      </p>
+      <p style={{ marginBottom: '25px', color: '#f1f5f9', fontSize: '14px' }}>
+        If you don't have a powerful graphics card (1GB+ VRAM), this may cause the viewer to crash or freeze.
+      </p>
+      <div style={{ display: 'flex', gap: '15px', justifyContent: 'center' }}>
+        <button
+          onClick={onProceed}
+          style={{
+            padding: '12px 24px',
+            backgroundColor: '#ff5722',
+            color: 'white',
+            border: 'none',
+            borderRadius: '6px',
+            cursor: 'pointer',
+            fontWeight: 'bold',
+            fontSize: '14px',
+          }}
+        >
+          Proceed Anyway
+          <br />
+          <span style={{ fontSize: '12px', fontWeight: 'normal' }}>(Risky)</span>
+        </button>
+        <button
+          onClick={onUse2D}
+          style={{
+            padding: '12px 24px',
+            backgroundColor: '#4CAF50',
+            color: 'white',
+            border: 'none',
+            borderRadius: '6px',
+            cursor: 'pointer',
+            fontWeight: 'bold',
+            fontSize: '14px',
+          }}
+        >
+          Stay in 2D Mode
+          <br />
+          <span style={{ fontSize: '12px', fontWeight: 'normal' }}>(Safe)</span>
+        </button>
+      </div>
+    </div >
+  );
+}
+
 
 function LayoutSelector({
   rows,
@@ -245,7 +382,7 @@ LayoutSelector.propTypes = {
 LayoutSelector.defaultProps = {
   columns: 4,
   rows: 3,
-  onLayoutChange: () => {},
+  onLayoutChange: () => { },
 };
 
 export default ToolbarLayoutSelectorWithServices;

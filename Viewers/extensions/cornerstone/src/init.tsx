@@ -32,6 +32,7 @@ import initContextMenu from './initContextMenu';
 import initDoubleClick from './initDoubleClick';
 import initViewTiming from './utils/initViewTiming';
 import { colormaps } from './utils/colormaps';
+import { detectGPUCapability } from './utils/gpuCapabilityCheck';
 
 const { registerColormap } = csUtilities.colormap;
 
@@ -47,6 +48,22 @@ export default async function init({
   extensionManager,
   appConfig,
 }: Types.Extensions.ExtensionParams): Promise<void> {
+  // =====================================================
+  // GPU CAPABILITY DETECTION - For logging/debugging only
+  // No behavior changes - uniform treatment for all users
+  // =====================================================
+  const gpuCapability = detectGPUCapability();
+
+  // Store GPU info for debugging (NOT used to change behavior)
+  appConfig.gpuRenderer = gpuCapability.renderer;
+  appConfig.isLowEndGPU = gpuCapability.isWeakGPU;
+
+  console.log('[GPU Info] Detected:', gpuCapability.renderer);
+  if (gpuCapability.isWeakGPU) {
+    console.log('[GPU Info] Note: This is an integrated/low-end GPU. Large 3D scans may be slow.');
+  }
+  // =====================================================
+
   // Note: this should run first before initializing the cornerstone
   // DO NOT CHANGE THE ORDER
   const value = appConfig.useSharedArrayBuffer;
@@ -99,6 +116,62 @@ export default async function init({
     viewportGridService,
     stateSyncService,
   } = servicesManager.services;
+
+  // =====================================================
+  // GLOBAL WebGL ERROR DETECTION
+  // Catches WebGL errors from VTK.js and other sources
+  // =====================================================
+  let hasShownGPUWarning = false;
+
+  const showGPUWarning = () => {
+    if (hasShownGPUWarning) return;
+    hasShownGPUWarning = true;
+    console.warn('[GPU] Showing GPU memory warning to user');
+    uiNotificationService.show({
+      title: 'GPU Memory Limit Reached',
+      message: 'This 3D scan is too large for your graphics card. Try closing other browser tabs or reloading the page.',
+      type: 'warning',
+      duration: 15000,
+    });
+  };
+
+  // Listen for WebGL context loss on ALL canvases (including VTK.js internal ones)
+  const attachCanvasListeners = () => {
+    const canvases = document.querySelectorAll('canvas');
+    canvases.forEach((canvas) => {
+      if (!canvas.dataset.gpuListenerAttached) {
+        canvas.dataset.gpuListenerAttached = 'true';
+        canvas.addEventListener('webglcontextlost', (e) => {
+          e.preventDefault();
+          console.warn('[GPU] WebGL context lost on canvas');
+          showGPUWarning();
+        });
+      }
+    });
+  };
+
+  // Use MutationObserver to catch dynamically created canvases
+  const observer = new MutationObserver(() => {
+    attachCanvasListeners();
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+
+  // Also attach to existing canvases
+  attachCanvasListeners();
+
+  // Global error handler for uncaught WebGL errors
+  window.addEventListener('error', (event) => {
+    const errorMsg = event.message || '';
+    if (
+      errorMsg.includes('WebGL') ||
+      errorMsg.includes('CONTEXT_LOST') ||
+      errorMsg.includes('GPU')
+    ) {
+      console.warn('[GPU] Caught global WebGL error:', errorMsg);
+      showGPUWarning();
+    }
+  });
+  // =====================================================
 
   window.services = servicesManager.services;
   window.extensionManager = extensionManager;

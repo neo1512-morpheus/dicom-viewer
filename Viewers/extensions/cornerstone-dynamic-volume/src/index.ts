@@ -21,8 +21,24 @@ const dynamicVolumeExtension = {
    * this extension is providing.
    */
   preRegistration: ({ servicesManager, commandsManager, configuration = {} }) => {
-    // TODO: look for the right fix
-    cache.setMaxCacheSize(5 * 1024 * 1024 * 1024);
+    // 1. Get the RAM approximation (Chrome/Edge only).
+    // If undefined (Firefox/Safari), we assume it is NULL/Low-End.
+    const deviceMemory = (navigator as any).deviceMemory;
+
+    // 2. Define the Safe Limit (1.5GB) and High Performance Limit (3GB)
+    // Note: We use 3GB instead of 4GB to leave room for the OS on 8GB laptops.
+    const SAFE_LIMIT = 1.5 * 1024 * 1024 * 1024;
+    const HIGH_LIMIT = 3 * 1024 * 1024 * 1024;
+
+    let cacheLimit = SAFE_LIMIT; // DEFAULT TO SAFE MODE
+
+    // 3. Only upgrade to High Limit if we are SURE the device has >= 8GB RAM
+    if (deviceMemory && deviceMemory >= 8) {
+      cacheLimit = HIGH_LIMIT;
+    }
+
+    cache.setMaxCacheSize(cacheLimit);
+    console.log(`[Cache] Dynamic Limit Set to: ${(cacheLimit / 1024 / 1024 / 1024).toFixed(1)} GB (Detected RAM: ${deviceMemory || 'Unknown'})`);
   },
   /**
    * PanelModule should provide a list of panels that will be available in OHIF

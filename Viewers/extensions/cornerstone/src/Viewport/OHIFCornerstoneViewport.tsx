@@ -277,6 +277,61 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     };
   }, [viewportId, elementEnabledHandler, cornerstoneViewportService]);
 
+  // =====================================================
+  // WebGL CONTEXT LOSS RECOVERY
+  // Shows user warning when GPU memory is exhausted
+  // =====================================================
+  const [hasShownGPUWarning, setHasShownGPUWarning] = useState(false);
+
+  useEffect(() => {
+    // Wait for viewport to be enabled (canvas to exist)
+    if (!enabledVPElement) return;
+
+    const canvas = elementRef.current?.querySelector('canvas');
+    if (!canvas) {
+      console.log('[GPU] No canvas found yet, waiting...');
+      return;
+    }
+
+    console.log('[GPU] Attaching WebGL context loss listener to canvas');
+
+    const handleContextLost = (event: Event) => {
+      event.preventDefault();
+      console.warn('[GPU] WebGL context lost! GPU memory exhausted.');
+
+      // Show user-friendly warning (only once per session)
+      if (!hasShownGPUWarning) {
+        setHasShownGPUWarning(true);
+        const { uiNotificationService } = servicesManager.services;
+        if (uiNotificationService) {
+          uiNotificationService.show({
+            title: 'GPU Memory Limit Reached',
+            message: 'This 3D scan is too large for your graphics card. Try closing other browser tabs or using a device with more GPU memory.',
+            type: 'warning',
+            duration: 15000, // 15 seconds
+          });
+        }
+      }
+    };
+
+    const handleContextRestored = () => {
+      console.log('[GPU] WebGL context restored.');
+      try {
+        cornerstoneViewportService.resize(true);
+      } catch (e) {
+        console.warn('[GPU] Could not resize after context restore:', e);
+      }
+    };
+
+    canvas.addEventListener('webglcontextlost', handleContextLost);
+    canvas.addEventListener('webglcontextrestored', handleContextRestored);
+
+    return () => {
+      canvas.removeEventListener('webglcontextlost', handleContextLost);
+      canvas.removeEventListener('webglcontextrestored', handleContextRestored);
+    };
+  }, [viewportId, enabledVPElement, cornerstoneViewportService, servicesManager, hasShownGPUWarning]);
+
   // Listen for volume loading progress
   useEffect(() => {
     const VOLUME_LOADING_PROGRESS = 'event::cornerstoneViewportService:volumeLoadingProgress';
@@ -297,13 +352,18 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
       }
     };
 
-    const unsubscribe = cornerstoneViewportService.subscribe(
+    // Robust subscription handling: checks if return value is a function or an object
+    const subscription = cornerstoneViewportService.subscribe(
       VOLUME_LOADING_PROGRESS,
       onProgress
     );
 
     return () => {
-      unsubscribe();
+      if (typeof subscription === 'function') {
+        subscription();
+      } else if (typeof subscription === 'object' && typeof subscription.unsubscribe === 'function') {
+        subscription.unsubscribe();
+      }
     };
   }, [displaySets, cornerstoneViewportService]);
 
@@ -316,7 +376,8 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
   // Note: this approach does not actually end of sending network requests
   // and it uses the network cache
   useEffect(() => {
-    const { unsubscribe } = displaySetService.subscribe(
+    // Robust subscription handling: checks if return value is a function or an object
+    const subscription = displaySetService.subscribe(
       displaySetService.EVENTS.DISPLAY_SET_SERIES_METADATA_INVALIDATED,
       async ({
         displaySetInstanceUID: invalidatedDisplaySetInstanceUID,
@@ -343,7 +404,11 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
       }
     );
     return () => {
-      unsubscribe();
+      if (typeof subscription === 'function') {
+        subscription();
+      } else if (typeof subscription === 'object' && typeof subscription.unsubscribe === 'function') {
+        subscription.unsubscribe();
+      }
     };
   }, [viewportId]);
 
@@ -535,7 +600,8 @@ function _subscribeToJumpToMeasurementEvents(
   viewportGridService,
   cornerstoneViewportService
 ) {
-  const { unsubscribe } = measurementService.subscribe(
+  // Robust subscription handling: checks if return value is a function or an object
+  const subscription = measurementService.subscribe(
     MeasurementService.EVENTS.JUMP_TO_MEASUREMENT_VIEWPORT,
     props => {
       cacheJumpToMeasurementEvent = props;
@@ -570,7 +636,14 @@ function _subscribeToJumpToMeasurementEvents(
     }
   );
 
-  return unsubscribe;
+  // Return a safe cleanup function that handles both types
+  return () => {
+    if (typeof subscription === 'function') {
+      subscription();
+    } else if (typeof subscription === 'object' && typeof subscription.unsubscribe === 'function') {
+      subscription.unsubscribe();
+    }
+  };
 }
 
 // Check if there is a queued jumpToMeasurement event

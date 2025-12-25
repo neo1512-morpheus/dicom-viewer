@@ -3,8 +3,8 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.jsx'
 
-// Register DICOM Service Worker for caching
-if ('serviceWorker' in navigator) {
+// Register DICOM Service Worker for caching (PRODUCTION ONLY)
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js')
       .then(reg => console.log('✅ DICOM Service Worker Registered', reg.scope))

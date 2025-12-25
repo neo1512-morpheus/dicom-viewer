@@ -127,12 +127,17 @@ export default async function init({
     if (hasShownGPUWarning) return;
     hasShownGPUWarning = true;
     console.warn('[GPU] Showing GPU memory warning to user');
-    uiNotificationService.show({
-      title: 'CRITICAL: GPU Memory Exhausted',
-      message: 'Your graphics card has crashed. You MUST reload the page to continue.',
-      type: 'error',
-      duration: 0,
-    });
+    // EMERGENCY FALLBACK: React might be dead, use raw DOM
+    const crashDiv = document.createElement('div');
+    crashDiv.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); color: red; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 99999; font-size: 24px; font-weight: bold; text-align: center;';
+    crashDiv.innerHTML = `
+      <div style="background: #222; padding: 40px; border: 2px solid red; border-radius: 8px;">
+        <h1>⚠️ CRITICAL GPU CRASH ⚠️</h1>
+        <p style="color: white; margin: 20px 0;">Your device ran out of memory (VRAM).</p>
+        <button onclick="window.location.reload()" style="padding: 15px 30px; font-size: 20px; cursor: pointer; background: red; color: white; border: none; border-radius: 4px;">RELOAD PAGE NOW</button>
+      </div>
+    `;
+    document.body.appendChild(crashDiv);
   };
 
   // Listen for WebGL context loss on ALL canvases (including VTK.js internal ones)

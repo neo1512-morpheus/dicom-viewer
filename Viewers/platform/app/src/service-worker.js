@@ -44,10 +44,9 @@ self.addEventListener('message', event => {
   if (event.data && event.data.type === 'SKIP_WAITING') {
     switch (event.data.type) {
       case 'SKIP_WAITING':
-        // TODO: We'll eventually want this to be user prompted
-        // workbox.core.skipWaiting();
-        // workbox.core.clientsClaim();
-        // TODO: Global notification to indicate incoming reload
+        // Immediately activate the new service worker
+        workbox.core.skipWaiting();
+        workbox.core.clientsClaim();
         break;
 
       default:

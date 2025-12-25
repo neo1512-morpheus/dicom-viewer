@@ -305,10 +305,10 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
         const { uiNotificationService } = servicesManager.services;
         if (uiNotificationService) {
           uiNotificationService.show({
-            title: 'GPU Memory Limit Reached',
-            message: 'This 3D scan is too large for your graphics card. Try closing other browser tabs or using a device with more GPU memory.',
-            type: 'warning',
-            duration: 15000, // 15 seconds
+            title: 'CRITICAL: GPU Memory Exhausted',
+            message: 'Your graphics card has crashed. You MUST reload the page to continue.',
+            type: 'error',
+            duration: 0,
           });
         }
       }

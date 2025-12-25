@@ -149,10 +149,10 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       console.error('[GPU] WebGL Context Lost! Device memory limits exceeded.');
       const { uiNotificationService } = this.servicesManager.services;
       uiNotificationService.show({
-        title: 'GPU Memory Overload',
-        message: 'Your graphics card has crashed because the 3D volume is too large. Please refresh or try a simpler layout.',
+        title: 'CRITICAL: GPU Memory Exhausted',
+        message: 'Your graphics card has crashed. You MUST reload the page to continue.',
         type: 'error',
-        duration: 8000
+        duration: 0,
       });
     }, false);
   }

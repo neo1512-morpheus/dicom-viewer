@@ -128,10 +128,10 @@ export default async function init({
     hasShownGPUWarning = true;
     console.warn('[GPU] Showing GPU memory warning to user');
     uiNotificationService.show({
-      title: 'GPU Memory Limit Reached',
-      message: 'This 3D scan is too large for your graphics card. Try closing other browser tabs or reloading the page.',
-      type: 'warning',
-      duration: 15000,
+      title: 'CRITICAL: GPU Memory Exhausted',
+      message: 'Your graphics card has crashed. You MUST reload the page to continue.',
+      type: 'error',
+      duration: 0,
     });
   };
 

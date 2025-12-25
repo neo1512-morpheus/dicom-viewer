@@ -18,14 +18,9 @@ const defaultContextMenu = {
             },
           ],
         },
-        {
-          label: 'Add Label',
-          commands: [
-            {
-              commandName: 'setMeasurementLabel',
-            },
-          ],
-        },
+        // [GEMINI FIX] "Add Label" removed - it was broken for Length/ROI tools
+        // (labels were stored but not rendered on the canvas)
+        // Use ArrowAnnotate tool from toolbar for text annotations instead
       ],
     },
   ],

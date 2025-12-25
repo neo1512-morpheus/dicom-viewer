@@ -385,7 +385,12 @@ const connectMeasurementServiceToTools = (
         data.text = label;
       }
 
-      // Todo: trigger render for annotation
+      // [GEMINI FIX] Trigger render for annotation after label update
+      // This fixes the "pan to update" bug where labels don't appear until viewport interaction
+      const renderingEngine = cornerstoneViewportService.getRenderingEngine();
+      if (renderingEngine) {
+        renderingEngine.render();
+      }
     }
   );
 

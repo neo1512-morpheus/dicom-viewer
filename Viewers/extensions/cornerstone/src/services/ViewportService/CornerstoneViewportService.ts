@@ -12,9 +12,10 @@ import {
   Enums as csEnums,
   BaseVolumeViewport,
   eventTarget,
+  metaData,
 } from '@cornerstonejs/core';
 
-import { utilities as csToolsUtils, Enums as csToolsEnums } from '@cornerstonejs/tools';
+import { utilities as csToolsUtils, Enums as csToolsEnums, annotation } from '@cornerstonejs/tools';
 import { IViewportService } from './IViewportService';
 import { RENDERING_ENGINE_ID } from './constants';
 import ViewportInfo, { DisplaySetOptions, PublicViewportOptions } from './Viewport';
@@ -108,6 +109,28 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       this.volumeLoadingProgress.delete(volumeId);
       this._broadcastEvent(EVENTS.VOLUME_LOADING_PROGRESS, { volumeId, percentComplete: 100 });
     });
+
+    // =========================================================================
+    // [GEMINI FIX] Metadata Proxy for Parallel Cache (#2d)
+    // =========================================================================
+    // The Measurement Service needs metadata (SeriesInstanceUID, etc.) to save annotations.
+    // Since we appended '#2d' to the imageIDs for the Parallel Cache, standard lookups fail.
+    // We register a high-priority provider (10000) to intercept these requests, strip the suffix,
+    // and redirect them to the original image metadata.
+    // =========================================================================
+    metaData.addProvider((type: string, imageId: string) => {
+      if (imageId && imageId.endsWith('#2d')) {
+        const cleanImageId = imageId.replace('#2d', '');
+        // Redirect to the original ID which exists in the store
+        return metaData.get(type, cleanImageId);
+      }
+      // Return undefined to let standard providers handle non-#2d images
+      return undefined;
+    }, 10000);
+    console.log('[GEMINI FIX] Registered #2d metadata proxy provider');
+
+    // Note: Measurement label render fix is now in initMeasurementService.ts
+    // (see MEASUREMENT_UPDATED subscriber with renderingEngine.render() call)
   }
 
   /**

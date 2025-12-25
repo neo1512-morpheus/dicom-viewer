@@ -77,14 +77,18 @@ function createDicomJSONApi(dicomJsonConfig) {
         });
       }
 
+      console.time('[DIAG] Manifest Fetch');
       const response = await fetch(url);
       const data = await response.json();
+      console.timeEnd('[DIAG] Manifest Fetch');
 
+      console.time('[DIAG] Metadata Processing');
       let StudyInstanceUID;
       let SeriesInstanceUID;
 
       // Track seen instances to prevent duplicates (fixes 732/600 slice issue)
       const seenSOPInstanceUIDs = new Set();
+      let instanceCount = 0;
 
       data.studies.forEach(study => {
         StudyInstanceUID = study.StudyInstanceUID;
@@ -102,6 +106,7 @@ function createDicomJSONApi(dicomJsonConfig) {
               return;
             }
             seenSOPInstanceUIDs.add(sopUID);
+            instanceCount++;
 
             // FIX: Extract TransferSyntaxUID safely for correct decoder selection
             const TransferSyntaxUID = naturalizedDicom.TransferSyntaxUID || naturalizedDicom['00020010']?.Value?.[0];
@@ -116,6 +121,8 @@ function createDicomJSONApi(dicomJsonConfig) {
           });
         });
       });
+      console.timeEnd('[DIAG] Metadata Processing');
+      console.log(`[DIAG] Processed ${instanceCount} instances`);
 
       _store.urls.push({
         url,

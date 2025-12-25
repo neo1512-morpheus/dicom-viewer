@@ -50,6 +50,7 @@ export const mprAnd3DVolumeViewport = {
             toolGroupId: 'mpr',
             viewportType: 'volume',
             orientation: 'axial',
+            voiLUTFunction: 'LINEAR_EXACT',
             initialImageOptions: {
               preset: 'middle',
             },
@@ -68,6 +69,13 @@ export const mprAnd3DVolumeViewport = {
           displaySets: [
             {
               id: 'mprDisplaySet',
+              options: {
+                // FIX: Force Bone Window to prevent gray look on CBCT
+                voi: {
+                  windowWidth: 4000,
+                  windowCenter: 1000,
+                },
+              },
             },
           ],
         },
@@ -76,6 +84,7 @@ export const mprAnd3DVolumeViewport = {
             toolGroupId: 'volume3d',
             viewportType: 'volume3d',
             orientation: 'coronal',
+            voiLUTFunction: 'LINEAR_EXACT',
             customViewportProps: {
               hideOverlays: true,
             },
@@ -98,6 +107,7 @@ export const mprAnd3DVolumeViewport = {
             toolGroupId: 'mpr',
             viewportType: 'volume',
             orientation: 'coronal',
+            voiLUTFunction: 'LINEAR_EXACT',
             initialImageOptions: {
               preset: 'middle',
             },
@@ -116,6 +126,13 @@ export const mprAnd3DVolumeViewport = {
           displaySets: [
             {
               id: 'mprDisplaySet',
+              options: {
+                // FIX: Force Bone Window to prevent gray look on CBCT
+                voi: {
+                  windowWidth: 4000,
+                  windowCenter: 1000,
+                },
+              },
             },
           ],
         },
@@ -124,6 +141,7 @@ export const mprAnd3DVolumeViewport = {
             toolGroupId: 'mpr',
             viewportType: 'volume',
             orientation: 'sagittal',
+            voiLUTFunction: 'LINEAR_EXACT',
             initialImageOptions: {
               preset: 'middle',
             },
@@ -142,6 +160,13 @@ export const mprAnd3DVolumeViewport = {
           displaySets: [
             {
               id: 'mprDisplaySet',
+              options: {
+                // FIX: Force Bone Window to prevent gray look on CBCT
+                voi: {
+                  windowWidth: 4000,
+                  windowCenter: 1000,
+                },
+              },
             },
           ],
         },

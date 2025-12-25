@@ -13,7 +13,7 @@ const config = {
   showWarningMessageForCrossOrigin: true,
   showCPUFallbackMessage: true,
   showLoadingIndicator: true,
-  strictZSpacingForVolumeViewport: true,
+  strictZSpacingForVolumeViewport: false, // Prevent volume crash on irregular CBCT slice spacing
   groupEnabledModesFirst: true,
   useSharedArrayBuffer: 'AUTO',
 
@@ -43,8 +43,9 @@ const config = {
 
   // Tier 2: Rendering Optimization
   rendering: {
-    useNorm16Texture: true,
+    useNorm16Texture: false,  // Disable to prevent race conditions on Intel GPUs
     preferSizeOverAccuracy: true,
+    use16BitDataType: false,  // Set to FALSE to prevent 3D Volume from polluting Stack's texture (Gemini Fix #2)
   },
 
   // filterQueryParam: false,

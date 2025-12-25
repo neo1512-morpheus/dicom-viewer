@@ -1,23 +1,41 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+import { S3Client, GetObjectCommand } from "npm:@aws-sdk/client-s3";
+import { getSignedUrl } from "npm:@aws-sdk/s3-request-presigner";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
-// Helper function to sign a single instance
-async function signInstanceUrl(supabaseClient, patientId, instance) {
-  if (instance.url && !instance.url.startsWith('http')) {
-    const filePath = `${patientId}/${instance.url}`
-    const { data: signedData } = await supabaseClient
-      .storage
-      .from('scans')
-      .createSignedUrl(filePath, 3600) // 1 hour expiry
+// Initialize S3 Client for R2
+const s3Client = new S3Client({
+  region: 'auto',
+  endpoint: `https://${Deno.env.get('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: Deno.env.get('R2_ACCESS_KEY_ID') ?? '',
+    secretAccessKey: Deno.env.get('R2_SECRET_ACCESS_KEY') ?? ''
+  }
+});
 
-    if (signedData?.signedUrl) {
+const bucketName = Deno.env.get('R2_BUCKET_NAME') ?? '';
+
+// Helper function to sign a single instance URL using R2/S3
+async function signInstanceUrl(patientId: string, instance: any) {
+  if (instance.url && !instance.url.startsWith('http')) {
+    const filePath = `${patientId}/${instance.url}`;
+
+    try {
+      const command = new GetObjectCommand({
+        Bucket: bucketName,
+        Key: filePath
+      });
+
+      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+
       // Mutate the instance object directly
-      instance.url = `dicomweb:${signedData.signedUrl}`
+      instance.url = `dicomweb:${signedUrl}`;
+    } catch (error) {
+      console.error(`Error signing URL for ${filePath}:`, error);
     }
   }
 }
@@ -28,11 +46,6 @@ serve(async (req) => {
   }
 
   try {
-    const supabaseClient = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    )
-
     const url = new URL(req.url)
     const patientId = url.searchParams.get('patientId')
 
@@ -44,18 +57,18 @@ serve(async (req) => {
 
     console.log(`Fetching manifest for: ${patientId}`)
 
-    const { data: manifestData, error: downloadError } = await supabaseClient
-      .storage
-      .from('scans')
-      .download(`${patientId}/dicom_manifest.json`)
+    // Download manifest from R2
+    const manifestCommand = new GetObjectCommand({
+      Bucket: bucketName,
+      Key: `${patientId}/dicom_manifest.json`
+    });
 
-    if (downloadError) throw downloadError
-
-    const manifestText = await manifestData.text()
-    const manifest = JSON.parse(manifestText)
+    const manifestResponse = await s3Client.send(manifestCommand);
+    const manifestText = await manifestResponse.Body?.transformToString() ?? '{}';
+    const manifest = JSON.parse(manifestText);
 
     // --- PARALLEL SIGNING ---
-    const signingPromises = [];
+    const signingPromises: Promise<void>[] = [];
     const studies = manifest.studies || []
     for (const study of studies) {
       const seriesList = study.series || []
@@ -63,7 +76,7 @@ serve(async (req) => {
         const instances = series.instances || []
         for (const instance of instances) {
           // Add the signing task to our list
-          signingPromises.push(signInstanceUrl(supabaseClient, patientId, instance));
+          signingPromises.push(signInstanceUrl(patientId, instance));
         }
       }
     }
@@ -72,12 +85,12 @@ serve(async (req) => {
     await Promise.all(signingPromises);
 
     return new Response(JSON.stringify(manifest), {
-      headers: { 
-        ...corsHeaders, 
+      headers: {
+        ...corsHeaders,
         'Content-Type': 'application/json',
         // Cache this generated JSON for 50 minutes. 
         // Subsequent reloads within this time will be INSTANT.
-        'Cache-Control': 'public, s-maxage=3000' 
+        'Cache-Control': 'public, s-maxage=3000'
       },
       status: 200,
     })

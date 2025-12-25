@@ -276,6 +276,10 @@ function initVolume3DToolGroup(extensionManager, toolGroupService) {
         bindings: [{ mouseButton: Enums.MouseBindings.Auxiliary }],
       },
     ],
+    // ReferenceLines must be disabled for volume3d to prevent black screen crash
+    disabled: [
+      { toolName: toolNames.ReferenceLines },
+    ],
   };
 
   toolGroupService.createToolGroupAndAddTools('volume3d', tools);

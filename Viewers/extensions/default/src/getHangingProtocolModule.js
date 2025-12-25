@@ -32,6 +32,10 @@ const defaultProtocol = {
       {
         id: 'defaultDisplaySetId',
         matchedDisplaySetsIndex: -1,
+        options: {
+          // FIX: Force Exact Math for new viewports
+          voiLUTFunction: 'LINEAR_EXACT',
+        },
       },
     ],
   },
@@ -91,6 +95,10 @@ const defaultProtocol = {
           displaySets: [
             {
               id: 'defaultDisplaySetId',
+              options: {
+                // FIX: Force Exact Math for 2D to prevent binary thresholding on 16-bit data
+                voiLUTFunction: 'LINEAR_EXACT',
+              },
             },
           ],
         },

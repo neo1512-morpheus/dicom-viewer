@@ -56,9 +56,13 @@ export default function initWADOImageLoader(
       // will convert everything to integers (to be able to work with cornerstone-2d).
       // Until the default is set to true (which is the case for cornerstone3D),
       // we should set this flag to false.
+      // !! FIX: Properly read use16BitDataType from rendering config !!
+      // Previously this was ignoring appConfig.rendering.use16BitDataType
       convertFloatPixelDataToInt: false,
       use16BitDataType:
-        Boolean(appConfig.useNorm16Texture) || Boolean(appConfig.preferSizeOverAccuracy),
+        appConfig?.rendering?.use16BitDataType ??
+        appConfig?.use16BitDataType ??
+        (Boolean(appConfig.useNorm16Texture) || Boolean(appConfig.preferSizeOverAccuracy)),
     },
     beforeSend: function (xhr) {
       //TODO should be removed in the future and request emitted by DicomWebDataSource

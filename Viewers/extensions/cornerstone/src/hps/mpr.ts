@@ -68,6 +68,7 @@ export const mpr: Types.HangingProtocol.Protocol = {
             toolGroupId: 'mpr',
             viewportType: 'volume',
             orientation: 'axial',
+            voiLUTFunction: 'LINEAR_EXACT',
             initialImageOptions: {
               preset: 'middle',
             },
@@ -89,6 +90,11 @@ export const mpr: Types.HangingProtocol.Protocol = {
               options: {
                 blendMode: 'avg',
                 slabThickness: 0.5,
+                // FIX: Force Bone Window to prevent gray look on CBCT
+                voi: {
+                  windowWidth: 4000,
+                  windowCenter: 1000,
+                },
               },
             },
           ],
@@ -99,6 +105,7 @@ export const mpr: Types.HangingProtocol.Protocol = {
             toolGroupId: 'mpr',
             viewportType: 'volume',
             orientation: 'sagittal',
+            voiLUTFunction: 'LINEAR_EXACT',
             initialImageOptions: {
               preset: 'middle',
             },
@@ -120,6 +127,11 @@ export const mpr: Types.HangingProtocol.Protocol = {
               options: {
                 blendMode: 'avg',
                 slabThickness: 0.5,
+                // FIX: Force Bone Window to prevent gray look on CBCT
+                voi: {
+                  windowWidth: 4000,
+                  windowCenter: 1000,
+                },
               },
             },
           ],
@@ -130,6 +142,7 @@ export const mpr: Types.HangingProtocol.Protocol = {
             toolGroupId: 'mpr',
             viewportType: 'volume',
             orientation: 'coronal',
+            voiLUTFunction: 'LINEAR_EXACT',
             initialImageOptions: {
               preset: 'middle',
             },
@@ -151,6 +164,11 @@ export const mpr: Types.HangingProtocol.Protocol = {
               options: {
                 blendMode: 'avg',
                 slabThickness: 0.5,
+                // FIX: Force Bone Window to prevent gray look on CBCT
+                voi: {
+                  windowWidth: 4000,
+                  windowCenter: 1000,
+                },
               },
             },
           ],

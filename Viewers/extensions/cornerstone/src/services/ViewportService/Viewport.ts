@@ -69,6 +69,7 @@ export type PublicDisplaySetOptions = {
   slabThickness?: number;
   colormap?: string;
   displayPreset?: string;
+  voiLUTFunction?: string;
 };
 
 export type DisplaySetOptions = {
@@ -79,6 +80,7 @@ export type DisplaySetOptions = {
   slabThickness?: number;
   colormap?: { name: string; opacity?: number };
   displayPreset?: string;
+  voiLUTFunction?: string;
 };
 
 type VOI = {
@@ -340,6 +342,7 @@ class ViewportInfo {
         slabThickness: option.slabThickness,
         blendMode,
         displayPreset: option.displayPreset,
+        voiLUTFunction: option.voiLUTFunction,
       });
     });
 

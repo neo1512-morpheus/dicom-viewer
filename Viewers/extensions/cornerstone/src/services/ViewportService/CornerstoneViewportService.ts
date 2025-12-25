@@ -524,6 +524,20 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
 
     this.viewportsById.set(viewportId, viewportInfo);
 
+    // FIX: Prevent 3D/Volume settings from corrupting 2D/Stack viewports
+    if (presentations?.lutPresentation) {
+      const currentViewportType = viewportInfo.getViewportType(); // 'stack' or 'volume'
+
+      // If the saved state is from a different viewport type (e.g. Volume -> Stack), discard it.
+      if (presentations.lutPresentation.viewportType &&
+        presentations.lutPresentation.viewportType !== currentViewportType) {
+        console.log(
+          `[CornerstoneViewportService] Discarding LUT presentation due to type mismatch: ${presentations.lutPresentation.viewportType} !== ${currentViewportType}`
+        );
+        presentations.lutPresentation = undefined;
+      }
+    }
+
     const viewport = renderingEngine.getViewport(viewportId);
     const displaySetPromise = this._setDisplaySets(
       viewport,
@@ -653,13 +667,100 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       if (colormap !== undefined) {
         properties.colormap = colormap;
       }
+
+      // FIX: Pass VOILUTFunction through to viewport for 16-bit stability
+      // Note: Using raw string 'LINEAR_EXACT' since enum may not exist in all CS versions
+      properties.VOILUTFunction = 'LINEAR_EXACT';
     }
 
     this._handleOverlays(viewport);
 
-    return viewport.setStack(imageIds, initialImageIndexToUse).then(() => {
+    console.log('[DEBUG] _setStackViewport called, setting stack with', imageIds.length, 'images');
+
+    // =========================================================================
+    // [GEMINI FIX] PARALLEL CACHE STRATEGY
+    // =========================================================================
+    // Problem: When 3D Volume loads, it caches images as Float32 with Modality
+    // LUT already applied. When StackViewport reuses these, it re-applies the LUT
+    // causing "Double Shift" corruption (binary look).
+    //
+    // Solution: Append '#2d' suffix to imageIds to force SEPARATE cache entries.
+    // - 3D Volume uses: wadors:...imageId
+    // - 2D Stack uses:  wadors:...imageId#2d
+    // This ensures StackViewport loads fresh Int16 WADO data, not the Volume's Float32.
+    // Tradeoff: First 2D load re-downloads, but subsequent switches are instant.
+    // =========================================================================
+    const stackImageIds = imageIds.map((imageId: string) => {
+      // Ensure we don't double-append if called multiple times
+      if (imageId.endsWith('#2d')) {
+        return imageId;
+      }
+      return `${imageId}#2d`;
+    });
+    console.log(`[GEMINI FIX] Parallel Cache: Using #2d suffixed imageIds (${stackImageIds.length} images)`);
+    // =========================================================================
+
+    // Load the image stack with parallel cache IDs
+    return viewport.setStack(stackImageIds, initialImageIndexToUse).then(() => {
+      console.log('[FIX] Stack loaded, now applying properties and recalculating VOI');
+
+      // Apply the properties that were passed in
       viewport.setProperties({ ...properties });
-      this.setPresentations(viewport.id, presentations);
+
+      // [GEMINI FIX] Recalculate VOI based on ACTUAL pixel data in memory
+      try {
+        const imageData = viewport.getImageData();
+
+        if (imageData && imageData.scalarData) {
+          // Find min/max of the current scalar data
+          const scalarData = imageData.scalarData;
+          let scalarMin = Infinity;
+          let scalarMax = -Infinity;
+
+          // Sample the data (checking every 100th pixel for performance)
+          const step = Math.max(1, Math.floor(scalarData.length / 10000));
+          for (let i = 0; i < scalarData.length; i += step) {
+            const val = scalarData[i];
+            if (val < scalarMin) scalarMin = val;
+            if (val > scalarMax) scalarMax = val;
+          }
+
+          // Apply the calculated range with some padding for window/level adjustment
+          const range = scalarMax - scalarMin;
+          const padding = range * 0.1; // 10% padding
+          viewport.setProperties({
+            // [GEMINI FIX] Keep the Unclamped VOI (allow negative values)
+            voiRange: {
+              lower: scalarMin - padding,
+              upper: scalarMax + padding
+            }
+          });
+          console.log(`[GEMINI FIX] Corrected VOI to actual data range: ${scalarMin} - ${scalarMax}`);
+        } else {
+          // Fallback: use safe wide range for raw CBCT data
+          viewport.setProperties({
+            voiRange: { lower: 0, upper: 40000 },
+            colormap: undefined,
+            invert: false,
+          });
+          console.log('[FIX] No imageData available, using fallback VOI range: 0 - 40000');
+        }
+      } catch (voiError) {
+        console.warn('[FIX] Failed to recalculate VOI:', voiError);
+        // Fallback
+        viewport.setProperties({
+          voiRange: { lower: 0, upper: 40000 },
+        });
+      }
+
+      // [FIX #2 - STEP 4] Final render
+      viewport.render();
+
+      // Log final state
+      const propsAfterFix = viewport.getProperties();
+      console.log('=== [FIX] FINAL STATE ===');
+      console.log('voiRange:', JSON.stringify(propsAfterFix.voiRange));
+      console.log('VOILUTFunction:', propsAfterFix.VOILUTFunction);
     });
   }
 
@@ -722,6 +823,8 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
 
     return 0;
   }
+
+
 
   async _setVolumeViewport(
     viewport: Types.IVolumeViewport,

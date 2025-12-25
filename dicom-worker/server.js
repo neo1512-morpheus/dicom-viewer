@@ -1,24 +1,41 @@
+require('dotenv').config(); // Loads .env if present (local dev), Docker injects env vars directly
 const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const AdmZip = require('adm-zip');
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const util = require('util');
 const dcmjs = require('dcmjs');
-require('dotenv').config();
 
 const execPromise = util.promisify(exec);
 const app = express();
 app.use(express.json());
 
-const supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+// Validate required R2 environment variables
+if (!process.env.R2_ENDPOINT) {
+    throw new Error('R2_ENDPOINT is missing. Set it in your .env or pass via --env-file.');
+}
+if (!process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
+    throw new Error('R2_ACCESS_KEY_ID or R2_SECRET_ACCESS_KEY is missing.');
+}
+if (!process.env.R2_BUCKET_NAME) {
+    throw new Error('R2_BUCKET_NAME is missing.');
+}
+
+// R2/S3 Client for uploads
+const s3Client = new S3Client({
+    region: 'auto',
+    endpoint: process.env.R2_ENDPOINT,
+    credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+    },
+    forcePathStyle: true
+});
 
 app.post('/webhook', async (req, res) => {
-    // 1. Input Normalization: Support both manual test and Supabase webhook
+    // 1. Input Normalization: Support both manual test and webhook
     const filename = req.body.filename || (req.body.record && req.body.record.name);
     if (!filename) {
         return res.status(400).json({ error: 'No filename provided. Send either "filename" or "record.name".' });
@@ -26,30 +43,20 @@ app.post('/webhook', async (req, res) => {
     if (!filename.endsWith('.zip')) return res.status(200).send('Ignored');
     console.log(`🚀 Processing ZIP: ${filename}`);
 
-    // Track if we used local file (for cleanup later)
-    let usedLocalFile = false;
     const localFilePath = path.join('/mnt/inbox', filename);
 
     try {
-        let fileData;
-
-        // 2. Hybrid Input Source: Check local volume mount first
-        if (fs.existsSync(localFilePath)) {
-            console.log('📂 Found file in volume mount. Processing locally...');
-            fileData = fs.readFileSync(localFilePath);
-            usedLocalFile = true;
-        } else {
-            // Fallback: Download from Supabase
-            console.log('☁️ File not local. Downloading from Supabase...');
-            const { data: supabaseData, error: dlError } =
-                await supabase.storage.from('scans').download(filename);
-            if (dlError) throw dlError;
-            fileData = Buffer.from(await supabaseData.arrayBuffer());
+        // Input: Read from local volume mount only
+        if (!fs.existsSync(localFilePath)) {
+            return res.status(404).json({ error: `File not found in /mnt/inbox: ${filename}` });
         }
 
-        // Construct the public base URL for OHIF compatibility
-        const projectRef = process.env.SUPABASE_URL.split('https://')[1].split('.')[0];
-        const publicBaseUrl = `https://${projectRef}.supabase.co/storage/v1/object/public/scans/compressed/${filename.replace('.zip', '')}`;
+        console.log('📂 Found file in volume mount. Processing locally...');
+        const fileData = fs.readFileSync(localFilePath);
+
+        // Construct the public base URL for OHIF compatibility (uses public r2.dev URL, not private S3 API)
+        const studyId = filename.replace('.zip', '');
+        const publicBaseUrl = `${process.env.R2_PUBLIC_URL}/compressed/${studyId}`;
 
         const zipPath = `/tmp/${path.basename(filename)}`;
         fs.writeFileSync(zipPath, fileData);
@@ -112,15 +119,13 @@ app.post('/webhook', async (req, res) => {
                 }
 
                 // 4. Compress Strategy (with Fallback)
-                // Use J2K (16-bit preservation) with multi-layer lossy compression to achieve ~10:1 ratio
-                // This reduces a 120MB scan to ~12MB, matching the competitor's network footprint.
                 const output = path.join(extractPath, `compressed_${file}`);
 
                 try {
-                    // 1. Run Compression (J2K High Quality)
+                    // Run Compression (J2K High Quality)
                     await execPromise(`gdcmconv --j2k --lossy -q 90 ${input} ${output}`);
 
-                    // 2. verify
+                    // Verify
                     const outStats = fs.statSync(output);
 
                     // Poison Pill: <3KB (3072 bytes)
@@ -138,23 +143,26 @@ app.post('/webhook', async (req, res) => {
                     fs.copyFileSync(input, output);
                 }
 
-                // 5. Upload (Original or Compressed)
+                // 5. Upload to R2
                 const uploadPath = filename.replace('.zip', '') + `/${file}`;
                 const uploadBuffer = fs.readFileSync(output);
-                await supabase.storage.from('scans').upload(
-                    `compressed/${uploadPath}`,
-                    uploadBuffer,
-                    {
-                        contentType: 'application/dicom',
-                        upsert: true
-                    }
-                );
+
+                try {
+                    await s3Client.send(new PutObjectCommand({
+                        Bucket: process.env.R2_BUCKET_NAME,
+                        Key: `compressed/${uploadPath}`,
+                        Body: uploadBuffer,
+                        ContentType: 'application/dicom'
+                    }));
+                } catch (uploadError) {
+                    console.error(`❌ R2 upload failed for ${uploadPath}:`, uploadError.message);
+                    throw uploadError;
+                }
 
                 // 6. Add to Manifest with FORCE-INJECTED TransferSyntaxUID
                 studyStruct.series[seriesUID].instances.push({
                     metadata: {
-                        ...dataset, // Copies all existing tags
-                        // FORCE INJECT: Ensures TransferSyntaxUID is at top level for viewer
+                        ...dataset,
                         TransferSyntaxUID: '1.2.840.10008.1.2.4.91'
                     },
                     url: `dicomweb:${publicBaseUrl}/${file}`
@@ -175,16 +183,19 @@ app.post('/webhook', async (req, res) => {
             ]
         };
 
-        // Upload Manifest
+        // Upload Manifest to R2
         const manifestPath = filename.replace('.zip', '') + '/dicom_manifest.json';
-        await supabase.storage.from('scans').upload(
-            `compressed/${manifestPath}`,
-            JSON.stringify(manifest, null, 2),
-            {
-                contentType: 'application/json',
-                upsert: true
-            }
-        );
+        try {
+            await s3Client.send(new PutObjectCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: `compressed/${manifestPath}`,
+                Body: JSON.stringify(manifest, null, 2),
+                ContentType: 'application/json'
+            }));
+        } catch (uploadError) {
+            console.error(`❌ R2 manifest upload failed for ${manifestPath}:`, uploadError.message);
+            throw uploadError;
+        }
 
         console.log(`📜 Manifest Generated: ${manifestPath}`);
 
@@ -192,8 +203,8 @@ app.post('/webhook', async (req, res) => {
         fs.rmSync(extractPath, { recursive: true, force: true });
         fs.unlinkSync(zipPath);
 
-        // 3. Cleanup: Delete raw file from volume mount if it was used
-        if (usedLocalFile && fs.existsSync(localFilePath)) {
+        // Delete raw file from volume mount after successful processing
+        if (fs.existsSync(localFilePath)) {
             fs.unlinkSync(localFilePath);
             console.log(`🗑️ Deleted local file: ${localFilePath}`);
         }

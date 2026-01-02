@@ -188,8 +188,8 @@ const toolbarButtons: Button[] = [
         },
       },
       evaluate: {
-        name: 'evaluate.cornerstoneTool',
-        disabledText: 'Select an MPR viewport to enable this tool',
+        name: 'evaluate.crosshairs',
+        disabledText: 'Crosshairs requires MPR or multi-viewport layout',
       },
     },
   },

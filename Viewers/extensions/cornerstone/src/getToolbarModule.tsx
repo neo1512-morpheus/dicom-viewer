@@ -269,6 +269,54 @@ export default function getToolbarModule({ commandsManager, servicesManager }: w
         };
       },
     },
+    // Crosshairs-specific evaluator - disables when fewer than 2 viewports exist
+    {
+      name: 'evaluate.crosshairs',
+      evaluate: ({ viewportId, button, disabledText }) => {
+        // First check if we have at least 2 viewports (crosshairs needs 2+)
+        const { viewports, layout } = viewportGridService.getState();
+        const totalViewports = layout.numRows * layout.numCols;
+
+        if (totalViewports < 2) {
+          return {
+            disabled: true,
+            className: '!text-common-bright ohif-disabled',
+            disabledText: disabledText ?? 'Crosshairs requires MPR or multi-viewport layout',
+          };
+        }
+
+        // Now check if the tool is available on the current viewport
+        const toolGroup = toolGroupService.getToolGroupForViewport(viewportId);
+
+        if (!toolGroup) {
+          return {
+            disabled: true,
+            className: '!text-common-bright ohif-disabled',
+            disabledText: disabledText ?? 'Not available on the current viewport',
+          };
+        }
+
+        const toolName = toolbarService.getToolNameForButton(button);
+
+        if (!toolGroup.hasTool(toolName)) {
+          return {
+            disabled: true,
+            className: '!text-common-bright ohif-disabled',
+            disabledText: disabledText ?? 'Not available on the current viewport',
+          };
+        }
+
+        const isPrimaryActive = toolGroup.getActivePrimaryMouseButtonTool() === toolName;
+
+        return {
+          disabled: false,
+          className: isPrimaryActive
+            ? '!text-black bg-primary-light rounded'
+            : '!text-common-bright hover:!bg-primary-dark hover:!text-primary-light rounded',
+          isActive: isPrimaryActive,
+        };
+      },
+    },
   ];
 }
 

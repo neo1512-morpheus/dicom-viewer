@@ -108,6 +108,217 @@ const defaultProtocol = {
   ],
 };
 
+// Axial 1x1 Volume Protocol
+const hpAxial = {
+  id: 'hpAxial',
+  name: 'Axial',
+  icon: 'layout-advanced-axial-primary',
+  isPreset: true,
+  locked: true,
+  imageLoadStrategy: 'nth',
+  protocolMatchingRules: [],
+  numberOfPriorsReferenced: 0,
+  displaySetSelectors: {
+    activeDisplaySet: {
+      seriesMatchingRules: [
+        {
+          weight: 1,
+          attribute: 'isReconstructable',
+          constraint: {
+            equals: {
+              value: true,
+            },
+          },
+          required: true,
+        },
+      ],
+    },
+  },
+  stages: [
+    {
+      name: 'axial',
+      viewportStructure: { layoutType: 'grid', properties: { rows: 1, columns: 1 } },
+      viewports: [
+        {
+          viewportOptions: {
+            toolGroupId: 'mpr',
+            viewportType: 'volume',
+            orientation: 'axial',
+            initialImageOptions: {
+              preset: 'middle',
+            },
+          },
+          displaySets: [
+            {
+              id: 'activeDisplaySet',
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+// Coronal 1x1 Volume Protocol
+const hpCoronal = {
+  id: 'hpCoronal',
+  name: 'Coronal',
+  icon: 'layout-common-1x1',
+  isPreset: true,
+  locked: true,
+  imageLoadStrategy: 'nth',
+  protocolMatchingRules: [],
+  numberOfPriorsReferenced: 0,
+  displaySetSelectors: {
+    activeDisplaySet: {
+      seriesMatchingRules: [
+        {
+          weight: 1,
+          attribute: 'isReconstructable',
+          constraint: {
+            equals: {
+              value: true,
+            },
+          },
+          required: true,
+        },
+      ],
+    },
+  },
+  stages: [
+    {
+      name: 'coronal',
+      viewportStructure: { layoutType: 'grid', properties: { rows: 1, columns: 1 } },
+      viewports: [
+        {
+          viewportOptions: {
+            toolGroupId: 'mpr',
+            viewportType: 'volume',
+            orientation: 'coronal',
+            initialImageOptions: {
+              preset: 'middle',
+            },
+          },
+          displaySets: [
+            {
+              id: 'activeDisplaySet',
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+// Sagittal 1x1 Volume Protocol
+const hpSagittal = {
+  id: 'hpSagittal',
+  name: 'Sagittal',
+  icon: 'layout-common-1x1',
+  isPreset: true,
+  locked: true,
+  imageLoadStrategy: 'nth',
+  protocolMatchingRules: [],
+  numberOfPriorsReferenced: 0,
+  displaySetSelectors: {
+    activeDisplaySet: {
+      seriesMatchingRules: [
+        {
+          weight: 1,
+          attribute: 'isReconstructable',
+          constraint: {
+            equals: {
+              value: true,
+            },
+          },
+          required: true,
+        },
+      ],
+    },
+  },
+  stages: [
+    {
+      name: 'sagittal',
+      viewportStructure: { layoutType: 'grid', properties: { rows: 1, columns: 1 } },
+      viewports: [
+        {
+          viewportOptions: {
+            toolGroupId: 'mpr',
+            viewportType: 'volume',
+            orientation: 'sagittal',
+            initialImageOptions: {
+              preset: 'middle',
+            },
+          },
+          displaySets: [
+            {
+              id: 'activeDisplaySet',
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+// 3D Only 1x1 Volume3D Protocol
+const hp3D = {
+  id: 'hp3D',
+  name: '3D Only',
+  icon: 'layout-advanced-3d-only',
+  isPreset: true,
+  locked: true,
+  imageLoadStrategy: 'interleaveCenter',
+  protocolMatchingRules: [],
+  numberOfPriorsReferenced: 0,
+  displaySetSelectors: {
+    activeDisplaySet: {
+      seriesMatchingRules: [
+        {
+          weight: 1,
+          attribute: 'isReconstructable',
+          constraint: {
+            equals: {
+              value: true,
+            },
+          },
+          required: true,
+        },
+      ],
+    },
+  },
+  stages: [
+    {
+      name: '3d',
+      viewportStructure: { layoutType: 'grid', properties: { rows: 1, columns: 1 } },
+      viewports: [
+        {
+          viewportOptions: {
+            toolGroupId: 'volume3d',
+            viewportType: 'volume3d',
+            orientation: 'coronal',
+            customViewportProps: {
+              hideOverlays: true,
+            },
+          },
+          displaySets: [
+            {
+              id: 'activeDisplaySet',
+              options: {
+                displayPreset: {
+                  CT: 'CT-Bone',
+                  MR: 'MR-Default',
+                  default: 'CT-Bone',
+                },
+              },
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 function getHangingProtocolModule() {
   return [
     {
@@ -123,6 +334,23 @@ function getHangingProtocolModule() {
     {
       name: hpMNCompare.id,
       protocol: hpMNCompare,
+    },
+    // Custom 1x1 volume protocols
+    {
+      name: hpAxial.id,
+      protocol: hpAxial,
+    },
+    {
+      name: hpCoronal.id,
+      protocol: hpCoronal,
+    },
+    {
+      name: hpSagittal.id,
+      protocol: hpSagittal,
+    },
+    {
+      name: hp3D.id,
+      protocol: hp3D,
     },
   ];
 }

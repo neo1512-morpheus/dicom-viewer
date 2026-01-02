@@ -986,8 +986,6 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       await viewport.setVolumes(volumeInputArray);
     } catch (err) {
       console.error(`Error setting volumes for viewport ${viewportId}:`, err);
-    } finally {
-      console.timeEnd(`VolumeSetup-${viewportId}`);
     }
 
     volumesProperties.forEach(({ properties, volumeId }) => {

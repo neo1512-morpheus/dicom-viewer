@@ -44,43 +44,53 @@ const _areSelectorsValid = (hp, displaySets, hangingProtocolService) => {
   );
 };
 
-const generateAdvancedPresets = ({ servicesManager }: withAppTypes) => {
-  const { hangingProtocolService, viewportGridService, displaySetService } =
-    servicesManager.services;
-
-  const hangingProtocols = Array.from(hangingProtocolService.protocols.values());
-
-  const viewportId = viewportGridService.getActiveViewportId();
-
-  if (!viewportId) {
-    return [];
-  }
-  const displaySetInsaneUIDs = viewportGridService.getDisplaySetsUIDsForViewport(viewportId);
-
-  if (!displaySetInsaneUIDs) {
-    return [];
-  }
-
-  const displaySets = displaySetInsaneUIDs.map(uid => displaySetService.getDisplaySetByUID(uid));
-
-  return hangingProtocols
-    .map(hp => {
-      if (!hp.isPreset) {
-        return null;
-      }
-
-      const areValid = _areSelectorsValid(hp, displaySets, hangingProtocolService);
-
-      return {
-        icon: hp.icon,
-        title: hp.name,
-        commandOptions: {
-          protocolId: hp.id,
-        },
-        disabled: !areValid,
-      };
-    })
-    .filter(preset => preset !== null);
+// Hardcoded list of 6 advanced presets for the layout menu
+// NOTE: reset: true bypasses viewportGridStore cache to prevent race condition bugs
+const generateAdvancedPresets = () => {
+  return [
+    {
+      icon: 'layout-common-1x1',
+      title: 'Axial',
+      evaluate: 'evaluate.mpr',
+      commandOptions: { protocolId: 'hpAxial', reset: true },
+      disabled: false,
+    },
+    {
+      icon: 'layout-common-1x1',
+      title: 'Coronal',
+      evaluate: 'evaluate.mpr',
+      commandOptions: { protocolId: 'hpCoronal', reset: true },
+      disabled: false,
+    },
+    {
+      icon: 'layout-common-1x1',
+      title: 'Sagittal',
+      evaluate: 'evaluate.mpr',
+      commandOptions: { protocolId: 'hpSagittal', reset: true },
+      disabled: false,
+    },
+    {
+      icon: 'layout-advanced-3d-only',
+      title: '3D Only',
+      evaluate: 'evaluate.mpr',
+      commandOptions: { protocolId: 'hp3D', reset: true },
+      disabled: false,
+    },
+    {
+      icon: 'layout-advanced-3d-four-up',
+      title: '3D Four Up',
+      evaluate: 'evaluate.mpr',
+      commandOptions: { protocolId: 'fourUp', reset: true },
+      disabled: false,
+    },
+    {
+      icon: 'layout-advanced-mpr',
+      title: 'MPR',
+      evaluate: 'evaluate.mpr',
+      commandOptions: { protocolId: 'mpr', reset: true },
+      disabled: false,
+    },
+  ];
 };
 
 function ToolbarLayoutSelectorWithServices({
@@ -273,7 +283,7 @@ function LayoutSelector({
   const [isOpen, setIsOpen] = useState(false);
   const dropdownRef = useRef(null);
 
-  const { customizationService } = servicesManager.services;
+  const { customizationService, displaySetService, viewportGridService } = servicesManager.services;
   const commonPresets = customizationService.get('commonPresets') || defaultCommonPresets;
   const advancedPresets =
     customizationService.get('advancedPresets') || generateAdvancedPresets({ servicesManager });
@@ -338,17 +348,36 @@ function LayoutSelector({
               <div className="text-aqua-pale text-xs">Advanced</div>
 
               <div className="flex flex-col gap-2.5">
-                {advancedPresets.map((preset, index) => (
-                  <LayoutPreset
-                    key={index + commonPresets.length}
-                    classNames="hover:bg-primary-dark group flex gap-2 p-1 cursor-pointer"
-                    icon={preset.icon}
-                    title={preset.title}
-                    disabled={preset.disabled}
-                    commandOptions={preset.commandOptions}
-                    onSelection={onSelectionPreset}
-                  />
-                ))}
+                {advancedPresets.map((preset, index) => {
+                  // Check if the current viewport allows this preset (e.g. is it a valid reconstructable volume?)
+                  // This mirrors the logic from evaluate.mpr in getToolbarModule.tsx
+                  let isPresetDisabled = preset.disabled || false;
+
+                  if (preset.evaluate === 'evaluate.mpr') {
+                    const viewportId = viewportGridService.getActiveViewportId();
+                    const displaySetUIDs = viewportGridService.getDisplaySetsUIDsForViewport(viewportId);
+
+                    if (displaySetUIDs?.length) {
+                      const displaySets = displaySetUIDs.map(uid => displaySetService.getDisplaySetByUID(uid));
+                      const areReconstructable = displaySets.every(ds => ds?.isReconstructable);
+                      if (!areReconstructable) {
+                        isPresetDisabled = true;
+                      }
+                    }
+                  }
+
+                  return (
+                    <LayoutPreset
+                      key={index + commonPresets.length}
+                      classNames={`hover:bg-primary-dark group flex gap-2 p-1 ${isPresetDisabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                      icon={preset.icon}
+                      title={preset.title}
+                      disabled={isPresetDisabled}
+                      commandOptions={preset.commandOptions}
+                      onSelection={onSelectionPreset}
+                    />
+                  );
+                })}
               </div>
             </div>
 

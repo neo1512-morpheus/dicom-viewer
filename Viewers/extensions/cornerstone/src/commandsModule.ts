@@ -808,11 +808,24 @@ function commandsModule({
       viewport.render();
     },
     resetCrosshairs: ({ viewportId }) => {
+      // GUARD: Crosshairs require at least 2 viewports to operate
+      // Skip silently if not enough viewports are ready (fixes race condition during MPR init)
+      const { viewports } = viewportGridService.getState();
+      if (viewports.size < 2) {
+        console.log('[Crosshairs] Skipping reset - need at least 2 viewports, currently have:', viewports.size);
+        return;
+      }
+
       const crosshairInstances = [];
 
       const getCrosshairInstances = toolGroupId => {
         const toolGroup = toolGroupService.getToolGroup(toolGroupId);
-        crosshairInstances.push(toolGroup.getToolInstance('Crosshairs'));
+        if (toolGroup) {
+          const instance = toolGroup.getToolInstance('Crosshairs');
+          if (instance) {
+            crosshairInstances.push(instance);
+          }
+        }
       };
 
       if (!viewportId) {
@@ -820,11 +833,18 @@ function commandsModule({
         toolGroupIds.forEach(getCrosshairInstances);
       } else {
         const toolGroup = toolGroupService.getToolGroupForViewport(viewportId);
-        getCrosshairInstances(toolGroup.id);
+        if (toolGroup) {
+          getCrosshairInstances(toolGroup.id);
+        }
       }
 
+      // Only reset if we found valid crosshair instances
       crosshairInstances.forEach(ins => {
-        ins?.resetCrosshairs();
+        try {
+          ins?.resetCrosshairs();
+        } catch (e) {
+          console.warn('[Crosshairs] Failed to reset:', e.message);
+        }
       });
     },
   };

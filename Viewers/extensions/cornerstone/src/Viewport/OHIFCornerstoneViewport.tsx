@@ -24,8 +24,135 @@ import { Types } from '@ohif/core';
 import OHIFViewportActionCorners from '../components/OHIFViewportActionCorners';
 import { getWindowLevelActionMenu } from '../components/WindowLevelActionMenu/getWindowLevelActionMenu';
 import { useAppConfig } from '@state';
+import { useCPROrchestrator } from '../../../../modes/cpr/src/useCPROrchestrator';
 
 import { LutPresentation, PositionPresentation } from '../types/Presentation';
+
+function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
+  const { onDone, onRedraw, isGenerating, error } = useCPROrchestrator({
+    servicesManager,
+    commandsManager,
+    sourceViewportId: viewportId,
+    panoWidth: 800,
+    panoHeight: 400,
+    slabHalfThicknessMm: 7,
+    slabSamples: 21,
+    aggregation: 'MEAN',
+  });
+  const [hasSpline, setHasSpline] = useState(false);
+
+  const setActiveAxialViewport = useCallback(() => {
+    const { cornerstoneViewportService, viewportGridService } = servicesManager.services;
+
+    const directViewport = cornerstoneViewportService.getCornerstoneViewport('cpr-axial');
+    if (directViewport) {
+      commandsManager.runCommand('setViewportActive', { viewportId: directViewport.id });
+      return;
+    }
+
+    const gridViewports = viewportGridService.getState().viewports;
+    for (const [gridViewportId, gridViewport] of gridViewports.entries()) {
+      if (gridViewport?.viewportOptions?.viewportId === 'cpr-axial') {
+        commandsManager.runCommand('setViewportActive', { viewportId: gridViewportId });
+        return;
+      }
+    }
+
+    commandsManager.runCommand('setViewportActive', { viewportId });
+  }, [servicesManager, commandsManager, viewportId]);
+
+  const onButtonMouseDown = useCallback(evt => {
+    evt.preventDefault();
+    evt.stopPropagation();
+  }, []);
+
+  useEffect(() => {
+    const updateSplineState = () => {
+      const allAnnotations = cs3DTools.annotation.state.getAllAnnotations?.() || [];
+      const splineCount = allAnnotations.filter(
+        annotation => annotation?.metadata?.toolName === 'SplineROI'
+      ).length;
+      setHasSpline(splineCount > 0);
+    };
+
+    updateSplineState();
+    const intervalId = window.setInterval(updateSplineState, 300);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [servicesManager, viewportId]);
+
+  const onPan = useCallback(() => {
+    setActiveAxialViewport();
+    commandsManager.runCommand('setToolActive', { toolName: 'Pan', toolGroupId: 'mpr' });
+  }, [commandsManager, setActiveAxialViewport]);
+
+  const onSpline = useCallback(() => {
+    setActiveAxialViewport();
+    commandsManager.runCommand('setToolActive', { toolName: 'SplineROI', toolGroupId: 'mpr' });
+  }, [commandsManager, setActiveAxialViewport]);
+
+  const onRedrawClick = useCallback(() => {
+    void onRedraw();
+  }, [onRedraw]);
+
+  const onDoneMouseDown = useCallback(
+    evt => {
+      evt.preventDefault();
+      evt.stopPropagation();
+    },
+    []
+  );
+
+  return (
+    <div className="flex max-w-[320px] flex-col gap-1 rounded bg-black/60 px-2 py-1 text-white">
+      <div className="text-[11px] leading-tight text-cyan-100">
+        {hasSpline
+          ? 'Arch ready. Press Done to generate CPR panels.'
+          : 'Draw Spline ROI on axial, then press Done.'}
+      </div>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          className="rounded border border-white/30 px-2 py-1 text-xs"
+          onMouseDown={onButtonMouseDown}
+          onClick={onPan}
+        >
+          Pan
+        </button>
+        <button
+          type="button"
+          className="rounded border border-white/30 px-2 py-1 text-xs"
+          onMouseDown={onButtonMouseDown}
+          onClick={onSpline}
+        >
+          Spline
+        </button>
+        <button
+          type="button"
+          className="rounded border border-white/30 px-2 py-1 text-xs"
+          onMouseDown={onButtonMouseDown}
+          onClick={onRedrawClick}
+        >
+          Redraw
+        </button>
+        <button
+          type="button"
+          className="rounded border border-white/40 px-2 py-1 text-xs disabled:opacity-50"
+          onMouseDown={onDoneMouseDown}
+          onClick={() => {
+            void onDone();
+          }}
+          disabled={isGenerating || !hasSpline}
+        >
+          {isGenerating ? 'Generating...' : 'Done'}
+        </button>
+      </div>
+      {error ? <span className="max-w-[300px] truncate text-[11px] text-red-300">{error}</span> : null}
+    </div>
+  );
+}
 
 function VolumeLoadingOverlay({ progress }) {
   if (!progress || progress.percentComplete >= 100) {
@@ -132,6 +259,7 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     viewportOptions,
     displaySetOptions,
     servicesManager,
+    commandsManager,
     onElementEnabled,
     // eslint-disable-next-line react/prop-types
     onElementDisabled,
@@ -157,12 +285,13 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     throw new Error('Viewport ID is required');
   }
 
-  // Since we only have support for dynamic data in volume viewports, we should
-  // handle this case here and set the viewportType to volume if any of the
-  // displaySets are dynamic volumes
-  viewportOptions.viewportType = displaySets.some(ds => ds.isDynamicVolume && ds.isReconstructable)
-    ? 'volume'
-    : viewportOptions.viewportType;
+  // Preserve explicit stack viewports (e.g. CPR pano) and only auto-promote when not pinned.
+  const hasDynamicReconstructable = displaySets.some(ds => ds.isDynamicVolume && ds.isReconstructable);
+  const isExplicitStackViewport = viewportOptions.viewportType === 'stack' || viewportId === 'cpr-pano';
+  viewportOptions.viewportType =
+    hasDynamicReconstructable && !isExplicitStackViewport
+      ? 'volume'
+      : viewportOptions.viewportType;
 
   const [scrollbarHeight, setScrollbarHeight] = useState('100px');
   const [enabledVPElement, setEnabledVPElement] = useState(null);
@@ -419,6 +548,8 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     if (!viewportOptions.viewportType) {
       viewportOptions.viewportType = STACK;
     }
+    let isCancelled = false;
+    let deferredViewportDataTimeoutId: number | null = null;
 
     const loadViewportData = async () => {
       const viewportData = await cornerstoneCacheService.createViewportData(
@@ -427,6 +558,9 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
         dataSource,
         initialImageIndex
       );
+      if (isCancelled) {
+        return;
+      }
 
       // The presentation state will have been stored previously by closing
       // a viewport.  Otherwise, this viewport will be unchanged and the
@@ -460,7 +594,13 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
 
       // Defer the heavy setViewportData call to allow React to finish the mount
       // and keep the UI responsive (e.g. allow the layout menu to close)
-      setTimeout(() => {
+      deferredViewportDataTimeoutId = window.setTimeout(() => {
+        if (isCancelled) {
+          return;
+        }
+        if (!cornerstoneViewportService.getViewportInfo(viewportId)) {
+          return;
+        }
         cornerstoneViewportService.setViewportData(
           viewportId,
           viewportData,
@@ -475,6 +615,12 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     };
 
     loadViewportData();
+    return () => {
+      isCancelled = true;
+      if (deferredViewportDataTimeoutId !== null) {
+        window.clearTimeout(deferredViewportDataTimeoutId);
+      }
+    };
   }, [viewportOptions, displaySets, dataSource]);
 
   /**
@@ -545,6 +691,27 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     });
   }, [displaySets, viewportId, viewportActionCornersService, servicesManager, commandsManager]);
 
+  // Inject CPR Done action only on cpr-axial viewport.
+  useEffect(() => {
+    if (viewportId !== 'cpr-axial') {
+      return;
+    }
+
+    viewportActionCornersService.setComponent({
+      viewportId,
+      id: 'cprDoneAction',
+      component: (
+        <CPRDoneAction
+          servicesManager={servicesManager}
+          commandsManager={commandsManager}
+          viewportId={viewportId}
+        />
+      ),
+      location: viewportActionCornersService.LOCATIONS.topLeft,
+      indexPriority: -200,
+    });
+  }, [viewportId, viewportActionCornersService, servicesManager, commandsManager]);
+
   return (
     <React.Fragment>
       <div className="viewport-wrapper">
@@ -557,6 +724,14 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
           style={{ height: '100%', width: '100%' }}
           onContextMenu={e => e.preventDefault()}
           onMouseDown={e => e.preventDefault()}
+          onWheel={
+            viewportId === 'cpr-crosssection'
+              ? e => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }
+              : undefined
+          }
           ref={elementRef}
         ></div>
         <CornerstoneOverlays

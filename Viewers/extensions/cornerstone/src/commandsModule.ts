@@ -9,8 +9,10 @@ import {
 import {
   ToolGroupManager,
   Enums,
+  annotation,
   utilities as cstUtils,
   ReferenceLinesTool,
+  cancelActiveManipulations,
 } from '@cornerstonejs/tools';
 import { Types as OhifTypes } from '@ohif/core';
 import { vec3, mat4 } from 'gl-matrix';
@@ -21,6 +23,7 @@ import toggleImageSliceSync from './utils/imageSliceSync/toggleImageSliceSync';
 import { getFirstAnnotationSelected } from './utils/measurementServiceMappings/utils/selection';
 import getActiveViewportEnabledElement from './utils/getActiveViewportEnabledElement';
 import toggleVOISliceSync from './utils/toggleVOISliceSync';
+import { cprStateService } from '../../../modes/cpr/src/CPRStateService';
 
 const toggleSyncFunctions = {
   imageSlice: toggleImageSliceSync,
@@ -53,7 +56,107 @@ function commandsModule({
 
   function _getActiveViewportToolGroupId() {
     const viewport = _getActiveViewportEnabledElement();
-    return toolGroupService.getToolGroupForViewport(viewport.id);
+    if (!viewport?.id) {
+      return null;
+    }
+    const toolGroup = toolGroupService.getToolGroupForViewport(viewport.id);
+    return toolGroup?.id ?? null;
+  }
+
+  function _getGridViewportIdByLogicalId(logicalViewportId: string): string | null {
+    const { viewports } = viewportGridService.getState();
+    type GridViewportLike = {
+      viewportOptions?: {
+        viewportId?: string;
+      };
+    };
+
+    const viewportMap = viewports as
+      | Map<string, GridViewportLike>
+      | Record<string, GridViewportLike>
+      | undefined;
+    const entries: Array<[string, GridViewportLike]> =
+      viewportMap && typeof (viewportMap as Map<string, GridViewportLike>).entries === 'function'
+        ? Array.from((viewportMap as Map<string, GridViewportLike>).entries())
+        : Object.entries((viewportMap || {}) as Record<string, GridViewportLike>);
+
+    for (const [gridViewportId, gridViewport] of entries) {
+      if (gridViewport?.viewportOptions?.viewportId === logicalViewportId) {
+        return String(gridViewportId);
+      }
+    }
+
+    return null;
+  }
+
+  function _setActiveCPRAxialViewport(): void {
+    const cprAxialViewport = cornerstoneViewportService.getCornerstoneViewport('cpr-axial');
+    if (cprAxialViewport?.id) {
+      viewportGridService.setActiveViewportId(cprAxialViewport.id);
+      return;
+    }
+
+    const mappedId = _getGridViewportIdByLogicalId('cpr-axial');
+    if (mappedId) {
+      viewportGridService.setActiveViewportId(mappedId);
+    }
+  }
+
+  function _clearCPRAxialAnnotations(element: HTMLDivElement): void {
+    const cprAnnotationTools = [
+      'SplineROI',
+      'PlanarFreehandROI',
+      'RectangleROI',
+      'CircleROI',
+      'EllipticalROI',
+      'Bidirectional',
+      'Length',
+      'ArrowAnnotate',
+      'LivewireContour',
+    ];
+
+    cprAnnotationTools.forEach(toolName => {
+      const toolAnnotations = annotation.state.getAnnotations(toolName, element) || [];
+      toolAnnotations.forEach(item => {
+        if (item?.annotationUID) {
+          annotation.state.removeAnnotation(item.annotationUID);
+        }
+      });
+    });
+  }
+
+  function _clearSelectedAnnotations(): void {
+    const selectedAnnotationUIDs = annotation.selection?.getAnnotationsSelected?.() || [];
+    selectedAnnotationUIDs.forEach(annotationUID => {
+      if (annotationUID) {
+        annotation.selection?.setAnnotationSelected?.(annotationUID, false);
+      }
+    });
+  }
+
+  function _getPreferredMPRAnnotationToolName(): string {
+    const mprToolGroup = ToolGroupManager.getToolGroup('mpr');
+    if (!mprToolGroup) {
+      return 'SplineROI';
+    }
+
+    const activeToolName = mprToolGroup.getActivePrimaryMouseButtonTool?.();
+    if (activeToolName && mprToolGroup.hasTool(activeToolName)) {
+      const activeToolInstance = mprToolGroup.getToolInstance?.(activeToolName);
+      if (activeToolInstance?.constructor?.isAnnotation) {
+        return activeToolName;
+      }
+    }
+
+    if (mprToolGroup.hasTool('SplineROI')) {
+      return 'SplineROI';
+    }
+
+    if (mprToolGroup.hasTool('PlanarFreehandROI')) {
+      return 'PlanarFreehandROI';
+    }
+
+    return activeToolName || 'SplineROI';
   }
 
   const actions = {
@@ -134,7 +237,33 @@ function commandsModule({
     /** Delete the given measurement */
     deleteMeasurement: ({ uid }) => {
       if (uid) {
+        _clearSelectedAnnotations();
+
+        const enabledElement = getActiveViewportEnabledElement(viewportGridService);
+        const element = enabledElement?.viewport?.element || enabledElement?.element;
+        if (element) {
+          cancelActiveManipulations(element as HTMLDivElement);
+        }
+
+        const cprAxialViewport = cornerstoneViewportService.getCornerstoneViewport('cpr-axial');
+        if (cprAxialViewport?.element && cprAxialViewport.element !== element) {
+          cancelActiveManipulations(cprAxialViewport.element as HTMLDivElement);
+        }
+
         measurementServiceSource.remove(uid);
+
+        const { protocolId } = hangingProtocolService.getState?.() || {};
+        if (protocolId === 'cpr') {
+          const mprToolGroup = ToolGroupManager.getToolGroup('mpr');
+          const preferredAnnotationTool = _getPreferredMPRAnnotationToolName();
+          _setActiveCPRAxialViewport();
+
+          if (mprToolGroup?.hasTool(preferredAnnotationTool)) {
+            actions.setToolActive({ toolName: preferredAnnotationTool, toolGroupId: 'mpr' });
+          } else if (mprToolGroup?.hasTool('SplineROI')) {
+            actions.setToolActive({ toolName: 'SplineROI', toolGroupId: 'mpr' });
+          }
+        }
       }
     },
     /**
@@ -145,7 +274,7 @@ function commandsModule({
       const labelConfig = customizationService.get('measurementLabels');
       const measurement = measurementService.getMeasurement(uid);
       showLabelAnnotationPopup(measurement, uiDialogService, labelConfig).then(
-        (val: Map<any, any>) => {
+        (val: Map<string, unknown>) => {
           measurementService.update(
             uid,
             {
@@ -237,7 +366,9 @@ function commandsModule({
       const { viewports } = viewportGridService.getState();
       const { isCineEnabled } = cineService.getState();
       cineService.setIsCineEnabled(!isCineEnabled);
-      viewports.forEach((_, index) => cineService.setCine({ id: index, isPlaying: false }));
+      viewports.forEach((_, index) =>
+        cineService.setCine({ id: index, isPlaying: false, frameRate: 24 })
+      );
     },
 
     setViewportWindowLevel({ viewportId, window, level }) {
@@ -251,7 +382,11 @@ function commandsModule({
 
       const { lower, upper } = csUtils.windowLevel.toLowHighRange(windowWidthNum, windowCenterNum);
 
-      viewport.setProperties({
+      const viewportWithSetProperties = viewport as {
+        setProperties: (props: unknown, actorUID?: string) => void;
+      };
+
+      viewportWithSetProperties.setProperties({
         voiRange: {
           upper,
           lower,
@@ -266,7 +401,11 @@ function commandsModule({
         colorbarService.removeColorbar(viewportId);
         return;
       }
-      colorbarService.addColorbar(viewportId, displaySetInstanceUIDs, options);
+      colorbarService.addColorbar(
+        viewportId,
+        displaySetInstanceUIDs,
+        options as Record<string, unknown>
+      );
     },
 
     setWindowLevel(props) {
@@ -372,6 +511,13 @@ function commandsModule({
         return;
       }
 
+      const { protocolId } = hangingProtocolService.getState?.() || {};
+      const toolInstance = toolGroup.getToolInstance?.(toolName);
+      const isAnnotationTool = !!toolInstance?.constructor?.isAnnotation;
+      if (protocolId === 'cpr' && toolGroup?.id === 'mpr' && isAnnotationTool) {
+        _setActiveCPRAxialViewport();
+      }
+
       const activeToolName = toolGroup.getActivePrimaryMouseButtonTool();
 
       if (activeToolName) {
@@ -389,6 +535,17 @@ function commandsModule({
           },
         ],
       });
+
+      if (toolName === 'Crosshairs' && toolGroup.id === 'mpr') {
+        const mprViewportIds = toolGroup.getViewportIds().filter(id => {
+          const candidateViewport = cornerstoneViewportService.getCornerstoneViewport(id);
+          return candidateViewport instanceof VolumeViewport;
+        });
+
+        if (mprViewportIds.length >= 2) {
+          mprViewportIds.forEach(id => actions.resetCrosshairs({ viewportId: id }));
+        }
+      }
     },
     showDownloadViewportModal: () => {
       const { activeViewportId } = viewportGridService.getState();
@@ -494,6 +651,58 @@ function commandsModule({
       }
 
       const { viewport } = enabledElement;
+      const { activeViewportId, viewports } = viewportGridService.getState();
+      const activeViewportState = activeViewportId ? viewports.get(activeViewportId) : null;
+      const logicalViewportId = activeViewportState?.viewportOptions?.viewportId || viewport.id;
+
+      _clearSelectedAnnotations();
+
+      if (viewport?.element) {
+        cancelActiveManipulations(viewport.element as HTMLDivElement);
+      }
+
+      if (logicalViewportId === 'cpr-axial') {
+        const axialElement = viewport.element as HTMLDivElement;
+        if (axialElement) {
+          _clearCPRAxialAnnotations(axialElement);
+        }
+
+        viewport.resetProperties?.();
+        viewport.resetCamera();
+        viewport.render();
+
+        const mprToolGroup = ToolGroupManager.getToolGroup('mpr');
+        const preferredAnnotationTool = _getPreferredMPRAnnotationToolName();
+        if (mprToolGroup?.hasTool(preferredAnnotationTool)) {
+          actions.setToolActive({ toolName: preferredAnnotationTool, toolGroupId: 'mpr' });
+        } else if (mprToolGroup?.hasTool('SplineROI')) {
+          actions.setToolActive({ toolName: 'SplineROI', toolGroupId: 'mpr' });
+        }
+        return;
+      }
+
+      if (logicalViewportId === 'cpr-crosssection' && cprStateService.hasData()) {
+        const frames = cprStateService.getFrames();
+        if (frames.length > 0) {
+          const frame = frames[0];
+          viewport.resetProperties?.();
+          viewport.setCamera({
+            focalPoint: Array.from(frame.position) as [number, number, number],
+            viewPlaneNormal: Array.from(frame.N_camera) as [number, number, number],
+            viewUp: Array.from(frame.S) as [number, number, number],
+            parallelScale: 20,
+            parallelProjection: true,
+          });
+          viewport.render();
+          return;
+        }
+      }
+
+      if (logicalViewportId === 'cpr-pano' && viewport instanceof StackViewport) {
+        cstUtils.jumpToSlice(viewport.element, { imageIndex: 0 });
+        viewport.render();
+        return;
+      }
 
       viewport.resetProperties?.();
       viewport.resetCamera();
@@ -590,7 +799,10 @@ function commandsModule({
           displaySet => displaySet.displaySetInstanceUID === displaySetInstanceUID
         );
         // If a matching display set is found, update the opacity with its value
-        hpOpacity = matchingDisplaySet?.displaySetOptions?.options?.colormap?.opacity;
+        const hpColormap = matchingDisplaySet?.displaySetOptions?.options?.colormap as
+          | { opacity?: number }
+          | undefined;
+        hpOpacity = hpColormap?.opacity;
       }
 
       // HP takes priority over the default opacity
@@ -599,7 +811,10 @@ function commandsModule({
       const setViewportProperties = (viewport, uid) => {
         const actorEntry = actorEntries.find(entry => entry.uid.includes(uid));
         const { actor: volumeActor, uid: volumeId } = actorEntry;
-        viewport.setProperties({ colormap, volumeActor }, volumeId);
+        const viewportWithSetProperties = viewport as {
+          setProperties: (props: unknown, actorUID?: string) => void;
+        };
+        viewportWithSetProperties.setProperties({ colormap, volumeActor }, volumeId);
       };
 
       if (viewport instanceof StackViewport) {
@@ -665,13 +880,15 @@ function commandsModule({
 
       const toolGroup = toolGroupService.getToolGroupForViewport(viewportId);
 
-      toolGroup?.setToolConfiguration(
-        ReferenceLinesTool.toolName,
-        {
-          sourceViewportId: viewportId,
-        },
-        true // overwrite
-      );
+      if (toolGroup?.hasTool(ReferenceLinesTool.toolName)) {
+        toolGroup.setToolConfiguration(
+          ReferenceLinesTool.toolName,
+          {
+            sourceViewportId: viewportId,
+          },
+          true // overwrite
+        );
+      }
 
       const renderingEngine = cornerstoneViewportService.getRenderingEngine();
       renderingEngine.render();
@@ -683,7 +900,7 @@ function commandsModule({
       // update vtkOpenGLTexture and imageData of computed volume
       const { imageData, vtkOpenGLTexture } = volume;
       const numSlices = imageData.getDimensions()[2];
-      const slicesToUpdate = [...Array(numSlices).keys()];
+      const slicesToUpdate = Array.from(Array(numSlices).keys());
       slicesToUpdate.forEach(i => {
         vtkOpenGLTexture.setUpdatedFrame(i);
       });
@@ -699,10 +916,11 @@ function commandsModule({
         numPanesWithData++;
 
         if (numPanesWithData === numPanes) {
-          commandsManager.run(...command);
+          const runWithArgs = commandsManager.run as (...args: unknown[]) => unknown;
+          runWithArgs(...command);
 
           // Unsubscribe from the event
-          unsubscribe(EVENT);
+          unsubscribe();
         }
       });
     },
@@ -712,7 +930,10 @@ function commandsModule({
       if (!viewport) {
         return;
       }
-      viewport.setProperties({
+      const viewportWithSetProperties = viewport as {
+        setProperties: (props: unknown, actorUID?: string) => void;
+      };
+      viewportWithSetProperties.setProperties({
         preset,
       });
       viewport.render();
@@ -808,19 +1029,50 @@ function commandsModule({
       viewport.render();
     },
     resetCrosshairs: ({ viewportId }) => {
-      // GUARD: Crosshairs require at least 2 viewports to operate
-      // Skip silently if not enough viewports are ready (fixes race condition during MPR init)
-      const { viewports } = viewportGridService.getState();
-      if (viewports.size < 2) {
-        console.log('[Crosshairs] Skipping reset - need at least 2 viewports, currently have:', viewports.size);
+      const { protocolId } = hangingProtocolService.getState?.() || {};
+      if (protocolId === 'cpr') {
+        return;
+      }
+
+      // SAFETY CHECK: Crosshairs only make sense for Volume viewports (MPR).
+      // If we are in a Stack viewport (2D), exit immediately to prevent errors.
+      const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
+
+      if (!viewport || !(viewport instanceof VolumeViewport)) {
+        return;
+      }
+
+      const mprToolGroup = toolGroupService.getToolGroup('mpr');
+      const mprVolumeViewportCount =
+        mprToolGroup
+          ?.getViewportIds()
+          ?.filter(id => {
+            const mprViewport = cornerstoneViewportService.getCornerstoneViewport(id);
+            return mprViewport instanceof VolumeViewport;
+          })
+          ?.length ?? 0;
+
+      // Crosshairs require at least two MPR volume viewports.
+      if (mprVolumeViewportCount < 2) {
         return;
       }
 
       const crosshairInstances = [];
+      const visitedToolGroupIds = new Set<string>();
 
       const getCrosshairInstances = toolGroupId => {
-        const toolGroup = toolGroupService.getToolGroup(toolGroupId);
-        if (toolGroup) {
+        if (!toolGroupId || visitedToolGroupIds.has(toolGroupId)) {
+          return;
+        }
+        visitedToolGroupIds.add(toolGroupId);
+
+        const toolGroup = ToolGroupManager.getToolGroup(toolGroupId);
+        if (toolGroup?.hasTool?.('Crosshairs')) {
+          const toolMode = toolGroup.getToolOptions?.('Crosshairs')?.mode;
+          if (toolMode !== Enums.ToolModes.Active) {
+            return;
+          }
+
           const instance = toolGroup.getToolInstance('Crosshairs');
           if (instance) {
             crosshairInstances.push(instance);
@@ -828,22 +1080,26 @@ function commandsModule({
         }
       };
 
-      if (!viewportId) {
-        const toolGroupIds = toolGroupService.getToolGroupIds();
-        toolGroupIds.forEach(getCrosshairInstances);
-      } else {
+      // Always include MPR group first, then viewport-specific and remaining groups.
+      getCrosshairInstances('mpr');
+
+      if (viewportId) {
         const toolGroup = toolGroupService.getToolGroupForViewport(viewportId);
         if (toolGroup) {
           getCrosshairInstances(toolGroup.id);
         }
       }
 
+      const toolGroupIds = toolGroupService.getToolGroupIds();
+      toolGroupIds.forEach(getCrosshairInstances);
+
       // Only reset if we found valid crosshair instances
       crosshairInstances.forEach(ins => {
         try {
           ins?.resetCrosshairs();
         } catch (e) {
-          console.warn('[Crosshairs] Failed to reset:', e.message);
+          const message = e instanceof Error ? e.message : String(e);
+          console.warn('[Crosshairs] Failed to reset:', message);
         }
       });
     },

@@ -23,6 +23,7 @@ const stylusToJavaScript = require('./rules/stylusToJavaScript.js');
 // ~~ ENV VARS
 const NODE_ENV = process.env.NODE_ENV;
 const QUICK_BUILD = process.env.QUICK_BUILD;
+const TERSER_PARALLEL = process.env.TERSER_PARALLEL;
 const BUILD_NUM = process.env.CIRCLE_BUILD_NUM || '0';
 
 // read from ../version.txt
@@ -142,6 +143,9 @@ module.exports = (env, argv, { SRC_DIR, ENTRY }) => {
         '@hooks': path.resolve(__dirname, '../platform/app/src/hooks'),
         '@routes': path.resolve(__dirname, '../platform/app/src/routes'),
         '@state': path.resolve(__dirname, '../platform/app/src/state'),
+        // Force a single React runtime for all workspace packages to avoid invalid hook call crashes.
+        react: path.resolve(__dirname, '../node_modules/react'),
+        'react-dom': path.resolve(__dirname, '../node_modules/react-dom'),
         'dicom-microscopy-viewer':
           'dicom-microscopy-viewer/dist/dynamic-import/dicomMicroscopyViewer.min.js',
         '@cornerstonejs/dicom-image-loader':
@@ -179,9 +183,12 @@ module.exports = (env, argv, { SRC_DIR, ENTRY }) => {
   };
 
   if (isProdBuild) {
+    const enableTerserParallel =
+      TERSER_PARALLEL !== undefined ? TERSER_PARALLEL === 'true' : false;
+
     config.optimization.minimizer = [
       new TerserJSPlugin({
-        parallel: true,
+        parallel: enableTerserParallel,
         terserOptions: {},
       }),
     ];

@@ -1,4 +1,5 @@
 import { PubSubService } from '@ohif/core';
+// @ts-ignore
 import * as OhifTypes from '@ohif/core/types';
 import {
   RenderingEngine,
@@ -34,6 +35,7 @@ const EVENTS = {
  * Handles cornerstone viewport logic including enabling, disabling, and
  * updating the viewport.
  */
+// @ts-ignore
 class CornerstoneViewportService extends PubSubService implements IViewportService {
   static REGISTRATION = {
     name: 'cornerstoneViewportService',
@@ -237,7 +239,14 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
    * @param viewportId - The viewportId to disable
    */
   public disableElement(viewportId: string): void {
-    this.renderingEngine?.disableElement(viewportId);
+    try {
+      const viewport = this.renderingEngine?.getViewport?.(viewportId);
+      if (viewport) {
+        this.renderingEngine?.disableElement(viewportId);
+      }
+    } catch (error) {
+      console.warn(`[CornerstoneViewportService] Failed to disable viewport ${viewportId}`, error);
+    }
 
     // clean up
     this.viewportsById.delete(viewportId);
@@ -498,16 +507,20 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // using its viewport (same viewportId as the new viewportInfo)
     const viewportInfo = this.viewportsById.get(viewportId);
 
+    if (!viewportInfo) {
+      // This can happen when setViewportData is deferred and the viewport unmounts first.
+      console.warn(
+        `[CornerstoneViewportService] Skipping setViewportData: viewport ${viewportId} is not enabled`
+      );
+      return;
+    }
+
     // We should store the presentation for the current viewport since we can't only
     // rely to store it WHEN the viewport is disabled since we might keep around the
     // same viewport/element and just change the viewportData for it (drag and drop etc.)
     // the disableElement storePresentation handle would not be called in this case
     // and we would lose the presentation.
     this.storePresentation({ viewportId: viewportInfo.getViewportId() });
-
-    if (!viewportInfo) {
-      throw new Error('element is not enabled for the given viewportId');
-    }
 
     // override the viewportOptions and displaySetOptions with the public ones
     // since those are the newly set ones, we set them here so that it handles defaults
@@ -640,15 +653,15 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       return null;
     }
 
-    const { referencedImageId } = cameraProps;
+    const { referencedImageId } = cameraProps as any;
     if (viewportInfo?.contains(displaySetInstanceUID, referencedImageId)) {
       return activeViewportId;
     }
 
     return (
-      [...this.viewportsById.values()].find(viewportInfo =>
+      Array.from(this.viewportsById.values()).find(viewportInfo =>
         viewportInfo.contains(displaySetInstanceUID, referencedImageId)
-      )?.viewportId ?? null
+      )?.getViewportId() ?? null
     );
   }
 
@@ -670,14 +683,14 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const { initialImageIndex, imageIds } = viewportData.data[0];
 
     let initialImageIndexToUse =
-      presentations?.positionPresentation?.initialImageIndex ?? initialImageIndex;
+      (presentations?.positionPresentation as any)?.initialImageIndex ?? initialImageIndex;
 
     if (initialImageIndexToUse === undefined || initialImageIndexToUse === null) {
       initialImageIndexToUse = this._getInitialImageIndexForViewport(viewportInfo, imageIds) || 0;
     }
 
-    const properties = { ...presentations.lutPresentation?.properties };
-    if (!presentations.lutPresentation?.properties) {
+    const properties = { ...(presentations.lutPresentation as any)?.properties };
+    if (!(presentations.lutPresentation as any)?.properties) {
       const { voi, voiInverted, colormap } = displaySetOptions[0];
       if (voi && (voi.windowWidth || voi.windowCenter)) {
         const { lower, upper } = csUtils.windowLevel.toLowHighRange(
@@ -703,85 +716,127 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     this._handleOverlays(viewport);
 
     console.log('[DEBUG] _setStackViewport called, setting stack with', imageIds.length, 'images');
+    const isCPRPanoViewport = viewport.id === 'cpr-pano';
+    if (isCPRPanoViewport) {
+      console.log('[CPR-TRACE] CornerstoneViewportService entering _setStackViewport for cpr-pano', {
+        initialImageIndexToUse,
+        firstInputImageId: imageIds?.[0],
+        hasLutPresentation: !!(presentations?.lutPresentation as any)?.properties,
+        requestedVOI: properties?.voiRange,
+        requestedColormap: (properties as any)?.colormap,
+      });
+    }
 
-    // =========================================================================
-    // [GEMINI FIX] PARALLEL CACHE STRATEGY
-    // =========================================================================
-    // Problem: When 3D Volume loads, it caches images as Float32 with Modality
-    // LUT already applied. When StackViewport reuses these, it re-applies the LUT
-    // causing "Double Shift" corruption (binary look).
-    //
-    // Solution: Append '#2d' suffix to imageIds to force SEPARATE cache entries.
-    // - 3D Volume uses: wadors:...imageId
-    // - 2D Stack uses:  wadors:...imageId#2d
-    // This ensures StackViewport loads fresh Int16 WADO data, not the Volume's Float32.
-    // Tradeoff: First 2D load re-downloads, but subsequent switches are instant.
-    // =========================================================================
-    const stackImageIds = imageIds.map((imageId: string) => {
-      // Ensure we don't double-append if called multiple times
-      if (imageId.endsWith('#2d')) {
-        return imageId;
-      }
-      return `${imageId}#2d`;
-    });
-    console.log(`[GEMINI FIX] Parallel Cache: Using #2d suffixed imageIds (${stackImageIds.length} images)`);
-    // =========================================================================
+    // Avoid #2d parallel cache rewriting on cpr-pano to reduce duplicate decode churn.
+    const shouldUseParallel2dCache = !isCPRPanoViewport;
+    const stackImageIds = shouldUseParallel2dCache
+      ? imageIds.map((imageId: string) => {
+          if (imageId.endsWith('#2d')) {
+            return imageId;
+          }
+          return `${imageId}#2d`;
+        })
+      : imageIds;
+
+    if (shouldUseParallel2dCache) {
+      console.log(
+        `[GEMINI FIX] Parallel Cache: Using #2d suffixed imageIds (${stackImageIds.length} images)`
+      );
+    } else {
+      console.log('[CPR-TRACE] cpr-pano using original stack imageIds (no #2d suffix)', {
+        firstStackImageId: stackImageIds?.[0],
+      });
+    }
 
     // Load the image stack with parallel cache IDs
     return viewport.setStack(stackImageIds, initialImageIndexToUse).then(() => {
       console.log('[FIX] Stack loaded, now applying properties and recalculating VOI');
+      if (isCPRPanoViewport) {
+        const loadedImageIds = viewport.getImageIds?.() || [];
+        const loadedIndex = Number(viewport.getCurrentImageIdIndex?.());
+        const safeLoadedIndex =
+          Number.isFinite(loadedIndex) && loadedImageIds.length
+            ? Math.max(0, Math.min(loadedImageIds.length - 1, Math.floor(loadedIndex)))
+            : 0;
+        console.log('[CPR-TRACE] cpr-pano after setStack in CornerstoneViewportService', {
+          loadedImageCount: loadedImageIds.length,
+          currentImageIndex: loadedIndex,
+          currentImageId: loadedImageIds[safeLoadedIndex],
+          propertiesBeforeApply: viewport.getProperties?.(),
+        });
+      }
 
       // Apply the properties that were passed in
       viewport.setProperties({ ...properties });
+      if (isCPRPanoViewport) {
+        console.log('[CPR-TRACE] cpr-pano after setProperties in CornerstoneViewportService', {
+          appliedProperties: properties,
+          liveProperties: viewport.getProperties?.(),
+        });
+      }
 
-      // [GEMINI FIX] Recalculate VOI based on ACTUAL pixel data in memory
+      // [GEMINI FIX] Recalculate VOI based on ACTUAL pixel data (Corrected for Slope/Intercept)
       try {
         const imageData = viewport.getImageData();
+        // SAFETY: Fetch slope/intercept from the wrapper, as VTK imageData doesn't have them
+        const { slope = 1, intercept = 0 } = viewport.getCornerstoneImage() || {};
 
         if (imageData && imageData.scalarData) {
-          // Find min/max of the current scalar data
           const scalarData = imageData.scalarData;
           let scalarMin = Infinity;
           let scalarMax = -Infinity;
 
-          // Sample the data (checking every 100th pixel for performance)
+          // Sample the data for performance
           const step = Math.max(1, Math.floor(scalarData.length / 10000));
           for (let i = 0; i < scalarData.length; i += step) {
-            const val = scalarData[i];
+            // FIX: Apply Modality LUT (Slope/Intercept) to get real HU values
+            const val = scalarData[i] * slope + intercept;
             if (val < scalarMin) scalarMin = val;
             if (val > scalarMax) scalarMax = val;
           }
 
-          // Apply the calculated range with some padding for window/level adjustment
           const range = scalarMax - scalarMin;
           const padding = range * 0.1; // 10% padding
           viewport.setProperties({
-            // [GEMINI FIX] Keep the Unclamped VOI (allow negative values)
             voiRange: {
               lower: scalarMin - padding,
               upper: scalarMax + padding
             }
           });
-          console.log(`[GEMINI FIX] Corrected VOI to actual data range: ${scalarMin} - ${scalarMax}`);
-        } else {
-          // Fallback: use safe wide range for raw CBCT data
-          viewport.setProperties({
-            voiRange: { lower: 0, upper: 40000 },
-            colormap: undefined,
-            invert: false,
-          });
-          console.log('[FIX] No imageData available, using fallback VOI range: 0 - 40000');
+          console.log(`[GEMINI FIX] Corrected VOI to actual data range (HU): ${scalarMin} - ${scalarMax}`);
         }
-      } catch (voiError) {
-        console.warn('[FIX] Failed to recalculate VOI:', voiError);
-        // Fallback
-        viewport.setProperties({
-          voiRange: { lower: 0, upper: 40000 },
-        });
+      } catch (error) {
+        console.warn('[GEMINI FIX] Failed to calculate auto VOI:', error);
       }
 
       // [FIX #2 - STEP 4] Final render
       viewport.render();
+      if (isCPRPanoViewport) {
+        const loadedImageIds = viewport.getImageIds?.() || [];
+        const loadedIndex = Number(viewport.getCurrentImageIdIndex?.());
+        const safeLoadedIndex =
+          Number.isFinite(loadedIndex) && loadedImageIds.length
+            ? Math.max(0, Math.min(loadedImageIds.length - 1, Math.floor(loadedIndex)))
+            : 0;
+        console.log('[CPR-TRACE] cpr-pano after render in CornerstoneViewportService', {
+          currentImageIndex: loadedIndex,
+          currentImageId: loadedImageIds[safeLoadedIndex],
+          liveProperties: viewport.getProperties?.(),
+        });
+        window.setTimeout(() => {
+          const delayedImageIds = viewport.getImageIds?.() || [];
+          const delayedIndex = Number(viewport.getCurrentImageIdIndex?.());
+          const safeDelayedIndex =
+            Number.isFinite(delayedIndex) && delayedImageIds.length
+              ? Math.max(0, Math.min(delayedImageIds.length - 1, Math.floor(delayedIndex)))
+              : 0;
+          console.log('[CPR-TRACE] cpr-pano delayed snapshot (+600ms) in CornerstoneViewportService', {
+            currentImageIndex: delayedIndex,
+            currentImageId: delayedImageIds[safeDelayedIndex],
+            liveProperties: viewport.getProperties?.(),
+          });
+        }, 600);
+      }
 
       // Log final state
       const propsAfterFix = viewport.getProperties();
@@ -808,7 +863,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     if (viewportType === csEnums.ViewportType.STACK) {
       numberOfSlices = imageIds.length;
     } else if (viewportType === csEnums.ViewportType.ORTHOGRAPHIC) {
-      const viewport = this.getCornerstoneViewport(viewportInfo.getViewportId());
+      const viewport = this.getCornerstoneViewport(viewportInfo.getViewportId()) as unknown as Types.IVolumeViewport;
       const imageSliceData = csUtils.getImageSliceDataForVolumeViewport(viewport);
 
       if (!imageSliceData) {
@@ -877,7 +932,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const volumeToLoad = [];
     const displaySetInstanceUIDs = [];
 
-    for (const [index, data] of viewportData.data.entries()) {
+    for (const [index, data] of Array.from(viewportData.data.entries())) {
       const { volume, imageIds, displaySetInstanceUID } = data;
 
       displaySetInstanceUIDs.push(displaySetInstanceUID);
@@ -950,7 +1005,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const displaySetOptions = viewportInfo.getDisplaySetOptions();
     const displaySetUIDs = viewportGridService.getDisplaySetsUIDsForViewport(viewport.id);
     const displaySet = displaySetService.getDisplaySetByUID(displaySetUIDs[0]);
-    const displaySetModality = displaySet?.Modality;
+    const displaySetModality = (displaySet as any)?.Modality;
 
     // Todo: use presentations states
     const volumesProperties = volumeInputArray.map((volumeInput, index) => {
@@ -976,7 +1031,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       }
 
       if (displayPreset !== undefined) {
-        properties.preset = displayPreset[displaySetModality] || displayPreset.default;
+        properties.preset = displayPreset[displaySetModality] || displayPreset['default'];
       }
 
       return { properties, volumeId };
@@ -997,7 +1052,9 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     this._handleOverlays(viewport);
 
     const toolGroup = toolGroupService.getToolGroupForViewport(viewport.id);
-    csToolsUtils.segmentation.triggerSegmentationRender(toolGroup.id);
+    if (toolGroup && (toolGroup as any).id && toolGroup.hasTool?.('SegmentationDisplay')) {
+      csToolsUtils.segmentation.triggerSegmentationRender((toolGroup as any).id);
+    }
 
     const imageIndex = this._getInitialImageIndexForViewport(viewportInfo);
 
@@ -1068,7 +1125,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // can be SEG or RTSTRUCT for now
     const overlayDisplaySet = displaySetInstanceUIDs
       .map(displaySetService.getDisplaySetByUID)
-      .find(displaySet => displaySet?.isOverlayDisplaySet);
+      .find(displaySet => (displaySet as any)?.isOverlayDisplaySet);
     if (overlayDisplaySet) {
       this.addOverlayRepresentationForDisplaySet(overlayDisplaySet, viewport);
     } else {
@@ -1088,6 +1145,9 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const { segmentationService, toolGroupService } = this.servicesManager.services;
 
     const toolGroup = toolGroupService.getToolGroupForViewport(viewport.id);
+    if (!toolGroup || !toolGroup.hasTool?.('SegmentationDisplay')) {
+      return;
+    }
 
     // this only returns hydrated segmentations
     const segmentations = segmentationService.getSegmentations();
@@ -1155,6 +1215,9 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const segmentationId = displaySet.displaySetInstanceUID;
 
     const toolGroup = toolGroupService.getToolGroupForViewport(viewport.id);
+    if (!toolGroup || !toolGroup.hasTool?.('SegmentationDisplay')) {
+      return;
+    }
 
     const representationType =
       referencedVolumeId && cache.getVolume(referencedVolumeId) !== undefined
@@ -1162,7 +1225,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         : csToolsEnums.SegmentationRepresentations.Contour;
 
     segmentationService.addSegmentationRepresentationToToolGroup(
-      toolGroup.id,
+      (toolGroup as any).id,
       segmentationId,
       false,
       representationType
@@ -1269,21 +1332,21 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       return;
     }
 
-    if (displaySet.frameOfReferenceUID) {
-      return displaySet.frameOfReferenceUID;
+    if ((displaySet as any).frameOfReferenceUID) {
+      return (displaySet as any).frameOfReferenceUID;
     }
 
-    if (displaySet.Modality === 'SEG') {
-      const { instance } = displaySet;
+    if ((displaySet as any).Modality === 'SEG') {
+      const { instance } = displaySet as any;
       return instance.FrameOfReferenceUID;
     }
 
-    if (displaySet.Modality === 'RTSTRUCT') {
-      const { instance } = displaySet;
+    if ((displaySet as any).Modality === 'RTSTRUCT') {
+      const { instance } = displaySet as any;
       return instance.ReferencedFrameOfReferenceSequence.FrameOfReferenceUID;
     }
 
-    const { images } = displaySet;
+    const { images } = displaySet as any;
     if (images && images.length) {
       return images[0].FrameOfReferenceUID;
     }

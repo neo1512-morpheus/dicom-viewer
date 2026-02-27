@@ -220,6 +220,14 @@ function initMPRToolGroup(extensionManager, toolGroupService, commandsManager, m
       { toolName: toolNames.Angle },
       { toolName: toolNames.CobbAngle },
       { toolName: toolNames.PlanarFreehandROI },
+      {
+        toolName: toolNames.SplineROI,
+        configuration: {
+          spline: {
+            drawPreviewEnabled: false,
+          },
+        },
+      },
       { toolName: toolNames.SegmentationDisplay },
       {
         toolName: toolNames.PlanarFreehandContourSegmentation,
@@ -285,6 +293,66 @@ function initVolume3DToolGroup(extensionManager, toolGroupService) {
   toolGroupService.createToolGroupAndAddTools('volume3d', tools);
 }
 
+function initCPRPanoToolGroup(extensionManager, toolGroupService) {
+  const utilityModule = extensionManager.getModuleEntry(
+    '@ohif/extension-cornerstone.utilityModule.tools'
+  );
+
+  const { toolNames, Enums } = utilityModule.exports;
+
+  const tools = {
+    active: [
+      {
+        toolName: toolNames.CPRCursor,
+        bindings: [{ mouseButton: Enums.MouseBindings.Primary }],
+      },
+      {
+        toolName: toolNames.Pan,
+        bindings: [{ mouseButton: Enums.MouseBindings.Auxiliary }],
+      },
+      {
+        toolName: toolNames.Zoom,
+        bindings: [{ mouseButton: Enums.MouseBindings.Secondary }],
+      },
+      { toolName: toolNames.StackScrollMouseWheel, bindings: [] },
+    ],
+    passive: [
+      { toolName: toolNames.StackScroll },
+      // Keep CPRCursor as default primary tool, but allow activating WL from toolbar.
+      { toolName: toolNames.WindowLevel },
+    ],
+  };
+
+  toolGroupService.createToolGroupAndAddTools('cprPano', tools);
+}
+
+function initCPRCrossSectionToolGroup(extensionManager, toolGroupService) {
+  const utilityModule = extensionManager.getModuleEntry(
+    '@ohif/extension-cornerstone.utilityModule.tools'
+  );
+
+  const { toolNames, Enums } = utilityModule.exports;
+
+  const tools = {
+    active: [
+      {
+        toolName: toolNames.WindowLevel,
+        bindings: [{ mouseButton: Enums.MouseBindings.Primary }],
+      },
+    ],
+    disabled: [
+      { toolName: toolNames.Pan },
+      { toolName: toolNames.Zoom },
+      { toolName: toolNames.StackScroll },
+      { toolName: toolNames.StackScrollMouseWheel },
+      { toolName: toolNames.Crosshairs },
+      { toolName: toolNames.SegmentationDisplay },
+    ],
+  };
+
+  toolGroupService.createToolGroupAndAddTools('cprCrossSection', tools);
+}
+
 function initToolGroups(extensionManager, toolGroupService, commandsManager, modeLabelConfig) {
   initDefaultToolGroup(
     extensionManager,
@@ -296,6 +364,8 @@ function initToolGroups(extensionManager, toolGroupService, commandsManager, mod
   initSRToolGroup(extensionManager, toolGroupService, commandsManager);
   initMPRToolGroup(extensionManager, toolGroupService, commandsManager, modeLabelConfig);
   initVolume3DToolGroup(extensionManager, toolGroupService);
+  initCPRPanoToolGroup(extensionManager, toolGroupService);
+  initCPRCrossSectionToolGroup(extensionManager, toolGroupService);
 }
 
 export default initToolGroups;

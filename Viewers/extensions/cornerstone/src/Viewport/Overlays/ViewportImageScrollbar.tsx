@@ -1,8 +1,10 @@
 import React, { useEffect } from 'react';
 import PropTypes from 'prop-types';
-import { Enums, Types, utilities } from '@cornerstonejs/core';
+import { Enums, Types, eventTarget, utilities } from '@cornerstonejs/core';
 import { utilities as csToolsUtils } from '@cornerstonejs/tools';
 import { ImageScrollbar } from '@ohif/ui';
+import { cprStateService } from '../../../../../modes/cpr/src/CPRStateService';
+import { CPR_CROSSSECTION_SYNC_EVENT, emitCPRCrossSectionSync } from '../../../../../modes/cpr/src/cprEvents';
 
 function CornerstoneImageScrollbar({
   viewportData,
@@ -15,7 +17,29 @@ function CornerstoneImageScrollbar({
 }: withAppTypes) {
   const { cineService, cornerstoneViewportService } = servicesManager.services;
 
+  const getLogicalViewportId = () => {
+    const viewportInfo = cornerstoneViewportService.getViewportInfo(viewportId);
+    return viewportInfo?.viewportOptions?.viewportId || viewportId;
+  };
+
+  const isCPRPanoViewport = () => getLogicalViewportId() === 'cpr-pano';
+  const isCPRCrossSectionViewport = () => getLogicalViewportId() === 'cpr-crosssection';
+
   const onImageScrollbarChange = (imageIndex, viewportId) => {
+    if (isCPRCrossSectionViewport() && cprStateService.hasData()) {
+      const frameCount = cprStateService.getFrames().length;
+      if (frameCount > 0) {
+        const frameIndex = Math.max(0, Math.min(Math.round(imageIndex), frameCount - 1));
+        cprStateService.setCurrentFrameIndex(frameIndex);
+        emitCPRCrossSectionSync({ frameIndex, viewportId: 'cpr-crosssection' });
+      }
+      return;
+    }
+
+    if (isCPRPanoViewport()) {
+      return;
+    }
+
     const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
 
     const { isCineEnabled } = cineService.getState();
@@ -44,6 +68,11 @@ function CornerstoneImageScrollbar({
     }
 
     if (viewportData.viewportType === Enums.ViewportType.STACK) {
+      if (isCPRPanoViewport()) {
+        setImageSliceData({ imageIndex: 0, numberOfSlices: 0 });
+        return;
+      }
+
       const imageIndex = viewport.getCurrentImageIdIndex();
 
       setImageSliceData({
@@ -55,6 +84,15 @@ function CornerstoneImageScrollbar({
     }
 
     if (viewportData.viewportType === Enums.ViewportType.ORTHOGRAPHIC) {
+      if (isCPRCrossSectionViewport() && cprStateService.hasData()) {
+        const frames = cprStateService.getFrames();
+        setImageSliceData({
+          imageIndex: cprStateService.getCurrentFrameIndex(),
+          numberOfSlices: frames.length,
+        });
+        return;
+      }
+
       const sliceData = utilities.getImageSliceDataForVolumeViewport(
         viewport as Types.IVolumeViewport
       );
@@ -70,6 +108,10 @@ function CornerstoneImageScrollbar({
 
   useEffect(() => {
     if (viewportData?.viewportType !== Enums.ViewportType.STACK) {
+      return;
+    }
+
+    if (isCPRPanoViewport()) {
       return;
     }
 
@@ -94,6 +136,10 @@ function CornerstoneImageScrollbar({
       return;
     }
 
+    if (isCPRCrossSectionViewport()) {
+      return;
+    }
+
     const updateVolumeIndex = event => {
       const { imageIndex, numberOfSlices } = event.detail;
       // find the index of imageId in the imageIds
@@ -106,6 +152,40 @@ function CornerstoneImageScrollbar({
       element.removeEventListener(Enums.Events.VOLUME_NEW_IMAGE, updateVolumeIndex);
     };
   }, [viewportData, element]);
+
+  useEffect(() => {
+    if (!isCPRCrossSectionViewport()) {
+      return;
+    }
+
+    const onCPRSync = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ frameIndex: number }>).detail;
+      if (!detail || !Number.isFinite(detail.frameIndex)) {
+        return;
+      }
+
+      const frames = cprStateService.getFrames();
+      if (!frames.length) {
+        return;
+      }
+
+      const frameIndex = Math.max(0, Math.min(Math.round(detail.frameIndex), frames.length - 1));
+      setImageSliceData({
+        imageIndex: frameIndex,
+        numberOfSlices: frames.length,
+      });
+    };
+
+    eventTarget.addEventListener(CPR_CROSSSECTION_SYNC_EVENT, onCPRSync);
+
+    return () => {
+      eventTarget.removeEventListener(CPR_CROSSSECTION_SYNC_EVENT, onCPRSync);
+    };
+  }, [viewportId]);
+
+  if (isCPRPanoViewport()) {
+    return null;
+  }
 
   return (
     <ImageScrollbar

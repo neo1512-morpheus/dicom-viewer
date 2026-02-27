@@ -319,6 +319,117 @@ const hp3D = {
   ],
 };
 
+// CPR protocol with 2 stages:
+// stage 0 = setup (draw spline on axial)
+// stage 1 = CPR view (axial + pano + cross-section)
+const hpCPR = {
+  id: 'cpr',
+  name: 'CPR',
+  icon: 'layout-advanced-mpr',
+  isPreset: true,
+  locked: true,
+  imageLoadStrategy: 'nth',
+  protocolMatchingRules: [],
+  numberOfPriorsReferenced: 0,
+  displaySetSelectors: {
+    activeDisplaySet: {
+      seriesMatchingRules: [
+        {
+          weight: 1,
+          attribute: 'isReconstructable',
+          constraint: {
+            equals: {
+              value: true,
+            },
+          },
+          required: true,
+        },
+      ],
+    },
+  },
+  stages: [
+    {
+      name: 'cpr-setup',
+      viewportStructure: { layoutType: 'grid', properties: { rows: 1, columns: 1 } },
+      viewports: [
+        {
+          viewportOptions: {
+            viewportId: 'cpr-axial',
+            toolGroupId: 'mpr',
+            viewportType: 'volume',
+            orientation: 'axial',
+            initialImageOptions: {
+              preset: 'middle',
+            },
+          },
+          displaySets: [
+            {
+              id: 'activeDisplaySet',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      name: 'cpr-view',
+      viewportStructure: { layoutType: 'grid', properties: { rows: 1, columns: 3 } },
+      viewports: [
+        {
+          viewportOptions: {
+            viewportId: 'cpr-axial',
+            toolGroupId: 'mpr',
+            viewportType: 'volume',
+            orientation: 'axial',
+            initialImageOptions: {
+              preset: 'middle',
+            },
+          },
+          displaySets: [
+            {
+              id: 'activeDisplaySet',
+            },
+          ],
+        },
+        {
+          viewportOptions: {
+            viewportId: 'cpr-pano',
+            toolGroupId: 'cprPano',
+            viewportType: 'stack',
+            allowUnmatchedView: true,
+          },
+          displaySets: [
+            {
+              id: 'activeDisplaySet',
+              options: {
+                voi: {
+                  windowWidth: 4000,
+                  windowCenter: 1000,
+                },
+              },
+            },
+          ],
+        },
+        {
+          viewportOptions: {
+            viewportId: 'cpr-crosssection',
+            toolGroupId: 'cprCrossSection',
+            viewportType: 'volume',
+            orientation: 'coronal',
+            initialImageOptions: {
+              preset: 'middle',
+            },
+          },
+          displaySets: [
+            {
+              id: 'activeDisplaySet',
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 function getHangingProtocolModule() {
   return [
     {
@@ -351,6 +462,10 @@ function getHangingProtocolModule() {
     {
       name: hp3D.id,
       protocol: hp3D,
+    },
+    {
+      name: hpCPR.id,
+      protocol: hpCPR,
     },
   ];
 }

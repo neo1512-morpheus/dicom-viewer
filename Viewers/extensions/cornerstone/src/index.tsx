@@ -36,6 +36,7 @@ import { showLabelAnnotationPopup } from './utils/callInputDialog';
 import ViewportActionCornersService from './services/ViewportActionCornersService/ViewportActionCornersService';
 import { ViewportActionCornersProvider } from './contextProviders/ViewportActionCornersProvider';
 import ActiveViewportWindowLevel from './components/ActiveViewportWindowLevel';
+import { registerPanoImageLoader } from '../../../modes/cpr/src/panoImageLoader';
 
 const { helpers: volumeLoaderHelpers } = csStreamingImageVolumeLoader;
 const { getDynamicVolumeInfo } = volumeLoaderHelpers ?? {};
@@ -112,6 +113,10 @@ const cornerstoneExtension: Types.Extensions.Extension = {
       ViewportActionCornersService.REGISTRATION.name,
       ViewportActionCornersProvider
     );
+
+    // Idempotent pano scheme registration (safe if preRegistration runs more than once)
+    registerPanoImageLoader();
+
     return init.call(this, props);
   },
 

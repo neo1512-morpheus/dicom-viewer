@@ -90,6 +90,13 @@ const generateAdvancedPresets = () => {
       commandOptions: { protocolId: 'mpr', reset: true },
       disabled: false,
     },
+    {
+      icon: 'layout-advanced-mpr',
+      title: 'CPR',
+      evaluate: 'evaluate.mpr',
+      commandOptions: { protocolId: 'cpr', stageIndex: 0, reset: true },
+      disabled: false,
+    },
   ];
 };
 
@@ -120,6 +127,7 @@ function ToolbarLayoutSelectorWithServices({
   const VOLUME_PROTOCOLS = [
     'mpr', '3d', 'volume', 'axial', 'sagittal', 'coronal', // general terms
     'fourup', 'fourUp', // 3D four up
+    'cpr', // CPR setup/view stages
     'only3d', // 3D only
     'main3d', // 3D main
     'primary3d', // 3D primary

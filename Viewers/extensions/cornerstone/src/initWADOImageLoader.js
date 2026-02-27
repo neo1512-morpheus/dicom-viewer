@@ -11,6 +11,7 @@ import { errorHandler, utils } from '@ohif/core';
 const { registerVolumeLoader } = volumeLoader;
 
 let initialized = false;
+let transferPixelDataPatched = false;
 
 function initWebWorkers(appConfig) {
   const config = {
@@ -48,6 +49,25 @@ export default function initWADOImageLoader(
     'cornerstoneStreamingDynamicImageVolume',
     cornerstoneStreamingDynamicImageVolumeLoader
   );
+
+  if (!transferPixelDataPatched) {
+    const forceNoTransfer = loadImageFn => {
+      return (imageId, options = {}) => {
+        return loadImageFn(imageId, {
+          ...options,
+          transferPixelData: false,
+        });
+      };
+    };
+
+    if (dicomImageLoader?.wadouri?.loadImage) {
+      dicomImageLoader.wadouri.loadImage = forceNoTransfer(dicomImageLoader.wadouri.loadImage);
+    }
+    if (dicomImageLoader?.wadors?.loadImage) {
+      dicomImageLoader.wadors.loadImage = forceNoTransfer(dicomImageLoader.wadors.loadImage);
+    }
+    transferPixelDataPatched = true;
+  }
 
   dicomImageLoader.configure({
     decodeConfig: {

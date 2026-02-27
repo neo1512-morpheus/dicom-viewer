@@ -124,12 +124,15 @@ export default async function init({
   let hasShownGPUWarning = false;
 
   const showGPUWarning = () => {
-    if (hasShownGPUWarning) return;
+    if (hasShownGPUWarning) {
+      return;
+    }
     hasShownGPUWarning = true;
     console.warn('[GPU] Showing GPU memory warning to user');
     // EMERGENCY FALLBACK: React might be dead, use raw DOM
     const crashDiv = document.createElement('div');
-    crashDiv.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); color: red; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 99999; font-size: 24px; font-weight: bold; text-align: center;';
+    crashDiv.style.cssText =
+      'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); color: red; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 99999; font-size: 24px; font-weight: bold; text-align: center;';
     crashDiv.innerHTML = `
       <div style="background: #222; padding: 40px; border: 2px solid red; border-radius: 8px;">
         <h1>⚠️ CRITICAL GPU CRASH ⚠️</h1>
@@ -143,10 +146,10 @@ export default async function init({
   // Listen for WebGL context loss on ALL canvases (including VTK.js internal ones)
   const attachCanvasListeners = () => {
     const canvases = document.querySelectorAll('canvas');
-    canvases.forEach((canvas) => {
+    canvases.forEach(canvas => {
       if (!canvas.dataset.gpuListenerAttached) {
         canvas.dataset.gpuListenerAttached = 'true';
-        canvas.addEventListener('webglcontextlost', (e) => {
+        canvas.addEventListener('webglcontextlost', e => {
           e.preventDefault();
           console.warn('[GPU] WebGL context lost on canvas');
           showGPUWarning();
@@ -165,7 +168,7 @@ export default async function init({
   attachCanvasListeners();
 
   // Global error handler for uncaught WebGL errors
-  window.addEventListener('error', (event) => {
+  window.addEventListener('error', event => {
     const errorMsg = event.message || '';
     if (
       errorMsg.includes('WebGL') ||
@@ -316,23 +319,81 @@ export default async function init({
    * Runs error handler for failed requests.
    * @param event
    */
-  const imageLoadFailedHandler = ({ detail }) => {
+  const imageLoadFailedHandler = evt => {
     const handler = errorHandler.getHTTPErrorHandler();
-    handler(detail.error);
+    const detail = evt?.detail ?? {};
+    const error = detail.error ?? detail;
+
+    if (!error || typeof error !== 'object') {
+      return;
+    }
+
+    // Some custom image loaders don't provide HTTP-shaped errors.
+    const normalizedError =
+      error.status == null
+        ? {
+            ...error,
+            status: 0,
+            message: error.message || 'Image load error',
+          }
+        : error;
+
+    try {
+      handler(normalizedError);
+    } catch (handlerError) {
+      console.warn(
+        '[Cornerstone] Failed to handle image load error',
+        handlerError,
+        normalizedError
+      );
+    }
   };
 
   eventTarget.addEventListener(EVENTS.STACK_VIEWPORT_NEW_STACK, evt => {
-    const { element } = evt.detail;
-    cornerstoneTools.utilities.stackContextPrefetch.enable(element);
+    const { element, imageIds } = evt.detail ?? {};
+
+    if (!element) {
+      return;
+    }
+
+    if (!Array.isArray(imageIds) || imageIds.length === 0) {
+      return;
+    }
+
+    const hasPanoImage = imageIds.some(
+      imageId => typeof imageId === 'string' && imageId.startsWith('pano://')
+    );
+    if (hasPanoImage) {
+      // Custom CPR pano image is synthetic and should not use stack prefetch logic.
+      return;
+    }
+
+    try {
+      cornerstoneTools.utilities.stackContextPrefetch.enable(element);
+    } catch (error) {
+      console.warn('[Cornerstone] Failed to enable stack prefetch', error);
+    }
   });
   eventTarget.addEventListener(EVENTS.IMAGE_LOAD_FAILED, imageLoadFailedHandler);
   eventTarget.addEventListener(EVENTS.IMAGE_LOAD_ERROR, imageLoadFailedHandler);
 
+  const cameraResetHandlers = new WeakMap<EventTarget, EventListener>();
+
   function elementEnabledHandler(evt) {
     const { element } = evt.detail;
 
-    element.addEventListener(EVENTS.CAMERA_RESET, evt => {
-      const { element } = evt.detail;
+    if (!element || cameraResetHandlers.has(element)) {
+      initViewTiming({ element });
+      return;
+    }
+
+    const onCameraReset: EventListener = evt => {
+      const detail = (evt as CustomEvent<{ element?: HTMLDivElement }>).detail;
+      const element = detail?.element;
+      if (!element) {
+        return;
+      }
+
       const enabledElement = getEnabledElement(element);
       // Guard: element may not be fully enabled yet when camera resets
       if (!enabledElement?.viewportId) {
@@ -340,7 +401,10 @@ export default async function init({
       }
       const { viewportId } = enabledElement;
       commandsManager.runCommand('resetCrosshairs', { viewportId });
-    });
+    };
+
+    element.addEventListener(EVENTS.CAMERA_RESET, onCameraReset);
+    cameraResetHandlers.set(element, onCameraReset);
 
     // eventTarget.addEventListener(EVENTS.STACK_VIEWPORT_NEW_STACK, toolbarEventListener);
 
@@ -350,7 +414,11 @@ export default async function init({
   function elementDisabledHandler(evt) {
     const { element } = evt.detail;
 
-    // element.removeEventListener(EVENTS.CAMERA_RESET, resetCrosshairs);
+    const resetHandler = cameraResetHandlers.get(element);
+    if (resetHandler) {
+      element.removeEventListener(EVENTS.CAMERA_RESET, resetHandler);
+      cameraResetHandlers.delete(element);
+    }
 
     // TODO - consider removing the callback when all elements are gone
     // eventTarget.removeEventListener(

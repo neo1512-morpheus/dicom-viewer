@@ -40,6 +40,7 @@ import {
 
 import CalibrationLineTool from './tools/CalibrationLineTool';
 import ImageOverlayViewerTool from './tools/ImageOverlayViewerTool';
+import CPRCursorTool from './tools/CPRCursorTool';
 
 export default function initCornerstoneTools(configuration = {}) {
   CrosshairsTool.isAnnotation = false;
@@ -83,6 +84,7 @@ export default function initCornerstoneTools(configuration = {}) {
   addTool(SplineROITool);
   addTool(LivewireContourTool);
   addTool(OrientationMarkerTool);
+  addTool(CPRCursorTool);
 
   // Modify annotation tools to use dashed lines on SR
   const annotationStyle = {
@@ -136,6 +138,7 @@ const toolNames = {
   LivewireContour: LivewireContourTool.toolName,
   PlanarFreehandROI: PlanarFreehandROITool.toolName,
   OrientationMarker: OrientationMarkerTool.toolName,
+  CPRCursor: CPRCursorTool.toolName,
 };
 
 export { toolNames };

@@ -45,6 +45,10 @@ app.post('/webhook', async (req, res) => {
 
     const localFilePath = path.join('/mnt/inbox', filename);
 
+    // Hoisted so finally block can reference them for cleanup
+    let zipPath;
+    let extractPath;
+
     try {
         // Input: Read from local volume mount only
         if (!fs.existsSync(localFilePath)) {
@@ -52,16 +56,17 @@ app.post('/webhook', async (req, res) => {
         }
 
         console.log('📂 Found file in volume mount. Processing locally...');
-        const fileData = fs.readFileSync(localFilePath);
+        let fileData = fs.readFileSync(localFilePath);
 
         // Construct the public base URL for OHIF compatibility (uses public r2.dev URL, not private S3 API)
         const studyId = filename.replace('.zip', '');
         const publicBaseUrl = `${process.env.R2_PUBLIC_URL}/compressed/${studyId}`;
 
-        const zipPath = `/tmp/${path.basename(filename)}`;
+        zipPath = `/tmp/${path.basename(filename)}`;
         fs.writeFileSync(zipPath, fileData);
+        fileData = null; // Release the ~1GB buffer so GC can reclaim it before the processing loop
 
-        const extractPath = `/tmp/extracted_${Date.now()}`;
+        extractPath = `/tmp/extracted_${Date.now()}`;
         const zip = new AdmZip(zipPath);
         zip.extractAllTo(extractPath, true);
 
@@ -159,6 +164,9 @@ app.post('/webhook', async (req, res) => {
                     throw uploadError;
                 }
 
+                // Free disk immediately — compressed slice already uploaded
+                fs.unlinkSync(output);
+
                 // 6. Add to Manifest with FORCE-INJECTED TransferSyntaxUID
                 studyStruct.series[seriesUID].instances.push({
                     metadata: {
@@ -199,20 +207,18 @@ app.post('/webhook', async (req, res) => {
 
         console.log(`📜 Manifest Generated: ${manifestPath}`);
 
-        // Cleanup
-        fs.rmSync(extractPath, { recursive: true, force: true });
-        fs.unlinkSync(zipPath);
-
-        // Delete raw file from volume mount after successful processing
-        if (fs.existsSync(localFilePath)) {
-            fs.unlinkSync(localFilePath);
-            console.log(`🗑️ Deleted local file: ${localFilePath}`);
-        }
-
         res.status(200).json({ status: 'success' });
     } catch (err) {
         console.error('❌ Error:', err);
         res.status(500).json({ error: err.message });
+    } finally {
+        // Cleanup always runs — on success AND on crash
+        fs.rmSync(extractPath, { recursive: true, force: true });
+        if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+        if (fs.existsSync(localFilePath)) {
+            fs.unlinkSync(localFilePath);
+            console.log(`🗑️ Deleted local file: ${localFilePath}`);
+        }
     }
 });
 

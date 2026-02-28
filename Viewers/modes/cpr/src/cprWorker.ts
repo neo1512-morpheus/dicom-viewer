@@ -5,6 +5,7 @@
 
 interface WorkerFrame {
   position: [number, number, number];
+  T?: [number, number, number];
   N_slab: [number, number, number];
 }
 
@@ -15,19 +16,45 @@ interface CPRWorkerInput {
   spacing: [number, number, number];
   origin: [number, number, number];
   direction: number[];
+  worldToIndex?: ArrayLike<number>;
   verticalDir?: [number, number, number];
   frames: WorkerFrame[];
   panoWidth: number;
   panoHeight: number;
+  vertHalfMm?: number;
   slabHalfThicknessMm: number;
   slabSamples: number;
   aggregation: 'MIP' | 'MEAN';
   applyModalityLut?: boolean;
+  allowStoredValueNormalization?: boolean;
+  disableStoredValueNormalization?: boolean;
   rescaleSlope?: number;
   rescaleIntercept?: number;
   bitsStored?: number;
+  bitsAllocated?: number;
+  highBit?: number;
   pixelRepresentation?: number;
+  isPreScaled?: boolean;
   debugRunId?: string;
+}
+
+function isMat4ArrayLike(value: unknown): value is ArrayLike<number> {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as ArrayLike<number>;
+  if (typeof candidate.length !== 'number' || candidate.length < 16) {
+    return false;
+  }
+
+  for (let i = 0; i < 16; i++) {
+    if (!Number.isFinite(Number(candidate[i]))) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 interface CPRWorkerSuccess {
@@ -37,6 +64,10 @@ interface CPRWorkerSuccess {
   panoHeight: number;
   minValue: number;
   maxValue: number;
+  modalityLutApplied: boolean;
+  requestedModalityLutApplied: boolean;
+  storedValueNormalizationApplied: boolean;
+  unsignedPackedArtifactDetected: boolean;
 }
 
 interface CPRWorkerError {
@@ -52,14 +83,50 @@ function normalize3(v: [number, number, number]): [number, number, number] {
   return [v[0] / len, v[1] / len, v[2] / len];
 }
 
+function dot3(a: [number, number, number], b: [number, number, number]): number {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function cross3(a: [number, number, number], b: [number, number, number]): [number, number, number] {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+}
+
+function percentile(values: number[], q: number): number {
+  if (!values.length) {
+    return NaN;
+  }
+  const sorted = values.slice().sort((a, b) => a - b);
+  const index = Math.max(0, Math.min(sorted.length - 1, q * (sorted.length - 1)));
+  const low = Math.floor(index);
+  const high = Math.ceil(index);
+  if (low === high) {
+    return sorted[low];
+  }
+  const t = index - low;
+  return sorted[low] * (1 - t) + sorted[high] * t;
+}
+
 function worldToVoxel(
   wx: number,
   wy: number,
   wz: number,
   origin: [number, number, number],
   spacing: [number, number, number],
-  invDir: number[]
+  invDir: number[],
+  worldToIndex?: ArrayLike<number>
 ): [number, number, number] {
+  if (isMat4ArrayLike(worldToIndex)) {
+    // vtk.js mat4 layout is column-major.
+    const vi = worldToIndex[0] * wx + worldToIndex[4] * wy + worldToIndex[8] * wz + worldToIndex[12];
+    const vj = worldToIndex[1] * wx + worldToIndex[5] * wy + worldToIndex[9] * wz + worldToIndex[13];
+    const vk = worldToIndex[2] * wx + worldToIndex[6] * wy + worldToIndex[10] * wz + worldToIndex[14];
+    return [vi, vj, vk];
+  }
+
   const rx = wx - origin[0];
   const ry = wy - origin[1];
   const rz = wz - origin[2];
@@ -160,7 +227,12 @@ function generatePanorama(input: CPRWorkerInput): {
   lutSamplePreview: number[];
   outputPixelPreview: number[];
   modalityLutApplied: boolean;
+  requestedModalityLutApplied: boolean;
   storedValueNormalizationApplied: boolean;
+  unsignedPackedArtifactDetected: boolean;
+  effectiveVerticalHalfMm: number;
+  verticalCenterOffsetMm: number;
+  adaptiveVerticalIntervalCount: number;
 } {
   const {
     scalarData,
@@ -168,20 +240,28 @@ function generatePanorama(input: CPRWorkerInput): {
     spacing,
     origin,
     direction,
+    worldToIndex,
     verticalDir,
     frames,
     panoWidth,
     panoHeight,
+    vertHalfMm: requestedVertHalfMm,
     slabHalfThicknessMm,
     slabSamples,
     aggregation,
+    allowStoredValueNormalization,
+    disableStoredValueNormalization,
     rescaleSlope,
     rescaleIntercept,
     bitsStored,
+    bitsAllocated,
+    highBit,
     pixelRepresentation,
+    isPreScaled,
   } = input;
 
-  const invDir = invertMatrix3(direction);
+  const hasWorldToIndex = isMat4ArrayLike(worldToIndex);
+  const invDir = hasWorldToIndex ? [] : invertMatrix3(direction);
   const pixelData = new Float32Array(panoWidth * panoHeight);
   let minValue = Infinity;
   let maxValue = -Infinity;
@@ -192,16 +272,60 @@ function generatePanorama(input: CPRWorkerInput): {
   const safeIntercept = Number.isFinite(rescaleIntercept) ? Number(rescaleIntercept) : 0;
   const safeBitsStored =
     Number.isFinite(bitsStored) && Number(bitsStored) >= 1 ? Math.floor(Number(bitsStored)) : null;
+  const safeBitsAllocated =
+    Number.isFinite(bitsAllocated) && Number(bitsAllocated) >= 1 ? Math.floor(Number(bitsAllocated)) : 16;
+  const safeHighBit = Number.isFinite(highBit) ? Math.floor(Number(highBit)) : null;
   const safePixelRepresentation =
     Number.isFinite(pixelRepresentation) && (Number(pixelRepresentation) === 0 || Number(pixelRepresentation) === 1)
       ? Number(pixelRepresentation)
       : null;
+  const safeIsPreScaled = isPreScaled === true;
+  const nominalStoredMax =
+    safeBitsStored !== null && safeBitsStored > 0 && safeBitsStored < 31
+      ? (1 << safeBitsStored) - 1
+      : Number.MAX_SAFE_INTEGER;
+  const sampledMinMax = (() => {
+    let min = Infinity;
+    let max = -Infinity;
+    const step = Math.max(1, Math.floor(scalarData.length / 4096));
+    for (let i = 0; i < scalarData.length; i += step) {
+      const value = Number(scalarData[i]);
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      if (value < min) {
+        min = value;
+      }
+      if (value > max) {
+        max = value;
+      }
+    }
+    return {
+      min: Number.isFinite(min) ? min : 0,
+      max: Number.isFinite(max) ? max : 0,
+    };
+  })();
+  const unsignedPackedArtifactDetected =
+    !safeIsPreScaled &&
+    scalarData instanceof Int16Array &&
+    safeBitsStored !== null &&
+    safeBitsStored < 16 &&
+    safePixelRepresentation === 0 &&
+    (sampledMinMax.min < -1 || sampledMinMax.max > nominalStoredMax + 8);
   const shouldNormalizeStoredValues =
+    !disableStoredValueNormalization &&
+    (allowStoredValueNormalization === true || unsignedPackedArtifactDetected) &&
     safeBitsStored !== null &&
     safeBitsStored < 16 &&
     safePixelRepresentation !== null &&
     scalarData instanceof Int16Array;
   const normalizedBitsStored = shouldNormalizeStoredValues ? (safeBitsStored as number) : 0;
+  const normalizedHighBit = shouldNormalizeStoredValues
+    ? Math.max(0, Math.min(safeBitsAllocated - 1, safeHighBit ?? normalizedBitsStored - 1))
+    : 0;
+  const bitAlignmentShift = shouldNormalizeStoredValues
+    ? Math.max(-15, Math.min(15, normalizedHighBit + 1 - normalizedBitsStored))
+    : 0;
   const storedMask = shouldNormalizeStoredValues ? (1 << normalizedBitsStored) - 1 : 0;
   const storedSignBit = shouldNormalizeStoredValues ? 1 << (normalizedBitsStored - 1) : 0;
   const storedRange = shouldNormalizeStoredValues ? 1 << normalizedBitsStored : 0;
@@ -213,17 +337,35 @@ function generatePanorama(input: CPRWorkerInput): {
         }
         const intValue = Math.round(value);
         const rawU16 = intValue & 0xffff;
-        let normalized = rawU16 & storedMask;
+        // Align stored bits to LSB using DICOM HighBit before masking/sign extension.
+        let aligned = rawU16;
+        if (bitAlignmentShift > 0) {
+          aligned = rawU16 >>> bitAlignmentShift;
+        } else if (bitAlignmentShift < 0) {
+          aligned = (rawU16 << -bitAlignmentShift) & 0xffff;
+        }
+        let normalized = aligned & storedMask;
         if (safePixelRepresentation === 1 && (normalized & storedSignBit) !== 0) {
           normalized -= storedRange;
         }
         return normalized;
       }
     : undefined;
-  // Enforce modality LUT conversion whenever metadata is non-identity.
-  // This prevents CPR pano output from staying in stored-value space.
-  const shouldApplyModalityLut = safeSlope !== 1 || safeIntercept !== 0;
+  // Respect caller policy when provided. Some studies already expose HU-like
+  // scalarData in the volume cache, even if DICOM metadata has non-identity
+  // rescale values. Forcing LUT again can double-shift intensities.
+  const requestedModalityLutApplied =
+    typeof input.applyModalityLut === 'boolean'
+      ? input.applyModalityLut
+      : safeSlope !== 1 || safeIntercept !== 0;
+  // If packed unsigned values are detected, force LUT after normalization;
+  // otherwise preserve caller policy.
+  const shouldApplyModalityLut = unsignedPackedArtifactDetected && !disableStoredValueNormalization
+    ? !safeIsPreScaled && (safeSlope !== 1 || safeIntercept !== 0)
+    : requestedModalityLutApplied;
   const lutSamplePreview: number[] = [];
+  const interpolationOobValue = shouldApplyModalityLut ? (-1000 - safeIntercept) / safeSlope : -1000;
+  const safeInterpolationOobValue = Number.isFinite(interpolationOobValue) ? interpolationOobValue : -1000;
 
   // Prefer precomputed vertical direction from orchestrator to keep main thread and worker
   // in exact agreement. Fallback to direction matrix K-axis if missing.
@@ -231,18 +373,26 @@ function generatePanorama(input: CPRWorkerInput): {
     Array.isArray(verticalDir) && verticalDir.length >= 3
       ? normalize3([verticalDir[0], verticalDir[1], verticalDir[2]])
       : normalize3([direction[6] ?? 0, direction[7] ?? 0, direction[8] ?? 1]);
-
-  const vertHalfMm = 15.0;
+  const vertHalfMm =
+    Number.isFinite(requestedVertHalfMm) && Number(requestedVertHalfMm) > 0
+      ? Number(requestedVertHalfMm)
+      : 15.0;
   const panoHeightDen = Math.max(1, panoHeight - 1);
-  const vertStepMm = (vertHalfMm * 2) / panoHeightDen;
 
   const slabSampleCount = Math.max(1, Math.floor(slabSamples));
   const slabStepMm = slabSampleCount > 1 ? (slabHalfThicknessMm * 2) / (slabSampleCount - 1) : 0;
-
+  const vertStepMm = (vertHalfMm * 2) / panoHeightDen;
+  let previousSlabDir: [number, number, number] | null = null;
   for (let col = 0; col < panoWidth; col++) {
     const frame = frames[col];
     const [px, py, pz] = frame.position;
-    const [nx, ny, nz_slab] = frame.N_slab;
+    let slabDir = normalize3(frame.N_slab);
+    if (previousSlabDir && dot3(previousSlabDir, slabDir) < 0) {
+      slabDir = [-slabDir[0], -slabDir[1], -slabDir[2]];
+    }
+    previousSlabDir = slabDir;
+
+    const [nx, ny, nz_slab] = slabDir;
 
     for (let row = 0; row < panoHeight; row++) {
       const vertOffsetMm = -vertHalfMm + row * vertStepMm;
@@ -260,8 +410,16 @@ function generatePanorama(input: CPRWorkerInput): {
         const sy = by + slabOffset * ny;
         const sz = bz + slabOffset * nz_slab;
 
-        const [vi, vj, vk] = worldToVoxel(sx, sy, sz, origin, spacing, invDir);
-        let sample = trilinear(scalarData, dimensions, vi, vj, vk, -1000, normalizeStoredSample);
+        const [vi, vj, vk] = worldToVoxel(sx, sy, sz, origin, spacing, invDir, worldToIndex);
+        let sample = trilinear(
+          scalarData,
+          dimensions,
+          vi,
+          vj,
+          vk,
+          safeInterpolationOobValue,
+          normalizeStoredSample
+        );
         if (shouldApplyModalityLut) {
           sample = sample * safeSlope + safeIntercept;
           if (lutSamplePreview.length < 5 && Number.isFinite(sample)) {
@@ -304,7 +462,12 @@ function generatePanorama(input: CPRWorkerInput): {
     lutSamplePreview,
     outputPixelPreview,
     modalityLutApplied: shouldApplyModalityLut,
+    requestedModalityLutApplied,
     storedValueNormalizationApplied: shouldNormalizeStoredValues,
+    unsignedPackedArtifactDetected,
+    effectiveVerticalHalfMm: vertHalfMm,
+    verticalCenterOffsetMm: 0,
+    adaptiveVerticalIntervalCount: 0,
   };
 }
 
@@ -320,7 +483,8 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
     const safeIntercept = Number.isFinite(input.rescaleIntercept)
       ? Number(input.rescaleIntercept)
       : 0;
-    const modalityLutFlagMismatch = !input.applyModalityLut && (safeSlope !== 1 || safeIntercept !== 0);
+    const modalityLutFlagMismatch =
+      input.applyModalityLut === false && (safeSlope !== 1 || safeIntercept !== 0);
 
     if (!input.scalarData || input.scalarData.length === 0) {
       throw new Error('Received empty or null scalar data.');
@@ -344,7 +508,12 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
       lutSamplePreview,
       outputPixelPreview,
       modalityLutApplied,
+      requestedModalityLutApplied,
       storedValueNormalizationApplied,
+      unsignedPackedArtifactDetected,
+      effectiveVerticalHalfMm,
+      verticalCenterOffsetMm,
+      adaptiveVerticalIntervalCount,
     } = generatePanorama(input);
     const elapsed = (performance.now() - start).toFixed(0);
 
@@ -360,17 +529,32 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
     if (storedValueNormalizationApplied) {
       console.log(`${workerTag} Applied bitsStored/pixelRepresentation normalization before interpolation.`, {
         bitsStored: input.bitsStored,
+        bitsAllocated: input.bitsAllocated,
+        highBit: input.highBit,
         pixelRepresentation: input.pixelRepresentation,
       });
     }
+    if (requestedModalityLutApplied !== modalityLutApplied || unsignedPackedArtifactDetected) {
+      console.warn(`${workerTag} LUT policy adjusted in worker`, {
+        requestedApplyModalityLut: requestedModalityLutApplied,
+        appliedModalityLut: modalityLutApplied,
+        unsignedPackedArtifactDetected,
+      });
+    }
+    console.debug(`${workerTag} Adaptive vertical sampling window`, {
+      configuredVertHalfMm: 40,
+      effectiveVerticalHalfMm,
+      verticalCenterOffsetMm,
+      sampledIntervals: adaptiveVerticalIntervalCount,
+    });
     console.log(
       `${workerTag} Output preview (first ${outputPixelPreview.length} pano pixels):`,
       outputPixelPreview
     );
     if (modalityLutFlagMismatch) {
       console.warn(
-        `${workerTag} applyModalityLut flag was false, but non-identity rescale metadata was detected. ` +
-          'LUT conversion was enforced in worker.'
+        `${workerTag} applyModalityLut=false with non-identity rescale metadata. ` +
+          'Worker respected caller policy to avoid double-rescale.'
       );
     }
 
@@ -381,6 +565,10 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
       panoHeight: input.panoHeight,
       minValue,
       maxValue,
+      modalityLutApplied,
+      requestedModalityLutApplied,
+      storedValueNormalizationApplied,
+      unsignedPackedArtifactDetected,
     };
 
     // eslint-disable-next-line no-restricted-globals

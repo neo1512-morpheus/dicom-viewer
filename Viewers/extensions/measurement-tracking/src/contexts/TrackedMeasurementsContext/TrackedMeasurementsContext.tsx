@@ -1,4 +1,4 @@
-import React, { useContext, useEffect } from 'react';
+import React, { useContext, useEffect, useMemo } from 'react';
 import PropTypes from 'prop-types';
 import { Machine } from 'xstate';
 import { useMachine } from '@xstate/react';
@@ -33,131 +33,151 @@ function TrackedMeasurementsContextProvider(
   const { activeViewportId, viewports } = viewportGrid;
   const { measurementService, displaySetService, customizationService } = servicesManager.services;
 
-  const machineOptions = Object.assign({}, defaultOptions);
-  machineOptions.actions = Object.assign({}, machineOptions.actions, {
-    jumpToFirstMeasurementInActiveViewport: (ctx, evt) => {
-      const { trackedStudy, trackedSeries, activeViewportId } = ctx;
-      const measurements = measurementService.getMeasurements();
-      const trackedMeasurements = measurements.filter(
-        m => trackedStudy === m.referenceStudyUID && trackedSeries.includes(m.referenceSeriesUID)
-      );
+  const measurementTrackingMachine = useMemo(() => {
+    const machineOptions = Object.assign({}, defaultOptions);
+    machineOptions.actions = Object.assign({}, machineOptions.actions, {
+      jumpToFirstMeasurementInActiveViewport: (ctx, evt) => {
+        const { trackedStudy, trackedSeries, activeViewportId } = ctx;
+        const measurements = measurementService.getMeasurements();
+        const trackedMeasurements = measurements.filter(
+          m => trackedStudy === m.referenceStudyUID && trackedSeries.includes(m.referenceSeriesUID)
+        );
 
-      console.log(
-        'jumping to measurement reset viewport',
-        activeViewportId,
-        trackedMeasurements[0]
-      );
-
-      const referencedDisplaySetUID = trackedMeasurements[0].displaySetInstanceUID;
-      const referencedDisplaySet = displaySetService.getDisplaySetByUID(referencedDisplaySetUID);
-
-      const referencedImages = referencedDisplaySet.images;
-      const isVolumeIdReferenced = referencedImages[0].imageId.startsWith('volumeId');
-
-      const measurementData = trackedMeasurements[0].data;
-
-      let imageIndex = 0;
-      if (!isVolumeIdReferenced && measurementData) {
-        // if it is imageId referenced find the index of the imageId, we don't have
-        // support for volumeId referenced images yet
-        imageIndex = referencedImages.findIndex(image => {
-          const imageIdToUse = Object.keys(measurementData)[0].substring(8);
-          return image.imageId === imageIdToUse;
-        });
-
-        if (imageIndex === -1) {
-          console.warn('Could not find image index for tracked measurement, using 0');
-          imageIndex = 0;
+        if (!trackedMeasurements.length) {
+          return;
         }
-      }
 
-      viewportGridService.setDisplaySetsForViewport({
-        viewportId: activeViewportId,
-        displaySetInstanceUIDs: [referencedDisplaySetUID],
-        viewportOptions: {
-          initialImageOptions: {
-            index: imageIndex,
-          },
-        },
-      });
-    },
-    showStructuredReportDisplaySetInActiveViewport: (ctx, evt) => {
-      if (evt.data.createdDisplaySetInstanceUIDs.length > 0) {
-        const StructuredReportDisplaySetInstanceUID = evt.data.createdDisplaySetInstanceUIDs[0];
+        console.log(
+          'jumping to measurement reset viewport',
+          activeViewportId,
+          trackedMeasurements[0]
+        );
+
+        const referencedDisplaySetUID = trackedMeasurements[0].displaySetInstanceUID;
+        const referencedDisplaySet = displaySetService.getDisplaySetByUID(referencedDisplaySetUID);
+        if (!referencedDisplaySet?.images?.length) {
+          return;
+        }
+
+        const referencedImages = referencedDisplaySet.images;
+        const isVolumeIdReferenced = referencedImages[0].imageId.startsWith('volumeId');
+
+        const measurementData = trackedMeasurements[0].data;
+
+        let imageIndex = 0;
+        if (!isVolumeIdReferenced && measurementData) {
+          // if it is imageId referenced find the index of the imageId, we don't have
+          // support for volumeId referenced images yet
+          imageIndex = referencedImages.findIndex(image => {
+            const imageIdToUse = Object.keys(measurementData)[0].substring(8);
+            return image.imageId === imageIdToUse;
+          });
+
+          if (imageIndex === -1) {
+            console.warn('Could not find image index for tracked measurement, using 0');
+            imageIndex = 0;
+          }
+        }
 
         viewportGridService.setDisplaySetsForViewport({
-          viewportId: evt.data.viewportId,
-          displaySetInstanceUIDs: [StructuredReportDisplaySetInstanceUID],
+          viewportId: activeViewportId,
+          displaySetInstanceUIDs: [referencedDisplaySetUID],
+          viewportOptions: {
+            initialImageOptions: {
+              index: imageIndex,
+            },
+          },
         });
-      }
-    },
-    discardPreviouslyTrackedMeasurements: (ctx, evt) => {
-      const measurements = measurementService.getMeasurements();
-      const filteredMeasurements = measurements.filter(ms =>
-        ctx.prevTrackedSeries.includes(ms.referenceSeriesUID)
-      );
-      const measurementIds = filteredMeasurements.map(fm => fm.id);
+      },
+      showStructuredReportDisplaySetInActiveViewport: (ctx, evt) => {
+        if (evt.data.createdDisplaySetInstanceUIDs.length > 0) {
+          const StructuredReportDisplaySetInstanceUID = evt.data.createdDisplaySetInstanceUIDs[0];
 
-      for (let i = 0; i < measurementIds.length; i++) {
-        measurementService.remove(measurementIds[i]);
-      }
-    },
-    clearAllMeasurements: (ctx, evt) => {
-      const measurements = measurementService.getMeasurements();
-      const measurementIds = measurements.map(fm => fm.uid);
+          viewportGridService.setDisplaySetsForViewport({
+            viewportId: evt.data.viewportId,
+            displaySetInstanceUIDs: [StructuredReportDisplaySetInstanceUID],
+          });
+        }
+      },
+      discardPreviouslyTrackedMeasurements: (ctx, evt) => {
+        const measurements = measurementService.getMeasurements();
+        const filteredMeasurements = measurements.filter(ms =>
+          ctx.prevTrackedSeries.includes(ms.referenceSeriesUID)
+        );
+        const measurementIds = filteredMeasurements.map(fm => fm.id);
 
-      for (let i = 0; i < measurementIds.length; i++) {
-        measurementService.remove(measurementIds[i]);
-      }
-    },
-  });
-  machineOptions.services = Object.assign({}, machineOptions.services, {
-    promptBeginTracking: promptBeginTracking.bind(null, {
-      servicesManager,
-      extensionManager,
-      appConfig,
-    }),
-    promptTrackNewSeries: promptTrackNewSeries.bind(null, {
-      servicesManager,
-      extensionManager,
-      appConfig,
-    }),
-    promptTrackNewStudy: promptTrackNewStudy.bind(null, {
-      servicesManager,
-      extensionManager,
-      appConfig,
-    }),
-    promptSaveReport: promptSaveReport.bind(null, {
-      servicesManager,
-      commandsManager,
-      extensionManager,
-      appConfig,
-    }),
-    promptHydrateStructuredReport: promptHydrateStructuredReport.bind(null, {
-      servicesManager,
-      extensionManager,
-      appConfig,
-    }),
-    hydrateStructuredReport: hydrateStructuredReport.bind(null, {
-      servicesManager,
-      extensionManager,
-      appConfig,
-    }),
-    promptLabelAnnotation: promptLabelAnnotation.bind(null, {
-      servicesManager,
-      extensionManager,
-    }),
-  });
-  machineOptions.guards = Object.assign({}, machineOptions.guards, {
-    isLabelOnMeasure: (ctx, evt, condMeta) => {
-      const labelConfig = customizationService.get('measurementLabels');
-      return labelConfig?.labelOnMeasure;
-    },
-    isLabelOnMeasureAndShouldKillMachine: (ctx, evt, condMeta) => {
-      const labelConfig = customizationService.get('measurementLabels');
-      return evt.data && evt.data.userResponse === RESPONSE.NO_NEVER && labelConfig?.labelOnMeasure;
-    },
-  });
+        for (let i = 0; i < measurementIds.length; i++) {
+          measurementService.remove(measurementIds[i]);
+        }
+      },
+      clearAllMeasurements: (ctx, evt) => {
+        const measurements = measurementService.getMeasurements();
+        const measurementIds = measurements.map(fm => fm.uid);
+
+        for (let i = 0; i < measurementIds.length; i++) {
+          measurementService.remove(measurementIds[i]);
+        }
+      },
+    });
+    machineOptions.services = Object.assign({}, machineOptions.services, {
+      promptBeginTracking: promptBeginTracking.bind(null, {
+        servicesManager,
+        extensionManager,
+        appConfig,
+      }),
+      promptTrackNewSeries: promptTrackNewSeries.bind(null, {
+        servicesManager,
+        extensionManager,
+        appConfig,
+      }),
+      promptTrackNewStudy: promptTrackNewStudy.bind(null, {
+        servicesManager,
+        extensionManager,
+        appConfig,
+      }),
+      promptSaveReport: promptSaveReport.bind(null, {
+        servicesManager,
+        commandsManager,
+        extensionManager,
+        appConfig,
+      }),
+      promptHydrateStructuredReport: promptHydrateStructuredReport.bind(null, {
+        servicesManager,
+        extensionManager,
+        appConfig,
+      }),
+      hydrateStructuredReport: hydrateStructuredReport.bind(null, {
+        servicesManager,
+        extensionManager,
+        appConfig,
+      }),
+      promptLabelAnnotation: promptLabelAnnotation.bind(null, {
+        servicesManager,
+        extensionManager,
+      }),
+    });
+    machineOptions.guards = Object.assign({}, machineOptions.guards, {
+      isLabelOnMeasure: (ctx, evt, condMeta) => {
+        const labelConfig = customizationService.get('measurementLabels');
+        return labelConfig?.labelOnMeasure;
+      },
+      isLabelOnMeasureAndShouldKillMachine: (ctx, evt, condMeta) => {
+        const labelConfig = customizationService.get('measurementLabels');
+        return evt.data && evt.data.userResponse === RESPONSE.NO_NEVER && labelConfig?.labelOnMeasure;
+      },
+    });
+
+    return Machine(machineConfiguration, machineOptions);
+  }, [
+    appConfig,
+    commandsManager,
+    customizationService,
+    displaySetService,
+    extensionManager,
+    measurementService,
+    servicesManager,
+    viewportGridService,
+  ]);
 
   // TODO: IMPROVE
   // - Add measurement_updated to cornerstone; debounced? (ext side, or consumption?)
@@ -167,8 +187,6 @@ function TrackedMeasurementsContextProvider(
   // - Fix "ellipses" series description dynamic truncate length
   // - Fix viewport border resize
   // - created/destroyed hooks for extensions (cornerstone measurement subscriptions in it's `init`)
-
-  const measurementTrackingMachine = Machine(machineConfiguration, machineOptions);
 
   const [trackedMeasurements, sendTrackedMeasurementsEvent] = useMachine(
     measurementTrackingMachine

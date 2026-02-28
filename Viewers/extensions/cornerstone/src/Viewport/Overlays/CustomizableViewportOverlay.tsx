@@ -10,6 +10,29 @@ import { StackViewportData, VolumeViewportData } from '../../types/CornerstoneCa
 
 import './CustomizableViewportOverlay.css';
 
+const isKnownWebGLUnavailableError = (error: unknown) => {
+  const message =
+    (typeof error === 'object' && error && 'message' in error
+      ? String((error as { message?: unknown }).message)
+      : String(error ?? '')) || '';
+  const stack =
+    (typeof error === 'object' && error && 'stack' in error
+      ? String((error as { stack?: unknown }).stack)
+      : '') || '';
+  const text = `${message}\n${stack}`;
+
+  return (
+    text.includes('Cannot create proxy with a non-object as target or handler') ||
+    text.includes('Cannot read properties of undefined (reading \'values\')') ||
+    text.includes('get3DContext') ||
+    text.includes('getRenderWindow') ||
+    text.includes('RenderWindow.js') ||
+    text.includes('RenderingEngine.ts:1093') ||
+    text.includes('RenderingEngine.ts:1174') ||
+    text.includes('WebGL')
+  );
+};
+
 const EPSILON = 1e-4;
 
 type ViewportData = StackViewportData | VolumeViewportData;
@@ -190,12 +213,26 @@ function CustomizableViewportOverlay({
       const OverlayItemComponent = OverlayItemComponents[customizationType];
 
       if (OverlayItemComponent) {
-        return <OverlayItemComponent {...overlayItemProps} />;
+        try {
+          return <OverlayItemComponent {...overlayItemProps} />;
+        } catch (error) {
+          if (!isKnownWebGLUnavailableError(error)) {
+            console.warn('[CustomizableViewportOverlay] Failed to render overlay item', error);
+          }
+          return null;
+        }
       } else {
         const renderItem = customizationService.transform(item);
 
         if (typeof renderItem.content === 'function') {
-          return renderItem.content(overlayItemProps);
+          try {
+            return renderItem.content(overlayItemProps);
+          } catch (error) {
+            if (!isKnownWebGLUnavailableError(error)) {
+              console.warn('[CustomizableViewportOverlay] Failed to render custom overlay item', error);
+            }
+            return null;
+          }
         }
       }
     },
@@ -401,7 +438,15 @@ function _getInstanceNumberFromVolume(
     return;
   }
 
-  const camera = cornerstoneViewport.getCamera();
+  let camera;
+  try {
+    camera = cornerstoneViewport.getCamera();
+  } catch (error) {
+    if (!isKnownWebGLUnavailableError(error)) {
+      console.warn('[CustomizableViewportOverlay] Failed to access viewport camera', error);
+    }
+    return;
+  }
   const { viewPlaneNormal } = camera;
   // checking if camera is looking at the acquisition plane (defined by the direction on the volume)
 

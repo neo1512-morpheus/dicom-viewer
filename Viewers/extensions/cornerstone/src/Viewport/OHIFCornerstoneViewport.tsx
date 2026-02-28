@@ -28,6 +28,29 @@ import { useCPROrchestrator } from '../../../../modes/cpr/src/useCPROrchestrator
 
 import { LutPresentation, PositionPresentation } from '../types/Presentation';
 
+const isKnownWebGLUnavailableError = (error: unknown) => {
+  const message =
+    (typeof error === 'object' && error && 'message' in error
+      ? String((error as { message?: unknown }).message)
+      : String(error ?? '')) || '';
+  const stack =
+    (typeof error === 'object' && error && 'stack' in error
+      ? String((error as { stack?: unknown }).stack)
+      : '') || '';
+  const text = `${message}\n${stack}`;
+
+  return (
+    text.includes('Cannot create proxy with a non-object as target or handler') ||
+    text.includes('Cannot read properties of undefined (reading \'values\')') ||
+    text.includes('get3DContext') ||
+    text.includes('getRenderWindow') ||
+    text.includes('RenderWindow.js') ||
+    text.includes('RenderingEngine.ts:1093') ||
+    text.includes('RenderingEngine.ts:1174') ||
+    text.includes('WebGL')
+  );
+};
+
 function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
   const { onDone, onRedraw, isGenerating, error } = useCPROrchestrator({
     servicesManager,
@@ -332,9 +355,21 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
       const renderingEngineId = viewportInfo.getRenderingEngineId();
       const syncGroups = viewportInfo.getSyncGroups();
 
-      toolGroupService.removeViewportFromToolGroup(viewportId, renderingEngineId);
+      try {
+        toolGroupService.removeViewportFromToolGroup(viewportId, renderingEngineId);
+      } catch (error) {
+        if (!isKnownWebGLUnavailableError(error)) {
+          console.warn('Failed to remove viewport from tool group during cleanup', error);
+        }
+      }
 
-      syncGroupService.removeViewportFromSyncGroup(viewportId, renderingEngineId, syncGroups);
+      try {
+        syncGroupService.removeViewportFromSyncGroup(viewportId, renderingEngineId, syncGroups);
+      } catch (error) {
+        if (!isKnownWebGLUnavailableError(error)) {
+          console.warn('Failed to remove viewport from sync group during cleanup', error);
+        }
+      }
 
       viewportActionCornersService.clear(viewportId);
     },
@@ -407,11 +442,8 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
   }, [viewportId, elementEnabledHandler, cornerstoneViewportService]);
 
   // =====================================================
-  // WebGL CONTEXT LOSS RECOVERY
-  // Shows user warning when GPU memory is exhausted
+  // WebGL CONTEXT LOSS LISTENERS
   // =====================================================
-  const [hasShownGPUWarning, setHasShownGPUWarning] = useState(false);
-
   useEffect(() => {
     // Wait for viewport to be enabled (canvas to exist)
     if (!enabledVPElement) return;
@@ -426,23 +458,6 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
 
     const handleContextLost = (event: Event) => {
       event.preventDefault();
-      console.warn('[GPU] WebGL context lost! GPU memory exhausted.');
-
-      // Show user-friendly warning (only once per session)
-      if (!hasShownGPUWarning) {
-        setHasShownGPUWarning(true);
-        // EMERGENCY FALLBACK: React might be dead, use raw DOM
-        const crashDiv = document.createElement('div');
-        crashDiv.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); color: red; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 99999; font-size: 24px; font-weight: bold; text-align: center;';
-        crashDiv.innerHTML = `
-          <div style="background: #222; padding: 40px; border: 2px solid red; border-radius: 8px;">
-            <h1>⚠️ CRITICAL GPU CRASH ⚠️</h1>
-            <p style="color: white; margin: 20px 0;">Your device ran out of memory (VRAM).</p>
-            <button onclick="window.location.reload()" style="padding: 15px 30px; font-size: 20px; cursor: pointer; background: red; color: white; border: none; border-radius: 4px;">RELOAD PAGE NOW</button>
-          </div>
-        `;
-        document.body.appendChild(crashDiv);
-      }
     };
 
     const handleContextRestored = () => {
@@ -461,7 +476,7 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
       canvas.removeEventListener('webglcontextlost', handleContextLost);
       canvas.removeEventListener('webglcontextrestored', handleContextRestored);
     };
-  }, [viewportId, enabledVPElement, cornerstoneViewportService, servicesManager, hasShownGPUWarning]);
+  }, [viewportId, enabledVPElement, cornerstoneViewportService, servicesManager]);
 
   // Listen for volume loading progress
   useEffect(() => {

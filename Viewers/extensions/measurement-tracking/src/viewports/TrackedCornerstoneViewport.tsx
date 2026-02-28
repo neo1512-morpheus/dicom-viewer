@@ -94,6 +94,11 @@ function TrackedCornerstoneViewport(props: withAppTypes) {
   }, [updateIsTracked, viewportId]);
 
   useEffect(() => {
+    const renderTrackedViewport = () => {
+      const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
+      viewport?.render?.();
+    };
+
     if (isTracked) {
       annotation.config.style.setViewportToolStyles(viewportId, {
         global: {
@@ -101,7 +106,7 @@ function TrackedCornerstoneViewport(props: withAppTypes) {
         },
       });
 
-      cornerstoneViewportService.getRenderingEngine().renderViewport(viewportId);
+      renderTrackedViewport();
 
       return;
     }
@@ -112,12 +117,12 @@ function TrackedCornerstoneViewport(props: withAppTypes) {
       },
     });
 
-    cornerstoneViewportService.getRenderingEngine().renderViewport(viewportId);
+    renderTrackedViewport();
 
     return () => {
       annotation.config.style.setViewportToolStyles(viewportId, {});
     };
-  }, [isTracked]);
+  }, [cornerstoneViewportService, isTracked, viewportId]);
 
   /**
    * The effect for listening to measurement service measurement added events

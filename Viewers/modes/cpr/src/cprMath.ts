@@ -165,7 +165,11 @@ function coercePoint3(v: Point3): Point3 {
   return [v[0], v[1], v[2]];
 }
 
-export function buildRMFFrames(positions: Point3[], tangents: Point3[]): CPRFrame[] {
+export function buildRMFFrames(
+  positions: Point3[],
+  tangents: Point3[],
+  verticalDir?: [number, number, number]
+): CPRFrame[] {
   if (!Array.isArray(positions) || !Array.isArray(tangents)) {
     throw new Error('[cprMath] positions and tangents must be arrays.');
   }
@@ -180,6 +184,7 @@ export function buildRMFFrames(positions: Point3[], tangents: Point3[]): CPRFram
 
   const count = positions.length;
   const frames: CPRFrame[] = new Array(count);
+  const normalizedVerticalDir = verticalDir ? normalize(coercePoint3(verticalDir), [0, 0, 1]) : null;
 
   const T0 = normalize(coercePoint3(tangents[0]), [1, 0, 0]);
   const initialN = chooseInitialNormal(T0);
@@ -190,6 +195,9 @@ export function buildRMFFrames(positions: Point3[], tangents: Point3[]): CPRFram
 
   let prevT = T0;
   let prevNslab = toSlabNormal(N, S);
+  if (normalizedVerticalDir) {
+    prevNslab = normalize(cross(T0, normalizedVerticalDir), prevNslab);
+  }
 
   frames[0] = {
     index: 0,
@@ -224,6 +232,9 @@ export function buildRMFFrames(positions: Point3[], tangents: Point3[]): CPRFram
     const Si = basis.S;
 
     let Nslab = toSlabNormal(Ni, Si);
+    if (normalizedVerticalDir) {
+      Nslab = normalize(cross(T, normalizedVerticalDir), Nslab);
+    }
     if (dot(Nslab, prevNslab) < 0) {
       Nslab = negate(Nslab);
     }

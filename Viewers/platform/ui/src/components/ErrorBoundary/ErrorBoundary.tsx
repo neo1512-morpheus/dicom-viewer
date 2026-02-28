@@ -10,6 +10,23 @@ import IconButton from '../IconButton';
 
 const isProduction = process.env.NODE_ENV === 'production';
 
+const isKnownWebGLUnavailableError = (error?: { message?: string; stack?: string } | null) => {
+  const message = String(error?.message ?? '');
+  const stack = String(error?.stack ?? '');
+  const text = `${message}\n${stack}`;
+
+  return (
+    text.includes('Cannot create proxy with a non-object as target or handler') ||
+    text.includes('Cannot read properties of undefined (reading \'values\')') ||
+    text.includes('get3DContext') ||
+    text.includes('getRenderWindow') ||
+    text.includes('RenderWindow.js') ||
+    text.includes('RenderingEngine.ts:1093') ||
+    text.includes('RenderingEngine.ts:1174') ||
+    text.includes('WebGL')
+  );
+};
+
 const DefaultFallback = ({ error, context, resetErrorBoundary, fallbackRoute }) => {
   const { t } = useTranslation('ErrorBoundary');
   const [showDetails, setShowDetails] = useState(false);
@@ -81,7 +98,9 @@ const ErrorBoundary = ({
   const [isOpen, setIsOpen] = useState(true);
 
   const onErrorHandler = (error, componentStack) => {
-    console.error(`${context} Error Boundary`, error, componentStack, context);
+    if (!isKnownWebGLUnavailableError(error)) {
+      console.error(`${context} Error Boundary`, error, componentStack, context);
+    }
     onError(error, componentStack, context);
   };
 

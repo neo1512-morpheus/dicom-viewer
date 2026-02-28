@@ -49,8 +49,7 @@ export function WindowLevelActionMenu({
   } = colorbarProperties;
   const { colorbarService, cornerstoneViewportService } = servicesManager.services;
   const viewportInfo = cornerstoneViewportService.getViewportInfo(viewportId);
-  const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
-  const backgroundColor = viewportInfo.getViewportOptions().background;
+  const backgroundColor = viewportInfo?.getViewportOptions?.()?.background;
   const isLight = backgroundColor ? utilities.isEqual(backgroundColor, [1, 1, 1]) : false;
 
   const nonImageModalities = ['SR', 'SEG', 'SM', 'RTSTRUCT', 'RTPLAN', 'RTDOSE'];
@@ -91,10 +90,10 @@ export function WindowLevelActionMenu({
       colorbarService.removeColorbar(viewportId);
       onSetColorbar();
     }, 0);
-  }, [viewportId, displaySets, viewport]);
+  }, [viewportId, displaySets, colorbarService, onSetColorbar]);
 
   useEffect(() => {
-    setMenuKey(menuKey + 1);
+    setMenuKey(prev => prev + 1);
     const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
     if (viewport instanceof VolumeViewport3D) {
       setIs3DVolume(true);
@@ -123,9 +122,9 @@ export function WindowLevelActionMenu({
         'flex shrink-0 cursor-pointer rounded active:text-white text-primary-light',
         isLight ? ' hover:bg-secondary-dark' : 'hover:bg-secondary-light/60'
       )}
-      menuStyle={{ maxHeight: vpHeight - 32, minWidth: 218 }}
+      menuStyle={{ maxHeight: (vpHeight ?? 250) - 32, minWidth: 218 }}
       onVisibilityChange={() => {
-        setVpHeight(element.clientHeight);
+        setVpHeight(element?.clientHeight ?? vpHeight ?? 250);
       }}
       menuKey={menuKey}
     >

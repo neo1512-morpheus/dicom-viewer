@@ -135,6 +135,31 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // (see MEASUREMENT_UPDATED subscriber with renderingEngine.render() call)
   }
 
+  private isWebGLUnavailableError(error: unknown): boolean {
+    const message =
+      (typeof error === 'object' && error && 'message' in error
+        ? String((error as { message?: unknown }).message)
+        : String(error ?? '')) || '';
+
+    const stack =
+      (typeof error === 'object' && error && 'stack' in error
+        ? String((error as { stack?: unknown }).stack)
+        : '') || '';
+
+    const text = `${message}\n${stack}`;
+
+    return (
+      text.includes('Cannot create proxy with a non-object as target or handler') ||
+      text.includes('get3DContext') ||
+      text.includes('getRenderWindow') ||
+      text.includes('Cannot read properties of undefined (reading \'values\')') ||
+      text.includes('WebGL') ||
+      text.includes('RenderWindow.js') ||
+      text.includes('RenderingEngine.ts:1093') ||
+      text.includes('RenderingEngine.ts:1174')
+    );
+  }
+
   /**
    * Adds the HTML element to the viewportService
    * @param {*} viewportId
@@ -144,23 +169,6 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const viewportInfo = new ViewportInfo(viewportId);
     viewportInfo.setElement(elementRef);
     this.viewportsById.set(viewportId, viewportInfo);
-
-    // Listen for WebGL context loss to provide user feedback
-    elementRef.addEventListener('webglcontextlost', (event) => {
-      event.preventDefault();
-      console.error('[GPU] WebGL Context Lost! Device memory limits exceeded.');
-      // EMERGENCY FALLBACK: React might be dead, use raw DOM
-      const crashDiv = document.createElement('div');
-      crashDiv.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); color: red; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 99999; font-size: 24px; font-weight: bold; text-align: center;';
-      crashDiv.innerHTML = `
-        <div style="background: #222; padding: 40px; border: 2px solid red; border-radius: 8px;">
-          <h1>⚠️ CRITICAL GPU CRASH ⚠️</h1>
-          <p style="color: white; margin: 20px 0;">Your device ran out of memory (VRAM).</p>
-          <button onclick="window.location.reload()" style="padding: 15px 30px; font-size: 20px; cursor: pointer; background: red; color: white; border: none; border-radius: 4px;">RELOAD PAGE NOW</button>
-        </div>
-      `;
-      document.body.appendChild(crashDiv);
-    }, false);
   }
 
   public getViewportIds(): string[] {
@@ -175,14 +183,18 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // get renderingEngine from cache if it exists
     const renderingEngine = getRenderingEngine(RENDERING_ENGINE_ID);
 
-    if (renderingEngine) {
+    if (renderingEngine && !renderingEngine.hasBeenDestroyed) {
       this.renderingEngine = renderingEngine;
       return this.renderingEngine;
     }
 
-    if (!renderingEngine || renderingEngine.hasBeenDestroyed) {
-      this.renderingEngine = new RenderingEngine(RENDERING_ENGINE_ID);
+    if (renderingEngine?.hasBeenDestroyed) {
+      console.warn(
+        '[CornerstoneViewportService] Found destroyed rendering engine in cache, recreating'
+      );
     }
+
+    this.renderingEngine = new RenderingEngine(RENDERING_ENGINE_ID);
 
     return this.renderingEngine;
   }
@@ -501,7 +513,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     publicDisplaySetOptions: DisplaySetOptions[],
     presentations?: Presentations
   ): void {
-    const renderingEngine = this.getRenderingEngine();
+    let renderingEngine = this.getRenderingEngine();
 
     // This is the old viewportInfo, which may have old options but we might be
     // using its viewport (same viewportId as the new viewportInfo)
@@ -555,7 +567,34 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // element which is not what we want. But enabledElement as part of the
     // renderingEngine is designed to be used like this. This will trigger
     // ENABLED_ELEMENT again and again, which will run onEnableElement callbacks
-    renderingEngine.enableElement(viewportInput);
+    try {
+      renderingEngine.enableElement(viewportInput);
+    } catch (enableError) {
+      if (this.isWebGLUnavailableError(enableError)) {
+        return;
+      }
+
+      console.warn(
+        `[CornerstoneViewportService] Failed to enable viewport ${viewportId} on existing engine, attempting recovery`,
+        enableError
+      );
+
+      try {
+        this.renderingEngine = new RenderingEngine(RENDERING_ENGINE_ID);
+        renderingEngine = this.renderingEngine;
+        renderingEngine.enableElement(viewportInput);
+      } catch (recoveryError) {
+        if (this.isWebGLUnavailableError(recoveryError)) {
+          return;
+        }
+
+        console.warn(
+          `[CornerstoneViewportService] Recovery failed while enabling viewport ${viewportId}`,
+          recoveryError
+        );
+        return;
+      }
+    }
 
     viewportInfo.setViewportOptions(viewportOptions);
     viewportInfo.setDisplaySetOptions(displaySetOptions);
@@ -578,7 +617,24 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       }
     }
 
-    const viewport = renderingEngine.getViewport(viewportId);
+    let viewport: Types.IViewport | null = null;
+    try {
+      viewport = renderingEngine.getViewport(viewportId);
+    } catch (error) {
+      console.warn(
+        `[CornerstoneViewportService] Failed to fetch viewport ${viewportId} after enableElement`,
+        error
+      );
+      return;
+    }
+
+    if (!viewport) {
+      console.warn(
+        `[CornerstoneViewportService] No viewport returned for ${viewportId} after enableElement`
+      );
+      return;
+    }
+
     const displaySetPromise = this._setDisplaySets(
       viewport,
       viewportData,
@@ -589,17 +645,35 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // The broadcast event here ensures that listeners have a valid, up to date
     // viewport to access.  Doing it too early can result in exceptions or
     // invalid data.
-    displaySetPromise.then(() => {
-      this._broadcastEvent(this.EVENTS.VIEWPORT_DATA_CHANGED, {
-        viewportData,
-        viewportId,
-      });
+    displaySetPromise
+      .then(() => {
+        this._broadcastEvent(this.EVENTS.VIEWPORT_DATA_CHANGED, {
+          viewportData,
+          viewportId,
+        });
 
-      // Batch render after viewport is fully initialized - allows progressive loading
-      requestAnimationFrame(() => {
-        renderingEngine.render();
+        // Batch render after viewport is fully initialized - allows progressive loading
+        requestAnimationFrame(() => {
+          try {
+            renderingEngine.render();
+          } catch (renderError) {
+            if (!this.isWebGLUnavailableError(renderError)) {
+              console.warn(
+                `[CornerstoneViewportService] Failed to render viewport ${viewportId} after data change`,
+                renderError
+              );
+            }
+          }
+        });
+      })
+      .catch(error => {
+        if (!this.isWebGLUnavailableError(error)) {
+          console.warn(
+            `[CornerstoneViewportService] Failed while setting display sets for viewport ${viewportId}`,
+            error
+          );
+        }
       });
-    });
   }
 
   /**
@@ -611,13 +685,30 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
   public getCornerstoneViewport(viewportId: string): Types.IViewport | null {
     const viewportInfo = this.getViewportInfo(viewportId);
 
-    if (!viewportInfo || !this.renderingEngine || this.renderingEngine.hasBeenDestroyed) {
+    if (!viewportInfo) {
       return null;
     }
 
-    const viewport = this.renderingEngine.getViewport(viewportId);
+    const renderingEngine =
+      (getRenderingEngine(RENDERING_ENGINE_ID) as Types.IRenderingEngine | undefined) ??
+      this.renderingEngine;
 
-    return viewport;
+    if (!renderingEngine || renderingEngine.hasBeenDestroyed) {
+      return null;
+    }
+
+    this.renderingEngine = renderingEngine;
+
+    try {
+      const viewport = renderingEngine.getViewport(viewportId);
+      return viewport ?? null;
+    } catch (error) {
+      console.warn(
+        `[CornerstoneViewportService] Failed to get viewport ${viewportId} from rendering engine`,
+        error
+      );
+      return null;
+    }
   }
 
   /**
@@ -775,38 +866,40 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         });
       }
 
-      // [GEMINI FIX] Recalculate VOI based on ACTUAL pixel data (Corrected for Slope/Intercept)
-      try {
-        const imageData = viewport.getImageData();
-        // SAFETY: Fetch slope/intercept from the wrapper, as VTK imageData doesn't have them
-        const { slope = 1, intercept = 0 } = viewport.getCornerstoneImage() || {};
+      if (!isCPRPanoViewport) {
+        // [GEMINI FIX] Recalculate VOI based on ACTUAL pixel data (Corrected for Slope/Intercept)
+        try {
+          const imageData = viewport.getImageData();
+          // SAFETY: Fetch slope/intercept from the wrapper, as VTK imageData doesn't have them
+          const { slope = 1, intercept = 0 } = viewport.getCornerstoneImage() || {};
 
-        if (imageData && imageData.scalarData) {
-          const scalarData = imageData.scalarData;
-          let scalarMin = Infinity;
-          let scalarMax = -Infinity;
+          if (imageData && imageData.scalarData) {
+            const scalarData = imageData.scalarData;
+            let scalarMin = Infinity;
+            let scalarMax = -Infinity;
 
-          // Sample the data for performance
-          const step = Math.max(1, Math.floor(scalarData.length / 10000));
-          for (let i = 0; i < scalarData.length; i += step) {
-            // FIX: Apply Modality LUT (Slope/Intercept) to get real HU values
-            const val = scalarData[i] * slope + intercept;
-            if (val < scalarMin) scalarMin = val;
-            if (val > scalarMax) scalarMax = val;
-          }
-
-          const range = scalarMax - scalarMin;
-          const padding = range * 0.1; // 10% padding
-          viewport.setProperties({
-            voiRange: {
-              lower: scalarMin - padding,
-              upper: scalarMax + padding
+            // Sample the data for performance
+            const step = Math.max(1, Math.floor(scalarData.length / 10000));
+            for (let i = 0; i < scalarData.length; i += step) {
+              // FIX: Apply Modality LUT (Slope/Intercept) to get real HU values
+              const val = scalarData[i] * slope + intercept;
+              if (val < scalarMin) scalarMin = val;
+              if (val > scalarMax) scalarMax = val;
             }
-          });
-          console.log(`[GEMINI FIX] Corrected VOI to actual data range (HU): ${scalarMin} - ${scalarMax}`);
+
+            const range = scalarMax - scalarMin;
+            const padding = range * 0.1; // 10% padding
+            viewport.setProperties({
+              voiRange: {
+                lower: scalarMin - padding,
+                upper: scalarMax + padding
+              }
+            });
+            console.log(`[GEMINI FIX] Corrected VOI to actual data range (HU): ${scalarMin} - ${scalarMax}`);
+          }
+        } catch (error) {
+          console.warn('[GEMINI FIX] Failed to calculate auto VOI:', error);
         }
-      } catch (error) {
-        console.warn('[GEMINI FIX] Failed to calculate auto VOI:', error);
       }
 
       // [FIX #2 - STEP 4] Final render
@@ -1066,13 +1159,31 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
 
     // Stage 1: Initial render after volume assignment (shows viewport structure)
     requestAnimationFrame(() => {
-      viewport.render();
+      try {
+        viewport.render();
+      } catch (renderError) {
+        if (!this.isWebGLUnavailableError(renderError)) {
+          console.warn(
+            `[CornerstoneViewportService] Failed initial volume render for viewport ${viewportId}`,
+            renderError
+          );
+        }
+      }
     });
 
     // Final render logic
     const triggerFinalRender = () => {
       requestAnimationFrame(() => {
-        viewport.render();
+        try {
+          viewport.render();
+        } catch (renderError) {
+          if (!this.isWebGLUnavailableError(renderError)) {
+            console.warn(
+              `[CornerstoneViewportService] Failed final volume render for viewport ${viewportId}`,
+              renderError
+            );
+          }
+        }
       });
     };
 
@@ -1254,12 +1365,21 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       displaySetPromise = this._setStackViewport(viewport, viewportData, viewportInfo);
     }
 
-    displaySetPromise.then(() => {
-      this._broadcastEvent(this.EVENTS.VIEWPORT_DATA_CHANGED, {
-        viewportData,
-        viewportId,
+    displaySetPromise
+      .then(() => {
+        this._broadcastEvent(this.EVENTS.VIEWPORT_DATA_CHANGED, {
+          viewportData,
+          viewportId,
+        });
+      })
+      .catch(error => {
+        if (!this.isWebGLUnavailableError(error)) {
+          console.warn(
+            `[CornerstoneViewportService] Failed to update viewport ${viewportId}`,
+            error
+          );
+        }
       });
-    });
   }
 
   _setDisplaySets(
@@ -1375,7 +1495,29 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const isImmediate = false;
 
     try {
-      const viewports = this.getRenderingEngine().getViewports();
+      const renderingEngine =
+        (getRenderingEngine(RENDERING_ENGINE_ID) as Types.IRenderingEngine | undefined) ??
+        this.renderingEngine;
+
+      if (!renderingEngine || renderingEngine.hasBeenDestroyed) {
+        return;
+      }
+
+      this.renderingEngine = renderingEngine;
+
+      let viewports = [];
+      try {
+        viewports = renderingEngine.getViewports?.() || [];
+      } catch (getViewportsError) {
+        if (!this.isWebGLUnavailableError(getViewportsError)) {
+          console.warn('Caught resize exception while querying viewports', getViewportsError);
+        }
+        return;
+      }
+
+      if (!Array.isArray(viewports) || viewports.length === 0) {
+        return;
+      }
 
       // Store the current position presentations for each viewport.
       viewports.forEach(({ id }) => {
@@ -1383,12 +1525,16 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         this.beforeResizePositionPresentations.set(id, presentation);
       });
 
-      // Batch resize operations to prevent main thread blocking
-      const renderingEngine = this.renderingEngine;
-
       // Use requestAnimationFrame to move heavy render operations off main thread
       requestAnimationFrame(() => {
-        renderingEngine.resize(isImmediate);
+        try {
+          renderingEngine.resize(isImmediate);
+        } catch (resizeError) {
+          if (!this.isWebGLUnavailableError(resizeError)) {
+            console.warn('Caught resize exception during first resize pass', resizeError);
+          }
+          return;
+        }
 
         // Reset the camera for viewports that should reset their camera on resize,
         // which means only those viewports that have a zoom level of 1.
@@ -1398,13 +1544,21 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
 
         // Single render after resize and presentation updates
         requestAnimationFrame(() => {
-          renderingEngine.resize(isImmediate);
-          renderingEngine.render();
+          try {
+            renderingEngine.resize(isImmediate);
+            renderingEngine.render();
+          } catch (renderError) {
+            if (!this.isWebGLUnavailableError(renderError)) {
+              console.warn('Caught resize exception during second resize pass', renderError);
+            }
+          }
         });
       });
     } catch (e) {
       // This can happen if the resize is too close to navigation or shutdown
-      console.warn('Caught resize exception', e);
+      if (!this.isWebGLUnavailableError(e)) {
+        console.warn('Caught resize exception', e);
+      }
     }
   }
 

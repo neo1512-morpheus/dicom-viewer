@@ -38,24 +38,25 @@ const StudyBrowser = ({
     const tabData = tabs.find(tab => tab.name === activeTabName);
     return tabData.studies.map(
       ({ studyInstanceUid, date, description, numInstances, modalities, displaySets }) => {
+        const displaySetList = Array.isArray(displaySets) ? displaySets : [];
         const isExpanded = expandedStudyInstanceUIDs.includes(studyInstanceUid);
         return (
           <React.Fragment key={studyInstanceUid}>
             <StudyItem
               date={date}
               description={description}
-              numInstances={numInstances}
-              modalities={modalities}
-              trackedSeries={getTrackedSeries(displaySets)}
+              numInstances={numInstances ?? 0}
+              modalities={modalities ?? ''}
+              trackedSeries={getTrackedSeries(displaySetList)}
               isActive={isExpanded}
               onClick={() => {
                 onClickStudy(studyInstanceUid);
               }}
               data-cy="thumbnail-list"
             />
-            {isExpanded && displaySets && (
+            {isExpanded && displaySetList.length > 0 && (
               <ThumbnailList
-                thumbnails={displaySets}
+                thumbnails={displaySetList}
                 activeDisplaySetInstanceUIDs={activeDisplaySetInstanceUIDs}
                 onThumbnailClick={onClickThumbnail}
                 onThumbnailDoubleClick={onDoubleClickThumbnail}

@@ -30,6 +30,111 @@ interface PanoVoiSettings {
   windowCenter: number;
 }
 
+function isHuLikeRange(minValue: number, maxValue: number): boolean {
+  return (
+    Number.isFinite(minValue) &&
+    Number.isFinite(maxValue) &&
+    minValue >= -5000 &&
+    maxValue <= 7000
+  );
+}
+
+function isSeverelyCorruptedPanoOutput(summary: FloatBufferDebugSummary | null): boolean {
+  if (!summary || summary.sampledCount < 100) {
+    return false;
+  }
+
+  const dominantLowBand =
+    summary.fractionBelowMinus950 > 0.85 && summary.p50 < -2500 && summary.max > 10000;
+  const dominantHighBand =
+    summary.fractionAbove3000 > 0.85 && summary.p50 > 5000 && summary.min < -2000;
+
+  return dominantLowBand || dominantHighBand;
+}
+
+function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boolean {
+  if (!summary || summary.sampledCount < 100) {
+    return true;
+  }
+
+  if (isSeverelyCorruptedPanoOutput(summary)) {
+    return true;
+  }
+
+  const robustSpan = summary.p99 - summary.p01;
+  const hasExtremeOutliers = summary.min < -9000 || summary.max > 14000;
+  const looksMostlySaturatedHigh = summary.fractionAbove3000 > 0.6;
+  const isLowContrast = Number.isFinite(robustSpan) && robustSpan < 700;
+
+  return hasExtremeOutliers || looksMostlySaturatedHigh || isLowContrast;
+}
+
+function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
+  if (!summary || summary.sampledCount < 100) {
+    return -Infinity;
+  }
+
+  const robustSpan = summary.p99 - summary.p01;
+  let score = 0;
+
+  if (Number.isFinite(robustSpan)) {
+    if (robustSpan >= 1500 && robustSpan <= 6500) {
+      score += 4;
+    } else if (robustSpan >= 900 && robustSpan <= 9000) {
+      score += 2;
+    } else {
+      score -= 2;
+    }
+  }
+
+  score += Math.max(-4, 3 - summary.fractionAbove3000 * 8);
+  score += summary.max > 14000 ? -3 : 2;
+  score += summary.min < -9000 ? -3 : 2;
+
+  return score;
+}
+
+function applyLinearRescaleToPixelData(
+  source: Float32Array,
+  slope: number,
+  intercept: number
+): { pixelData: Float32Array; minValue: number; maxValue: number } | null {
+  const safeSlope = Number.isFinite(slope) && Math.abs(Number(slope)) > 1e-8 ? Number(slope) : 1;
+  const safeIntercept = Number.isFinite(intercept) ? Number(intercept) : 0;
+  const hasNonIdentityRescale = Math.abs(safeSlope - 1) > 1e-6 || Math.abs(safeIntercept) > 1e-6;
+
+  if (!hasNonIdentityRescale || !source || source.length === 0) {
+    return null;
+  }
+
+  const converted = new Float32Array(source.length);
+  let minValue = Infinity;
+  let maxValue = -Infinity;
+
+  for (let i = 0; i < source.length; i++) {
+    const value = Number(source[i]);
+    const transformed = Number.isFinite(value) ? value * safeSlope + safeIntercept : -1000;
+    const safeValue = Number.isFinite(transformed) ? transformed : -1000;
+    converted[i] = safeValue;
+    if (safeValue < minValue) {
+      minValue = safeValue;
+    }
+    if (safeValue > maxValue) {
+      maxValue = safeValue;
+    }
+  }
+
+  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+    return null;
+  }
+
+  return {
+    pixelData: converted,
+    minValue,
+    maxValue,
+  };
+}
+
 function percentileFromSorted(values: number[], q: number): number {
   if (!values.length) {
     return NaN;
@@ -139,13 +244,26 @@ function computeAdaptivePanoVoi(
   const windowWidth = Math.max(1, upper - lower);
   const windowCenter = lower + windowWidth / 2;
 
+  // If robust VOI still lands far outside plausible HU-like bounds and the
+  // sampled distribution is heavily split on both sides, prefer a stable
+  // dental default window instead of propagating pathological outliers.
+  const hasSplitOutliers =
+    !!summary &&
+    summary.fractionBelowMinus950 > 0.4 &&
+    summary.fractionAbove3000 > 0.15;
+  const isExtremeWindow = lower < -5000 || upper > 7000;
+  if (hasSplitOutliers && isExtremeWindow) {
+    return {
+      lower: fallbackLower,
+      upper: fallbackUpper,
+      windowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
+      windowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
+    };
+  }
+
   // Guardrail: if the data appears HU-like, avoid very narrow windows that
   // can make CPR pano look "washed white with black speckles".
-  const looksLikeHU =
-    Number.isFinite(rangeLow) &&
-    Number.isFinite(rangeHigh) &&
-    rangeLow >= -5000 &&
-    rangeHigh <= 7000;
+  const looksLikeHU = isHuLikeRange(rangeLow, rangeHigh);
 
   if (looksLikeHU) {
     const MIN_HU_WINDOW_WIDTH = 2500;
@@ -216,10 +334,14 @@ function dist3(a: [number, number, number], b: [number, number, number]): number
 
 function normalize3(v: [number, number, number]): [number, number, number] {
   const out = vec3.create();
-  vec3.normalize(out, vec3.fromValues(v[0], v[1], v[2]));
-  if (!Number.isFinite(out[0]) || !Number.isFinite(out[1]) || !Number.isFinite(out[2])) {
+  const inVec = vec3.fromValues(v[0], v[1], v[2]);
+  if (!Number.isFinite(inVec[0]) || !Number.isFinite(inVec[1]) || !Number.isFinite(inVec[2])) {
     return [1, 0, 0];
   }
+  if (vec3.length(inVec) < 1e-8) {
+    return [1, 0, 0];
+  }
+  vec3.normalize(out, inVec);
   return [out[0], out[1], out[2]];
 }
 
@@ -412,6 +534,21 @@ function buildArcLengthSpline(
   return { positions, tangents };
 }
 
+interface CPRWorkerLaunchResult {
+  pixelData: Float32Array;
+  width: number;
+  height: number;
+  minValue: number;
+  maxValue: number;
+  modalityLutApplied: boolean;
+  requestedModalityLutApplied: boolean;
+  storedValueNormalizationApplied: boolean;
+  unsignedPackedArtifactDetected: boolean;
+  effectiveIsPreScaled: boolean;
+  rescaleSlope: number;
+  rescaleIntercept: number;
+}
+
 function launchCPRWorker(params: {
   volume: cornerstone.Types.IImageVolume;
   frames: CPRFrame[];
@@ -421,14 +558,12 @@ function launchCPRWorker(params: {
   slabSamples: number;
   aggregation: 'MIP' | 'MEAN';
   verticalDir?: [number, number, number];
+  forceApplyModalityLut?: boolean;
+  modalityLutOverride?: boolean;
+  forceDisableStoredValueNormalization?: boolean;
+  verticalHalfMm?: number;
   debugRunId?: string;
-}): Promise<{
-  pixelData: Float32Array;
-  width: number;
-  height: number;
-  minValue: number;
-  maxValue: number;
-}> {
+}): Promise<CPRWorkerLaunchResult> {
   return new Promise((resolve, reject) => {
     // @ts-expect-error Vite/webpack handles import.meta.url worker URLs at build time.
     const worker = new Worker(new URL('./cprWorker.ts', import.meta.url), { type: 'module' });
@@ -437,11 +572,15 @@ function launchCPRWorker(params: {
       volume,
       frames,
       panoWidth,
-      panoHeight,
+      panoHeight: requestedPanoHeight,
       slabHalfThicknessMm,
       slabSamples,
       aggregation,
       verticalDir,
+      forceApplyModalityLut,
+      modalityLutOverride,
+      forceDisableStoredValueNormalization,
+      verticalHalfMm,
       debugRunId,
     } = params;
     const logPrefix = debugRunId ? `[CPR][${debugRunId}]` : '[CPR]';
@@ -449,28 +588,52 @@ function launchCPRWorker(params: {
     const scalarData = volume.imageData.getPointData().getScalars().getData() as
       | Float32Array
       | Int16Array;
+    const dimensions = volume.imageData.getDimensions() as [number, number, number];
+    const spacing = volume.imageData.getSpacing() as [number, number, number];
+    const worldToIndexMatrix =
+      (volume.imageData as { getWorldToIndex?: () => ArrayLike<number> | null | undefined })
+        .getWorldToIndex?.() ?? null;
+    const worldToIndexCandidate = worldToIndexMatrix
+      ? Array.from(worldToIndexMatrix).slice(0, 16)
+      : null;
+    const hasWorldToIndex =
+      !!worldToIndexCandidate &&
+      worldToIndexCandidate.length >= 16 &&
+      worldToIndexCandidate.every(value => Number.isFinite(value));
+    const worldToIndex = hasWorldToIndex ? worldToIndexCandidate : undefined;
+    const panoHeight = Math.max(1, Math.floor(Number(requestedPanoHeight) || 1));
+    const dynamicVertHalfMm =
+      Number.isFinite(verticalHalfMm) && Number(verticalHalfMm) > 0 ? Number(verticalHalfMm) : 15;
+    console.log('[CPR] vertical sampling config', {
+      requestedPanoHeight,
+      panoHeight,
+      dynamicVertHalfMm,
+      verticalHalfMmOverride: verticalHalfMm,
+    });
     const { minValue: scalarMin, maxValue: scalarMax } = estimateScalarRange(scalarData);
     const { slope: rescaleSlope, intercept: rescaleIntercept } = getVolumeRescale(volume);
-    const { bitsStored, pixelRepresentation } = getVolumePixelStorage(volume);
-    const applyModalityLut = shouldApplyModalityLutForCPR(rescaleSlope, rescaleIntercept);
+    const { bitsStored, bitsAllocated, highBit, pixelRepresentation, isPreScaled: rawIsPreScaled } =
+      getVolumePixelStorage(volume);
+    const effectiveIsPreScaled = resolveEffectivePreScaledFlag({
+      isPreScaled: rawIsPreScaled,
+      scalarMin,
+      scalarMax,
+      slope: rescaleSlope,
+      intercept: rescaleIntercept,
+    });
 
     const scalarType =
       (scalarData as { constructor?: { name?: string } })?.constructor?.name || 'UnknownTypedArray';
-    console.log(`${logPrefix} launchCPRWorker intensity normalization decision`, {
-      scalarType,
-      scalarMin,
-      scalarMax,
-      rescaleSlope,
-      rescaleIntercept,
-      bitsStored,
-      pixelRepresentation,
-      applyModalityLut,
-      modalityLutPolicy: 'APPLY_WHEN_NON_IDENTITY_RESCALE',
-      aggregation,
-      voiWindowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
-      voiWindowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
-    });
+
+    if (rawIsPreScaled && !effectiveIsPreScaled) {
+      console.warn(
+        `${logPrefix} volume.isPreScaled=true but scalar range is not HU-like with non-identity rescale; ` +
+          'overriding preScaled flag for CPR worker.'
+      );
+    }
+
     if (
+      !effectiveIsPreScaled &&
       Number.isFinite(bitsStored) &&
       Number(bitsStored) > 0 &&
       Number(bitsStored) < 16 &&
@@ -479,17 +642,92 @@ function launchCPRWorker(params: {
       console.warn(`${logPrefix} Source scalar range exceeds nominal bitsStored range.`, {
         scalarMax,
         bitsStored,
+        bitsAllocated,
+        highBit,
         pixelRepresentation,
       });
     }
 
-    if (!applyModalityLut && (Math.abs(rescaleSlope - 1) > 1e-6 || Math.abs(rescaleIntercept) > 1e-6)) {
+    const nominalBitsStored =
+      Number.isFinite(bitsStored) && Number(bitsStored) > 0 ? Math.floor(Number(bitsStored)) : 16;
+    const nominalStoredMax =
+      nominalBitsStored > 0 && nominalBitsStored < 31 ? (1 << nominalBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
+    const hasUnsignedPackedArtifact =
+      !effectiveIsPreScaled &&
+      scalarData instanceof Int16Array &&
+      nominalBitsStored < 16 &&
+      Number(pixelRepresentation) === 0 &&
+      (scalarMin < -1 || scalarMax > nominalStoredMax + 8);
+    const allowStoredValueNormalization =
+      !forceDisableStoredValueNormalization &&
+      !effectiveIsPreScaled &&
+      scalarData instanceof Int16Array &&
+      nominalBitsStored < 16 &&
+      (hasUnsignedPackedArtifact ||
+        (Number(pixelRepresentation) === 0 && scalarMin >= 0 && scalarMax <= nominalStoredMax));
+    const heuristicApplyModalityLut = shouldApplyModalityLutForCPR({
+      slope: rescaleSlope,
+      intercept: rescaleIntercept,
+      scalarMin,
+      scalarMax,
+      bitsStored,
+      pixelRepresentation,
+      allowStoredValueNormalization,
+      isPreScaled: effectiveIsPreScaled,
+    });
+    const applyModalityLut =
+      typeof modalityLutOverride === 'boolean'
+        ? modalityLutOverride
+        : forceApplyModalityLut
+          ? true
+          : heuristicApplyModalityLut;
+
+    console.log(`${logPrefix} launchCPRWorker intensity normalization decision`, {
+      scalarType,
+      scalarMin,
+      scalarMax,
+      rescaleSlope,
+      rescaleIntercept,
+      bitsStored,
+      bitsAllocated,
+      highBit,
+      pixelRepresentation,
+      rawIsPreScaled,
+      effectiveIsPreScaled,
+      forceApplyModalityLut: !!forceApplyModalityLut,
+      modalityLutOverride,
+      forceDisableStoredValueNormalization: !!forceDisableStoredValueNormalization,
+      heuristicApplyModalityLut,
+      applyModalityLut,
+      allowStoredValueNormalization,
+      hasUnsignedPackedArtifact,
+      modalityLutPolicy: 'HEURISTIC_APPLY_FOR_STORED_VALUES',
+      aggregation,
+      hasWorldToIndex,
+      requestedPanoHeight,
+      finalPanoHeight: panoHeight,
+      dynamicVertHalfMm,
+      voiWindowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
+      voiWindowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
+    });
+
+    if (
+      !effectiveIsPreScaled &&
+      !applyModalityLut &&
+      (Math.abs(rescaleSlope - 1) > 1e-6 || Math.abs(rescaleIntercept) > 1e-6)
+    ) {
       console.warn(
         `${logPrefix} applyModalityLut=false while source metadata has non-identity rescale. ` +
-          'If source pixels are stored values (not HU), fixed WW/WL may cause washed-out pano.'
+        'If source pixels are stored values (not HU), fixed WW/WL may cause washed-out pano.'
       );
     }
-    if (!applyModalityLut && Math.abs(rescaleIntercept) > 1e-6 && scalarMin >= 0 && scalarMax <= 5000) {
+    if (
+      !effectiveIsPreScaled &&
+      !applyModalityLut &&
+      Math.abs(rescaleIntercept) > 1e-6 &&
+      scalarMin >= 0 &&
+      scalarMax <= 5000
+    ) {
       console.error(`${logPrefix} RESCALE_BYPASS_DETECTED`, {
         scalarMin,
         scalarMax,
@@ -505,6 +743,7 @@ function launchCPRWorker(params: {
 
     const serializedFrames = frames.map(f => ({
       position: Array.from(f.position) as [number, number, number],
+      T: Array.from(f.T) as [number, number, number],
       N_slab: Array.from(f.N_slab) as [number, number, number],
     }));
 
@@ -523,6 +762,13 @@ function launchCPRWorker(params: {
         height: data.panoHeight,
         minValue: data.minValue,
         maxValue: data.maxValue,
+        modalityLutApplied: data.modalityLutApplied === true,
+        requestedModalityLutApplied: data.requestedModalityLutApplied === true,
+        storedValueNormalizationApplied: data.storedValueNormalizationApplied === true,
+        unsignedPackedArtifactDetected: data.unsignedPackedArtifactDetected === true,
+        effectiveIsPreScaled,
+        rescaleSlope,
+        rescaleIntercept,
       });
     };
 
@@ -534,22 +780,29 @@ function launchCPRWorker(params: {
     worker.postMessage({
       scalarData: dataToSend,
       isSharedArrayBuffer,
-      dimensions: volume.imageData.getDimensions(),
-      spacing: volume.imageData.getSpacing(),
+      dimensions,
+      spacing,
       origin: volume.imageData.getOrigin(),
       direction: volume.imageData.getDirection(),
+      worldToIndex,
       frames: serializedFrames,
       panoWidth,
       panoHeight,
+      vertHalfMm: dynamicVertHalfMm,
       slabHalfThicknessMm,
       slabSamples,
       aggregation,
       verticalDir,
       applyModalityLut,
+      allowStoredValueNormalization,
+      disableStoredValueNormalization: !!forceDisableStoredValueNormalization,
       rescaleSlope,
       rescaleIntercept,
       bitsStored,
+      bitsAllocated,
+      highBit,
       pixelRepresentation,
+      isPreScaled: effectiveIsPreScaled,
       debugRunId,
     });
   });
@@ -599,9 +852,9 @@ function getVolumeRescale(
 
   const modalityLut = cornerstone.metaData.get('modalityLutModule', firstImageId) as
     | {
-        rescaleSlope?: number;
-        rescaleIntercept?: number;
-      }
+      rescaleSlope?: number;
+      rescaleIntercept?: number;
+    }
     | undefined;
 
   const slope = Number(modalityLut?.rescaleSlope);
@@ -615,40 +868,155 @@ function getVolumeRescale(
 
 function getVolumePixelStorage(
   volume: cornerstone.Types.IImageVolume
-): { bitsStored: number; pixelRepresentation: number } {
+): {
+  bitsStored: number;
+  bitsAllocated: number;
+  highBit: number;
+  pixelRepresentation: number;
+  isPreScaled: boolean;
+} {
   const imageIds = (volume as cornerstone.Types.IImageVolume & { imageIds?: string[] }).imageIds;
   const firstImageId = Array.isArray(imageIds) && imageIds.length > 0 ? imageIds[0] : undefined;
+  const isPreScaled = !!(volume as cornerstone.Types.IImageVolume & { isPreScaled?: boolean })
+    .isPreScaled;
 
   if (!firstImageId) {
-    return { bitsStored: 16, pixelRepresentation: 1 };
+    return {
+      bitsStored: 16,
+      bitsAllocated: 16,
+      highBit: 15,
+      pixelRepresentation: 1,
+      isPreScaled,
+    };
   }
 
   const imagePixelModule = cornerstone.metaData.get('imagePixelModule', firstImageId) as
     | {
-        bitsStored?: number;
-        pixelRepresentation?: number;
-      }
+      bitsStored?: number;
+      bitsAllocated?: number;
+      highBit?: number;
+      pixelRepresentation?: number;
+    }
     | undefined;
 
   const bitsStored = Number(imagePixelModule?.bitsStored);
+  const bitsAllocated = Number(imagePixelModule?.bitsAllocated);
+  const highBit = Number(imagePixelModule?.highBit);
   const pixelRepresentation = Number(imagePixelModule?.pixelRepresentation);
+  const safeBitsStored = Number.isFinite(bitsStored) && bitsStored >= 1 ? Math.floor(bitsStored) : 16;
+  const safeBitsAllocated =
+    Number.isFinite(bitsAllocated) && bitsAllocated >= safeBitsStored
+      ? Math.floor(bitsAllocated)
+      : 16;
+  const safeHighBit = Number.isFinite(highBit) && highBit >= 0 ? Math.floor(highBit) : safeBitsStored - 1;
 
   return {
-    bitsStored: Number.isFinite(bitsStored) && bitsStored >= 1 ? bitsStored : 16,
+    bitsStored: safeBitsStored,
+    bitsAllocated: safeBitsAllocated,
+    highBit: Math.max(0, Math.min(safeBitsAllocated - 1, safeHighBit)),
     pixelRepresentation:
       Number.isFinite(pixelRepresentation) && (pixelRepresentation === 0 || pixelRepresentation === 1)
         ? pixelRepresentation
         : 1,
+    isPreScaled,
   };
 }
 
-function shouldApplyModalityLutForCPR(
-  slope: number,
-  intercept: number
-): boolean {
-  // Policy: whenever modality rescale is non-identity, apply it in CPR generation.
-  // This avoids producing pano output in stored-value space.
-  return Math.abs(slope - 1) > 1e-6 || Math.abs(intercept) > 1e-6;
+function shouldApplyModalityLutForCPR(params: {
+  slope: number;
+  intercept: number;
+  scalarMin: number;
+  scalarMax: number;
+  bitsStored: number;
+  pixelRepresentation: number;
+  allowStoredValueNormalization: boolean;
+  isPreScaled: boolean;
+}): boolean {
+  const {
+    slope,
+    intercept,
+    scalarMin,
+    scalarMax,
+    bitsStored,
+    pixelRepresentation,
+    allowStoredValueNormalization,
+    isPreScaled,
+  } = params;
+  const hasNonIdentityRescale = Math.abs(slope - 1) > 1e-6 || Math.abs(intercept) > 1e-6;
+
+  // Identity metadata means no LUT conversion is needed.
+  if (!hasNonIdentityRescale) {
+    return false;
+  }
+
+  // Streaming volume loaders commonly pre-apply modality scaling into scalarData.
+  // Re-applying slope/intercept in CPR would double-rescale and corrupt pano intensities.
+  if (isPreScaled) {
+    return false;
+  }
+
+  // If we are explicitly normalizing packed stored values, apply LUT afterwards
+  // to land in HU-like display space.
+  if (allowStoredValueNormalization) {
+    return true;
+  }
+
+  const isUnsigned = pixelRepresentation === 0;
+  const looksLikeHU = isHuLikeRange(scalarMin, scalarMax);
+
+  // Unsigned stored-value data cannot contain negatives. If negatives exist,
+  // cached scalar data is already transformed; applying intercept again would
+  // double-shift intensities. Restrict this shortcut to HU-like ranges only.
+  if (isUnsigned && scalarMin < -1 && looksLikeHU) {
+    return false;
+  }
+
+  const safeBitsStored =
+    Number.isFinite(bitsStored) && bitsStored >= 1 && bitsStored <= 31
+      ? Math.floor(bitsStored)
+      : 16;
+
+  // For sub-16-bit data, only apply modality LUT when scalar range still looks
+  // like native stored-value range for that bit depth.
+  if (safeBitsStored < 16) {
+    const storedMin = isUnsigned ? 0 : -(1 << (safeBitsStored - 1));
+    const storedMax = isUnsigned ? (1 << safeBitsStored) - 1 : (1 << (safeBitsStored - 1)) - 1;
+    const margin = Math.max(8, Math.round((storedMax - storedMin) * 0.02));
+    const looksStored =
+      Number.isFinite(scalarMin) &&
+      Number.isFinite(scalarMax) &&
+      scalarMin >= storedMin - margin &&
+      scalarMax <= storedMax + margin;
+
+    if (!looksLikeHU) {
+      return true;
+    }
+
+    return looksStored;
+  }
+
+  return true;
+}
+
+function resolveEffectivePreScaledFlag(params: {
+  isPreScaled: boolean;
+  scalarMin: number;
+  scalarMax: number;
+  slope: number;
+  intercept: number;
+}): boolean {
+  const { isPreScaled, scalarMin, scalarMax, slope, intercept } = params;
+
+  if (!isPreScaled) {
+    return false;
+  }
+
+  const hasNonIdentityRescale = Math.abs(slope - 1) > 1e-6 || Math.abs(intercept) > 1e-6;
+  if (!hasNonIdentityRescale) {
+    return true;
+  }
+
+  return isHuLikeRange(scalarMin, scalarMax);
 }
 
 function findViewportByLogicalId(
@@ -806,7 +1174,7 @@ function logPanoViewportSnapshot(
   }
 
   const currentImageId = getCurrentStackImageId(viewport);
-  const properties = (viewport.getProperties?.() || {}) as {
+  const properties = ((viewport as { getProperties?: () => unknown }).getProperties?.() || {}) as {
     voiRange?: { lower?: number; upper?: number };
     VOILUTFunction?: unknown;
     invert?: unknown;
@@ -826,20 +1194,20 @@ function logPanoViewportSnapshot(
   const cornerstoneImage = stackViewport.getCornerstoneImage?.() || null;
   const modalityLut = currentImageId
     ? (cornerstone.metaData.get('modalityLutModule', currentImageId) as
-        | {
-            rescaleSlope?: number;
-            rescaleIntercept?: number;
-          }
-        | undefined)
+      | {
+        rescaleSlope?: number;
+        rescaleIntercept?: number;
+      }
+      | undefined)
     : undefined;
   const voiLut = currentImageId
     ? (cornerstone.metaData.get('voiLutModule', currentImageId) as
-        | {
-            windowWidth?: number[] | number;
-            windowCenter?: number[] | number;
-            voiLUTFunction?: string;
-          }
-        | undefined)
+      | {
+        windowWidth?: number[] | number;
+        windowCenter?: number[] | number;
+        voiLUTFunction?: string;
+      }
+      | undefined)
     : undefined;
   const metadataWindowWidth = Array.isArray(voiLut?.windowWidth)
     ? toFiniteNumber(voiLut?.windowWidth?.[0])
@@ -865,14 +1233,14 @@ function logPanoViewportSnapshot(
     },
     cornerstoneImage: cornerstoneImage
       ? {
-          imageId: cornerstoneImage.imageId,
-          minPixelValue: cornerstoneImage.minPixelValue,
-          maxPixelValue: cornerstoneImage.maxPixelValue,
-          slope: cornerstoneImage.slope,
-          intercept: cornerstoneImage.intercept,
-          windowWidth: cornerstoneImage.windowWidth,
-          windowCenter: cornerstoneImage.windowCenter,
-        }
+        imageId: cornerstoneImage.imageId,
+        minPixelValue: cornerstoneImage.minPixelValue,
+        maxPixelValue: cornerstoneImage.maxPixelValue,
+        slope: cornerstoneImage.slope,
+        intercept: cornerstoneImage.intercept,
+        windowWidth: cornerstoneImage.windowWidth,
+        windowCenter: cornerstoneImage.windowCenter,
+      }
       : null,
     metadata: {
       modalityLutSlope: toFiniteNumber(modalityLut?.rescaleSlope),
@@ -905,7 +1273,7 @@ function applyPanoDisplaySettings(
     invert: false,
     colormap: undefined,
     VOILUTFunction: 'LINEAR_EXACT',
-  });
+  } as any);
 }
 
 function cloneCameraState(
@@ -1126,6 +1494,56 @@ interface UseCPROrchestratorReturn {
 type PointObject = { x: number; y: number; z: number };
 type PointLike = [number, number, number] | PointObject;
 
+function summarizeFrameGeometry(
+  frames: CPRFrame[],
+  verticalDir: [number, number, number]
+): {
+  sampled: number;
+  meanAbsDotTSlab: number;
+  p95AbsDotTSlab: number;
+  meanAbsDotTVertical: number;
+} {
+  if (!Array.isArray(frames) || frames.length === 0) {
+    return {
+      sampled: 0,
+      meanAbsDotTSlab: 0,
+      p95AbsDotTSlab: 0,
+      meanAbsDotTVertical: 0,
+    };
+  }
+
+  const dotsTSlab: number[] = [];
+  const dotsTVertical: number[] = [];
+  const stride = Math.max(1, Math.floor(frames.length / 128));
+  const v = normalize3(verticalDir);
+
+  for (let i = 0; i < frames.length; i += stride) {
+    const frame = frames[i];
+    const t = normalize3([frame.T[0], frame.T[1], frame.T[2]]);
+    const nSlab = normalize3([frame.N_slab[0], frame.N_slab[1], frame.N_slab[2]]);
+    dotsTSlab.push(Math.abs(t[0] * nSlab[0] + t[1] * nSlab[1] + t[2] * nSlab[2]));
+    dotsTVertical.push(Math.abs(t[0] * v[0] + t[1] * v[1] + t[2] * v[2]));
+  }
+
+  const mean = (values: number[]) =>
+    values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+  const p95 = (() => {
+    if (dotsTSlab.length === 0) {
+      return 0;
+    }
+    const sorted = dotsTSlab.slice().sort((a, b) => a - b);
+    const index = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+    return sorted[index];
+  })();
+
+  return {
+    sampled: dotsTSlab.length,
+    meanAbsDotTSlab: mean(dotsTSlab),
+    p95AbsDotTSlab: p95,
+    meanAbsDotTVertical: mean(dotsTVertical),
+  };
+}
+
 function getVolumeVerticalDirection(
   direction?: ArrayLike<number> | null
 ): [number, number, number] {
@@ -1140,6 +1558,31 @@ function getVolumeVerticalDirection(
   ];
 
   return normalize3(zAxis);
+}
+
+function getSourceViewportVerticalDirection(
+  sourceViewport: any,
+  volumeDirection?: ArrayLike<number> | null
+): [number, number, number] {
+  if (volumeDirection && volumeDirection.length >= 9) {
+    return getVolumeVerticalDirection(volumeDirection);
+  }
+
+  const camera = sourceViewport?.getCamera?.();
+  const cameraUp = camera?.viewUp;
+
+  if (Array.isArray(cameraUp) && cameraUp.length >= 3) {
+    const candidate: [number, number, number] = [
+      Number(cameraUp[0] ?? 0),
+      Number(cameraUp[1] ?? 0),
+      Number(cameraUp[2] ?? 0),
+    ];
+    if (Number.isFinite(candidate[0]) && Number.isFinite(candidate[1]) && Number.isFinite(candidate[2])) {
+      return normalize3(candidate);
+    }
+  }
+
+  return [0, 0, 1];
 }
 
 function toXYZTuple(p: PointLike): [number, number, number] {
@@ -1157,8 +1600,8 @@ export function useCPROrchestrator({
   sourceViewportId,
   panoWidth = 800,
   panoHeight = 400,
-  slabHalfThicknessMm = 7,
-  slabSamples = 21,
+  slabHalfThicknessMm = 4,
+  slabSamples = 11,
   aggregation = 'MEAN',
 }: UseCPROrchestratorProps): UseCPROrchestratorReturn {
   const [isGenerating, setIsGenerating] = useState(false);
@@ -1324,15 +1767,22 @@ export function useCPROrchestrator({
         sourceVolumeId,
       });
 
-      const verticalDir = getVolumeVerticalDirection(volume.imageData?.getDirection?.());
+      const verticalDir = getSourceViewportVerticalDirection(
+        axialViewport,
+        volume.imageData?.getDirection?.()
+      );
       const { positions, tangents } = buildArcLengthSpline(rawControlPoints, panoWidth);
-      const frames = buildRMFFrames(positions, tangents);
+      const frames = buildRMFFrames(positions, tangents, verticalDir);
+      console.log(`[CPR][${debugRunId}] frame geometry summary`, {
+        verticalDir,
+        ...summarizeFrameGeometry(frames, verticalDir),
+      });
       const panoImageId = createPanoImageId();
       console.log(`[CPR][${debugRunId}] generated panoImageId`, { panoImageId });
 
       // Precompute pano before stage switch so cpr-pano does not visibly flash
       // the source stack before the pano:// image arrives.
-      const panoWorkerResult = await launchCPRWorker({
+      const workerInput = {
         volume,
         frames,
         panoWidth,
@@ -1341,15 +1791,160 @@ export function useCPROrchestrator({
         slabSamples,
         aggregation,
         verticalDir,
+        verticalHalfMm: 15,
         debugRunId,
+      };
+      const runWorkerAttempt = async (
+        label: string,
+        overrides: Partial<Parameters<typeof launchCPRWorker>[0]>
+      ): Promise<{
+        label: string;
+        result: CPRWorkerLaunchResult;
+        summary: FloatBufferDebugSummary | null;
+        voi: PanoVoiSettings;
+        qualityBase: number;
+        qualityScore: number;
+        huDomain: boolean;
+        convertedToHu: boolean;
+      }> => {
+        const rawResult = await launchCPRWorker({
+          ...workerInput,
+          ...overrides,
+        });
+        let result = rawResult;
+        const hasIdentityRescaleMetadata =
+          Math.abs(result.rescaleSlope - 1) <= 1e-6 && Math.abs(result.rescaleIntercept) <= 1e-6;
+        let huDomain =
+          result.modalityLutApplied || result.effectiveIsPreScaled || hasIdentityRescaleMetadata;
+        let convertedToHu = false;
+
+        if (!huDomain) {
+          const converted = applyLinearRescaleToPixelData(
+            result.pixelData,
+            result.rescaleSlope,
+            result.rescaleIntercept
+          );
+          if (converted) {
+            result = {
+              ...result,
+              pixelData: converted.pixelData,
+              minValue: converted.minValue,
+              maxValue: converted.maxValue,
+              modalityLutApplied: true,
+            };
+            huDomain = true;
+            convertedToHu = true;
+          }
+        }
+
+        const summary = summarizeFloatBufferForDebug(result.pixelData);
+        const voi = computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
+        const qualityBase = scorePanoQuality(summary);
+        const qualityScore = qualityBase + (huDomain ? 0 : -100);
+
+        console.log(`[CPR][${debugRunId}] pano attempt ${label}`, {
+          qualityBase,
+          qualityScore,
+          minValue: result.minValue,
+          maxValue: result.maxValue,
+          p01: summary?.p01,
+          p50: summary?.p50,
+          p99: summary?.p99,
+          fractionBelowMinus950: summary?.fractionBelowMinus950,
+          fractionAbove3000: summary?.fractionAbove3000,
+          huDomain,
+          convertedToHu,
+          hasIdentityRescaleMetadata,
+          modalityLutApplied: result.modalityLutApplied,
+          requestedModalityLutApplied: result.requestedModalityLutApplied,
+          effectiveIsPreScaled: result.effectiveIsPreScaled,
+          rescaleSlope: result.rescaleSlope,
+          rescaleIntercept: result.rescaleIntercept,
+          overrides,
+        });
+
+        return {
+          label,
+          result,
+          summary,
+          voi,
+          qualityBase,
+          qualityScore,
+          huDomain,
+          convertedToHu,
+        };
+      };
+
+      let bestAttempt = await runWorkerAttempt('primary', {});
+
+      if (isLikelyPoorPanoQuality(bestAttempt.summary)) {
+        const retryConfigs: Array<{
+          label: string;
+          overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
+        }> = [
+          {
+            label: 'retry-force-lut-no-normalization',
+            overrides: {
+              modalityLutOverride: true,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: 12,
+              aggregation: 'MEAN',
+            },
+          },
+          {
+            label: 'retry-force-lut-mip',
+            overrides: {
+              modalityLutOverride: true,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: 12,
+              aggregation: 'MIP',
+            },
+          },
+        ];
+        // No-LUT fallback is only valid for already pre-scaled scalar data.
+        if (bestAttempt.result.effectiveIsPreScaled) {
+          retryConfigs.push({
+            label: 'retry-no-lut-no-normalization',
+            overrides: {
+              modalityLutOverride: false,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: 12,
+              aggregation: 'MEAN',
+            },
+          });
+        }
+
+        for (const retryConfig of retryConfigs) {
+          const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
+          if (attempt.qualityScore > bestAttempt.qualityScore) {
+            bestAttempt = attempt;
+          }
+        }
+      }
+
+      if (!bestAttempt.huDomain) {
+        throw new Error(
+          '[CPR] Selected panoramic attempt is not in HU domain and could not be safely normalized.'
+        );
+      }
+
+      if (isLikelyPoorPanoQuality(bestAttempt.summary)) {
+        throw new Error(
+          '[CPR] Panoramic output failed quality checks after all intensity fallback attempts.'
+        );
+      }
+
+      let panoWorkerResult = bestAttempt.result;
+      let panoDebugSummary = bestAttempt.summary;
+      let adaptiveVoi = bestAttempt.voi;
+      console.log(`[CPR][${debugRunId}] selected pano attempt`, {
+        label: bestAttempt.label,
+        qualityBase: bestAttempt.qualityBase,
+        qualityScore: bestAttempt.qualityScore,
+        huDomain: bestAttempt.huDomain,
+        convertedToHu: bestAttempt.convertedToHu,
       });
 
-      const panoDebugSummary = summarizeFloatBufferForDebug(panoWorkerResult.pixelData);
-      const adaptiveVoi = computeAdaptivePanoVoi(
-        panoDebugSummary,
-        panoWorkerResult.minValue,
-        panoWorkerResult.maxValue
-      );
       if (panoDebugSummary) {
         console.log(`[CPR][${debugRunId}] Worker pano output stats (sampled)`, {
           min: panoDebugSummary.min,
@@ -1367,7 +1962,7 @@ export function useCPROrchestrator({
         if (panoDebugSummary.fractionAbove3000 > 0.6 || panoDebugSummary.fractionBelowMinus950 > 0.6) {
           console.warn(
             `[CPR][${debugRunId}] Majority of pano samples are outside reference band [-950, 3000]. ` +
-              `Adaptive VOI is [${adaptiveVoi.lower.toFixed(0)}, ${adaptiveVoi.upper.toFixed(0)}].`
+            `Adaptive VOI is [${adaptiveVoi.lower.toFixed(0)}, ${adaptiveVoi.upper.toFixed(0)}].`
           );
         }
       }

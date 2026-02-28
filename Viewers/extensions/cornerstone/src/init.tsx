@@ -1,5 +1,4 @@
 import OHIF, { Types, errorHandler } from '@ohif/core';
-import React from 'react';
 
 import * as cornerstone from '@cornerstonejs/core';
 import * as cornerstoneTools from '@cornerstonejs/tools';
@@ -109,77 +108,12 @@ export default async function init({
   const {
     userAuthenticationService,
     customizationService,
-    uiModalService,
     uiNotificationService,
     cornerstoneViewportService,
     hangingProtocolService,
     viewportGridService,
     stateSyncService,
   } = servicesManager.services;
-
-  // =====================================================
-  // GLOBAL WebGL ERROR DETECTION
-  // Catches WebGL errors from VTK.js and other sources
-  // =====================================================
-  let hasShownGPUWarning = false;
-
-  const showGPUWarning = () => {
-    if (hasShownGPUWarning) {
-      return;
-    }
-    hasShownGPUWarning = true;
-    console.warn('[GPU] Showing GPU memory warning to user');
-    // EMERGENCY FALLBACK: React might be dead, use raw DOM
-    const crashDiv = document.createElement('div');
-    crashDiv.style.cssText =
-      'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); color: red; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 99999; font-size: 24px; font-weight: bold; text-align: center;';
-    crashDiv.innerHTML = `
-      <div style="background: #222; padding: 40px; border: 2px solid red; border-radius: 8px;">
-        <h1>⚠️ CRITICAL GPU CRASH ⚠️</h1>
-        <p style="color: white; margin: 20px 0;">Your device ran out of memory (VRAM).</p>
-        <button onclick="window.location.reload()" style="padding: 15px 30px; font-size: 20px; cursor: pointer; background: red; color: white; border: none; border-radius: 4px;">RELOAD PAGE NOW</button>
-      </div>
-    `;
-    document.body.appendChild(crashDiv);
-  };
-
-  // Listen for WebGL context loss on ALL canvases (including VTK.js internal ones)
-  const attachCanvasListeners = () => {
-    const canvases = document.querySelectorAll('canvas');
-    canvases.forEach(canvas => {
-      if (!canvas.dataset.gpuListenerAttached) {
-        canvas.dataset.gpuListenerAttached = 'true';
-        canvas.addEventListener('webglcontextlost', e => {
-          e.preventDefault();
-          console.warn('[GPU] WebGL context lost on canvas');
-          showGPUWarning();
-        });
-      }
-    });
-  };
-
-  // Use MutationObserver to catch dynamically created canvases
-  const observer = new MutationObserver(() => {
-    attachCanvasListeners();
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
-
-  // Also attach to existing canvases
-  attachCanvasListeners();
-
-  // Global error handler for uncaught WebGL errors
-  window.addEventListener('error', event => {
-    const errorMsg = event.message || '';
-    if (
-      errorMsg.includes('WebGL') ||
-      errorMsg.includes('CONTEXT_LOST') ||
-      errorMsg.includes('GPU')
-    ) {
-      console.warn('[GPU] Caught global WebGL error:', errorMsg);
-      showGPUWarning();
-    }
-  });
-  // =====================================================
 
   window.services = servicesManager.services;
   window.extensionManager = extensionManager;
@@ -196,10 +130,6 @@ export default async function init({
         'Cross Origin Isolation is not enabled, read more about it here: https://docs.ohif.org/faq/',
       type: 'warning',
     });
-  }
-
-  if (appConfig.showCPUFallbackMessage && cornerstone.getShouldUseCPURendering()) {
-    _showCPURenderingModal(uiModalService, hangingProtocolService);
   }
 
   // Stores a map from `lutPresentationId` to a Presentation object so that
@@ -443,41 +373,5 @@ export default async function init({
       });
     },
     1000
-  );
-}
-
-function CPUModal() {
-  return (
-    <div>
-      <p>
-        Your computer does not have enough GPU power to support the default GPU rendering mode. OHIF
-        has switched to CPU rendering mode. Please note that CPU rendering does not support all
-        features such as Volume Rendering, Multiplanar Reconstruction, and Segmentation Overlays.
-      </p>
-    </div>
-  );
-}
-
-function _showCPURenderingModal(uiModalService, hangingProtocolService) {
-  const callback = progress => {
-    if (progress === 100) {
-      uiModalService.show({
-        content: CPUModal,
-        title: 'OHIF Fell Back to CPU Rendering',
-      });
-
-      return true;
-    }
-  };
-
-  const { unsubscribe } = hangingProtocolService.subscribe(
-    hangingProtocolService.EVENTS.PROTOCOL_CHANGED,
-    () => {
-      const done = callback(100);
-
-      if (done) {
-        unsubscribe();
-      }
-    }
   );
 }

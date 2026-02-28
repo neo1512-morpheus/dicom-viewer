@@ -56,6 +56,30 @@ export default class ToolGroupService {
     this._init();
   }
 
+  private isWebGLUnavailableError(error: unknown): boolean {
+    const message =
+      (typeof error === 'object' && error && 'message' in error
+        ? String((error as { message?: unknown }).message)
+        : String(error ?? '')) || '';
+
+    const stack =
+      (typeof error === 'object' && error && 'stack' in error
+        ? String((error as { stack?: unknown }).stack)
+        : '') || '';
+
+    const text = `${message}\n${stack}`;
+
+    return (
+      text.includes('Cannot create proxy with a non-object as target or handler') ||
+      text.includes('Cannot read properties of undefined (reading \'values\')') ||
+      text.includes('get3DContext') ||
+      text.includes('getRenderWindow') ||
+      text.includes('RenderWindow.js') ||
+      text.includes('RenderingEngine.ts:1093') ||
+      text.includes('WebGL')
+    );
+  }
+
   onModeExit() {
     this.destroy();
   }
@@ -82,7 +106,22 @@ export default class ToolGroupService {
       }
 
       const { renderingEngineId, viewportId } = enabledElement;
-      const toolGroup = ToolGroupManager.getToolGroupForViewport(viewportId, renderingEngineId);
+      let toolGroup;
+
+      try {
+        toolGroup = ToolGroupManager.getToolGroupForViewport(viewportId, renderingEngineId);
+      } catch (error) {
+        if (!this.isWebGLUnavailableError(error)) {
+          console.warn(
+            'Failed to resolve tool group for viewportId:',
+            viewportId,
+            'and renderingEngineId:',
+            renderingEngineId,
+            error
+          );
+        }
+        return;
+      }
 
       if (!toolGroup) {
         console.warn(
@@ -107,7 +146,19 @@ export default class ToolGroupService {
 
   public getToolGroupForViewport(viewportId: string): Types.IToolGroup | void {
     const renderingEngine = this.cornerstoneViewportService.getRenderingEngine();
-    return ToolGroupManager.getToolGroupForViewport(viewportId, renderingEngine.id);
+
+    if (!renderingEngine?.id) {
+      return;
+    }
+
+    try {
+      return ToolGroupManager.getToolGroupForViewport(viewportId, renderingEngine.id);
+    } catch (error) {
+      if (!this.isWebGLUnavailableError(error)) {
+        console.warn('Failed to get tool group for viewport', viewportId, error);
+      }
+      return;
+    }
   }
 
   public getActiveToolForViewport(viewportId: string): string {
@@ -136,15 +187,39 @@ export default class ToolGroupService {
     renderingEngineId: string,
     deleteToolGroupIfEmpty?: boolean
   ): void {
-    const toolGroup = ToolGroupManager.getToolGroupForViewport(viewportId, renderingEngineId);
+    let toolGroup;
+
+    try {
+      toolGroup = ToolGroupManager.getToolGroupForViewport(viewportId, renderingEngineId);
+    } catch (error) {
+      if (!this.isWebGLUnavailableError(error)) {
+        console.warn('Failed to get tool group while removing viewport', viewportId, error);
+      }
+      return;
+    }
 
     if (!toolGroup) {
       return;
     }
 
-    toolGroup.removeViewports(renderingEngineId, viewportId);
+    try {
+      toolGroup.removeViewports(renderingEngineId, viewportId);
+    } catch (error) {
+      if (!this.isWebGLUnavailableError(error)) {
+        console.warn('Failed to remove viewport from tool group', viewportId, error);
+      }
+      return;
+    }
 
-    const viewportIds = toolGroup.getViewportIds();
+    let viewportIds = [];
+    try {
+      viewportIds = toolGroup.getViewportIds();
+    } catch (error) {
+      if (!this.isWebGLUnavailableError(error)) {
+        console.warn('Failed to query tool group viewport ids', toolGroup.id, error);
+      }
+      return;
+    }
 
     if (viewportIds.length === 0 && deleteToolGroupIfEmpty) {
       ToolGroupManager.destroyToolGroup(toolGroup.id);
@@ -160,7 +235,13 @@ export default class ToolGroupService {
       // If toolGroupId is not provided, add the viewport to all toolGroups
       const toolGroups = ToolGroupManager.getAllToolGroups();
       toolGroups.forEach(toolGroup => {
-        toolGroup.addViewport(viewportId, renderingEngineId);
+        try {
+          toolGroup.addViewport(viewportId, renderingEngineId);
+        } catch (error) {
+          if (!this.isWebGLUnavailableError(error)) {
+            console.warn('Failed to add viewport to tool group', toolGroup.id, error);
+          }
+        }
       });
     } else {
       let toolGroup = ToolGroupManager.getToolGroup(toolGroupId);
@@ -168,7 +249,13 @@ export default class ToolGroupService {
         toolGroup = this.createToolGroup(toolGroupId);
       }
 
-      toolGroup.addViewport(viewportId, renderingEngineId);
+      try {
+        toolGroup.addViewport(viewportId, renderingEngineId);
+      } catch (error) {
+        if (!this.isWebGLUnavailableError(error)) {
+          console.warn('Failed to add viewport to tool group', toolGroupId, error);
+        }
+      }
     }
 
     this._broadcastEvent(EVENTS.VIEWPORT_ADDED, {

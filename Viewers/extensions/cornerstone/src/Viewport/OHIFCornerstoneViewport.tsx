@@ -58,8 +58,8 @@ function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
     sourceViewportId: viewportId,
     panoWidth: 800,
     panoHeight: 400,
-    slabHalfThicknessMm: 7,
-    slabSamples: 21,
+    slabHalfThicknessMm: 2,
+    slabSamples: 7,
     aggregation: 'MEAN',
   });
   const [hasSpline, setHasSpline] = useState(false);

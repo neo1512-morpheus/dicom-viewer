@@ -6,6 +6,9 @@ export interface PanoImagePayload {
   height: number;
   minValue: number;
   maxValue: number;
+  huDomain?: boolean;
+  columnPixelSpacing?: number;
+  rowPixelSpacing?: number;
   windowWidth?: number;
   windowCenter?: number;
   slope?: number;
@@ -18,8 +21,8 @@ let panoImageCounter = 0;
 const PANO_FRAME_OF_REFERENCE_UID = 'CPR_PANO_FRAME_OF_REFERENCE';
 const PANO_SERIES_INSTANCE_UID = 'CPR_PANO_SERIES_INSTANCE';
 const PANO_STUDY_INSTANCE_UID = 'CPR_PANO_STUDY_INSTANCE';
-const DEFAULT_PANO_WINDOW_WIDTH = 4000;
-const DEFAULT_PANO_WINDOW_CENTER = 1000;
+const DEFAULT_PANO_WINDOW_WIDTH = 3000;
+const DEFAULT_PANO_WINDOW_CENTER = 600;
 
 interface PanoDisplayMetadata {
   minValue: number;
@@ -33,6 +36,7 @@ interface PanoDisplayMetadata {
 function getPanoDisplayMetadata(payload: PanoImagePayload | null): PanoDisplayMetadata {
   const safeMin = Number.isFinite(payload?.minValue) ? Number(payload?.minValue) : -1000;
   const safeMax = Number.isFinite(payload?.maxValue) ? Number(payload?.maxValue) : 3000;
+  const isHuDomain = payload?.huDomain === true;
   const payloadSlope =
     Number.isFinite(payload?.slope) && Math.abs(Number(payload?.slope)) > 1e-8
       ? Number(payload?.slope)
@@ -58,7 +62,7 @@ function getPanoDisplayMetadata(payload: PanoImagePayload | null): PanoDisplayMe
   const modalityMin = safeMin;
   const modalityMax = safeMax;
   const dynamicRange = Math.max(1, modalityMax - modalityMin);
-  const looksLikeHU = modalityMin >= -5000 && modalityMax <= 7000 && dynamicRange >= 250;
+  const looksLikeHU = isHuDomain && modalityMin >= -5000 && modalityMax <= 7000 && dynamicRange >= 250;
 
   const windowWidth =
     Number.isFinite(payload?.windowWidth) && Number(payload?.windowWidth) > 1
@@ -83,6 +87,25 @@ function getPanoDisplayMetadata(payload: PanoImagePayload | null): PanoDisplayMe
   };
 }
 
+function getPanoPixelSpacing(payload: PanoImagePayload | null): {
+  rowPixelSpacing: number;
+  columnPixelSpacing: number;
+} {
+  const rowPixelSpacing =
+    Number.isFinite(payload?.rowPixelSpacing) && Number(payload?.rowPixelSpacing) > 0
+      ? Number(payload?.rowPixelSpacing)
+      : 1;
+  const columnPixelSpacing =
+    Number.isFinite(payload?.columnPixelSpacing) && Number(payload?.columnPixelSpacing) > 0
+      ? Number(payload?.columnPixelSpacing)
+      : 1;
+
+  return {
+    rowPixelSpacing,
+    columnPixelSpacing,
+  };
+}
+
 export function createPanoImageId(): string {
   panoImageCounter += 1;
   return `pano://current/${Date.now()}-${panoImageCounter}`;
@@ -101,6 +124,7 @@ export function clearPanoImageCache(): void {
 function createImageObject(imageId: string, payload: PanoImagePayload): cornerstone.Types.IImage {
   const { pixelData, width, height } = payload;
   const display = getPanoDisplayMetadata(payload);
+  const spacing = getPanoPixelSpacing(payload);
 
   const image: cornerstone.Types.IImage = {
     imageId,
@@ -122,8 +146,8 @@ function createImageObject(imageId: string, payload: PanoImagePayload): cornerst
     color: false,
     rgba: false,
     numComps: 1,
-    columnPixelSpacing: 1,
-    rowPixelSpacing: 1,
+    columnPixelSpacing: spacing.columnPixelSpacing,
+    rowPixelSpacing: spacing.rowPixelSpacing,
     sizeInBytes: pixelData.byteLength,
     invert: false,
   };
@@ -178,9 +202,11 @@ function panoMetadataProvider(type: string, imageId: string) {
   }
 
   const payload = getPanoPayloadForMetadata(imageId);
+  const isHuDomain = payload?.huDomain === true;
   const width = payload?.width ?? 1;
   const height = payload?.height ?? 1;
   const display = getPanoDisplayMetadata(payload);
+  const spacing = getPanoPixelSpacing(payload);
 
   if (type === 'imagePlaneModule') {
     return {
@@ -189,8 +215,8 @@ function panoMetadataProvider(type: string, imageId: string) {
       columns: width,
       rowCosines: [1, 0, 0],
       columnCosines: [0, 1, 0],
-      rowPixelSpacing: 1,
-      columnPixelSpacing: 1,
+      rowPixelSpacing: spacing.rowPixelSpacing,
+      columnPixelSpacing: spacing.columnPixelSpacing,
       imagePositionPatient: [0, 0, 0],
       sliceThickness: 1,
       imageOrientationPatient: [1, 0, 0, 0, 1, 0],
@@ -208,6 +234,12 @@ function panoMetadataProvider(type: string, imageId: string) {
     };
   }
 
+  if (type === 'multiFrameModule') {
+    return {
+      numberOfFrames: 1,
+    };
+  }
+
   if (type === 'voiLutModule') {
     return {
       windowCenter: [display.windowCenter],
@@ -217,11 +249,18 @@ function panoMetadataProvider(type: string, imageId: string) {
   }
 
   if (type === 'modalityLutModule') {
-    return {
+    const module = {
       rescaleIntercept: display.intercept,
       rescaleSlope: display.slope,
-      rescaleType: 'HU',
     };
+    if (isHuDomain) {
+      return {
+        ...module,
+        rescaleType: 'HU',
+      };
+    }
+
+    return module;
   }
 
   if (type === 'generalSeriesModule') {

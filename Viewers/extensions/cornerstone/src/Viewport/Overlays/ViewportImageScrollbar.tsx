@@ -69,7 +69,7 @@ function CornerstoneImageScrollbar({
 
     if (viewportData.viewportType === Enums.ViewportType.STACK) {
       if (isCPRPanoViewport()) {
-        setImageSliceData({ imageIndex: 0, numberOfSlices: 0 });
+        setImageSliceData({ imageIndex: 0, numberOfSlices: 1 });
         return;
       }
 

@@ -839,6 +839,16 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       });
     }
 
+    if (viewport.id === 'cpr-pano') {
+      const firstImageId = stackImageIds?.[0] ?? '';
+      if (!firstImageId.startsWith('pano://')) {
+        console.log(
+          '[CPR] _setStackViewport: blocking non-pano:// stack load into cpr-pano. Orchestrator will set the correct pano:// stack.'
+        );
+        return Promise.resolve();
+      }
+    }
+
     // Load the image stack with parallel cache IDs
     return viewport.setStack(stackImageIds, initialImageIndexToUse).then(() => {
       console.log('[FIX] Stack loaded, now applying properties and recalculating VOI');

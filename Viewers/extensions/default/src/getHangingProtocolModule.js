@@ -401,10 +401,6 @@ const hpCPR = {
             {
               id: 'activeDisplaySet',
               options: {
-                voi: {
-                  windowWidth: 4000,
-                  windowCenter: 1000,
-                },
               },
             },
           ],

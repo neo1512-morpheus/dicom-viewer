@@ -9,8 +9,12 @@ import { buildRMFFrames } from './cprMath';
 import { CPR_CROSSSECTION_SYNC_EVENT, CPRCrossSectionSyncDetail } from './cprEvents';
 import type { CPRFrame } from './cprMath';
 
-const CPR_PANO_DEFAULT_WINDOW_WIDTH = 4000;
-const CPR_PANO_DEFAULT_WINDOW_CENTER = 1000;
+const CPR_PANO_DEFAULT_WINDOW_WIDTH = 3000;
+const CPR_PANO_DEFAULT_WINDOW_CENTER = 600;
+const CPR_PANO_MAX_DIMENSION = 4096;
+const CPR_PANO_DEFAULT_VERTICAL_HALF_MM = 20;
+const CPR_PANO_MAX_VERTICAL_HALF_MM = 26;
+const CPR_PANO_TARGET_ASPECT = 1.35;
 
 interface FloatBufferDebugSummary {
   sampledCount: number;
@@ -21,6 +25,7 @@ interface FloatBufferDebugSummary {
   p99: number;
   fractionBelowMinus950: number;
   fractionAbove3000: number;
+  meanAbsDelta: number;
 }
 
 interface PanoVoiSettings {
@@ -37,6 +42,31 @@ function isHuLikeRange(minValue: number, maxValue: number): boolean {
     minValue >= -5000 &&
     maxValue <= 7000
   );
+}
+
+function isLikelyStoredValueRange(
+  minValue: number,
+  maxValue: number,
+  bitsStored: number,
+  pixelRepresentation: number
+): boolean {
+  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+    return false;
+  }
+
+  const safeBitsStored =
+    Number.isFinite(bitsStored) && bitsStored >= 1 && bitsStored <= 31 ? Math.floor(bitsStored) : 16;
+  const isSigned = Number(pixelRepresentation) === 1;
+
+  if (isSigned) {
+    const signedMin = safeBitsStored < 31 ? -(1 << (safeBitsStored - 1)) : Number.MIN_SAFE_INTEGER;
+    const signedMax =
+      safeBitsStored < 31 ? (1 << (safeBitsStored - 1)) - 1 : Number.MAX_SAFE_INTEGER;
+    return minValue >= signedMin - 8 && maxValue <= signedMax + 8;
+  }
+
+  const unsignedMax = safeBitsStored < 31 ? (1 << safeBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
+  return minValue >= -1 && maxValue <= unsignedMax + 8;
 }
 
 function isSeverelyCorruptedPanoOutput(summary: FloatBufferDebugSummary | null): boolean {
@@ -65,8 +95,19 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
   const hasExtremeOutliers = summary.min < -9000 || summary.max > 14000;
   const looksMostlySaturatedHigh = summary.fractionAbove3000 > 0.6;
   const isLowContrast = Number.isFinite(robustSpan) && robustSpan < 700;
+  const hasSplitTailDistribution =
+    summary.fractionBelowMinus950 > 0.5 && summary.fractionAbove3000 > 0.2;
+  const hasMedianOutOfTypicalRange = summary.p50 < -1800 || summary.p50 > 2600;
+  const hasStrongSpeckleNoise = summary.meanAbsDelta > 780;
 
-  return hasExtremeOutliers || looksMostlySaturatedHigh || isLowContrast;
+  return (
+    hasExtremeOutliers ||
+    looksMostlySaturatedHigh ||
+    isLowContrast ||
+    hasSplitTailDistribution ||
+    hasMedianOutOfTypicalRange ||
+    hasStrongSpeckleNoise
+  );
 }
 
 function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
@@ -90,6 +131,27 @@ function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
   score += Math.max(-4, 3 - summary.fractionAbove3000 * 8);
   score += summary.max > 14000 ? -3 : 2;
   score += summary.min < -9000 ? -3 : 2;
+  if (summary.p50 >= -700 && summary.p50 <= 1700) {
+    score += 4;
+  } else {
+    score -= Math.min(6, Math.abs(summary.p50 - 500) / 600);
+  }
+
+  if (summary.fractionBelowMinus950 > 0.5 && summary.fractionAbove3000 > 0.2) {
+    score -= 5;
+  }
+
+  if (Number.isFinite(robustSpan) && robustSpan > 10000) {
+    score -= Math.min(6, (robustSpan - 10000) / 1200);
+  }
+
+  if (summary.meanAbsDelta <= 380) {
+    score += 3;
+  } else if (summary.meanAbsDelta <= 620) {
+    score += 1;
+  } else {
+    score -= Math.min(8, (summary.meanAbsDelta - 620) / 120);
+  }
 
   return score;
 }
@@ -166,6 +228,9 @@ function summarizeFloatBufferForDebug(buffer: Float32Array): FloatBufferDebugSum
   let max = -Infinity;
   let belowCount = 0;
   let aboveCount = 0;
+  let lastSampleValue: number | null = null;
+  let absDeltaAccum = 0;
+  let absDeltaCount = 0;
 
   for (let i = 0; i < buffer.length; i += step) {
     const value = Number(buffer[i]);
@@ -186,6 +251,11 @@ function summarizeFloatBufferForDebug(buffer: Float32Array): FloatBufferDebugSum
     if (value >= 3000) {
       aboveCount += 1;
     }
+    if (lastSampleValue !== null) {
+      absDeltaAccum += Math.abs(value - lastSampleValue);
+      absDeltaCount += 1;
+    }
+    lastSampleValue = value;
   }
 
   if (!samples.length || !Number.isFinite(min) || !Number.isFinite(max)) {
@@ -204,6 +274,7 @@ function summarizeFloatBufferForDebug(buffer: Float32Array): FloatBufferDebugSum
     p99: percentileFromSorted(samples, 0.99),
     fractionBelowMinus950: belowCount / sampledCount,
     fractionAbove3000: aboveCount / sampledCount,
+    meanAbsDelta: absDeltaCount > 0 ? absDeltaAccum / absDeltaCount : 0,
   };
 }
 
@@ -232,7 +303,7 @@ function computeAdaptivePanoVoi(
 
   // Avoid hard clipping by padding both sides of the robust percentile range.
   const robustSpan = Math.max(1, upper - lower);
-  const padding = Math.max(50, robustSpan * 0.1);
+  const padding = Math.max(30, robustSpan * 0.05);
   lower -= padding;
   upper += padding;
 
@@ -244,20 +315,25 @@ function computeAdaptivePanoVoi(
   const windowWidth = Math.max(1, upper - lower);
   const windowCenter = lower + windowWidth / 2;
 
-  // If robust VOI still lands far outside plausible HU-like bounds and the
-  // sampled distribution is heavily split on both sides, prefer a stable
-  // dental default window instead of propagating pathological outliers.
+  // If robust VOI lands outside plausible HU-like bounds with split tails,
+  // avoid hard fallback to fixed dental VOI (which can produce white/black
+  // banding). Instead use a bounded robust window around the median.
   const hasSplitOutliers =
     !!summary &&
     summary.fractionBelowMinus950 > 0.4 &&
     summary.fractionAbove3000 > 0.15;
   const isExtremeWindow = lower < -5000 || upper > 7000;
   if (hasSplitOutliers && isExtremeWindow) {
+    const robustCenter = Number.isFinite(summary?.p50) ? Number(summary?.p50) : windowCenter;
+    const boundedWidth = Math.max(2500, Math.min(12000, robustSpan * 1.2));
+    const splitCappedWidth = Math.min(boundedWidth, 3200);
+    const splitCappedLower = robustCenter - splitCappedWidth / 2;
+    const splitCappedUpper = robustCenter + splitCappedWidth / 2;
     return {
-      lower: fallbackLower,
-      upper: fallbackUpper,
-      windowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
-      windowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
+      lower: splitCappedLower,
+      upper: splitCappedUpper,
+      windowWidth: splitCappedWidth,
+      windowCenter: robustCenter,
     };
   }
 
@@ -266,17 +342,26 @@ function computeAdaptivePanoVoi(
   const looksLikeHU = isHuLikeRange(rangeLow, rangeHigh);
 
   if (looksLikeHU) {
-    const MIN_HU_WINDOW_WIDTH = 2500;
-    if (windowWidth < MIN_HU_WINDOW_WIDTH) {
-      const centeredLower = windowCenter - MIN_HU_WINDOW_WIDTH / 2;
-      const centeredUpper = windowCenter + MIN_HU_WINDOW_WIDTH / 2;
-      return {
-        lower: centeredLower,
-        upper: centeredUpper,
-        windowWidth: MIN_HU_WINDOW_WIDTH,
-        windowCenter,
-      };
-    }
+    const MIN_HU_WINDOW_WIDTH = 2300;
+    const MAX_DENTAL_WINDOW_WIDTH = 3200;
+    const widthWithMin = Math.max(windowWidth, MIN_HU_WINDOW_WIDTH);
+    const cappedWidth = Math.min(widthWithMin, MAX_DENTAL_WINDOW_WIDTH);
+    const dentalCenterMin = 300;
+    const dentalCenterMax = 800;
+    const biasedCenter =
+      windowCenter < dentalCenterMin
+        ? windowCenter + (dentalCenterMin - windowCenter) * 0.4
+        : windowCenter > dentalCenterMax
+          ? windowCenter - (windowCenter - dentalCenterMax) * 0.4
+          : windowCenter;
+    const cappedLower = biasedCenter - cappedWidth / 2;
+    const cappedUpper = biasedCenter + cappedWidth / 2;
+    return {
+      lower: cappedLower,
+      upper: cappedUpper,
+      windowWidth: cappedWidth,
+      windowCenter: biasedCenter,
+    };
   }
 
   return { lower, upper, windowWidth, windowCenter };
@@ -330,6 +415,21 @@ function dist3(a: [number, number, number], b: [number, number, number]): number
   const dy = a[1] - b[1];
   const dz = a[2] - b[2];
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function toPositiveFinite(value: unknown, fallback: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
+  }
+
+  return numeric;
+}
+
+function clampPanoDimension(value: unknown): number {
+  const numeric = Number(value);
+  const safeValue = Number.isFinite(numeric) ? Math.round(numeric) : 2;
+  return Math.max(2, Math.min(CPR_PANO_MAX_DIMENSION, safeValue));
 }
 
 function normalize3(v: [number, number, number]): [number, number, number] {
@@ -454,6 +554,39 @@ function addPhantomEndpoints(pts: [number, number, number][]): [number, number, 
   return [phantomStart, ...pts, phantomEnd];
 }
 
+function computeSplineTotalArcLength(rawPoints: [number, number, number][]): number {
+  if (rawPoints.length < 2) {
+    return 0;
+  }
+
+  const extended = addPhantomEndpoints(rawPoints);
+  const nSegments = extended.length - 3;
+  if (nSegments <= 0) {
+    return 0;
+  }
+
+  const FINE_STEPS = 2000;
+  const stepsPerSegment = Math.max(1, Math.floor(FINE_STEPS / nSegments));
+  let prevPt = catmullRomPoint(extended[0], extended[1], extended[2], extended[3], 0);
+  let totalArcLength = 0;
+
+  for (let seg = 0; seg < nSegments; seg++) {
+    const Pm1 = extended[seg];
+    const P0 = extended[seg + 1];
+    const P1 = extended[seg + 2];
+    const P2 = extended[seg + 3];
+
+    for (let step = 1; step <= stepsPerSegment; step++) {
+      const localT = step / stepsPerSegment;
+      const pt = catmullRomPoint(Pm1, P0, P1, P2, localT);
+      totalArcLength += dist3(prevPt, pt);
+      prevPt = pt;
+    }
+  }
+
+  return Number.isFinite(totalArcLength) && totalArcLength > 0 ? totalArcLength : 0;
+}
+
 function buildArcLengthSpline(
   rawPoints: [number, number, number][],
   nSamples: number
@@ -547,6 +680,8 @@ interface CPRWorkerLaunchResult {
   effectiveIsPreScaled: boolean;
   rescaleSlope: number;
   rescaleIntercept: number;
+  bitsStored: number;
+  pixelRepresentation: number;
 }
 
 function launchCPRWorker(params: {
@@ -620,6 +755,8 @@ function launchCPRWorker(params: {
       scalarMax,
       slope: rescaleSlope,
       intercept: rescaleIntercept,
+      bitsStored,
+      pixelRepresentation,
     });
 
     const scalarType =
@@ -652,18 +789,26 @@ function launchCPRWorker(params: {
       Number.isFinite(bitsStored) && Number(bitsStored) > 0 ? Math.floor(Number(bitsStored)) : 16;
     const nominalStoredMax =
       nominalBitsStored > 0 && nominalBitsStored < 31 ? (1 << nominalBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
+    const nominalSignedMin =
+      nominalBitsStored > 0 && nominalBitsStored < 31 ? -(1 << (nominalBitsStored - 1)) : Number.MIN_SAFE_INTEGER;
     const hasUnsignedPackedArtifact =
       !effectiveIsPreScaled &&
       scalarData instanceof Int16Array &&
       nominalBitsStored < 16 &&
       Number(pixelRepresentation) === 0 &&
       (scalarMin < -1 || scalarMax > nominalStoredMax + 8);
+    const hasBitDepthRangeMismatch =
+      !effectiveIsPreScaled &&
+      scalarData instanceof Int16Array &&
+      nominalBitsStored < 16 &&
+      (scalarMin < nominalSignedMin - 8 || scalarMax > nominalStoredMax + 8);
     const allowStoredValueNormalization =
       !forceDisableStoredValueNormalization &&
       !effectiveIsPreScaled &&
       scalarData instanceof Int16Array &&
       nominalBitsStored < 16 &&
       (hasUnsignedPackedArtifact ||
+        hasBitDepthRangeMismatch ||
         (Number(pixelRepresentation) === 0 && scalarMin >= 0 && scalarMax <= nominalStoredMax));
     const heuristicApplyModalityLut = shouldApplyModalityLutForCPR({
       slope: rescaleSlope,
@@ -701,6 +846,7 @@ function launchCPRWorker(params: {
       applyModalityLut,
       allowStoredValueNormalization,
       hasUnsignedPackedArtifact,
+      hasBitDepthRangeMismatch,
       modalityLutPolicy: 'HEURISTIC_APPLY_FOR_STORED_VALUES',
       aggregation,
       hasWorldToIndex,
@@ -769,6 +915,8 @@ function launchCPRWorker(params: {
         effectiveIsPreScaled,
         rescaleSlope,
         rescaleIntercept,
+        bitsStored,
+        pixelRepresentation,
       });
     };
 
@@ -795,7 +943,8 @@ function launchCPRWorker(params: {
       verticalDir,
       applyModalityLut,
       allowStoredValueNormalization,
-      disableStoredValueNormalization: !!forceDisableStoredValueNormalization,
+      disableStoredValueNormalization:
+        forceDisableStoredValueNormalization === true ? true : undefined,
       rescaleSlope,
       rescaleIntercept,
       bitsStored,
@@ -1004,8 +1153,10 @@ function resolveEffectivePreScaledFlag(params: {
   scalarMax: number;
   slope: number;
   intercept: number;
+  bitsStored: number;
+  pixelRepresentation: number;
 }): boolean {
-  const { isPreScaled, scalarMin, scalarMax, slope, intercept } = params;
+  const { isPreScaled, scalarMin, scalarMax, slope, intercept, bitsStored, pixelRepresentation } = params;
 
   if (!isPreScaled) {
     return false;
@@ -1013,6 +1164,34 @@ function resolveEffectivePreScaledFlag(params: {
 
   const hasNonIdentityRescale = Math.abs(slope - 1) > 1e-6 || Math.abs(intercept) > 1e-6;
   if (!hasNonIdentityRescale) {
+    return true;
+  }
+
+  // Extremely wide ranges are unlikely to be stable HU-space scalars and are
+  // safer to treat as stored values for downstream recovery retries.
+  const looksImplausiblyWideRange =
+    Number.isFinite(scalarMin) &&
+    Number.isFinite(scalarMax) &&
+    (scalarMin < -9000 || scalarMax > 14000);
+  if (looksImplausiblyWideRange) {
+    return false;
+  }
+
+  const safeBitsStored =
+    Number.isFinite(bitsStored) && bitsStored >= 1 && bitsStored <= 31 ? Math.floor(bitsStored) : 16;
+  const isUnsigned = pixelRepresentation === 0;
+  const unsignedStoredMax =
+    safeBitsStored > 0 && safeBitsStored < 31 ? (1 << safeBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
+  const looksLikeUnsignedStoredRange =
+    isUnsigned &&
+    Number.isFinite(scalarMin) &&
+    Number.isFinite(scalarMax) &&
+    scalarMin >= -1 &&
+    scalarMax <= unsignedStoredMax + 8;
+
+  // If loader marks volume as pre-scaled and scalar range does not look like
+  // native unsigned stored values, prefer preserving current scalar domain.
+  if (!looksLikeUnsignedStoredRange) {
     return true;
   }
 
@@ -1598,11 +1777,11 @@ export function useCPROrchestrator({
   servicesManager,
   commandsManager,
   sourceViewportId,
-  panoWidth = 800,
-  panoHeight = 400,
+  panoWidth: requestedPanoWidth = 800,
+  panoHeight: requestedPanoHeight = 400,
   slabHalfThicknessMm = 4,
   slabSamples = 11,
-  aggregation = 'MEAN',
+  aggregation = 'MIP',
 }: UseCPROrchestratorProps): UseCPROrchestratorReturn {
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1767,13 +1946,55 @@ export function useCPROrchestrator({
         sourceVolumeId,
       });
 
+      const requestedPanoWidthPx = clampPanoDimension(requestedPanoWidth);
+      const requestedPanoHeightPx = clampPanoDimension(requestedPanoHeight);
+      console.log(`[CPR][${debugRunId}] deriving pano dimensions`, {
+        requestedPanoWidth: requestedPanoWidthPx,
+        requestedPanoHeight: requestedPanoHeightPx,
+      });
+
+      const rawVolumeSpacing = volume.imageData?.getSpacing?.() as
+        | [number, number, number]
+        | undefined;
+      const spacingX = toPositiveFinite(rawVolumeSpacing?.[0], 1);
+      const spacingY = toPositiveFinite(rawVolumeSpacing?.[1], 1);
+      const spacingZ = toPositiveFinite(rawVolumeSpacing?.[2], 1);
+      const minSpacing = Math.min(spacingX, spacingY, spacingZ);
+      const totalArcLength = computeSplineTotalArcLength(rawControlPoints);
+      const safeTotalArcLength = Math.max(minSpacing, toPositiveFinite(totalArcLength, minSpacing));
+      const idealPanoWidth = Math.round(safeTotalArcLength / minSpacing);
+      const minimumPanoWidthPx = Math.max(320, Math.round(requestedPanoWidthPx * 0.6));
+      const finalPanoWidth = clampPanoDimension(Math.max(idealPanoWidth, minimumPanoWidthPx));
+      const columnPixelSpacing = toPositiveFinite(
+        safeTotalArcLength / Math.max(1, finalPanoWidth - 1),
+        minSpacing
+      );
+      const autoVerticalHalfMm = toPositiveFinite(
+        safeTotalArcLength / (2 * CPR_PANO_TARGET_ASPECT),
+        CPR_PANO_DEFAULT_VERTICAL_HALF_MM
+      );
+      const baseVerticalHalfMm = Math.max(
+        CPR_PANO_DEFAULT_VERTICAL_HALF_MM,
+        Math.min(CPR_PANO_MAX_VERTICAL_HALF_MM, autoVerticalHalfMm)
+      );
+      const thinnerVerticalHalfMm = Math.max(14, Math.min(24, baseVerticalHalfMm * 0.82));
+      const minimumPanoHeightPx = Math.max(160, Math.round(requestedPanoHeightPx * 0.55));
+
       const verticalDir = getSourceViewportVerticalDirection(
         axialViewport,
         volume.imageData?.getDirection?.()
       );
-      const { positions, tangents } = buildArcLengthSpline(rawControlPoints, panoWidth);
+      const { positions, tangents } = buildArcLengthSpline(rawControlPoints, finalPanoWidth);
       const frames = buildRMFFrames(positions, tangents, verticalDir);
       console.log(`[CPR][${debugRunId}] frame geometry summary`, {
+        totalArcLength: safeTotalArcLength,
+        minSpacing,
+        idealPanoWidth,
+        finalPanoWidth,
+        columnPixelSpacing,
+        baseVerticalHalfMm,
+        thinnerVerticalHalfMm,
+        minimumPanoHeightPx,
         verticalDir,
         ...summarizeFrameGeometry(frames, verticalDir),
       });
@@ -1785,13 +2006,11 @@ export function useCPROrchestrator({
       const workerInput = {
         volume,
         frames,
-        panoWidth,
-        panoHeight,
         slabHalfThicknessMm,
         slabSamples,
         aggregation,
         verticalDir,
-        verticalHalfMm: 15,
+        verticalHalfMm: baseVerticalHalfMm,
         debugRunId,
       };
       const runWorkerAttempt = async (
@@ -1806,10 +2025,33 @@ export function useCPROrchestrator({
         qualityScore: number;
         huDomain: boolean;
         convertedToHu: boolean;
+        rescaleSkippedAsUnsafe: boolean;
+        panoWidth: number;
+        panoHeight: number;
+        actualVertHalfMm: number;
+        columnPixelSpacing: number;
+        rowPixelSpacing: number;
       }> => {
+        const overrideVerticalHalfMm = Number(overrides.verticalHalfMm);
+        const actualVertHalfMm =
+          Number.isFinite(overrideVerticalHalfMm) && overrideVerticalHalfMm > 0
+            ? overrideVerticalHalfMm
+            : toPositiveFinite(workerInput.verticalHalfMm, baseVerticalHalfMm);
+        const idealPanoHeight = Math.round((actualVertHalfMm * 2) / minSpacing);
+        const aspectDrivenHeight = Math.round(finalPanoWidth / CPR_PANO_TARGET_ASPECT);
+        const finalPanoHeight = clampPanoDimension(
+          Math.max(idealPanoHeight, aspectDrivenHeight, minimumPanoHeightPx)
+        );
+        const rowPixelSpacing = toPositiveFinite(
+          (actualVertHalfMm * 2) / Math.max(1, finalPanoHeight - 1),
+          minSpacing
+        );
         const rawResult = await launchCPRWorker({
           ...workerInput,
           ...overrides,
+          panoWidth: finalPanoWidth,
+          panoHeight: finalPanoHeight,
+          verticalHalfMm: actualVertHalfMm,
         });
         let result = rawResult;
         const hasIdentityRescaleMetadata =
@@ -1817,30 +2059,52 @@ export function useCPROrchestrator({
         let huDomain =
           result.modalityLutApplied || result.effectiveIsPreScaled || hasIdentityRescaleMetadata;
         let convertedToHu = false;
+        let rescaleSkippedAsUnsafe = false;
 
         if (!huDomain) {
-          const converted = applyLinearRescaleToPixelData(
-            result.pixelData,
-            result.rescaleSlope,
-            result.rescaleIntercept
+          const canSafelyApplyRescale = isLikelyStoredValueRange(
+            result.minValue,
+            result.maxValue,
+            result.bitsStored,
+            result.pixelRepresentation
           );
-          if (converted) {
-            result = {
-              ...result,
-              pixelData: converted.pixelData,
-              minValue: converted.minValue,
-              maxValue: converted.maxValue,
-              modalityLutApplied: true,
-            };
-            huDomain = true;
-            convertedToHu = true;
+          if (canSafelyApplyRescale) {
+            const converted = applyLinearRescaleToPixelData(
+              result.pixelData,
+              result.rescaleSlope,
+              result.rescaleIntercept
+            );
+            if (converted) {
+              result = {
+                ...result,
+                pixelData: converted.pixelData,
+                minValue: converted.minValue,
+                maxValue: converted.maxValue,
+                modalityLutApplied: true,
+              };
+              huDomain = true;
+              convertedToHu = true;
+            }
+          } else {
+            // Metadata appears inconsistent with sampled intensity domain;
+            // avoid applying potentially destructive linear rescale.
+            huDomain = false;
+            rescaleSkippedAsUnsafe = true;
           }
         }
 
         const summary = summarizeFloatBufferForDebug(result.pixelData);
         const voi = computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
         const qualityBase = scorePanoQuality(summary);
-        const qualityScore = qualityBase + (huDomain ? 0 : -100);
+        const splitPenalty = summary
+          ? Math.max(0, summary.fractionBelowMinus950 - 0.3) * 8 +
+            Math.max(0, summary.fractionAbove3000 - 0.2) * 10 +
+            Math.max(0, summary.p50 - 2200) / 300 +
+            Math.max(0, -1700 - summary.p50) / 300 +
+            Math.max(0, summary.max - 12000) / 1500 +
+            Math.max(0, -9000 - summary.min) / 1500
+          : 8;
+        const qualityScore = qualityBase + (huDomain ? 0 : -100) - splitPenalty;
 
         console.log(`[CPR][${debugRunId}] pano attempt ${label}`, {
           qualityBase,
@@ -1850,16 +2114,23 @@ export function useCPROrchestrator({
           p01: summary?.p01,
           p50: summary?.p50,
           p99: summary?.p99,
+          meanAbsDelta: summary?.meanAbsDelta,
           fractionBelowMinus950: summary?.fractionBelowMinus950,
           fractionAbove3000: summary?.fractionAbove3000,
           huDomain,
           convertedToHu,
+          rescaleSkippedAsUnsafe,
           hasIdentityRescaleMetadata,
           modalityLutApplied: result.modalityLutApplied,
           requestedModalityLutApplied: result.requestedModalityLutApplied,
           effectiveIsPreScaled: result.effectiveIsPreScaled,
           rescaleSlope: result.rescaleSlope,
           rescaleIntercept: result.rescaleIntercept,
+          actualVertHalfMm,
+          idealPanoHeight,
+          finalPanoHeight,
+          columnPixelSpacing,
+          rowPixelSpacing,
           overrides,
         });
 
@@ -1872,43 +2143,103 @@ export function useCPROrchestrator({
           qualityScore,
           huDomain,
           convertedToHu,
+          rescaleSkippedAsUnsafe,
+          panoWidth: finalPanoWidth,
+          panoHeight: finalPanoHeight,
+          actualVertHalfMm,
+          columnPixelSpacing,
+          rowPixelSpacing,
         };
       };
 
-      let bestAttempt = await runWorkerAttempt('primary', {});
+      let bestAttempt = await runWorkerAttempt('primary', {
+        modalityLutOverride: true,
+        verticalHalfMm: thinnerVerticalHalfMm,
+        slabHalfThicknessMm: 3,
+        slabSamples: 9,
+        aggregation: 'MEAN',
+      });
 
       if (isLikelyPoorPanoQuality(bestAttempt.summary)) {
         const retryConfigs: Array<{
           label: string;
           overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
-        }> = [
-          {
-            label: 'retry-force-lut-no-normalization',
-            overrides: {
-              modalityLutOverride: true,
-              forceDisableStoredValueNormalization: true,
-              verticalHalfMm: 12,
-              aggregation: 'MEAN',
-            },
-          },
-          {
-            label: 'retry-force-lut-mip',
-            overrides: {
-              modalityLutOverride: true,
-              forceDisableStoredValueNormalization: true,
-              verticalHalfMm: 12,
-              aggregation: 'MIP',
-            },
-          },
-        ];
-        // No-LUT fallback is only valid for already pre-scaled scalar data.
+        }> = [];
         if (bestAttempt.result.effectiveIsPreScaled) {
+          // Avoid forcing LUT on data that is already effectively pre-scaled.
           retryConfigs.push({
-            label: 'retry-no-lut-no-normalization',
+            label: 'retry-no-lut-mip-thinner',
             overrides: {
               modalityLutOverride: false,
               forceDisableStoredValueNormalization: true,
-              verticalHalfMm: 12,
+              verticalHalfMm: thinnerVerticalHalfMm,
+              slabHalfThicknessMm: 3,
+              slabSamples: 9,
+              aggregation: 'MIP',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-no-lut-mean-thinner',
+            overrides: {
+              modalityLutOverride: false,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: thinnerVerticalHalfMm,
+              slabHalfThicknessMm: 3,
+              slabSamples: 9,
+              aggregation: 'MEAN',
+            },
+          });
+        } else {
+          retryConfigs.push({
+            label: 'retry-no-lut-mip-thinner',
+            overrides: {
+              modalityLutOverride: false,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: thinnerVerticalHalfMm,
+              slabHalfThicknessMm: 3,
+              slabSamples: 9,
+              aggregation: 'MIP',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-force-lut-mip-with-normalization',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: thinnerVerticalHalfMm,
+              slabHalfThicknessMm: 3,
+              slabSamples: 9,
+              aggregation: 'MIP',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-force-lut-mean-with-normalization',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: thinnerVerticalHalfMm,
+              slabHalfThicknessMm: 3,
+              slabSamples: 9,
+              aggregation: 'MEAN',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-force-lut-mip-no-normalization',
+            overrides: {
+              modalityLutOverride: true,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: thinnerVerticalHalfMm,
+              slabHalfThicknessMm: 3,
+              slabSamples: 9,
+              aggregation: 'MIP',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-force-lut-mean-no-normalization',
+            overrides: {
+              modalityLutOverride: true,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: thinnerVerticalHalfMm,
+              slabHalfThicknessMm: 3,
+              slabSamples: 9,
               aggregation: 'MEAN',
             },
           });
@@ -1916,33 +2247,59 @@ export function useCPROrchestrator({
 
         for (const retryConfig of retryConfigs) {
           const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
-          if (attempt.qualityScore > bestAttempt.qualityScore) {
+          if (
+            attempt.qualityScore > bestAttempt.qualityScore ||
+            (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
+              attempt.qualityBase > bestAttempt.qualityBase)
+          ) {
             bestAttempt = attempt;
           }
         }
       }
 
       if (!bestAttempt.huDomain) {
-        throw new Error(
-          '[CPR] Selected panoramic attempt is not in HU domain and could not be safely normalized.'
+        console.warn(
+          `[CPR][${debugRunId}] Selected panoramic attempt is not in HU domain and could not be safely normalized.`,
+          {
+            label: bestAttempt.label,
+            qualityBase: bestAttempt.qualityBase,
+            qualityScore: bestAttempt.qualityScore,
+          }
         );
       }
 
       if (isLikelyPoorPanoQuality(bestAttempt.summary)) {
-        throw new Error(
-          '[CPR] Panoramic output failed quality checks after all intensity fallback attempts.'
+        console.warn(
+          `[CPR][${debugRunId}] proceeding with best available pano despite quality warning`,
+          {
+            label: bestAttempt.label,
+            qualityBase: bestAttempt.qualityBase,
+            qualityScore: bestAttempt.qualityScore,
+            summary: bestAttempt.summary,
+          }
         );
       }
 
       let panoWorkerResult = bestAttempt.result;
       let panoDebugSummary = bestAttempt.summary;
       let adaptiveVoi = bestAttempt.voi;
+      const selectedPanoWidth = bestAttempt.panoWidth;
+      const selectedPanoHeight = bestAttempt.panoHeight;
+      const selectedActualVertHalfMm = bestAttempt.actualVertHalfMm;
+      const selectedColumnPixelSpacing = bestAttempt.columnPixelSpacing;
+      const selectedRowPixelSpacing = bestAttempt.rowPixelSpacing;
       console.log(`[CPR][${debugRunId}] selected pano attempt`, {
         label: bestAttempt.label,
         qualityBase: bestAttempt.qualityBase,
         qualityScore: bestAttempt.qualityScore,
         huDomain: bestAttempt.huDomain,
         convertedToHu: bestAttempt.convertedToHu,
+        rescaleSkippedAsUnsafe: bestAttempt.rescaleSkippedAsUnsafe,
+        panoWidth: selectedPanoWidth,
+        panoHeight: selectedPanoHeight,
+        actualVertHalfMm: selectedActualVertHalfMm,
+        columnPixelSpacing: selectedColumnPixelSpacing,
+        rowPixelSpacing: selectedRowPixelSpacing,
       });
 
       if (panoDebugSummary) {
@@ -2013,10 +2370,13 @@ export function useCPROrchestrator({
             height: panoWorkerResult.height,
             minValue: panoWorkerResult.minValue,
             maxValue: panoWorkerResult.maxValue,
+            huDomain: bestAttempt.huDomain,
             windowWidth: adaptiveVoi.windowWidth,
             windowCenter: adaptiveVoi.windowCenter,
             slope: 1,
             intercept: 0,
+            columnPixelSpacing: selectedColumnPixelSpacing,
+            rowPixelSpacing: selectedRowPixelSpacing,
           });
 
           console.log(`[CPR][${debugRunId}] Pano payload metadata pushed to loader`, {
@@ -2029,11 +2389,18 @@ export function useCPROrchestrator({
             voiUpper: adaptiveVoi.upper,
             slope: 1,
             intercept: 0,
+            width: panoWorkerResult.width,
+            height: panoWorkerResult.height,
+            columnPixelSpacing: selectedColumnPixelSpacing,
+            rowPixelSpacing: selectedRowPixelSpacing,
           });
 
           const panoViewport = await waitForPanoStackViewport(servicesManager);
           logPanoViewportSnapshot(debugRunId, 'before-setStack', panoViewport);
           await panoViewport.setStack([panoImageId], 0);
+          if (typeof (panoViewport as { resetCamera?: () => void }).resetCamera === 'function') {
+            panoViewport.resetCamera();
+          }
           logPanoViewportSnapshot(debugRunId, 'after-setStack', panoViewport);
           applyPanoDisplaySettings(debugRunId, 'after-setStack', panoViewport, adaptiveVoi);
           logPanoViewportSnapshot(debugRunId, 'after-setProperties', panoViewport);
@@ -2053,6 +2420,12 @@ export function useCPROrchestrator({
               );
 
               const liveViewport = findViewportByLogicalId(servicesManager, 'cpr-pano');
+              if (
+                liveViewport &&
+                typeof (liveViewport as { resetCamera?: () => void }).resetCamera === 'function'
+              ) {
+                liveViewport.resetCamera();
+              }
               applyPanoDisplaySettings(
                 debugRunId,
                 'after-first-image-rendered',
@@ -2148,8 +2521,8 @@ export function useCPROrchestrator({
     servicesManager,
     commandsManager,
     sourceViewportId,
-    panoWidth,
-    panoHeight,
+    requestedPanoWidth,
+    requestedPanoHeight,
     slabHalfThicknessMm,
     slabSamples,
     aggregation,

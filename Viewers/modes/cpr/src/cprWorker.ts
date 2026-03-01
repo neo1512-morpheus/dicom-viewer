@@ -142,6 +142,25 @@ function invertMatrix3(m: number[]): number[] {
   return [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]];
 }
 
+function indexToWorld(
+  i: number,
+  j: number,
+  k: number,
+  origin: [number, number, number],
+  spacing: [number, number, number],
+  direction: number[]
+): [number, number, number] {
+  const sx = i * spacing[0];
+  const sy = j * spacing[1];
+  const sz = k * spacing[2];
+
+  return [
+    origin[0] + direction[0] * sx + direction[3] * sy + direction[6] * sz,
+    origin[1] + direction[1] * sx + direction[4] * sy + direction[7] * sz,
+    origin[2] + direction[2] * sx + direction[5] * sy + direction[8] * sz,
+  ];
+}
+
 function trilinear(
   data: Float32Array | Int16Array,
   dims: [number, number, number],
@@ -220,6 +239,89 @@ function trilinearCore(
   return c0 + fk * (c1 - c0);
 }
 
+function applyLightBilateralDenoise(
+  pixelData: Float32Array,
+  width: number,
+  height: number,
+  blendWeight: number
+): boolean {
+  if (width < 3 || height < 3 || blendWeight <= 0) {
+    return false;
+  }
+
+  const source = new Float32Array(pixelData);
+  const sigmaRange = 220;
+  const sigmaRangeDen = 2 * sigmaRange * sigmaRange;
+  const clampedBlend = Math.max(0, Math.min(0.6, blendWeight));
+  const keepWeight = 1 - clampedBlend;
+
+  const neighbors: Array<[number, number, number]> = [
+    [-1, -1, 0.45],
+    [0, -1, 0.7],
+    [1, -1, 0.45],
+    [-1, 0, 0.7],
+    [1, 0, 0.7],
+    [-1, 1, 0.45],
+    [0, 1, 0.7],
+    [1, 1, 0.45],
+  ];
+
+  for (let row = 1; row < height - 1; row++) {
+    for (let col = 1; col < width - 1; col++) {
+      const index = row * width + col;
+      const center = source[index];
+      if (!Number.isFinite(center)) {
+        continue;
+      }
+
+      let weightedSum = center;
+      let weightTotal = 1;
+
+      for (let n = 0; n < neighbors.length; n++) {
+        const [dx, dy, spatialWeight] = neighbors[n];
+        const neighborValue = source[(row + dy) * width + (col + dx)];
+        if (!Number.isFinite(neighborValue)) {
+          continue;
+        }
+        const delta = neighborValue - center;
+        const rangeWeight = Math.exp(-(delta * delta) / sigmaRangeDen);
+        const weight = spatialWeight * rangeWeight;
+        weightedSum += neighborValue * weight;
+        weightTotal += weight;
+      }
+
+      const filtered = weightTotal > 0 ? weightedSum / weightTotal : center;
+      pixelData[index] = keepWeight * center + clampedBlend * filtered;
+    }
+  }
+
+  return true;
+}
+
+function computeArrayMinMax(buffer: Float32Array): { minValue: number; maxValue: number } {
+  let minValue = Infinity;
+  let maxValue = -Infinity;
+
+  for (let i = 0; i < buffer.length; i++) {
+    const value = Number(buffer[i]);
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    if (value < minValue) {
+      minValue = value;
+    }
+    if (value > maxValue) {
+      maxValue = value;
+    }
+  }
+
+  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+    return { minValue: 0, maxValue: 0 };
+  }
+
+  return { minValue, maxValue };
+}
+
 function generatePanorama(input: CPRWorkerInput): {
   pixelData: Float32Array;
   minValue: number;
@@ -233,6 +335,9 @@ function generatePanorama(input: CPRWorkerInput): {
   effectiveVerticalHalfMm: number;
   verticalCenterOffsetMm: number;
   adaptiveVerticalIntervalCount: number;
+  effectiveSlabSampleCount: number;
+  robustMipTopCount: number;
+  denoiseApplied: boolean;
 } {
   const {
     scalarData,
@@ -267,6 +372,7 @@ function generatePanorama(input: CPRWorkerInput): {
   let maxValue = -Infinity;
   const aggregationMode = aggregation === 'MEAN' ? 'MEAN' : 'MIP';
   const isMeanAggregation = aggregationMode === 'MEAN';
+  let robustMipTopCount = 1;
   const safeSlope =
     Number.isFinite(rescaleSlope) && Math.abs(Number(rescaleSlope)) > 1e-8 ? Number(rescaleSlope) : 1;
   const safeIntercept = Number.isFinite(rescaleIntercept) ? Number(rescaleIntercept) : 0;
@@ -312,13 +418,20 @@ function generatePanorama(input: CPRWorkerInput): {
     safeBitsStored < 16 &&
     safePixelRepresentation === 0 &&
     (sampledMinMax.min < -1 || sampledMinMax.max > nominalStoredMax + 8);
-  const shouldNormalizeStoredValues =
-    !disableStoredValueNormalization &&
-    (allowStoredValueNormalization === true || unsignedPackedArtifactDetected) &&
+  const normalizationEligible =
     safeBitsStored !== null &&
     safeBitsStored < 16 &&
     safePixelRepresentation !== null &&
     scalarData instanceof Int16Array;
+  // Respect explicit caller policy whenever provided; only fall back to
+  // heuristic detection when no explicit normalization preference is given.
+  const shouldNormalizeStoredValues =
+    normalizationEligible &&
+    (disableStoredValueNormalization === true
+      ? false
+      : typeof allowStoredValueNormalization === 'boolean'
+        ? allowStoredValueNormalization
+        : unsignedPackedArtifactDetected);
   const normalizedBitsStored = shouldNormalizeStoredValues ? (safeBitsStored as number) : 0;
   const normalizedHighBit = shouldNormalizeStoredValues
     ? Math.max(0, Math.min(safeBitsAllocated - 1, safeHighBit ?? normalizedBitsStored - 1))
@@ -354,15 +467,17 @@ function generatePanorama(input: CPRWorkerInput): {
   // Respect caller policy when provided. Some studies already expose HU-like
   // scalarData in the volume cache, even if DICOM metadata has non-identity
   // rescale values. Forcing LUT again can double-shift intensities.
-  const requestedModalityLutApplied =
-    typeof input.applyModalityLut === 'boolean'
-      ? input.applyModalityLut
-      : safeSlope !== 1 || safeIntercept !== 0;
-  // If packed unsigned values are detected, force LUT after normalization;
-  // otherwise preserve caller policy.
-  const shouldApplyModalityLut = unsignedPackedArtifactDetected && !disableStoredValueNormalization
-    ? !safeIsPreScaled && (safeSlope !== 1 || safeIntercept !== 0)
-    : requestedModalityLutApplied;
+  const hasExplicitApplyModalityLut = typeof input.applyModalityLut === 'boolean';
+  const requestedModalityLutApplied = hasExplicitApplyModalityLut
+    ? input.applyModalityLut
+    : safeSlope !== 1 || safeIntercept !== 0;
+  // Respect explicit caller LUT policy. If caller does not provide one,
+  // retain legacy heuristic for packed unsigned recovery.
+  const shouldApplyModalityLut = hasExplicitApplyModalityLut
+    ? requestedModalityLutApplied
+    : unsignedPackedArtifactDetected && !disableStoredValueNormalization
+      ? !safeIsPreScaled && (safeSlope !== 1 || safeIntercept !== 0)
+      : requestedModalityLutApplied;
   const lutSamplePreview: number[] = [];
   const interpolationOobValue = shouldApplyModalityLut ? (-1000 - safeIntercept) / safeSlope : -1000;
   const safeInterpolationOobValue = Number.isFinite(interpolationOobValue) ? interpolationOobValue : -1000;
@@ -378,10 +493,86 @@ function generatePanorama(input: CPRWorkerInput): {
       ? Number(requestedVertHalfMm)
       : 15.0;
   const panoHeightDen = Math.max(1, panoHeight - 1);
-
-  const slabSampleCount = Math.max(1, Math.floor(slabSamples));
+  const baseSlabSampleCount = Math.max(1, Math.floor(slabSamples));
+  const positiveSpacings = spacing.filter(value => Number.isFinite(value) && Number(value) > 0);
+  const minVolumeSpacingMm = positiveSpacings.length ? Math.min(...positiveSpacings) : 1;
+  const targetSlabStepMm = Math.max(0.2, minVolumeSpacingMm * 0.75);
+  const adaptiveSampleCount =
+    slabHalfThicknessMm > 0 ? Math.ceil((slabHalfThicknessMm * 2) / targetSlabStepMm) + 1 : 1;
+  const slabSampleCount = Math.max(baseSlabSampleCount, Math.min(41, adaptiveSampleCount));
+  if (!isMeanAggregation) {
+    robustMipTopCount =
+      slabSampleCount <= 1 ? 1 : slabSampleCount >= 13 ? 4 : slabSampleCount >= 7 ? 3 : 2;
+  }
   const slabStepMm = slabSampleCount > 1 ? (slabHalfThicknessMm * 2) / (slabSampleCount - 1) : 0;
   const vertStepMm = (vertHalfMm * 2) / panoHeightDen;
+  const [nx, ny, nz] = dimensions;
+
+  // Compute a global center offset along vertical direction to keep the
+  // requested vertical sampling window inside the volume bounds as much as possible.
+  let verticalCenterOffsetMm = 0;
+  if (nx > 1 && ny > 1 && nz > 1 && Array.isArray(frames) && frames.length > 0) {
+    const maxI = nx - 1;
+    const maxJ = ny - 1;
+    const maxK = nz - 1;
+    const cornerIndices: Array<[number, number, number]> = [
+      [0, 0, 0],
+      [maxI, 0, 0],
+      [0, maxJ, 0],
+      [0, 0, maxK],
+      [maxI, maxJ, 0],
+      [maxI, 0, maxK],
+      [0, maxJ, maxK],
+      [maxI, maxJ, maxK],
+    ];
+    let minProjection = Infinity;
+    let maxProjection = -Infinity;
+
+    for (const [ci, cj, ck] of cornerIndices) {
+      const world = indexToWorld(ci, cj, ck, origin, spacing, direction);
+      const projection = dot3(world, effectiveVerticalDir);
+      if (projection < minProjection) {
+        minProjection = projection;
+      }
+      if (projection > maxProjection) {
+        maxProjection = projection;
+      }
+    }
+
+    if (Number.isFinite(minProjection) && Number.isFinite(maxProjection)) {
+      let minRequiredOffset = -Infinity;
+      let maxAllowedOffset = Infinity;
+
+      for (let idx = 0; idx < frames.length; idx++) {
+        const frameProjection = dot3(frames[idx].position, effectiveVerticalDir);
+        const requiredOffsetForLowerSide = minProjection + vertHalfMm - frameProjection;
+        const allowedOffsetForUpperSide = maxProjection - vertHalfMm - frameProjection;
+        if (requiredOffsetForLowerSide > minRequiredOffset) {
+          minRequiredOffset = requiredOffsetForLowerSide;
+        }
+        if (allowedOffsetForUpperSide < maxAllowedOffset) {
+          maxAllowedOffset = allowedOffsetForUpperSide;
+        }
+      }
+
+      if (Number.isFinite(minRequiredOffset) && Number.isFinite(maxAllowedOffset)) {
+        if (minRequiredOffset <= maxAllowedOffset) {
+          verticalCenterOffsetMm = Math.max(
+            minRequiredOffset,
+            Math.min(0, maxAllowedOffset)
+          );
+        } else {
+          // No single offset can fit the entire window for all frames; choose least-violation midpoint.
+          verticalCenterOffsetMm = (minRequiredOffset + maxAllowedOffset) / 2;
+        }
+      }
+    }
+  }
+
+  const _dbgFirstFive: Array<{ row: number; vi: number; vj: number; vk: number; sample: number }> = [];
+  let _dbgChecked = 0;
+  let _dbgOob = 0;
+
   let previousSlabDir: [number, number, number] | null = null;
   for (let col = 0; col < panoWidth; col++) {
     const frame = frames[col];
@@ -392,25 +583,51 @@ function generatePanorama(input: CPRWorkerInput): {
     }
     previousSlabDir = slabDir;
 
-    const [nx, ny, nz_slab] = slabDir;
+    const [slabDirX, slabDirY, slabDirZ] = slabDir;
 
     for (let row = 0; row < panoHeight; row++) {
-      const vertOffsetMm = -vertHalfMm + row * vertStepMm;
+      const vertOffsetMm = verticalCenterOffsetMm + (vertHalfMm - row * vertStepMm);
 
       const bx = px + vertOffsetMm * effectiveVerticalDir[0];
       const by = py + vertOffsetMm * effectiveVerticalDir[1];
       const bz = pz + vertOffsetMm * effectiveVerticalDir[2];
 
-      let accumulator = isMeanAggregation ? 0 : -Infinity;
+      let accumulator = 0;
+      let max1 = -Infinity;
+      let max2 = -Infinity;
+      let max3 = -Infinity;
+      let max4 = -Infinity;
 
       for (let s = 0; s < slabSampleCount; s++) {
         const slabOffset = slabSampleCount > 1 ? -slabHalfThicknessMm + s * slabStepMm : 0;
 
-        const sx = bx + slabOffset * nx;
-        const sy = by + slabOffset * ny;
-        const sz = bz + slabOffset * nz_slab;
+        const sx = bx + slabOffset * slabDirX;
+        const sy = by + slabOffset * slabDirY;
+        const sz = bz + slabOffset * slabDirZ;
 
         const [vi, vj, vk] = worldToVoxel(sx, sy, sz, origin, spacing, invDir, worldToIndex);
+        if (col === 0 && row < 5 && s === 0) {
+          _dbgFirstFive.push({
+            row,
+            vi: Math.round(vi * 100) / 100,
+            vj: Math.round(vj * 100) / 100,
+            vk: Math.round(vk * 100) / 100,
+            sample: 0,
+          });
+        }
+        if (_dbgChecked < 200) {
+          const _isOob =
+            vi < -0.5 ||
+            vj < -0.5 ||
+            vk < -0.5 ||
+            vi > dimensions[0] - 0.5 ||
+            vj > dimensions[1] - 0.5 ||
+            vk > dimensions[2] - 0.5;
+          _dbgChecked++;
+          if (_isOob) {
+            _dbgOob++;
+          }
+        }
         let sample = trilinear(
           scalarData,
           dimensions,
@@ -430,16 +647,43 @@ function generatePanorama(input: CPRWorkerInput): {
           sample = -1000;
         }
 
-        if (!isMeanAggregation) {
-          if (sample > accumulator) {
-            accumulator = sample;
-          }
-        } else {
+        if (isMeanAggregation) {
           accumulator += sample;
+        } else if (sample >= max1) {
+          max4 = max3;
+          max3 = max2;
+          max2 = max1;
+          max1 = sample;
+        } else if (sample >= max2) {
+          max4 = max3;
+          max3 = max2;
+          max2 = sample;
+        } else if (sample >= max3) {
+          max4 = max3;
+          max3 = sample;
+        } else if (sample > max4) {
+          max4 = sample;
         }
       }
 
-      const pixelValueRaw = isMeanAggregation ? accumulator / slabSampleCount : accumulator;
+      let pixelValueRaw: number;
+      if (isMeanAggregation) {
+        pixelValueRaw = accumulator / slabSampleCount;
+      } else {
+        if (Number.isFinite(max2) && max1 - max2 > 1200) {
+          // Suppress isolated bright spikes that dominate strict MIP.
+          max1 = 0.5 * (max1 + max2);
+        }
+        if (robustMipTopCount >= 4 && Number.isFinite(max4)) {
+          pixelValueRaw = 0.25 * (max1 + max2 + max3 + max4);
+        } else if (robustMipTopCount >= 3 && Number.isFinite(max3)) {
+          pixelValueRaw = (max1 + max2 + max3) / 3;
+        } else if (robustMipTopCount >= 2 && Number.isFinite(max2)) {
+          pixelValueRaw = 0.5 * (max1 + max2);
+        } else {
+          pixelValueRaw = max1;
+        }
+      }
       const pixelValue = Number.isFinite(pixelValueRaw) ? pixelValueRaw : -1000;
 
       const pixelIndex = row * panoWidth + col;
@@ -454,6 +698,37 @@ function generatePanorama(input: CPRWorkerInput): {
     }
   }
 
+  const denoiseBlend = isMeanAggregation ? 0.30 : 0.18;
+  const denoiseApplied = applyLightBilateralDenoise(pixelData, panoWidth, panoHeight, denoiseBlend);
+  if (denoiseApplied) {
+    const denoisedRange = computeArrayMinMax(pixelData);
+    minValue = denoisedRange.minValue;
+    maxValue = denoisedRange.maxValue;
+  }
+
+  const diagnosticPayload = {
+    oobRate: {
+      checked: _dbgChecked,
+      oob: _dbgOob,
+      oobPercent: Math.round((_dbgOob / _dbgChecked) * 100) + '%',
+    },
+    firstFiveVoxelIndices: _dbgFirstFive,
+    volumeDimensions: dimensions,
+    volumeOrigin: origin,
+    volumeSpacing: spacing,
+    effectiveVerticalDir,
+    slabDir: frames?.[0]
+      ? {
+          N_slab: frames[0].N_slab,
+          tangent: frames[0].T ?? null,
+        }
+      : null,
+    firstFrameWorldPos: frames?.[0]?.position ?? null,
+    lastFrameWorldPos: frames?.[frames.length - 1]?.position ?? null,
+  };
+  console.warn('[CPR-DIAGNOSTIC]', diagnosticPayload);
+  console.warn('[CPR-DIAGNOSTIC-JSON]', JSON.stringify(diagnosticPayload));
+
   const outputPixelPreview = Array.from(pixelData.subarray(0, Math.min(5, pixelData.length)));
   return {
     pixelData,
@@ -466,8 +741,11 @@ function generatePanorama(input: CPRWorkerInput): {
     storedValueNormalizationApplied: shouldNormalizeStoredValues,
     unsignedPackedArtifactDetected,
     effectiveVerticalHalfMm: vertHalfMm,
-    verticalCenterOffsetMm: 0,
-    adaptiveVerticalIntervalCount: 0,
+    verticalCenterOffsetMm,
+    adaptiveVerticalIntervalCount: frames.length,
+    effectiveSlabSampleCount: slabSampleCount,
+    robustMipTopCount,
+    denoiseApplied,
   };
 }
 
@@ -514,6 +792,9 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
       effectiveVerticalHalfMm,
       verticalCenterOffsetMm,
       adaptiveVerticalIntervalCount,
+      effectiveSlabSampleCount,
+      robustMipTopCount,
+      denoiseApplied,
     } = generatePanorama(input);
     const elapsed = (performance.now() - start).toFixed(0);
 
@@ -534,7 +815,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
         pixelRepresentation: input.pixelRepresentation,
       });
     }
-    if (requestedModalityLutApplied !== modalityLutApplied || unsignedPackedArtifactDetected) {
+    if (requestedModalityLutApplied !== modalityLutApplied) {
       console.warn(`${workerTag} LUT policy adjusted in worker`, {
         requestedApplyModalityLut: requestedModalityLutApplied,
         appliedModalityLut: modalityLutApplied,
@@ -542,10 +823,14 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
       });
     }
     console.debug(`${workerTag} Adaptive vertical sampling window`, {
-      configuredVertHalfMm: 40,
+      configuredVertHalfMm: input.vertHalfMm,
       effectiveVerticalHalfMm,
       verticalCenterOffsetMm,
       sampledIntervals: adaptiveVerticalIntervalCount,
+      requestedSlabSamples: input.slabSamples,
+      effectiveSlabSampleCount,
+      robustMipTopCount,
+      denoiseApplied,
     });
     console.log(
       `${workerTag} Output preview (first ${outputPixelPreview.length} pano pixels):`,

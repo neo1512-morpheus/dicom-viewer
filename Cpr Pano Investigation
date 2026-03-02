@@ -1,0 +1,166 @@
+# CPR Panoramic Viewport Corruption — Root Cause Investigation
+
+## 1. Smoking Gun? **YES**
+
+## 2. Primary Root Cause (single sentence)
+
+**MIP aggregation with zero denoising (`denoiseBlend = 0` for MIP) on inherently-noisy CBCT cone-beam data amplifies voxel-level noise into the catastrophic salt-and-pepper speckle pattern visible in the panoramic viewport, while the attempt scoring system penalizes the smoother MEAN aggregation (-1.5 pts) and only adds it as a last-resort fallback, so the noisier MIP result wins every time.**
+
+---
+
+## 3. Proof Bullets
+
+### 3A. The Denoising Gap: MIP Gets Zero Filtering
+
+| File | Line | Evidence |
+|---|---|---|
+| [cprWorker.ts](file:///d:/diacom%20demo/Viewers/modes/cpr/src/cprWorker.ts#L788) | 788 | `const denoiseBlend = isMeanAggregation ? 0.30 : 0;` |
+
+- **MEAN aggregation** → bilateral denoise with blend weight 0.30
+- **MIP aggregation** → `denoiseBlend = 0` → **NO denoising at all**
+
+The primary attempt (and most retries) all use `aggregation: 'MIP'` — see [useCPROrchestrator.ts:2416](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L2416). The denoised MEAN path is only tried as a last-resort fallback at [useCPROrchestrator.ts:2500-2524](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L2500-L2524), and only if `isLikelyPoorPanoQuality(bestAttempt.summary)` returns true.
+
+### 3B. MIP Noise Amplification on CBCT Data
+
+MIP selects the **maximum** value across each slab ray. In CBCT data (which has significantly higher voxel-level noise than medical CT due to cone-beam geometry, lower dose, and flat-panel detectors), the noise peaks dominate the maximum selection, creating "salt-and-pepper" speckle.
+
+The "robust MIP" (averaging top-N) at [cprWorker.ts:759-773](file:///d:/diacom%20demo/Viewers/modes/cpr/src/cprWorker.ts#L759-L773) only partially helps:
+
+```
+robustMipTopCount = 5 (for slabSampleCount=13)
+→ averages top 4 of 13 samples (only 4 accumulators: max1..max4)
+```
+
+This still amplifies noise — averaging the top 4 noise peaks in a 5mm slab produces a noisy result.
+
+### 3C. Attempt Scoring Biases AGAINST MEAN
+
+| File | Line | Evidence |
+|---|---|---|
+| [useCPROrchestrator.ts](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L2255) | 2255 | `const aggregationPenalty = requestedAggregation === 'MEAN' ? 1.5 : 0;` |
+
+MEAN gets a flat -1.5 quality penalty, biasing the selection toward MIP even when MIP is objectively noisier. Combined with the quality scorer at [useCPROrchestrator.ts:141-185](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L141-L185) that rewards "HU-like" ranges (which MIP achieves too), the MIP attempt typically wins.
+
+### 3D. MEAN Fallback Only Fires Under Extreme Conditions
+
+At [useCPROrchestrator.ts:2500](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L2500):
+```typescript
+if (isLikelyPoorPanoQuality(bestAttempt.summary)) {
+  // Only THEN add MEAN retries
+}
+```
+
+And `isLikelyPoorPanoQuality` at [useCPROrchestrator.ts:85-111](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L85-L111) has strict thresholds. A noisy-but-structurally-present MIP output (like the screenshot) may not trigger this check, since:
+- The p01/p99 range looks nominally correct (dental HU range)
+- The fraction below -950 / above 3000 may be within bounds
+- The output has recognizable structure, just buried in noise
+
+---
+
+## 4. Pipeline Integrity Verification (Ruled Out)
+
+### ✅ Buffer Integrity Chain — CLEAN
+
+| Stage | Evidence |
+|---|---|
+| Worker → postMessage | `pixelData.buffer` transferred via [Transferable](file:///d:/diacom%20demo/Viewers/modes/cpr/src/cprWorker.ts#L984), no copy mutation |
+| Worker message → resolve | Direct reference pass at [useCPROrchestrator.ts:972](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L972) |
+| Payload → loader cache | `setPanoImagePayload` stores reference at [panoImageLoader.ts:115](file:///d:/diacom%20demo/Viewers/modes/cpr/src/panoImageLoader.ts#L115) |
+| Loader → image object | `getPixelData: () => pixelData` closure at [panoImageLoader.ts:163](file:///d:/diacom%20demo/Viewers/modes/cpr/src/panoImageLoader.ts#L163) |
+| Image → VTK data | `scalarData.set(pixelData)` copy at [updateVTKImageDataWithCornerstoneImage.js:22](file:///d:/diacom%20demo/Viewers/node_modules/@cornerstonejs/core/dist/esm/utilities/updateVTKImageDataWithCornerstoneImage.js#L22) |
+
+### ✅ Display Pipeline — CLEAN
+
+| Property | Value | File:Line |
+|---|---|---|
+| slope/intercept in payload | `1` / `0` | [useCPROrchestrator.ts:2707-2708](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L2707-L2708) |
+| modalityLutModule.rescaleSlope | `1` | [panoImageLoader.ts:59-60](file:///d:/diacom%20demo/Viewers/modes/cpr/src/panoImageLoader.ts#L59-L60) (forced to identity) |
+| voiLUTFunction | `'LINEAR_EXACT'` | [panoImageLoader.ts:162](file:///d:/diacom%20demo/Viewers/modes/cpr/src/panoImageLoader.ts#L162) |
+| imagePixelModule bits | `bitsAllocated=32, bitsStored=32` | [panoImageLoader.ts:256-258](file:///d:/diacom%20demo/Viewers/modes/cpr/src/panoImageLoader.ts#L256-L258) |
+| Double-LUT guard | Non-identity rescale explicitly ignored with warning | [panoImageLoader.ts:50-58](file:///d:/diacom%20demo/Viewers/modes/cpr/src/panoImageLoader.ts#L50-L58) |
+
+### ✅ Geometry — CORRECT
+
+| Check | Result |
+|---|---|
+| `verticalDir` from volume direction matrix Z-axis | Correct at [useCPROrchestrator.ts:1825-1839](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L1825-L1839) |
+| `N_slab = cross(T, verticalDir)` (buccal-lingual direction) | Correct at [cprMath.ts:236](file:///d:/diacom%20demo/Viewers/modes/cpr/src/cprMath.ts#L236) |
+| Frame count matches panoWidth | `buildArcLengthSpline(rawControlPoints, finalPanoWidth)` at [useCPROrchestrator.ts:2102](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L2102) |
+| Trilinear indexing `data[k*ny*nx + j*nx + i]` matches VTK layout | Correct at [cprWorker.ts:220-229](file:///d:/diacom%20demo/Viewers/modes/cpr/src/cprWorker.ts#L220-L229) |
+| `worldToIndex` mat4 path (column-major vtk.js) | Correct at [cprWorker.ts:132-137](file:///d:/diacom%20demo/Viewers/modes/cpr/src/cprWorker.ts#L132-L137) |
+| OOB rate | Confirmed 0% in diagnostics |
+
+### ⚠️ `invertMatrix3` Latent Bug (NOT the current root cause)
+
+At [cprWorker.ts:152](file:///d:/diacom%20demo/Viewers/modes/cpr/src/cprWorker.ts#L152): `invertMatrix3` transposes the 1D column-major direction array, but the `worldToVoxel` fallback path reads `invDir` as if row-major. This produces incorrect voxel coordinates when the direction matrix is not identity. **However**, when `worldToIndex` (mat4 from vtk.js) is available, this path is bypassed. For this user's setup, the mat4 path is used, so this bug is latent.
+
+### ✅ Race/Stale Payload — NOT OBSERVED
+
+- `clearPanoImageCache()` called before `setPanoImagePayload` at [useCPROrchestrator.ts:2697](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L2697)
+- `panoImageId` is unique per run (timestamp + counter) at [panoImageLoader.ts:110-111](file:///d:/diacom%20demo/Viewers/modes/cpr/src/panoImageLoader.ts#L110-L111)
+- VOI re-asserted after first render at [useCPROrchestrator.ts:2763-2798](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L2763-L2798) plus 3 delayed re-applies at [useCPROrchestrator.ts:2801-2813](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L2801-L2813)
+
+---
+
+## 5. Minimal Patch Plan (NOT applied)
+
+### Change 1: Enable denoising for MIP aggregation
+
+**File**: [cprWorker.ts](file:///d:/diacom%20demo/Viewers/modes/cpr/src/cprWorker.ts), line 788
+
+```diff
+-  const denoiseBlend = isMeanAggregation ? 0.30 : 0;
++  const denoiseBlend = isMeanAggregation ? 0.30 : 0.25;
+```
+
+**Effect**: MIP output gets light bilateral denoising (σ_range=220 HU, blend 25%), suppressing high-frequency noise while preserving edges.
+
+### Change 2: Remove MEAN aggregation penalty
+
+**File**: [useCPROrchestrator.ts](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts), line 2255
+
+```diff
+-  const aggregationPenalty = requestedAggregation === 'MEAN' ? 1.5 : 0;
++  const aggregationPenalty = 0;
+```
+
+**Effect**: MEAN and MIP compete on equal footing in quality scoring. For noisy CBCT data, MEAN typically wins because it inherently averages noise.
+
+### Change 3: Always include MEAN fallback attempts (not just when quality is poor)
+
+**File**: [useCPROrchestrator.ts](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts), around line 2500
+
+```diff
+-  if (isLikelyPoorPanoQuality(bestAttempt.summary)) {
++  {
+     retryConfigs.push({
+       label: 'retry-mean-fallback-narrow',
+       ...
+     });
+```
+
+**Effect**: MEAN attempts are always evaluated, not just as a last resort. The quality scorer decides which is best.
+
+### Expected Log Changes After Fix
+
+```
+[CPR-SELECTED-JSON] selectedAggregation: "MEAN" (was "MIP")
+[CPR-DIAGNOSTIC] denoise.applied: true (was false)
+[CPR-DIAGNOSTIC] denoise.blend: 0.25 or 0.30
+```
+
+Visual output: smooth, clinically-usable dental panoramic with preserved contrast between teeth, bone, and soft tissue. Noise reduced from "catastrophic" to acceptable clinical levels.
+
+---
+
+## 6. Secondary Contributing Factor
+
+### `meanAbsDelta` Quality Penalty May Be Too Aggressive
+
+At [useCPROrchestrator.ts:181](file:///d:/diacom%20demo/Viewers/modes/cpr/src/useCPROrchestrator.ts#L181):
+```typescript
+score -= Math.min(12, (summary.meanAbsDelta - 520) / 80);
+```
+
+For noisy MIP, `meanAbsDelta` (mean of absolute neighbor deltas) will be high, but this penalty is capped at 12 points while MIP-specific penalties don't exist. A dedicated "noise variance" quality metric comparing standard deviation to signal range would better discriminate noisy MIP from clean MEAN outputs.

@@ -110,6 +110,34 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
   );
 }
 
+function getHardRejectReason(summary: FloatBufferDebugSummary | null): string | null {
+  if (!summary || summary.sampledCount < 100) {
+    return 'insufficient-samples';
+  }
+
+  if (isSeverelyCorruptedPanoOutput(summary)) {
+    return 'severely-corrupted';
+  }
+
+  if (summary.meanAbsDelta > 760) {
+    return 'speckle-noise';
+  }
+
+  if (summary.fractionAbove3000 > 0.35 && summary.p50 > 950) {
+    return 'high-saturation';
+  }
+
+  if (summary.fractionBelowMinus950 < 0.003 && summary.p50 > 1200) {
+    return 'dense-fill';
+  }
+
+  if (summary.p01 > -450 && summary.p50 > 900) {
+    return 'no-air-high-median';
+  }
+
+  return null;
+}
+
 function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
   if (!summary || summary.sampledCount < 100) {
     return -Infinity;
@@ -131,10 +159,10 @@ function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
   score += Math.max(-4, 3 - summary.fractionAbove3000 * 8);
   score += summary.max > 14000 ? -3 : 2;
   score += summary.min < -9000 ? -3 : 2;
-  if (summary.p50 >= -700 && summary.p50 <= 1700) {
+  if (summary.p50 >= -500 && summary.p50 <= 1200) {
     score += 4;
   } else {
-    score -= Math.min(6, Math.abs(summary.p50 - 500) / 600);
+    score -= Math.min(8, Math.abs(summary.p50 - 450) / 450);
   }
 
   if (summary.fractionBelowMinus950 > 0.5 && summary.fractionAbove3000 > 0.2) {
@@ -145,12 +173,12 @@ function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
     score -= Math.min(6, (robustSpan - 10000) / 1200);
   }
 
-  if (summary.meanAbsDelta <= 380) {
+  if (summary.meanAbsDelta <= 320) {
     score += 3;
-  } else if (summary.meanAbsDelta <= 620) {
+  } else if (summary.meanAbsDelta <= 520) {
     score += 1;
   } else {
-    score -= Math.min(8, (summary.meanAbsDelta - 620) / 120);
+    score -= Math.min(12, (summary.meanAbsDelta - 520) / 80);
   }
 
   return score;
@@ -342,6 +370,20 @@ function computeAdaptivePanoVoi(
   const looksLikeHU = isHuLikeRange(rangeLow, rangeHigh);
 
   if (looksLikeHU) {
+    const denseHighNoAir =
+      !!summary && summary.p50 > 900 && summary.fractionBelowMinus950 < 0.01 && summary.p99 > 2000;
+    if (denseHighNoAir) {
+      const lower = -1000;
+      const upper = 2200;
+      const windowWidth = upper - lower;
+      return {
+        lower,
+        upper,
+        windowWidth,
+        windowCenter: lower + windowWidth / 2,
+      };
+    }
+
     const MIN_HU_WINDOW_WIDTH = 2300;
     const MAX_DENTAL_WINDOW_WIDTH = 3200;
     const widthWithMin = Math.max(windowWidth, MIN_HU_WINDOW_WIDTH);
@@ -682,6 +724,15 @@ interface CPRWorkerLaunchResult {
   rescaleIntercept: number;
   bitsStored: number;
   pixelRepresentation: number;
+  workerDebugPayload?: {
+    diagnostic?: Record<string, unknown>;
+    outputSignature?: {
+      sampledCount?: number;
+      checksum?: number;
+      absChecksum?: number;
+      first16?: number[];
+    };
+  };
 }
 
 function launchCPRWorker(params: {
@@ -697,6 +748,7 @@ function launchCPRWorker(params: {
   modalityLutOverride?: boolean;
   forceDisableStoredValueNormalization?: boolean;
   verticalHalfMm?: number;
+  verticalCenterOffsetMm?: number;
   debugRunId?: string;
 }): Promise<CPRWorkerLaunchResult> {
   return new Promise((resolve, reject) => {
@@ -716,6 +768,7 @@ function launchCPRWorker(params: {
       modalityLutOverride,
       forceDisableStoredValueNormalization,
       verticalHalfMm,
+      verticalCenterOffsetMm,
       debugRunId,
     } = params;
     const logPrefix = debugRunId ? `[CPR][${debugRunId}]` : '[CPR]';
@@ -744,6 +797,7 @@ function launchCPRWorker(params: {
       panoHeight,
       dynamicVertHalfMm,
       verticalHalfMmOverride: verticalHalfMm,
+      verticalCenterOffsetMmOverride: verticalCenterOffsetMm,
     });
     const { minValue: scalarMin, maxValue: scalarMax } = estimateScalarRange(scalarData);
     const { slope: rescaleSlope, intercept: rescaleIntercept } = getVolumeRescale(volume);
@@ -765,7 +819,7 @@ function launchCPRWorker(params: {
     if (rawIsPreScaled && !effectiveIsPreScaled) {
       console.warn(
         `${logPrefix} volume.isPreScaled=true but scalar range is not HU-like with non-identity rescale; ` +
-          'overriding preScaled flag for CPR worker.'
+        'overriding preScaled flag for CPR worker.'
       );
     }
 
@@ -902,6 +956,18 @@ function launchCPRWorker(params: {
         return;
       }
 
+      console.log(`${logPrefix} [CPR-WORKER-MESSAGE-JSON]`, JSON.stringify({
+        width: data.panoWidth,
+        height: data.panoHeight,
+        minValue: data.minValue,
+        maxValue: data.maxValue,
+        modalityLutApplied: data.modalityLutApplied === true,
+        requestedModalityLutApplied: data.requestedModalityLutApplied === true,
+        storedValueNormalizationApplied: data.storedValueNormalizationApplied === true,
+        unsignedPackedArtifactDetected: data.unsignedPackedArtifactDetected === true,
+        workerDebugPayload: data.debugPayload ?? null,
+      }));
+
       resolve({
         pixelData: data.pixelData,
         width: data.panoWidth,
@@ -917,6 +983,8 @@ function launchCPRWorker(params: {
         rescaleIntercept,
         bitsStored,
         pixelRepresentation,
+        workerDebugPayload:
+          data.debugPayload && typeof data.debugPayload === 'object' ? data.debugPayload : undefined,
       });
     };
 
@@ -937,6 +1005,7 @@ function launchCPRWorker(params: {
       panoWidth,
       panoHeight,
       vertHalfMm: dynamicVertHalfMm,
+      verticalCenterOffsetMm,
       slabHalfThicknessMm,
       slabSamples,
       aggregation,
@@ -1349,6 +1418,11 @@ function logPanoViewportSnapshot(
     console.log(`[CPR][${runId}] PANO_SNAPSHOT ${stage}`, {
       missingViewport: true,
     });
+    console.log('[CPR-PANO-SNAPSHOT-JSON]', JSON.stringify({
+      runId,
+      stage,
+      missingViewport: true,
+    }));
     return;
   }
 
@@ -1429,6 +1503,20 @@ function logPanoViewportSnapshot(
       voiLUTFunction: voiLut?.voiLUTFunction,
     },
   });
+  console.log('[CPR-PANO-SNAPSHOT-JSON]', JSON.stringify({
+    runId,
+    stage,
+    viewportId: viewport.id,
+    currentImageId,
+    isPanoScheme: typeof currentImageId === 'string' && currentImageId.startsWith('pano://'),
+    viewportVoiRange: properties.voiRange ?? null,
+    viewportVoiLutFunction: properties.VOILUTFunction ?? null,
+    imageWindowWidth: cornerstoneImage?.windowWidth ?? null,
+    imageWindowCenter: cornerstoneImage?.windowCenter ?? null,
+    metadataWindowWidth,
+    metadataWindowCenter,
+    metadataVoiLutFunction: voiLut?.voiLUTFunction ?? null,
+  }));
 }
 
 function applyPanoDisplaySettings(
@@ -1453,6 +1541,17 @@ function applyPanoDisplaySettings(
     colormap: undefined,
     VOILUTFunction: 'LINEAR_EXACT',
   } as any);
+  const appliedProperties = ((viewport as { getProperties?: () => unknown }).getProperties?.() || {}) as {
+    voiRange?: { lower?: number; upper?: number };
+    VOILUTFunction?: unknown;
+  };
+  console.log('[CPR-VOI-APPLY-JSON]', JSON.stringify({
+    runId,
+    stage,
+    requestedVoi: adaptiveVoi,
+    appliedVoiRange: appliedProperties.voiRange ?? null,
+    appliedVoiLutFunction: appliedProperties.VOILUTFunction ?? null,
+  }));
 }
 
 function cloneCameraState(
@@ -1779,8 +1878,8 @@ export function useCPROrchestrator({
   sourceViewportId,
   panoWidth: requestedPanoWidth = 800,
   panoHeight: requestedPanoHeight = 400,
-  slabHalfThicknessMm = 4,
-  slabSamples = 11,
+  slabHalfThicknessMm = 2.5,
+  slabSamples = 13,
   aggregation = 'MIP',
 }: UseCPROrchestratorProps): UseCPROrchestratorReturn {
   const [isGenerating, setIsGenerating] = useState(false);
@@ -1978,6 +2077,24 @@ export function useCPROrchestrator({
         Math.min(CPR_PANO_MAX_VERTICAL_HALF_MM, autoVerticalHalfMm)
       );
       const thinnerVerticalHalfMm = Math.max(14, Math.min(24, baseVerticalHalfMm * 0.82));
+      const narrowVerticalHalfMm = Math.max(12, Math.min(16, thinnerVerticalHalfMm * 0.68));
+      const mediumVerticalHalfMm = Math.max(
+        narrowVerticalHalfMm + 1.2,
+        Math.min(18, thinnerVerticalHalfMm * 0.82)
+      );
+      const broadVerticalHalfMm = thinnerVerticalHalfMm;
+      const neutralVerticalCenterOffsetMm = 0;
+      const subtleMandibularCenterOffsetMm = -2;
+      const mandibularCenterOffsetMm = -3.5;
+      const strongMandibularCenterOffsetMm = -5;
+      const balancedSlabHalfThicknessMm = 2.5;
+      const balancedSlabSamples = 13;
+      const fastSlabHalfThicknessMm = 1.5;
+      const fastSlabSamples = 9;
+      const meanFallbackSlabHalfThicknessMm = 1.0;
+      const meanFallbackSlabSamples = 7;
+      const sharpMeanSlabHalfThicknessMm = 0.3;   // ~2 voxels total slab
+      const sharpMeanSlabSamples = 3;
       const minimumPanoHeightPx = Math.max(160, Math.round(requestedPanoHeightPx * 0.55));
 
       const verticalDir = getSourceViewportVerticalDirection(
@@ -2011,6 +2128,7 @@ export function useCPROrchestrator({
         aggregation,
         verticalDir,
         verticalHalfMm: baseVerticalHalfMm,
+        verticalCenterOffsetMm: neutralVerticalCenterOffsetMm,
         debugRunId,
       };
       const runWorkerAttempt = async (
@@ -2019,19 +2137,39 @@ export function useCPROrchestrator({
       ): Promise<{
         label: string;
         result: CPRWorkerLaunchResult;
+        workerDebugPayload?: CPRWorkerLaunchResult['workerDebugPayload'];
         summary: FloatBufferDebugSummary | null;
         voi: PanoVoiSettings;
         qualityBase: number;
         qualityScore: number;
+        hardRejectReason: string | null;
         huDomain: boolean;
         convertedToHu: boolean;
         rescaleSkippedAsUnsafe: boolean;
         panoWidth: number;
         panoHeight: number;
         actualVertHalfMm: number;
+        verticalCenterOffsetMm: number;
         columnPixelSpacing: number;
         rowPixelSpacing: number;
+        aggregation: 'MIP' | 'MEAN';
+        slabHalfThicknessMm: number;
+        slabSamples: number;
       }> => {
+        const requestedAggregation = (overrides.aggregation ?? workerInput.aggregation) === 'MEAN' ? 'MEAN' : 'MIP';
+        const requestedSlabHalfThicknessMm = toPositiveFinite(
+          overrides.slabHalfThicknessMm,
+          toPositiveFinite(workerInput.slabHalfThicknessMm, balancedSlabHalfThicknessMm)
+        );
+        const requestedSlabSamples = Math.max(
+          1,
+          Math.floor(
+            toPositiveFinite(overrides.slabSamples, toPositiveFinite(workerInput.slabSamples, balancedSlabSamples))
+          )
+        );
+        const requestedVerticalCenterOffsetMm = toFiniteNumber(
+          overrides.verticalCenterOffsetMm ?? workerInput.verticalCenterOffsetMm
+        ) ?? 0;
         const overrideVerticalHalfMm = Number(overrides.verticalHalfMm);
         const actualVertHalfMm =
           Number.isFinite(overrideVerticalHalfMm) && overrideVerticalHalfMm > 0
@@ -2052,6 +2190,7 @@ export function useCPROrchestrator({
           panoWidth: finalPanoWidth,
           panoHeight: finalPanoHeight,
           verticalHalfMm: actualVertHalfMm,
+          verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
         });
         let result = rawResult;
         const hasIdentityRescaleMetadata =
@@ -2098,17 +2237,40 @@ export function useCPROrchestrator({
         const qualityBase = scorePanoQuality(summary);
         const splitPenalty = summary
           ? Math.max(0, summary.fractionBelowMinus950 - 0.3) * 8 +
-            Math.max(0, summary.fractionAbove3000 - 0.2) * 10 +
-            Math.max(0, summary.p50 - 2200) / 300 +
-            Math.max(0, -1700 - summary.p50) / 300 +
-            Math.max(0, summary.max - 12000) / 1500 +
-            Math.max(0, -9000 - summary.min) / 1500
+          Math.max(0, summary.fractionAbove3000 - 0.2) * 10 +
+          Math.max(0, summary.p50 - 2200) / 300 +
+          Math.max(0, -1700 - summary.p50) / 300 +
+          Math.max(0, summary.max - 12000) / 1500 +
+          Math.max(0, -9000 - summary.min) / 1500
           : 8;
-        const qualityScore = qualityBase + (huDomain ? 0 : -100) - splitPenalty;
+        const denseFillPenalty = summary
+          ? Math.max(0, summary.p50 - 850) / 70 + Math.max(0, summary.p50 - 1150) / 45
+          : 0;
+        const noAirPenalty = summary
+          ? summary.fractionBelowMinus950 < 0.005
+            ? 6
+            : summary.fractionBelowMinus950 < 0.015
+              ? 3
+              : 0
+          : 0;
+        const elevatedP01Penalty = summary ? Math.max(0, summary.p01 + 780) / 80 : 0;
+        const aggregationPenalty = 0;
+        const hardRejectReason = getHardRejectReason(summary);
+        const hardRejectPenalty = hardRejectReason ? 30 : 0;
+        const qualityScore =
+          qualityBase +
+          (huDomain ? 0 : -100) -
+          splitPenalty -
+          denseFillPenalty -
+          noAirPenalty -
+          elevatedP01Penalty -
+          aggregationPenalty -
+          hardRejectPenalty;
 
         console.log(`[CPR][${debugRunId}] pano attempt ${label}`, {
           qualityBase,
           qualityScore,
+          aggregation: requestedAggregation,
           minValue: result.minValue,
           maxValue: result.maxValue,
           p01: summary?.p01,
@@ -2127,135 +2289,323 @@ export function useCPROrchestrator({
           rescaleSlope: result.rescaleSlope,
           rescaleIntercept: result.rescaleIntercept,
           actualVertHalfMm,
+          verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
           idealPanoHeight,
           finalPanoHeight,
+          slabHalfThicknessMm: requestedSlabHalfThicknessMm,
+          slabSamples: requestedSlabSamples,
+          splitPenalty,
+          denseFillPenalty,
+          noAirPenalty,
+          elevatedP01Penalty,
+          hardRejectReason,
+          hardRejectPenalty,
           columnPixelSpacing,
           rowPixelSpacing,
           overrides,
         });
+        console.log(
+          '[CPR-ATTEMPT-JSON]',
+          JSON.stringify({
+            runId: debugRunId,
+            label,
+            qualityBase,
+            qualityScore,
+            aggregation: requestedAggregation,
+            slabHalfThicknessMm: requestedSlabHalfThicknessMm,
+            slabSamples: requestedSlabSamples,
+            verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
+            huDomain,
+            convertedToHu,
+            rescaleSkippedAsUnsafe,
+            minValue: result.minValue,
+            maxValue: result.maxValue,
+            p01: summary?.p01 ?? null,
+            p50: summary?.p50 ?? null,
+            p99: summary?.p99 ?? null,
+            meanAbsDelta: summary?.meanAbsDelta ?? null,
+            fractionBelowMinus950: summary?.fractionBelowMinus950 ?? null,
+            fractionAbove3000: summary?.fractionAbove3000 ?? null,
+            splitPenalty,
+            denseFillPenalty,
+            noAirPenalty,
+            elevatedP01Penalty,
+            hardRejectReason,
+            hardRejectPenalty,
+            voi,
+            workerDebugPayload: result.workerDebugPayload ?? null,
+          })
+        );
 
         return {
           label,
           result,
+          workerDebugPayload: result.workerDebugPayload,
           summary,
           voi,
           qualityBase,
           qualityScore,
+          hardRejectReason,
           huDomain,
           convertedToHu,
           rescaleSkippedAsUnsafe,
           panoWidth: finalPanoWidth,
           panoHeight: finalPanoHeight,
           actualVertHalfMm,
+          verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
           columnPixelSpacing,
           rowPixelSpacing,
+          aggregation: requestedAggregation,
+          slabHalfThicknessMm: requestedSlabHalfThicknessMm,
+          slabSamples: requestedSlabSamples,
         };
       };
 
-      let bestAttempt = await runWorkerAttempt('primary', {
+      const attemptAudit: Array<{
+        label: string;
+        qualityBase: number;
+        qualityScore: number;
+        hardRejectReason: string | null;
+        aggregation: 'MIP' | 'MEAN';
+        slabHalfThicknessMm: number;
+        slabSamples: number;
+        verticalCenterOffsetMm: number;
+        huDomain: boolean;
+        p01: number | null;
+        p50: number | null;
+        p99: number | null;
+        meanAbsDelta: number | null;
+        fractionBelowMinus950: number | null;
+        fractionAbove3000: number | null;
+      }> = [];
+      const recordAttemptAudit = (attempt: {
+        label: string;
+        qualityBase: number;
+        qualityScore: number;
+        hardRejectReason: string | null;
+        aggregation: 'MIP' | 'MEAN';
+        slabHalfThicknessMm: number;
+        slabSamples: number;
+        verticalCenterOffsetMm: number;
+        huDomain: boolean;
+        summary: FloatBufferDebugSummary | null;
+      }): void => {
+        attemptAudit.push({
+          label: attempt.label,
+          qualityBase: attempt.qualityBase,
+          qualityScore: attempt.qualityScore,
+          hardRejectReason: attempt.hardRejectReason,
+          aggregation: attempt.aggregation,
+          slabHalfThicknessMm: attempt.slabHalfThicknessMm,
+          slabSamples: attempt.slabSamples,
+          verticalCenterOffsetMm: attempt.verticalCenterOffsetMm,
+          huDomain: attempt.huDomain,
+          p01: attempt.summary?.p01 ?? null,
+          p50: attempt.summary?.p50 ?? null,
+          p99: attempt.summary?.p99 ?? null,
+          meanAbsDelta: attempt.summary?.meanAbsDelta ?? null,
+          fractionBelowMinus950: attempt.summary?.fractionBelowMinus950 ?? null,
+          fractionAbove3000: attempt.summary?.fractionAbove3000 ?? null,
+        });
+      };
+
+      let bestAttempt = await runWorkerAttempt('primary-balanced-mip-medium', {
         modalityLutOverride: true,
-        verticalHalfMm: thinnerVerticalHalfMm,
-        slabHalfThicknessMm: 3,
-        slabSamples: 9,
-        aggregation: 'MEAN',
+        verticalHalfMm: mediumVerticalHalfMm,
+        verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+        slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+        slabSamples: balancedSlabSamples,
+        aggregation: 'MIP',
+      });
+      recordAttemptAudit(bestAttempt);
+
+      const retryConfigs: Array<{
+        label: string;
+        overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
+      }> = [
+          {
+            label: 'retry-balanced-mip-narrow',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: mandibularCenterOffsetMm,
+              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+              slabSamples: balancedSlabSamples,
+              aggregation: 'MIP',
+            },
+          },
+          {
+            label: 'retry-fast-mip-narrow',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: mandibularCenterOffsetMm,
+              slabHalfThicknessMm: fastSlabHalfThicknessMm,
+              slabSamples: fastSlabSamples,
+              aggregation: 'MIP',
+            },
+          },
+          {
+            label: 'retry-balanced-mip-medium-strong-bias',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: mediumVerticalHalfMm,
+              verticalCenterOffsetMm: strongMandibularCenterOffsetMm,
+              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+              slabSamples: balancedSlabSamples,
+              aggregation: 'MIP',
+            },
+          },
+          {
+            label: 'retry-balanced-mip-broad-biased',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: broadVerticalHalfMm,
+              verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+              slabSamples: balancedSlabSamples,
+              aggregation: 'MIP',
+            },
+          },
+        ];
+
+      if (bestAttempt.result.effectiveIsPreScaled) {
+        // Evaluate a no-LUT variant when source appears pre-scaled.
+        retryConfigs.push({
+          label: 'retry-no-lut-mip-medium',
+          overrides: {
+            modalityLutOverride: false,
+            forceDisableStoredValueNormalization: true,
+            verticalHalfMm: mediumVerticalHalfMm,
+            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+            slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+            slabSamples: balancedSlabSamples,
+            aggregation: 'MIP',
+          },
+        });
+      } else {
+        retryConfigs.push({
+          label: 'retry-force-lut-mip-medium-no-normalization',
+          overrides: {
+            modalityLutOverride: true,
+            forceDisableStoredValueNormalization: true,
+            verticalHalfMm: mediumVerticalHalfMm,
+            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+            slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+            slabSamples: balancedSlabSamples,
+            aggregation: 'MIP',
+          },
+        });
+      }
+
+      // Sharp MEAN attempts — thin slab for maximum tooth separation
+      retryConfigs.push({
+        label: 'retry-mean-sharp-narrow',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: narrowVerticalHalfMm,
+          verticalCenterOffsetMm: mandibularCenterOffsetMm,
+          slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
+          slabSamples: sharpMeanSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
+      retryConfigs.push({
+        label: 'retry-mean-sharp-medium',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: mediumVerticalHalfMm,
+          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+          slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
+          slabSamples: sharpMeanSlabSamples,
+          aggregation: 'MEAN',
+        },
       });
 
-      if (isLikelyPoorPanoQuality(bestAttempt.summary)) {
-        const retryConfigs: Array<{
-          label: string;
-          overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
-        }> = [];
-        if (bestAttempt.result.effectiveIsPreScaled) {
-          // Avoid forcing LUT on data that is already effectively pre-scaled.
-          retryConfigs.push({
-            label: 'retry-no-lut-mip-thinner',
-            overrides: {
-              modalityLutOverride: false,
-              forceDisableStoredValueNormalization: true,
-              verticalHalfMm: thinnerVerticalHalfMm,
-              slabHalfThicknessMm: 3,
-              slabSamples: 9,
-              aggregation: 'MIP',
-            },
-          });
-          retryConfigs.push({
-            label: 'retry-no-lut-mean-thinner',
-            overrides: {
-              modalityLutOverride: false,
-              forceDisableStoredValueNormalization: true,
-              verticalHalfMm: thinnerVerticalHalfMm,
-              slabHalfThicknessMm: 3,
-              slabSamples: 9,
-              aggregation: 'MEAN',
-            },
-          });
-        } else {
-          retryConfigs.push({
-            label: 'retry-no-lut-mip-thinner',
-            overrides: {
-              modalityLutOverride: false,
-              forceDisableStoredValueNormalization: true,
-              verticalHalfMm: thinnerVerticalHalfMm,
-              slabHalfThicknessMm: 3,
-              slabSamples: 9,
-              aggregation: 'MIP',
-            },
-          });
-          retryConfigs.push({
-            label: 'retry-force-lut-mip-with-normalization',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: thinnerVerticalHalfMm,
-              slabHalfThicknessMm: 3,
-              slabSamples: 9,
-              aggregation: 'MIP',
-            },
-          });
-          retryConfigs.push({
-            label: 'retry-force-lut-mean-with-normalization',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: thinnerVerticalHalfMm,
-              slabHalfThicknessMm: 3,
-              slabSamples: 9,
-              aggregation: 'MEAN',
-            },
-          });
-          retryConfigs.push({
-            label: 'retry-force-lut-mip-no-normalization',
-            overrides: {
-              modalityLutOverride: true,
-              forceDisableStoredValueNormalization: true,
-              verticalHalfMm: thinnerVerticalHalfMm,
-              slabHalfThicknessMm: 3,
-              slabSamples: 9,
-              aggregation: 'MIP',
-            },
-          });
-          retryConfigs.push({
-            label: 'retry-force-lut-mean-no-normalization',
-            overrides: {
-              modalityLutOverride: true,
-              forceDisableStoredValueNormalization: true,
-              verticalHalfMm: thinnerVerticalHalfMm,
-              slabHalfThicknessMm: 3,
-              slabSamples: 9,
-              aggregation: 'MEAN',
-            },
-          });
-        }
+      // Softer MEAN fallback attempts for comparison
+      retryConfigs.push({
+        label: 'retry-mean-fallback-narrow',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: narrowVerticalHalfMm,
+          verticalCenterOffsetMm: mandibularCenterOffsetMm,
+          slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
+          slabSamples: meanFallbackSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
+      retryConfigs.push({
+        label: 'retry-mean-fallback-narrow-no-normalization',
+        overrides: {
+          modalityLutOverride: true,
+          forceDisableStoredValueNormalization: true,
+          verticalHalfMm: narrowVerticalHalfMm,
+          verticalCenterOffsetMm: mandibularCenterOffsetMm,
+          slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
+          slabSamples: meanFallbackSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
 
-        for (const retryConfig of retryConfigs) {
-          const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
-          if (
-            attempt.qualityScore > bestAttempt.qualityScore ||
-            (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
-              attempt.qualityBase > bestAttempt.qualityBase)
-          ) {
-            bestAttempt = attempt;
-          }
+      for (const retryConfig of retryConfigs) {
+        const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
+        recordAttemptAudit(attempt);
+        const bestHardRejected = !!bestAttempt.hardRejectReason;
+        const attemptHardRejected = !!attempt.hardRejectReason;
+        if (
+          (bestHardRejected && !attemptHardRejected) ||
+          (bestHardRejected === attemptHardRejected &&
+            (attempt.qualityScore > bestAttempt.qualityScore ||
+              (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
+                attempt.qualityBase > bestAttempt.qualityBase)))
+        ) {
+          bestAttempt = attempt;
         }
       }
+
+      const rankedAttempts = attemptAudit
+        .slice()
+        .sort((a, b) => {
+          const aHardRejected = !!a.hardRejectReason;
+          const bHardRejected = !!b.hardRejectReason;
+          if (aHardRejected !== bHardRejected) {
+            return aHardRejected ? 1 : -1;
+          }
+          return (b.qualityScore - a.qualityScore) || (b.qualityBase - a.qualityBase);
+        });
+      const selectedAttempt = rankedAttempts[0];
+      const runnerUpAttempt = rankedAttempts.length > 1 ? rankedAttempts[1] : null;
+      console.log(
+        '[CPR-ATTEMPT-LIST-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          attempts: attemptAudit,
+          selectedLabel: bestAttempt.label,
+        })
+      );
+      console.log(
+        '[CPR-SELECTED-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          selectedLabel: bestAttempt.label,
+          selectedAggregation: bestAttempt.aggregation,
+          selectedSlabHalfThicknessMm: bestAttempt.slabHalfThicknessMm,
+          selectedSlabSamples: bestAttempt.slabSamples,
+          selectedVerticalCenterOffsetMm: bestAttempt.verticalCenterOffsetMm,
+          selectedHardRejectReason: bestAttempt.hardRejectReason,
+          selectedQualityScore: bestAttempt.qualityScore,
+          selectedQualityBase: bestAttempt.qualityBase,
+          selectedSummary: bestAttempt.summary,
+          selectedVoi: bestAttempt.voi,
+          selectedWorkerDebugPayload: bestAttempt.workerDebugPayload ?? null,
+          runnerUp: runnerUpAttempt,
+          scoreDeltaToRunnerUp:
+            runnerUpAttempt ? bestAttempt.qualityScore - runnerUpAttempt.qualityScore : null,
+          baseDeltaToRunnerUp:
+            runnerUpAttempt ? bestAttempt.qualityBase - runnerUpAttempt.qualityBase : null,
+          selectedMatchesRankedTop: selectedAttempt?.label === bestAttempt.label,
+        })
+      );
 
       if (!bestAttempt.huDomain) {
         console.warn(
@@ -2292,12 +2642,17 @@ export function useCPROrchestrator({
         label: bestAttempt.label,
         qualityBase: bestAttempt.qualityBase,
         qualityScore: bestAttempt.qualityScore,
+        hardRejectReason: bestAttempt.hardRejectReason,
+        aggregation: bestAttempt.aggregation,
         huDomain: bestAttempt.huDomain,
         convertedToHu: bestAttempt.convertedToHu,
         rescaleSkippedAsUnsafe: bestAttempt.rescaleSkippedAsUnsafe,
         panoWidth: selectedPanoWidth,
         panoHeight: selectedPanoHeight,
         actualVertHalfMm: selectedActualVertHalfMm,
+        verticalCenterOffsetMm: bestAttempt.verticalCenterOffsetMm,
+        slabHalfThicknessMm: bestAttempt.slabHalfThicknessMm,
+        slabSamples: bestAttempt.slabSamples,
         columnPixelSpacing: selectedColumnPixelSpacing,
         rowPixelSpacing: selectedRowPixelSpacing,
       });
@@ -2394,6 +2749,28 @@ export function useCPROrchestrator({
             columnPixelSpacing: selectedColumnPixelSpacing,
             rowPixelSpacing: selectedRowPixelSpacing,
           });
+          console.log('[CPR-LOADER-METADATA-JSON]', JSON.stringify({
+            runId: debugRunId,
+            panoImageId,
+            minValue: panoWorkerResult.minValue,
+            maxValue: panoWorkerResult.maxValue,
+            windowWidth: adaptiveVoi.windowWidth,
+            windowCenter: adaptiveVoi.windowCenter,
+            voiLower: adaptiveVoi.lower,
+            voiUpper: adaptiveVoi.upper,
+            width: panoWorkerResult.width,
+            height: panoWorkerResult.height,
+            columnPixelSpacing: selectedColumnPixelSpacing,
+            rowPixelSpacing: selectedRowPixelSpacing,
+            selectedAttempt: {
+              label: bestAttempt.label,
+              aggregation: bestAttempt.aggregation,
+              verticalCenterOffsetMm: bestAttempt.verticalCenterOffsetMm,
+              slabHalfThicknessMm: bestAttempt.slabHalfThicknessMm,
+              slabSamples: bestAttempt.slabSamples,
+              qualityScore: bestAttempt.qualityScore,
+            },
+          }));
 
           const panoViewport = await waitForPanoStackViewport(servicesManager);
           logPanoViewportSnapshot(debugRunId, 'before-setStack', panoViewport);

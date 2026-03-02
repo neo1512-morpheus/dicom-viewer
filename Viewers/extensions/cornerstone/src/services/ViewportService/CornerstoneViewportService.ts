@@ -799,9 +799,12 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         properties.colormap = colormap;
       }
 
-      // FIX: Pass VOILUTFunction through to viewport for 16-bit stability
-      // Note: Using raw string 'LINEAR_EXACT' since enum may not exist in all CS versions
-      properties.VOILUTFunction = 'LINEAR_EXACT';
+      // Skip VOILUTFunction injection for cpr-pano: setting it without a voiRange triggers
+      // Cornerstone's internal auto-VOI reset (setVOILUTFunction → setVOI(null) → scalar range).
+      // The orchestrator's applyPanoDisplaySettings handles this correctly for cpr-pano.
+      if (viewport.id !== 'cpr-pano') {
+        properties.VOILUTFunction = 'LINEAR_EXACT';
+      }
     }
 
     this._handleOverlays(viewport);
@@ -822,11 +825,11 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const shouldUseParallel2dCache = !isCPRPanoViewport;
     const stackImageIds = shouldUseParallel2dCache
       ? imageIds.map((imageId: string) => {
-          if (imageId.endsWith('#2d')) {
-            return imageId;
-          }
-          return `${imageId}#2d`;
-        })
+        if (imageId.endsWith('#2d')) {
+          return imageId;
+        }
+        return `${imageId}#2d`;
+      })
       : imageIds;
 
     if (shouldUseParallel2dCache) {

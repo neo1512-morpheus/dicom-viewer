@@ -7,6 +7,7 @@ import { cprStateService } from './CPRStateService';
 import { setPanoImagePayload, createPanoImageId, clearPanoImageCache } from './panoImageLoader';
 import { buildRMFFrames } from './cprMath';
 import { CPR_CROSSSECTION_SYNC_EVENT, CPRCrossSectionSyncDetail } from './cprEvents';
+import { renderPanoGpu, isGpuPanoAvailable } from './cprGpuRenderer';
 import type { CPRFrame } from './cprMath';
 
 const CPR_PANO_DEFAULT_WINDOW_WIDTH = 3000;
@@ -373,7 +374,7 @@ function computeAdaptivePanoVoi(
     const denseHighNoAir =
       !!summary && summary.p50 > 900 && summary.fractionBelowMinus950 < 0.01 && summary.p99 > 2000;
     if (denseHighNoAir) {
-      const lower = -1000;
+      const lower = -400;
       const upper = 2200;
       const windowWidth = upper - lower;
       return {
@@ -384,12 +385,12 @@ function computeAdaptivePanoVoi(
       };
     }
 
-    const MIN_HU_WINDOW_WIDTH = 2300;
-    const MAX_DENTAL_WINDOW_WIDTH = 3200;
+    const MIN_HU_WINDOW_WIDTH = 2800;
+    const MAX_DENTAL_WINDOW_WIDTH = 4500;
     const widthWithMin = Math.max(windowWidth, MIN_HU_WINDOW_WIDTH);
     const cappedWidth = Math.min(widthWithMin, MAX_DENTAL_WINDOW_WIDTH);
-    const dentalCenterMin = 300;
-    const dentalCenterMax = 800;
+    const dentalCenterMin = 200;
+    const dentalCenterMax = 600;
     const biasedCenter =
       windowCenter < dentalCenterMin
         ? windowCenter + (dentalCenterMin - windowCenter) * 0.4
@@ -2093,8 +2094,8 @@ export function useCPROrchestrator({
       const fastSlabSamples = 9;
       const meanFallbackSlabHalfThicknessMm = 1.0;
       const meanFallbackSlabSamples = 7;
-      const sharpMeanSlabHalfThicknessMm = 0.3;   // ~2 voxels total slab
-      const sharpMeanSlabSamples = 3;
+      const sharpMeanSlabHalfThicknessMm = 1.2;   // 2.4mm slab keeps teeth edges tighter
+      const sharpMeanSlabSamples = 7;
       const minimumPanoHeightPx = Math.max(160, Math.round(requestedPanoHeightPx * 0.55));
 
       const verticalDir = getSourceViewportVerticalDirection(
@@ -2409,13 +2410,419 @@ export function useCPROrchestrator({
         });
       };
 
-      let bestAttempt = await runWorkerAttempt('primary-balanced-mip-medium', {
+      // ── GPU RENDER PATH ──────────────────────────────────────────
+      // Try GPU-accelerated rendering first. Falls back to CPU workers if unavailable.
+      let gpuRenderSucceeded = false;
+      let gpuPanoResult: { pixelData: Float32Array; width: number; height: number; minValue: number; maxValue: number } | null = null;
+
+      if (isGpuPanoAvailable()) {
+        try {
+          const gpuVertHalfMm = mediumVerticalHalfMm;
+          const gpuVertCenterOffsetMm = subtleMandibularCenterOffsetMm;
+          const gpuActualVertHalfMm = gpuVertHalfMm;
+
+          // Extract volume data directly (these are scoped inside launchCPRWorker)
+          const gpuScalarData = volume.imageData.getPointData().getScalars().getData() as
+            | Float32Array
+            | Int16Array;
+          const gpuDimensions = volume.imageData.getDimensions() as [number, number, number];
+          const gpuSpacing = volume.imageData.getSpacing() as [number, number, number];
+          const gpuOrigin = volume.imageData.getOrigin() as [number, number, number];
+          const gpuDirection = Array.from(volume.imageData.getDirection());
+          const gpuWorldToIndexMat =
+            (volume.imageData as { getWorldToIndex?: () => ArrayLike<number> | null | undefined })
+              .getWorldToIndex?.() ?? null;
+          const gpuWorldToIndex = gpuWorldToIndexMat
+            ? Array.from(gpuWorldToIndexMat).slice(0, 16)
+            : null;
+
+          // Determine rescale parameters — use same heuristic as CPU worker
+          const { slope: gpuRescaleSlope, intercept: gpuRescaleIntercept } = getVolumeRescale(volume);
+          const gpuPixStorage = getVolumePixelStorage(volume);
+          const { minValue: gpuScalarMin, maxValue: gpuScalarMax } = estimateScalarRange(gpuScalarData);
+          const gpuIsPreScaled = resolveEffectivePreScaledFlag({
+            isPreScaled: gpuPixStorage.isPreScaled,
+            scalarMin: gpuScalarMin,
+            scalarMax: gpuScalarMax,
+            slope: gpuRescaleSlope,
+            intercept: gpuRescaleIntercept,
+            bitsStored: gpuPixStorage.bitsStored,
+            pixelRepresentation: gpuPixStorage.pixelRepresentation,
+          });
+          // Use the same heuristic as the CPU worker for applying modality LUT.
+          // For GPU, prefer honoring raw volume.isPreScaled=true to avoid
+          // destructive double-rescale when range heuristics are ambiguous.
+          const gpuHeuristicApplyLut = shouldApplyModalityLutForCPR({
+            slope: gpuRescaleSlope,
+            intercept: gpuRescaleIntercept,
+            scalarMin: gpuScalarMin,
+            scalarMax: gpuScalarMax,
+            bitsStored: gpuPixStorage.bitsStored,
+            pixelRepresentation: gpuPixStorage.pixelRepresentation,
+            allowStoredValueNormalization: false,
+            isPreScaled: gpuIsPreScaled,
+          });
+          const gpuApplyRescale = gpuPixStorage.isPreScaled ? false : gpuHeuristicApplyLut;
+          const gpuHasNonIdentityRescale =
+            Math.abs(gpuRescaleSlope - 1) > 1e-6 || Math.abs(gpuRescaleIntercept) > 1e-6;
+
+          console.log(`[CPR][${debugRunId}] GPU rescale diagnosis`, {
+            rescaleSlope: gpuRescaleSlope,
+            rescaleIntercept: gpuRescaleIntercept,
+            rawIsPreScaled: gpuPixStorage.isPreScaled,
+            isPreScaled: gpuIsPreScaled,
+            heuristicApplyLut: gpuHeuristicApplyLut,
+            applyRescale: gpuApplyRescale,
+            scalarMin: gpuScalarMin,
+            scalarMax: gpuScalarMax,
+            bitsStored: gpuPixStorage.bitsStored,
+            pixelRepresentation: gpuPixStorage.pixelRepresentation,
+          });
+
+          console.log(`[CPR][${debugRunId}] Attempting GPU panoramic render...`);
+          const gpuFrames = frames.map(f => ({
+            position: f.position as [number, number, number],
+            N_slab: f.N_slab as [number, number, number],
+          }));
+          const gpuPanoHeight = clampPanoDimension(
+            Math.max(
+              Math.round((gpuActualVertHalfMm * 2) / minSpacing),
+              Math.round(finalPanoWidth / CPR_PANO_TARGET_ASPECT),
+              minimumPanoHeightPx
+            )
+          );
+
+          const runGpuAttempt = (
+            label: string,
+            applyRescaleFlag: boolean
+          ): {
+            label: string;
+            applyRescale: boolean;
+            result: { pixelData: Float32Array; width: number; height: number; minValue: number; maxValue: number };
+            summary: FloatBufferDebugSummary | null;
+            qualityScore: number;
+            hardRejectReason: string | null;
+            likelyPoor: boolean;
+          } => {
+            const result = renderPanoGpu(
+              {
+                scalarData: gpuScalarData,
+                dimensions: gpuDimensions,
+                spacing: gpuSpacing,
+                origin: gpuOrigin,
+                direction: gpuDirection,
+                worldToIndex: gpuWorldToIndex,
+                frames: gpuFrames,
+                panoWidth: finalPanoWidth,
+                panoHeight: gpuPanoHeight,
+                verticalDir: verticalDir as [number, number, number],
+                vertHalfMm: gpuActualVertHalfMm,
+                verticalCenterOffsetMm: gpuVertCenterOffsetMm,
+                slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
+                slabSamples: sharpMeanSlabSamples,
+                gaussSigma: 0.55,
+                rescaleSlope: gpuRescaleSlope,
+                rescaleIntercept: gpuRescaleIntercept,
+                applyRescale: applyRescaleFlag,
+              },
+              sourceVolumeId
+            );
+
+            const summary = summarizeFloatBufferForDebug(result.pixelData);
+            const qualityBase = scorePanoQuality(summary);
+            const hardRejectReason = getHardRejectReason(summary);
+            const hardRejectPenalty = hardRejectReason ? 30 : 0;
+            const qualityScore = qualityBase - hardRejectPenalty;
+            const likelyPoor = isLikelyPoorPanoQuality(summary);
+
+            console.log(`[CPR][${debugRunId}] GPU attempt ${label}`, {
+              applyRescale: applyRescaleFlag,
+              minValue: result.minValue,
+              maxValue: result.maxValue,
+              p01: summary?.p01,
+              p50: summary?.p50,
+              p99: summary?.p99,
+              meanAbsDelta: summary?.meanAbsDelta,
+              fractionBelowMinus950: summary?.fractionBelowMinus950,
+              fractionAbove3000: summary?.fractionAbove3000,
+              qualityScore,
+              hardRejectReason,
+              likelyPoor,
+            });
+
+            return {
+              label,
+              applyRescale: applyRescaleFlag,
+              result,
+              summary,
+              qualityScore,
+              hardRejectReason,
+              likelyPoor,
+            };
+          };
+
+          const primaryGpuAttempt = runGpuAttempt('primary', gpuApplyRescale);
+          let selectedGpuAttempt = primaryGpuAttempt;
+
+          const toggledApplyRescale = !gpuApplyRescale;
+          if (
+            gpuHasNonIdentityRescale &&
+            (primaryGpuAttempt.likelyPoor || !!primaryGpuAttempt.hardRejectReason)
+          ) {
+            const retryGpuAttempt = runGpuAttempt('rescale-toggled-retry', toggledApplyRescale);
+            const primaryScore = Number.isFinite(primaryGpuAttempt.qualityScore)
+              ? primaryGpuAttempt.qualityScore
+              : -Infinity;
+            const retryScore = Number.isFinite(retryGpuAttempt.qualityScore)
+              ? retryGpuAttempt.qualityScore
+              : -Infinity;
+            const retryLooksBetter =
+              (!retryGpuAttempt.likelyPoor && primaryGpuAttempt.likelyPoor) ||
+              retryScore > primaryScore + 0.25;
+            if (retryLooksBetter) {
+              selectedGpuAttempt = retryGpuAttempt;
+            }
+          }
+
+          if (selectedGpuAttempt.likelyPoor) {
+            console.warn(
+              `[CPR][${debugRunId}] GPU output still looks corrupted after recovery attempts. Falling back to CPU workers.`,
+              {
+                selectedAttempt: selectedGpuAttempt.label,
+                applyRescale: selectedGpuAttempt.applyRescale,
+                minValue: selectedGpuAttempt.result.minValue,
+                maxValue: selectedGpuAttempt.result.maxValue,
+                hardRejectReason: selectedGpuAttempt.hardRejectReason,
+              }
+            );
+            gpuRenderSucceeded = false;
+          } else {
+            gpuPanoResult = selectedGpuAttempt.result;
+            gpuRenderSucceeded = true;
+            console.log(
+              `[CPR][${debugRunId}] GPU render succeeded (${selectedGpuAttempt.label}): ${selectedGpuAttempt.result.width}x${selectedGpuAttempt.result.height}`,
+              {
+                applyRescale: selectedGpuAttempt.applyRescale,
+                minValue: selectedGpuAttempt.result.minValue,
+                maxValue: selectedGpuAttempt.result.maxValue,
+                qualityScore: selectedGpuAttempt.qualityScore,
+              }
+            );
+          }
+        } catch (gpuError) {
+          console.warn(`[CPR][${debugRunId}] GPU render failed, falling back to CPU workers.`, gpuError);
+          gpuRenderSucceeded = false;
+        }
+      } else {
+        console.log(`[CPR][${debugRunId}] GPU not available, using CPU workers.`);
+      }
+
+      // If GPU succeeded, skip all CPU worker attempts
+      if (gpuRenderSucceeded && gpuPanoResult) {
+        const gpuSummary = summarizeFloatBufferForDebug(gpuPanoResult.pixelData);
+
+        // ── VOI STRATEGY: inherit from axial viewport, or use sensible dental defaults ──
+        // The adaptive algorithm was systematically biased high, causing dense structures
+        // (bone/enamel >2500 HU) to clip white. Axial viewport already has correct W/L.
+        let gpuVoi: PanoVoiSettings = (() => {
+          try {
+            const axialVp = findViewportByLogicalId(servicesManager, 'cpr-axial');
+            const axialProps = (axialVp as any)?.getProperties?.();
+            const axialVoiRange = axialProps?.voiRange;
+            if (
+              axialVoiRange &&
+              Number.isFinite(axialVoiRange.lower) &&
+              Number.isFinite(axialVoiRange.upper) &&
+              axialVoiRange.upper > axialVoiRange.lower
+            ) {
+              const lower = axialVoiRange.lower;
+              const upper = axialVoiRange.upper;
+              const windowWidth = upper - lower;
+              const windowCenter = lower + windowWidth / 2;
+              console.log(`[CPR][${debugRunId}] GPU VOI: inherited from axial viewport`, { lower, upper, windowWidth, windowCenter });
+              return { lower, upper, windowWidth, windowCenter };
+            }
+          } catch (voiErr) {
+            console.warn(`[CPR][${debugRunId}] Could not read axial viewport VOI, using dental default`, voiErr);
+          }
+          // Dental panoramic default: W:4000, L:500 → range [-1500, 2500]
+          // Covers air (-1000), soft tissue (0-100), bone (200-1900), dense enamel (2000-4000)
+          const defaultWW = 4000;
+          const defaultWL = 500;
+          const lower = defaultWL - defaultWW / 2;
+          const upper = defaultWL + defaultWW / 2;
+          console.log(`[CPR][${debugRunId}] GPU VOI: using dental panoramic default`, { lower, upper, windowWidth: defaultWW, windowCenter: defaultWL });
+          return { lower, upper, windowWidth: defaultWW, windowCenter: defaultWL };
+        })();
+        const gpuPanoHeight = gpuPanoResult.height;
+        const gpuActualVertHalfMm = mediumVerticalHalfMm;
+        const gpuRowPixelSpacing = toPositiveFinite(
+          (gpuActualVertHalfMm * 2) / Math.max(1, gpuPanoHeight - 1),
+          minSpacing
+        );
+
+        // Use GPU result directly — bypass all CPU worker attempts
+        const panoWorkerResult = gpuPanoResult;
+        const panoDebugSummary = gpuSummary;
+        const adaptiveVoi = gpuVoi;
+        const selectedPanoWidth = gpuPanoResult.width;
+        const selectedPanoHeight = gpuPanoHeight;
+        const selectedActualVertHalfMm = gpuActualVertHalfMm;
+        const selectedColumnPixelSpacing = columnPixelSpacing;
+        const selectedRowPixelSpacing = gpuRowPixelSpacing;
+
+        console.log(`[CPR][${debugRunId}] Using GPU render result`, {
+          panoWidth: selectedPanoWidth,
+          panoHeight: selectedPanoHeight,
+          minValue: panoWorkerResult.minValue,
+          maxValue: panoWorkerResult.maxValue,
+          voiLower: adaptiveVoi.lower,
+          voiUpper: adaptiveVoi.upper,
+        });
+
+        // Skip to the stage switch / image loading code below
+        // (same flow as CPU path starting from line "Keep exactly one arch annotation")
+        removeSplineAnnotationsExcept(latestAnnotationUID);
+        cprStateService.setArchData(rawControlPoints, frames, sourceVolumeId, latestAnnotationUID);
+        clearProtocolListener();
+
+        let protocolAppliedHandled = false;
+        const onProtocolApplied = async () => {
+          if (protocolAppliedHandled) return;
+          protocolAppliedHandled = true;
+          clearProtocolListener();
+          try {
+            void (async () => {
+              try {
+                const axialViewportAfterSwitch = await waitForViewportByLogicalId(
+                  servicesManager, 'cpr-axial', 4000
+                );
+                if (axialViewportAfterSwitch && preservedAxialCamera) {
+                  axialViewportAfterSwitch.setCamera(
+                    preservedAxialCamera as Partial<ReturnType<typeof axialViewportAfterSwitch.getCamera>>
+                  );
+                  axialViewportAfterSwitch.render();
+                  cornerstoneTools.utilities.triggerAnnotationRender(axialViewportAfterSwitch.element);
+                }
+              } catch (e) {
+                console.warn(`[CPR][${debugRunId}] Failed to restore axial camera`, e);
+              }
+            })();
+
+            clearPanoImageCache();
+            setPanoImagePayload(panoImageId, {
+              pixelData: panoWorkerResult.pixelData,
+              width: panoWorkerResult.width,
+              height: panoWorkerResult.height,
+              minValue: panoWorkerResult.minValue,
+              maxValue: panoWorkerResult.maxValue,
+              huDomain: true,
+              windowWidth: adaptiveVoi.windowWidth,
+              windowCenter: adaptiveVoi.windowCenter,
+              slope: 1,
+              intercept: 0,
+              columnPixelSpacing: selectedColumnPixelSpacing,
+              rowPixelSpacing: selectedRowPixelSpacing,
+            });
+
+            const panoViewport = await waitForPanoStackViewport(servicesManager);
+            logPanoViewportSnapshot(debugRunId, 'gpu-before-setStack', panoViewport);
+            // Apply camera reset BEFORE setStack so it cannot stomp our post-load VOI
+            if (typeof (panoViewport as { resetCamera?: () => void }).resetCamera === 'function') {
+              panoViewport.resetCamera();
+            }
+            await panoViewport.setStack([panoImageId], 0);
+            logPanoViewportSnapshot(debugRunId, 'gpu-after-setStack', panoViewport);
+            applyPanoDisplaySettings(debugRunId, 'gpu-after-setStack', panoViewport, adaptiveVoi);
+            panoViewport.render();
+
+            // Re-assert VOI after first render
+            if (panoViewport.element) {
+              let reappliedOnRender = false;
+              const onFirstImageRendered = () => {
+                if (reappliedOnRender) return;
+                reappliedOnRender = true;
+                panoViewport.element.removeEventListener(
+                  cornerstone.Enums.Events.IMAGE_RENDERED,
+                  onFirstImageRendered
+                );
+                const liveViewport = findViewportByLogicalId(servicesManager, 'cpr-pano');
+                if (liveViewport && typeof (liveViewport as { resetCamera?: () => void }).resetCamera === 'function') {
+                  liveViewport.resetCamera();
+                }
+                applyPanoDisplaySettings(debugRunId, 'gpu-after-first-image-rendered', liveViewport, adaptiveVoi);
+                liveViewport?.render?.();
+              };
+              panoViewport.element.addEventListener(
+                cornerstone.Enums.Events.IMAGE_RENDERED,
+                onFirstImageRendered
+              );
+            }
+            [120, 500, 1500].forEach(delayMs => {
+              window.setTimeout(() => {
+                const livePanoViewport = findViewportByLogicalId(servicesManager, 'cpr-pano');
+                applyPanoDisplaySettings(debugRunId, `gpu-post+${delayMs}ms`, livePanoViewport, adaptiveVoi);
+                livePanoViewport?.render?.();
+              }, delayMs);
+            });
+
+            commandsManager.runCommand('setToolActive', {
+              toolName: 'CPRCursor',
+              toolGroupId: 'cprPano',
+            });
+            cornerstoneTools.utilities.triggerAnnotationRender(panoViewport.element);
+            initializeCrossSection(frames, servicesManager);
+          } catch (err) {
+            console.error(`[CPR][${debugRunId}] GPU post-render error`, err);
+            if (isMountedRef.current) {
+              setError(err instanceof Error ? err.message : String(err));
+            }
+          } finally {
+            if (isMountedRef.current) {
+              setIsGenerating(false);
+            }
+          }
+        };
+
+        const gpuProtocolAppliedEvent =
+          hangingProtocolService.EVENTS.PROTOCOL_APPLIED ||
+          hangingProtocolService.EVENTS.PROTOCOL_CHANGED;
+
+        if (!gpuProtocolAppliedEvent) {
+          throw new Error('[CPR] No supported hanging protocol event found for GPU path.');
+        }
+
+        hpSubscriptionRef.current = hangingProtocolService.subscribe(
+          gpuProtocolAppliedEvent,
+          onProtocolApplied
+        );
+
+        // Safety timeout in case protocol change event never arrives
+        hpTimeoutRef.current = window.setTimeout(() => {
+          clearProtocolListener();
+          if (isMountedRef.current) {
+            console.error(`[CPR][${debugRunId}] GPU path: timed out waiting for protocol change.`);
+            setError('[CPR] Timed out waiting for hanging protocol change after GPU render.');
+            setIsGenerating(false);
+          }
+        }, 12000);
+
+        console.log(`[CPR][${debugRunId}] GPU path: switching to CPR stage 1`);
+        commandsManager.runCommand('setHangingProtocol', {
+          protocolId: 'cpr',
+          stageIndex: 1,
+        });
+        return; // GPU path complete — skip all CPU worker code below
+      }
+
+      // ── CPU WORKER FALLBACK PATH ─────────────────────────────────
+      let bestAttempt = await runWorkerAttempt('primary-mean-sharp-medium', {
         modalityLutOverride: true,
         verticalHalfMm: mediumVerticalHalfMm,
         verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-        slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-        slabSamples: balancedSlabSamples,
-        aggregation: 'MIP',
+        slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
+        slabSamples: sharpMeanSlabSamples,
+        aggregation: 'MEAN',
       });
       recordAttemptAudit(bestAttempt);
 
@@ -2423,129 +2830,44 @@ export function useCPROrchestrator({
         label: string;
         overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
       }> = [
+          // MEAN with narrow vertical coverage (focused on teeth)
           {
-            label: 'retry-balanced-mip-narrow',
+            label: 'retry-mean-sharp-narrow',
             overrides: {
               modalityLutOverride: true,
               verticalHalfMm: narrowVerticalHalfMm,
               verticalCenterOffsetMm: mandibularCenterOffsetMm,
-              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-              slabSamples: balancedSlabSamples,
-              aggregation: 'MIP',
+              slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
+              slabSamples: sharpMeanSlabSamples,
+              aggregation: 'MEAN',
             },
           },
+          // MEAN with broader vertical coverage
           {
-            label: 'retry-fast-mip-narrow',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: narrowVerticalHalfMm,
-              verticalCenterOffsetMm: mandibularCenterOffsetMm,
-              slabHalfThicknessMm: fastSlabHalfThicknessMm,
-              slabSamples: fastSlabSamples,
-              aggregation: 'MIP',
-            },
-          },
-          {
-            label: 'retry-balanced-mip-medium-strong-bias',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: mediumVerticalHalfMm,
-              verticalCenterOffsetMm: strongMandibularCenterOffsetMm,
-              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-              slabSamples: balancedSlabSamples,
-              aggregation: 'MIP',
-            },
-          },
-          {
-            label: 'retry-balanced-mip-broad-biased',
+            label: 'retry-mean-sharp-broad',
             overrides: {
               modalityLutOverride: true,
               verticalHalfMm: broadVerticalHalfMm,
               verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-              slabSamples: balancedSlabSamples,
-              aggregation: 'MIP',
+              slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
+              slabSamples: sharpMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          },
+          // MEAN with no normalization fallback
+          {
+            label: 'retry-mean-sharp-no-normalization',
+            overrides: {
+              modalityLutOverride: true,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: mandibularCenterOffsetMm,
+              slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
+              slabSamples: sharpMeanSlabSamples,
+              aggregation: 'MEAN',
             },
           },
         ];
-
-      if (bestAttempt.result.effectiveIsPreScaled) {
-        // Evaluate a no-LUT variant when source appears pre-scaled.
-        retryConfigs.push({
-          label: 'retry-no-lut-mip-medium',
-          overrides: {
-            modalityLutOverride: false,
-            forceDisableStoredValueNormalization: true,
-            verticalHalfMm: mediumVerticalHalfMm,
-            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-            slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-            slabSamples: balancedSlabSamples,
-            aggregation: 'MIP',
-          },
-        });
-      } else {
-        retryConfigs.push({
-          label: 'retry-force-lut-mip-medium-no-normalization',
-          overrides: {
-            modalityLutOverride: true,
-            forceDisableStoredValueNormalization: true,
-            verticalHalfMm: mediumVerticalHalfMm,
-            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-            slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-            slabSamples: balancedSlabSamples,
-            aggregation: 'MIP',
-          },
-        });
-      }
-
-      // Sharp MEAN attempts — thin slab for maximum tooth separation
-      retryConfigs.push({
-        label: 'retry-mean-sharp-narrow',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: narrowVerticalHalfMm,
-          verticalCenterOffsetMm: mandibularCenterOffsetMm,
-          slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
-          slabSamples: sharpMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-sharp-medium',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: mediumVerticalHalfMm,
-          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-          slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
-          slabSamples: sharpMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-
-      // Softer MEAN fallback attempts for comparison
-      retryConfigs.push({
-        label: 'retry-mean-fallback-narrow',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: narrowVerticalHalfMm,
-          verticalCenterOffsetMm: mandibularCenterOffsetMm,
-          slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
-          slabSamples: meanFallbackSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-fallback-narrow-no-normalization',
-        overrides: {
-          modalityLutOverride: true,
-          forceDisableStoredValueNormalization: true,
-          verticalHalfMm: narrowVerticalHalfMm,
-          verticalCenterOffsetMm: mandibularCenterOffsetMm,
-          slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
-          slabSamples: meanFallbackSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
 
       for (const retryConfig of retryConfigs) {
         const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
@@ -2632,7 +2954,32 @@ export function useCPROrchestrator({
 
       let panoWorkerResult = bestAttempt.result;
       let panoDebugSummary = bestAttempt.summary;
-      let adaptiveVoi = bestAttempt.voi;
+      // Override the data-adaptive VOI with axial viewport W/L — avoids the high-bias
+      // problem where enamel/bone clips white because adaptive center is too high.
+      let adaptiveVoi: PanoVoiSettings = (() => {
+        try {
+          const axialVpForVoi = findViewportByLogicalId(servicesManager, 'cpr-axial');
+          const axialP = (axialVpForVoi as any)?.getProperties?.();
+          const axialRange = axialP?.voiRange;
+          if (
+            axialRange &&
+            Number.isFinite(axialRange.lower) &&
+            Number.isFinite(axialRange.upper) &&
+            axialRange.upper > axialRange.lower
+          ) {
+            const lower = axialRange.lower;
+            const upper = axialRange.upper;
+            const windowWidth = upper - lower;
+            const windowCenter = lower + windowWidth / 2;
+            console.log(`[CPR][${debugRunId}] CPU VOI: inherited from axial viewport`, { lower, upper, windowWidth, windowCenter });
+            return { lower, upper, windowWidth, windowCenter };
+          }
+        } catch (_e) { /* ignore */ }
+        // Dental panoramic default: W:4000, L:500 → range [-1500, 2500]
+        const ww = 4000, wl = 500;
+        console.log(`[CPR][${debugRunId}] CPU VOI: using dental panoramic default W:${ww} L:${wl}`);
+        return { lower: wl - ww / 2, upper: wl + ww / 2, windowWidth: ww, windowCenter: wl };
+      })();
       const selectedPanoWidth = bestAttempt.panoWidth;
       const selectedPanoHeight = bestAttempt.panoHeight;
       const selectedActualVertHalfMm = bestAttempt.actualVertHalfMm;
@@ -2774,10 +3121,11 @@ export function useCPROrchestrator({
 
           const panoViewport = await waitForPanoStackViewport(servicesManager);
           logPanoViewportSnapshot(debugRunId, 'before-setStack', panoViewport);
-          await panoViewport.setStack([panoImageId], 0);
+          // Apply camera reset BEFORE setStack so it cannot stomp our post-load VOI
           if (typeof (panoViewport as { resetCamera?: () => void }).resetCamera === 'function') {
             panoViewport.resetCamera();
           }
+          await panoViewport.setStack([panoImageId], 0);
           logPanoViewportSnapshot(debugRunId, 'after-setStack', panoViewport);
           applyPanoDisplaySettings(debugRunId, 'after-setStack', panoViewport, adaptiveVoi);
           logPanoViewportSnapshot(debugRunId, 'after-setProperties', panoViewport);
@@ -3019,3 +3367,4 @@ export function useCPROrchestrator({
 
   return { onDone, onRedraw, onSliderChange, isGenerating, error };
 }
+

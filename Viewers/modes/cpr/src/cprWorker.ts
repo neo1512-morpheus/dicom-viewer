@@ -255,56 +255,48 @@ function applyLightBilateralDenoise(
   height: number,
   blendWeight: number
 ): boolean {
-  if (width < 3 || height < 3 || blendWeight <= 0) {
-    return false;
-  }
+  if (width < 3 || height < 3 || blendWeight <= 0) return false;
 
-  const source = new Float32Array(pixelData);
-  const sigmaRange = 220;
+  // Aggressive multi-pass bilateral denoise: σ_range=500 HU smooths bone texture
+  // (~300-700 HU variation) while preserving tooth/air edges (>1000 HU difference)
+  const sigmaRange = 500;
   const sigmaRangeDen = 2 * sigmaRange * sigmaRange;
-  const clampedBlend = Math.max(0, Math.min(0.6, blendWeight));
+  const clampedBlend = Math.max(0, Math.min(0.85, blendWeight));
   const keepWeight = 1 - clampedBlend;
+  const numPasses = 3;
 
   const neighbors: Array<[number, number, number]> = [
-    [-1, -1, 0.45],
-    [0, -1, 0.7],
-    [1, -1, 0.45],
-    [-1, 0, 0.7],
-    [1, 0, 0.7],
-    [-1, 1, 0.45],
-    [0, 1, 0.7],
-    [1, 1, 0.45],
+    [-1, -1, 0.45], [0, -1, 0.7], [1, -1, 0.45],
+    [-1, 0, 0.7], [1, 0, 0.7],
+    [-1, 1, 0.45], [0, 1, 0.7], [1, 1, 0.45],
   ];
 
-  for (let row = 1; row < height - 1; row++) {
-    for (let col = 1; col < width - 1; col++) {
-      const index = row * width + col;
-      const center = source[index];
-      if (!Number.isFinite(center)) {
-        continue;
-      }
+  for (let pass = 0; pass < numPasses; pass++) {
+    const source = new Float32Array(pixelData);
+    for (let row = 1; row < height - 1; row++) {
+      for (let col = 1; col < width - 1; col++) {
+        const index = row * width + col;
+        const center = source[index];
+        if (!Number.isFinite(center)) continue;
 
-      let weightedSum = center;
-      let weightTotal = 1;
-
-      for (let n = 0; n < neighbors.length; n++) {
-        const [dx, dy, spatialWeight] = neighbors[n];
-        const neighborValue = source[(row + dy) * width + (col + dx)];
-        if (!Number.isFinite(neighborValue)) {
-          continue;
+        let weightedSum = center;
+        let weightTotal = 1;
+        for (let n = 0; n < neighbors.length; n++) {
+          const [dx, dy, spatialWeight] = neighbors[n];
+          const neighborValue = source[(row + dy) * width + (col + dx)];
+          if (!Number.isFinite(neighborValue)) continue;
+          const delta = neighborValue - center;
+          const rangeWeight = Math.exp(-(delta * delta) / sigmaRangeDen);
+          const weight = spatialWeight * rangeWeight;
+          weightedSum += neighborValue * weight;
+          weightTotal += weight;
         }
-        const delta = neighborValue - center;
-        const rangeWeight = Math.exp(-(delta * delta) / sigmaRangeDen);
-        const weight = spatialWeight * rangeWeight;
-        weightedSum += neighborValue * weight;
-        weightTotal += weight;
-      }
 
-      const filtered = weightTotal > 0 ? weightedSum / weightTotal : center;
-      pixelData[index] = keepWeight * center + clampedBlend * filtered;
+        const filtered = weightTotal > 0 ? weightedSum / weightTotal : center;
+        pixelData[index] = keepWeight * center + clampedBlend * filtered;
+      }
     }
   }
-
   return true;
 }
 
@@ -546,16 +538,18 @@ function generatePanorama(input: CPRWorkerInput): {
   const targetSlabStepMm = Math.max(0.2, minVolumeSpacingMm * 0.75);
   const adaptiveSampleCount =
     slabHalfThicknessMm > 0 ? Math.ceil((slabHalfThicknessMm * 2) / targetSlabStepMm) + 1 : 1;
-  const slabSampleCount = Math.max(
-    1,
-    Math.min(
-      13,
-      Math.max(
-        baseSlabSampleCount,
-        Math.min(adaptiveSampleCount, baseSlabSampleCount + 2)
+  const slabSampleCount = slabHalfThicknessMm <= 0.5
+    ? baseSlabSampleCount   // thin slab: use exact requested count for max sharpness
+    : Math.max(
+      1,
+      Math.min(
+        13,
+        Math.max(
+          baseSlabSampleCount,
+          Math.min(adaptiveSampleCount, baseSlabSampleCount + 2)
+        )
       )
-    )
-  );
+    );
   if (!isMeanAggregation) {
     robustMipTopCount =
       slabSampleCount <= 1
@@ -636,6 +630,7 @@ function generatePanorama(input: CPRWorkerInput): {
     }
   }
 
+  // Clamp only the user-requested additive offset, not the volume-aware offset.
   const baseCenterOffsetLimitMm = Math.min(5, Math.max(2, vertHalfMm * 0.3));
   const requestedCenterOffsetMm =
     Number.isFinite(requestedVerticalCenterOffsetMm) ? Number(requestedVerticalCenterOffsetMm) : 0;
@@ -644,14 +639,33 @@ function generatePanorama(input: CPRWorkerInput): {
     Math.min(baseCenterOffsetLimitMm, requestedCenterOffsetMm)
   );
   verticalCenterOffsetMm += clampedRequestedCenterOffsetMm;
-  verticalCenterOffsetMm = Math.max(
-    -baseCenterOffsetLimitMm,
-    Math.min(baseCenterOffsetLimitMm, verticalCenterOffsetMm)
-  );
-  const effectiveVerticalHalfMm = vertHalfMm;
+  // NOTE: Do NOT re-clamp verticalCenterOffsetMm to ±5mm here.
+  // The volume-aware offset computed above (lines 568-631) must be preserved
+  // so the vertical window can shift fully to stay inside the volume.
+
+  // Dynamically shrink vertHalfMm when the vertical window would exceed volume bounds.
+  let effectiveVerticalHalfMm = vertHalfMm;
+  if (Number.isFinite(volumeMinProjection) && Number.isFinite(volumeMaxProjection) &&
+    volumeMinProjection < volumeMaxProjection && frames.length > 0) {
+    let maxSafeHalf = vertHalfMm;
+    for (let idx = 0; idx < frames.length; idx++) {
+      const fp = dot3(frames[idx].position, effectiveVerticalDir) + verticalCenterOffsetMm;
+      const headroomAbove = volumeMaxProjection - fp;
+      const headroomBelow = fp - volumeMinProjection;
+      const headroom = Math.min(headroomAbove, headroomBelow);
+      if (Number.isFinite(headroom) && headroom < maxSafeHalf) {
+        maxSafeHalf = headroom;
+      }
+    }
+    // Allow a slim 2mm OOB margin to avoid clipping right at the edge,
+    // but prevent the large gray strips.  Floor at 8mm to keep the image usable.
+    effectiveVerticalHalfMm = Math.max(8, Math.min(vertHalfMm, maxSafeHalf + 2));
+  }
   const vertStepMm = (effectiveVerticalHalfMm * 2) / panoHeightDen;
 
   const slabDirs: Array<[number, number, number]> = new Array(panoWidth);
+  // Compute per-column curvature for variable-thickness slab (thin slabs only)
+  const perColumnSlabHalf: Float32Array = new Float32Array(panoWidth);
   {
     let previousSlabDir: [number, number, number] | null = null;
     for (let col = 0; col < panoWidth; col++) {
@@ -661,6 +675,28 @@ function generatePanorama(input: CPRWorkerInput): {
       }
       slabDirs[col] = slabDir;
       previousSlabDir = slabDir;
+    }
+    if (slabHalfThicknessMm <= 0.5) {
+      // Variable-thickness: only for thin slabs to avoid over-sampling
+      const slabCurvatureScale = slabHalfThicknessMm * 4;
+      for (let col = 0; col < panoWidth; col++) {
+        let curvature = 0;
+        if (col > 0 && col < panoWidth - 1) {
+          const T_prev = frames[col - 1].T;
+          const T_next = frames[col + 1].T;
+          const tangentDot = Math.max(-1, Math.min(1,
+            T_prev[0] * T_next[0] + T_prev[1] * T_next[1] + T_prev[2] * T_next[2]
+          ));
+          curvature = Math.acos(tangentDot);
+        }
+        const curvatureBoost = Math.min(slabHalfThicknessMm, curvature * slabCurvatureScale);
+        perColumnSlabHalf[col] = slabHalfThicknessMm + curvatureBoost;
+      }
+    } else {
+      // Thick slabs: use fixed thickness (variable would oversample outside the arch)
+      for (let col = 0; col < panoWidth; col++) {
+        perColumnSlabHalf[col] = slabHalfThicknessMm;
+      }
     }
   }
 
@@ -684,9 +720,15 @@ function generatePanorama(input: CPRWorkerInput): {
       let max2 = -Infinity;
       let max3 = -Infinity;
       let max4 = -Infinity;
+      // For MEAN: Gaussian-weighted truncated mean
+      const meanSamples = isMeanAggregation ? new Float32Array(slabSampleCount) : null;
+      const meanWeights = isMeanAggregation ? new Float32Array(slabSampleCount) : null;
+      const gaussSigmaSq2 = 2 * 0.7 * 0.7; // σ=0.7mm focal trough
 
       for (let s = 0; s < slabSampleCount; s++) {
-        const slabOffset = slabSampleCount > 1 ? -slabHalfThicknessMm + s * slabStepMm : 0;
+        const colSlabHalf = perColumnSlabHalf[col];
+        const colSlabStep = slabSampleCount > 1 ? (colSlabHalf * 2) / (slabSampleCount - 1) : 0;
+        const slabOffset = slabSampleCount > 1 ? -colSlabHalf + s * colSlabStep : 0;
 
         const sx = bx + slabOffset * slabDirX;
         const sy = by + slabOffset * slabDirY;
@@ -703,51 +745,30 @@ function generatePanorama(input: CPRWorkerInput): {
           });
         }
         if (_dbgChecked < 200) {
-          const _isOob =
-            vi < -0.5 ||
-            vj < -0.5 ||
-            vk < -0.5 ||
-            vi > dimensions[0] - 0.5 ||
-            vj > dimensions[1] - 0.5 ||
-            vk > dimensions[2] - 0.5;
+          const _isOob = vi < -0.5 || vj < -0.5 || vk < -0.5 ||
+            vi > dimensions[0] - 0.5 || vj > dimensions[1] - 0.5 || vk > dimensions[2] - 0.5;
           _dbgChecked++;
-          if (_isOob) {
-            _dbgOob++;
-          }
+          if (_isOob) _dbgOob++;
         }
-        let sample = trilinear(
-          scalarData,
-          dimensions,
-          vi,
-          vj,
-          vk,
-          safeInterpolationOobValue,
-          normalizeStoredSample
-        );
+        let sample = trilinear(scalarData, dimensions, vi, vj, vk, safeInterpolationOobValue, normalizeStoredSample);
         if (shouldApplyModalityLut) {
           sample = sample * safeSlope + safeIntercept;
           if (lutSamplePreview.length < 5 && Number.isFinite(sample)) {
             lutSamplePreview.push(sample);
           }
         }
-        if (!Number.isFinite(sample)) {
-          sample = -1000;
-        }
+        if (!Number.isFinite(sample)) sample = -1000;
 
         if (isMeanAggregation) {
-          accumulator += sample;
+          const gw = Math.exp(-(slabOffset * slabOffset) / gaussSigmaSq2);
+          meanSamples![s] = sample;
+          meanWeights![s] = gw;
         } else if (sample >= max1) {
-          max4 = max3;
-          max3 = max2;
-          max2 = max1;
-          max1 = sample;
+          max4 = max3; max3 = max2; max2 = max1; max1 = sample;
         } else if (sample >= max2) {
-          max4 = max3;
-          max3 = max2;
-          max2 = sample;
+          max4 = max3; max3 = max2; max2 = sample;
         } else if (sample >= max3) {
-          max4 = max3;
-          max3 = sample;
+          max4 = max3; max3 = sample;
         } else if (sample > max4) {
           max4 = sample;
         }
@@ -755,42 +776,47 @@ function generatePanorama(input: CPRWorkerInput): {
 
       let pixelValueRaw: number;
       if (isMeanAggregation) {
-        pixelValueRaw = accumulator / slabSampleCount;
+        const trimCount = slabSampleCount >= 7 ? Math.max(1, Math.floor(slabSampleCount * 0.15)) : 0;
+        const idxBuf = new Uint8Array(slabSampleCount);
+        for (let i = 0; i < slabSampleCount; i++) idxBuf[i] = i;
+        for (let i = 1; i < slabSampleCount; i++) {
+          const keyVal = meanSamples![i];
+          const keyIdx = idxBuf[i];
+          let j = i - 1;
+          while (j >= 0 && meanSamples![idxBuf[j]] > keyVal) {
+            idxBuf[j + 1] = idxBuf[j];
+            j--;
+          }
+          idxBuf[j + 1] = keyIdx;
+        }
+        let wSum = 0;
+        let wTotal = 0;
+        for (let i = trimCount; i < slabSampleCount - trimCount; i++) {
+          const idx = idxBuf[i];
+          wSum += meanSamples![idx] * meanWeights![idx];
+          wTotal += meanWeights![idx];
+        }
+        pixelValueRaw = wTotal > 0 ? wSum / wTotal : meanSamples![Math.floor(slabSampleCount / 2)];
       } else {
-        if (Number.isFinite(max2) && max1 - max2 > 850) {
-          // Suppress isolated bright spikes that dominate strict MIP.
-          max1 = 0.5 * (max1 + max2);
-        }
-        if (robustMipTopCount >= 4 && Number.isFinite(max4)) {
-          pixelValueRaw = 0.25 * (max1 + max2 + max3 + max4);
-        } else if (robustMipTopCount >= 3 && Number.isFinite(max3)) {
-          pixelValueRaw = (max1 + max2 + max3) / 3;
-        } else if (robustMipTopCount >= 2 && Number.isFinite(max2)) {
-          pixelValueRaw = 0.5 * (max1 + max2);
-        } else {
-          pixelValueRaw = max1;
-        }
+        pixelValueRaw = max1;
+        if (Number.isFinite(max2) && max1 - max2 > 850) max1 = 0.5 * (max1 + max2);
+        if (robustMipTopCount >= 4 && Number.isFinite(max4)) pixelValueRaw = 0.25 * (max1 + max2 + max3 + max4);
+        else if (robustMipTopCount >= 3 && Number.isFinite(max3)) pixelValueRaw = (max1 + max2 + max3) / 3;
+        else if (robustMipTopCount >= 2 && Number.isFinite(max2)) pixelValueRaw = 0.5 * (max1 + max2);
       }
       const pixelValue = Number.isFinite(pixelValueRaw) ? pixelValueRaw : -1000;
 
       const pixelIndex = row * panoWidth + col;
       pixelData[pixelIndex] = pixelValue;
 
-      if (pixelValue < minValue) {
-        minValue = pixelValue;
-      }
-      if (pixelValue > maxValue) {
-        maxValue = pixelValue;
-      }
+      if (pixelValue < minValue) minValue = pixelValue;
+      if (pixelValue > maxValue) maxValue = pixelValue;
     }
   }
 
-  // Adaptive denoise: thinner slabs get less smoothing to preserve fine detail
-  const baseDenoiseBlend = isMeanAggregation ? 0.30 : 0.25;
-  const slabThicknessFactor = Math.min(1.0, slabHalfThicknessMm / 1.0);
-  const denoiseBlend = baseDenoiseBlend * slabThicknessFactor;
-  const denoiseApplied =
-    denoiseBlend > 0 && applyLightBilateralDenoise(pixelData, panoWidth, panoHeight, denoiseBlend);
+  // Aggressive multi-pass bilateral denoise: smooths trabecular bone grain
+  const denoiseBlend = 0.65;
+  const denoiseApplied = applyLightBilateralDenoise(pixelData, panoWidth, panoHeight, denoiseBlend);
   if (denoiseApplied) {
     const denoisedRange = computeArrayMinMax(pixelData);
     minValue = denoisedRange.minValue;
@@ -824,8 +850,7 @@ function generatePanorama(input: CPRWorkerInput): {
       slabHalfThicknessMm,
       aggregation: aggregationMode,
     },
-    denoise: {
-      blend: denoiseBlend,
+    sharpen: {
       applied: denoiseApplied,
     },
     firstFrameWorldPos: frames?.[0]?.position ?? null,

@@ -1,0 +1,216 @@
+# CPR Panoramic White-Out — Full Debug Context for Handoff Agent
+
+## Project Location
+`d:\diacom demo\Viewers\` — OHIF-based DICOM viewer (React + Cornerstone3D + WebGL2)
+
+---
+
+## What The Problem Looks Like (No Images — Description)
+
+There are **three CPR viewports** displayed side-by-side after the user draws a dental arch spline and clicks "Done":
+
+- **Left (axial)**: Perfectly clean, correct gray-scale dental CBCT slice. W:4500 L:1000. Shows teeth and bone beautifully.
+- **Middle (panoramic CPR)**: **Completely ruined**. The image is almost entirely pure-white with scattered pure-black blobs. No gray tones whatsoever. It looks binary / posterized — like a threshold filter was applied. The middle viewport shows `W: 4500 L: 1000` in the corner (correct VOI), yet still looks binary.
+- **Right (cross-section)**: Perfectly clean. Good gray-scale, correct.
+
+The panoramic image is a GPU-rendered curved-planar-reformation — it takes the volume data and samples along a curved arch path through the jaw to produce a flattened panoramic view of the dental arch (like a dental panoramic X-ray).
+
+---
+
+## Data Type Context
+
+- Modality: CBCT (Cone Beam CT), dental
+- Stored values: Int16 (voxel values before rescale)
+- DICOM rescale: typically slope=1, intercept=-1024 (so HU = stored - 1024)
+- Cornerstone3D streams and pre-scales the volume: `volume.isPreScaled = true`
+- So `volume.scalarData` (Float32Array or Int16Array) already contains **HU values** (e.g., air = -1024, bone = 400-1900, enamel = 2000-4000)
+- The GPU renderer receives these pre-scaled HU values directly from `volume.imageData.getPointData().getScalars().getData()`
+
+---
+
+## Architecture — The Rendering Pipeline
+
+### Key Files
+```
+d:\diacom demo\Viewers\modes\cpr\src\
+  cprGpuRenderer.ts         ← GPU renderer (WebGL2, the main suspect)
+  panoImageLoader.ts        ← Custom Cornerstone image loader for pano:// imageIds
+  useCPROrchestrator.ts     ← Orchestrates the whole CPR flow (3200+ lines)
+
+d:\diacom demo\Viewers\extensions\cornerstone\src\services\ViewportService\
+  CornerstoneViewportService.ts  ← OHIF's viewport management, calls setStack
+```
+
+### The Rendering Flow
+
+```
+useCPROrchestrator.ts
+  → calls cprGpuRenderer.renderPanoGpu(...)
+      → uploads volume to R32F WebGL2 3D texture
+      → renders curved plane via fragment shader
+      → readPixels → Float32Array (the "pixelData")
+      → returns { pixelData, width, height, minValue, maxValue }
+  → calls setPanoImagePayload(panoImageId, { pixelData, windowWidth, windowCenter, ... })
+      → stores payload in panoImageLoader.ts memory cache
+  → calls panoViewport.setStack(['pano://current/...'], 0)
+      → Cornerstone calls panoImageLoader to resolve the imageId
+      → panoImageLoader returns a Cornerstone IImage object with getPixelData()
+      → Cornerstone uploads pixelData to GPU for display
+      → Cornerstone applies VOI (voiRange) to transfer function → renders to canvas
+```
+
+---
+
+## What We Tried (And Why It Didn't Fix It)
+
+### Attempt 1: Fix texture precision (R16F → R32F)
+**File:** `cprGpuRenderer.ts` ~line 332  
+**Change:** `gl.R16F` → `gl.R32F` for the 3D volume texture  
+**Rationale:** R16F (half-float) has only ~11 bits mantissa, causing quantization of HU values  
+**Result:** No visible improvement
+
+### Attempt 2: Relax HU clamp in fragment shader
+**File:** `cprGpuRenderer.ts` fragment shader ~line 137  
+**Change:** `clamp(hu, -1024.0, 4096.0)` → `clamp(hu, -2048.0, 16384.0)`  
+**Result:** No visible improvement
+
+### Attempt 3: Fix adaptive VOI bias
+**Files:** `useCPROrchestrator.ts` `computeAdaptivePanoVoi()` function  
+**Change:** Widened window limits, shifted center bias lower  
+**Result:** VOI display now shows W:4500 L:1000 (correct, matching axial), but image is STILL binary
+
+### Attempt 4: Inherit VOI from axial viewport
+**File:** `useCPROrchestrator.ts` GPU path + CPU path  
+**Change:** Instead of adaptive VOI, read `axialViewport.getProperties().voiRange` and copy to pano  
+**Result:** W/L values in pano viewport now correctly match axial. Image is STILL binary.
+
+### Attempt 5: Move resetCamera() before setStack()
+**File:** `useCPROrchestrator.ts`  
+**Rationale:** `resetCamera()` after `setStack()` might trigger `resetToDefaultProperties()` → wipes VOI  
+**Result:** No visible improvement
+
+### Attempt 6: Skip VOILUTFunction injection for cpr-pano
+**File:** `CornerstoneViewportService.ts`  
+**Rationale:** Setting `VOILUTFunction` without `voiRange` triggers Cornerstone's auto-VOI reset  
+**Result:** No visible improvement
+
+---
+
+## Critical Observation After Attempt 4
+
+After fixing the VOI, the middle viewport **corner overlay now shows W:4500 L:1000** — exactly matching the axial viewport. This is proof the VOI is now correctly applied. Yet the image is still binary white-black.
+
+**This means: the problem is NOT the VOI. The pixel data values themselves are wrong.**
+
+With `W:4500 L:1000` → lower = -1250, upper = 3250:
+- Values below -1250 → pure black (air, background)
+- Values -1250 to 3250 → gray gradient (should be bone and soft tissue)
+- Values above 3250 → pure white (only very dense enamel/metal)
+
+But the image shows **mostly pure white with pure black patches** — no gray at all. This means the majority of pixel values are either very large (way above 3250) or very small (below -1250). No intermediate values.
+
+**For data that IS pre-scaled HU** (air=-1024, bone=250-1800, enamel=2000-4000), a window of [-1250, 3250] should show rich gray detail. The binary appearance means the pixel values are NOT in the expected HU range.
+
+---
+
+## Most Likely Root Cause: GPU readPixels Output Format
+
+### Hypothesis
+The GPU renderer (`cprGpuRenderer.ts`) renders the panoramic slice into a framebuffer and then calls `gl.readPixels()` to extract the pixel data. The critical question is:
+
+**What format is the output framebuffer, and what format is used in readPixels?**
+
+If the output framebuffer is standard 8-bit RGBA (the WebGL default), then float HU values get clamped and quantized to `[0, 255]` when the fragment shader writes to it — even if the shader computes the correct HU value. The `readPixels` would then return values in `[0, 255]`, which the rest of the pipeline interprets as HU values. With `W:4500 L:1000`, a range of only 0-255 would mostly appear either all-white or all-black.
+
+### What to investigate in `cprGpuRenderer.ts`
+
+1. **Framebuffer attachment format**: When the FBO is created, what texture format is attached? Look for `gl.framebufferTexture2D(...)` and what texture type is used as the color attachment. If it's `gl.RGBA` + `gl.UNSIGNED_BYTE` (default), output is 8-bit.
+
+2. **The readPixels call**: Find `gl.readPixels(...)` and check:
+   - 5th arg (format): `gl.RED`, `gl.RG`, `gl.RGB`, `gl.RGBA`?
+   - 6th arg (type): `gl.FLOAT`? Or `gl.UNSIGNED_BYTE`?
+   - The output buffer type: `Float32Array`? Or `Uint8Array`?  
+   If type is `gl.UNSIGNED_BYTE` but the receiving array is `Float32Array`, values are still only 0-255 stored as floats.
+
+3. **Fragment shader output variable type**: Is `gl_FragColor` / the output variable declared as `out float` (R32F FBO) or `out vec4` (RGBA FBO)?
+
+4. **Value normalization in shader**: Does the shader normalize the HU value to [0, 1] before writing output? E.g., `fragOutput = (hu - minHU) / range`? If so, the readback would yield [0,1] floats, not HU values.
+
+5. **The `EXT_color_buffer_float` extension**: Is it enabled? This extension is required to render to float framebuffers. Without it, float output is silently clamped.
+
+### Specific Pattern to Look For
+
+```glsl
+// BAD: shader outputs normalized [0,1] value
+out float fragOutput;
+void main() {
+  float hu = ...; // correct HU value
+  fragOutput = (hu + 1024.0) / 5120.0; // WRONG: normalizes to [0,1]
+}
+```
+
+```glsl
+// GOOD: shader outputs raw HU value
+out float fragOutput;
+void main() {
+  float hu = ...; // correct HU value
+  fragOutput = hu; // store actual HU
+}
+```
+
+Also check if `panoImageLoader.ts` does any additional scaling/normalization when it receives the pixelData and wraps it into a Cornerstone `IImage`. It sets `minPixelValue`, `maxPixelValue`, `slope`, `intercept` on the image — if slope/intercept are wrong, Cornerstone may re-scale the already-correct pixel values incorrectly.
+
+---
+
+## Key Functions to Examine
+
+### `cprGpuRenderer.ts`
+- `FRAG_SRC` (the GLSL fragment shader string) — check output variable type and what value is written
+- `ensureGpuContext()` — check what framebuffer texture format is attached
+- `renderPano()` / the main render call — check `gl.readPixels` call
+- The function that creates the output framebuffer textures
+
+### `panoImageLoader.ts`
+- The function that wraps pixelData into a Cornerstone IImage
+- Check `minPixelValue`, `maxPixelValue`, `slope`, `intercept` being set
+- Check if `getPixelData()` returns the data as-is or transforms it
+
+### `useCPROrchestrator.ts`
+- Around line 2594: `setPanoImagePayload(panoImageId, { ... slope: 1, intercept: 0 ... })` — these are passed to the image loader
+
+---
+
+## Console Logs That Would Help
+
+The log line `[CPR-LOADER-PAYLOAD-JSON]` in the browser console shows what the GPU renderer outputs. Key fields to check:
+- `minValue` and `maxValue` of the GPU output pixelData
+- `windowWidth` and `windowCenter` being stored
+
+If `minValue=0` and `maxValue=1.0` (or similar very small float range), that confirms the normalization hypothesis.
+
+If `minValue=-1024` and `maxValue=4096`, the GPU values are correct HU and the bug is downstream in how Cornerstone maps them during display.
+
+---
+
+## What Is Definitely Working
+
+- Left (axial) viewport: Cornerstone stack viewport with real DICOM slices → perfect
+- Right (cross-section) viewport: Cornerstone stack viewport with `cross://` custom imageId → perfect  
+- The pano imageId format is `pano://current/<timestamp>` (custom loader)
+- All three viewports show `W:4500 L:1000` (VOI is now correctly inherited)
+
+## What Is Definitely Not Working
+
+- The panoramic GPU-rendered image pixel values are incorrect — the resulting image looks binary (only pure black or pure white pixels, no gray intermediate values)
+
+---
+
+## Specific Question for Debugging Agent
+
+**The core question**: In `cprGpuRenderer.ts`, when `gl.readPixels()` is called to extract the rendered panoramic data, what are the exact format parameters, and does the fragment shader output raw HU values or normalized values? The binary appearance of the image (despite correct W/L) strongly suggests the pixel data is either:
+
+1. Normalized to [0,1] (then stored as floats and misinterpreted as HU), OR
+2. Truncated to 8-bit [0,255] (then stored as floats), OR
+3. The output FBO is not float-capable (EXT_color_buffer_float not active), causing silently clamped/wrong output
+
+Please examine `d:\diacom demo\Viewers\modes\cpr\src\cprGpuRenderer.ts` (specifically the fragment shader, framebuffer setup, and readPixels call) and `d:\diacom demo\Viewers\modes\cpr\src\panoImageLoader.ts` to find where the value range is being destroyed.

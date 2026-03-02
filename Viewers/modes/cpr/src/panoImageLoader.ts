@@ -114,6 +114,23 @@ export function createPanoImageId(): string {
 export function setPanoImagePayload(imageId: string, payload: PanoImagePayload): void {
   panoImageCache.set(imageId, payload);
   latestPanoImageId = imageId;
+  console.log('[CPR-LOADER-PAYLOAD-JSON]', JSON.stringify({
+    imageId,
+    width: payload.width,
+    height: payload.height,
+    minValue: payload.minValue,
+    maxValue: payload.maxValue,
+    huDomain: payload.huDomain === true,
+    windowWidth: payload.windowWidth ?? null,
+    windowCenter: payload.windowCenter ?? null,
+    slope: payload.slope ?? null,
+    intercept: payload.intercept ?? null,
+    rowPixelSpacing: payload.rowPixelSpacing ?? null,
+    columnPixelSpacing: payload.columnPixelSpacing ?? null,
+    first8: Array.from(payload.pixelData.subarray(0, Math.min(8, payload.pixelData.length))).map(
+      value => Math.round(Number(value) * 1000) / 1000
+    ),
+  }));
 }
 
 export function clearPanoImageCache(): void {
@@ -125,6 +142,14 @@ function createImageObject(imageId: string, payload: PanoImagePayload): cornerst
   const { pixelData, width, height } = payload;
   const display = getPanoDisplayMetadata(payload);
   const spacing = getPanoPixelSpacing(payload);
+  console.log('[CPR-LOADER-IMAGE-JSON]', JSON.stringify({
+    imageId,
+    width,
+    height,
+    display,
+    spacing,
+    huDomain: payload.huDomain === true,
+  }));
 
   const image: cornerstone.Types.IImage = {
     imageId,
@@ -163,6 +188,7 @@ function panoImageLoader(imageId: string): {
     const payload = panoImageCache.get(imageId);
 
     if (!payload) {
+      console.error('[CPR-LOADER-MISS-JSON]', JSON.stringify({ imageId, latestPanoImageId }));
       reject(
         new Error(
           `[panoImageLoader] No panoramic image cached for imageId: "${imageId}". ` +

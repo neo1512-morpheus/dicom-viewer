@@ -249,56 +249,8 @@ function trilinearCore(
   return c0 + fk * (c1 - c0);
 }
 
-function applyLightBilateralDenoise(
-  pixelData: Float32Array,
-  width: number,
-  height: number,
-  blendWeight: number
-): boolean {
-  if (width < 3 || height < 3 || blendWeight <= 0) return false;
-
-  // Aggressive multi-pass bilateral denoise: σ_range=500 HU smooths bone texture
-  // (~300-700 HU variation) while preserving tooth/air edges (>1000 HU difference)
-  const sigmaRange = 500;
-  const sigmaRangeDen = 2 * sigmaRange * sigmaRange;
-  const clampedBlend = Math.max(0, Math.min(0.85, blendWeight));
-  const keepWeight = 1 - clampedBlend;
-  const numPasses = 3;
-
-  const neighbors: Array<[number, number, number]> = [
-    [-1, -1, 0.45], [0, -1, 0.7], [1, -1, 0.45],
-    [-1, 0, 0.7], [1, 0, 0.7],
-    [-1, 1, 0.45], [0, 1, 0.7], [1, 1, 0.45],
-  ];
-
-  for (let pass = 0; pass < numPasses; pass++) {
-    const source = new Float32Array(pixelData);
-    for (let row = 1; row < height - 1; row++) {
-      for (let col = 1; col < width - 1; col++) {
-        const index = row * width + col;
-        const center = source[index];
-        if (!Number.isFinite(center)) continue;
-
-        let weightedSum = center;
-        let weightTotal = 1;
-        for (let n = 0; n < neighbors.length; n++) {
-          const [dx, dy, spatialWeight] = neighbors[n];
-          const neighborValue = source[(row + dy) * width + (col + dx)];
-          if (!Number.isFinite(neighborValue)) continue;
-          const delta = neighborValue - center;
-          const rangeWeight = Math.exp(-(delta * delta) / sigmaRangeDen);
-          const weight = spatialWeight * rangeWeight;
-          weightedSum += neighborValue * weight;
-          weightTotal += weight;
-        }
-
-        const filtered = weightTotal > 0 ? weightedSum / weightTotal : center;
-        pixelData[index] = keepWeight * center + clampedBlend * filtered;
-      }
-    }
-  }
-  return true;
-}
+// applyLightBilateralDenoise has been removed — strict MIP output is clean enough
+// from hardware trilinear interpolation and does not require post-processing.
 
 function computeArrayMinMax(buffer: Float32Array): { minValue: number; maxValue: number } {
   let minValue = Infinity;
@@ -368,7 +320,6 @@ function generatePanorama(input: CPRWorkerInput): {
   adaptiveVerticalIntervalCount: number;
   effectiveSlabSampleCount: number;
   robustMipTopCount: number;
-  denoiseApplied: boolean;
   diagnosticPayload: Record<string, unknown>;
   outputSignature: {
     sampledCount: number;
@@ -411,7 +362,7 @@ function generatePanorama(input: CPRWorkerInput): {
   let maxValue = -Infinity;
   const aggregationMode = aggregation === 'MEAN' ? 'MEAN' : 'MIP';
   const isMeanAggregation = aggregationMode === 'MEAN';
-  let robustMipTopCount = 1;
+  const robustMipTopCount = 1;
   const safeSlope =
     Number.isFinite(rescaleSlope) && Math.abs(Number(rescaleSlope)) > 1e-8 ? Number(rescaleSlope) : 1;
   const safeIntercept = Number.isFinite(rescaleIntercept) ? Number(rescaleIntercept) : 0;
@@ -538,29 +489,13 @@ function generatePanorama(input: CPRWorkerInput): {
   const targetSlabStepMm = Math.max(0.2, minVolumeSpacingMm * 0.75);
   const adaptiveSampleCount =
     slabHalfThicknessMm > 0 ? Math.ceil((slabHalfThicknessMm * 2) / targetSlabStepMm) + 1 : 1;
+  // For thick slabs (≥1mm), use the requested count directly for GPU/CPU parity.
+  // Cap at 32 to match GPU MAX_SLAB.
   const slabSampleCount = slabHalfThicknessMm <= 0.5
     ? baseSlabSampleCount   // thin slab: use exact requested count for max sharpness
-    : Math.max(
-      1,
-      Math.min(
-        13,
-        Math.max(
-          baseSlabSampleCount,
-          Math.min(adaptiveSampleCount, baseSlabSampleCount + 2)
-        )
-      )
-    );
-  if (!isMeanAggregation) {
-    robustMipTopCount =
-      slabSampleCount <= 1
-        ? 1
-        : slabSampleCount >= 13
-          ? 5
-          : slabSampleCount >= 9
-            ? 4
-            : slabSampleCount >= 7
-              ? 3
-              : 2;
+    : Math.max(1, Math.min(32, baseSlabSampleCount));
+  if (baseSlabSampleCount > 32) {
+    console.warn('[cprWorker] Slab sample count clamped from', baseSlabSampleCount, 'to 32');
   }
   const slabStepMm = slabSampleCount > 1 ? (slabHalfThicknessMm * 2) / (slabSampleCount - 1) : 0;
   const [nx, ny, nz] = dimensions;
@@ -720,10 +655,11 @@ function generatePanorama(input: CPRWorkerInput): {
       let max2 = -Infinity;
       let max3 = -Infinity;
       let max4 = -Infinity;
-      // For MEAN: Gaussian-weighted truncated mean
+      // Gaussian-weighted mean: σ = 60% of slab half-thickness (matches GPU shader)
       const meanSamples = isMeanAggregation ? new Float32Array(slabSampleCount) : null;
       const meanWeights = isMeanAggregation ? new Float32Array(slabSampleCount) : null;
-      const gaussSigmaSq2 = 2 * 0.7 * 0.7; // σ=0.7mm focal trough
+      const gaussSigma = Math.max(0.3, perColumnSlabHalf[col] * 0.6);
+      const gaussSigmaSq2 = 2 * gaussSigma * gaussSigma;
 
       for (let s = 0; s < slabSampleCount; s++) {
         const colSlabHalf = perColumnSlabHalf[col];
@@ -759,6 +695,9 @@ function generatePanorama(input: CPRWorkerInput): {
         }
         if (!Number.isFinite(sample)) sample = -1000;
 
+        // Wide safety clamp — matches GPU shader [-3000, 10000]
+        sample = Math.max(-3000, Math.min(10000, sample));
+
         if (isMeanAggregation) {
           const gw = Math.exp(-(slabOffset * slabOffset) / gaussSigmaSq2);
           meanSamples![s] = sample;
@@ -776,7 +715,9 @@ function generatePanorama(input: CPRWorkerInput): {
 
       let pixelValueRaw: number;
       if (isMeanAggregation) {
-        const trimCount = slabSampleCount >= 7 ? Math.max(1, Math.floor(slabSampleCount * 0.15)) : 0;
+        // Winsorize top ~8% to suppress metal/enamel spikes (matches GPU shader)
+        const trimHi = Math.max(1, Math.floor(slabSampleCount / 12));
+        const winsorIdx = slabSampleCount - 1 - trimHi;
         const idxBuf = new Uint8Array(slabSampleCount);
         for (let i = 0; i < slabSampleCount; i++) idxBuf[i] = i;
         for (let i = 1; i < slabSampleCount; i++) {
@@ -789,20 +730,25 @@ function generatePanorama(input: CPRWorkerInput): {
           }
           idxBuf[j + 1] = keyIdx;
         }
+        // Winsorize: cap high values to the 92nd percentile value
+        if (winsorIdx >= 0 && winsorIdx < slabSampleCount) {
+          const winsorCap = meanSamples![idxBuf[winsorIdx]];
+          for (let i = winsorIdx + 1; i < slabSampleCount; i++) {
+            meanSamples![idxBuf[i]] = winsorCap;
+          }
+        }
+        // Gaussian-weighted mean of winsorized samples
         let wSum = 0;
         let wTotal = 0;
-        for (let i = trimCount; i < slabSampleCount - trimCount; i++) {
+        for (let i = 0; i < slabSampleCount; i++) {
           const idx = idxBuf[i];
           wSum += meanSamples![idx] * meanWeights![idx];
           wTotal += meanWeights![idx];
         }
         pixelValueRaw = wTotal > 0 ? wSum / wTotal : meanSamples![Math.floor(slabSampleCount / 2)];
       } else {
+        // Strict MIP: take the maximum value (matches GPU shader behavior)
         pixelValueRaw = max1;
-        if (Number.isFinite(max2) && max1 - max2 > 850) max1 = 0.5 * (max1 + max2);
-        if (robustMipTopCount >= 4 && Number.isFinite(max4)) pixelValueRaw = 0.25 * (max1 + max2 + max3 + max4);
-        else if (robustMipTopCount >= 3 && Number.isFinite(max3)) pixelValueRaw = (max1 + max2 + max3) / 3;
-        else if (robustMipTopCount >= 2 && Number.isFinite(max2)) pixelValueRaw = 0.5 * (max1 + max2);
       }
       const pixelValue = Number.isFinite(pixelValueRaw) ? pixelValueRaw : -1000;
 
@@ -814,14 +760,7 @@ function generatePanorama(input: CPRWorkerInput): {
     }
   }
 
-  // Aggressive multi-pass bilateral denoise: smooths trabecular bone grain
-  const denoiseBlend = 0.65;
-  const denoiseApplied = applyLightBilateralDenoise(pixelData, panoWidth, panoHeight, denoiseBlend);
-  if (denoiseApplied) {
-    const denoisedRange = computeArrayMinMax(pixelData);
-    minValue = denoisedRange.minValue;
-    maxValue = denoisedRange.maxValue;
-  }
+  // No post-processing: strict MIP output is clean enough from trilinear interpolation.
 
   const diagnosticPayload = {
     oobRate: {
@@ -850,9 +789,7 @@ function generatePanorama(input: CPRWorkerInput): {
       slabHalfThicknessMm,
       aggregation: aggregationMode,
     },
-    sharpen: {
-      applied: denoiseApplied,
-    },
+    postProcessing: 'none',
     firstFrameWorldPos: frames?.[0]?.position ?? null,
     lastFrameWorldPos: frames?.[frames.length - 1]?.position ?? null,
   };
@@ -876,7 +813,6 @@ function generatePanorama(input: CPRWorkerInput): {
     adaptiveVerticalIntervalCount: 1,
     effectiveSlabSampleCount: slabSampleCount,
     robustMipTopCount,
-    denoiseApplied,
     diagnosticPayload,
     outputSignature,
   };
@@ -927,7 +863,6 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
       adaptiveVerticalIntervalCount,
       effectiveSlabSampleCount,
       robustMipTopCount,
-      denoiseApplied,
       diagnosticPayload,
       outputSignature,
     } = generatePanorama(input);
@@ -966,7 +901,6 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
       requestedSlabSamples: input.slabSamples,
       effectiveSlabSampleCount,
       robustMipTopCount,
-      denoiseApplied,
     });
     console.log(
       `${workerTag} Output preview (first ${outputPixelPreview.length} pano pixels):`,
@@ -982,7 +916,6 @@ self.onmessage = function (event: MessageEvent<CPRWorkerInput>) {
       verticalCenterOffsetMm,
       effectiveSlabSampleCount,
       robustMipTopCount,
-      denoiseApplied,
     }));
     if (modalityLutFlagMismatch) {
       console.warn(

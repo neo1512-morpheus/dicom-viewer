@@ -26,11 +26,11 @@ export interface GpuPanoInput {
     verticalCenterOffsetMm: number;
     slabHalfThicknessMm: number;
     slabSamples: number;
-    gaussSigma: number; // σ for Gaussian slab weighting
 
     rescaleSlope: number;
     rescaleIntercept: number;
     applyRescale: boolean;
+    normalizationSignature?: string | null;
 
     /** Optional normalizer for packed stored values (bit alignment, sign extension). */
     normalizeStoredSample?: (value: number) => number;
@@ -67,7 +67,6 @@ uniform float uVertHalfMm;
 uniform float uVertCenterOffsetMm;
 uniform float uSlabHalfMm;
 uniform int uSlabSamples;
-uniform float uGaussSigma;
 uniform int uPanoWidth;
 uniform int uPanoHeight;
 
@@ -98,18 +97,24 @@ void main() {
 
   vec3 baseWorld = pos + vertOffsetMm * uVerticalDir;
 
-  float gaussSigmaSq2 = 2.0 * uGaussSigma * uGaussSigma;
   float slabStep = uSlabSamples > 1
     ? (uSlabHalfMm * 2.0) / float(uSlabSamples - 1)
     : 0.0;
 
-  // Edge margin: reject samples within 1.5 voxels of volume boundary
-  vec3 edgeMargin = 1.5 / uDims;
-  vec3 uvwMin = edgeMargin;
-  vec3 uvwMax = vec3(1.0) - edgeMargin;
+  // Gaussian sigma for focal trough weighting: 60% of slab half-thickness
+  // concentrates weight near the center while still using outer samples
+  float gaussSigma = max(0.3, uSlabHalfMm * 0.6);
+  float gaussSigmaSq2 = 2.0 * gaussSigma * gaussSigma;
 
-  float huSum = 0.0;
-  float wSum = 0.0;
+  // Hybrid edge handling boundaries:
+  // Far OOB: outside [-0.5/dim, 1.0 + 0.5/dim] -> skip (air)
+  // Near edge: between far boundary and texel center range -> clamp UV
+  vec3 farOobMin = -0.5 / uDims;
+  vec3 farOobMax = vec3(1.0) + 0.5 / uDims;
+  vec3 clampMin = 0.5 / uDims;
+  vec3 clampMax = vec3(1.0) - 0.5 / uDims;
+
+  // Collect valid samples for Gaussian-weighted trimmed mean
   float huSamples[32];
   float wSamples[32];
   int validCount = 0;
@@ -126,9 +131,13 @@ void main() {
     vec4 voxel4 = uWorldToIndex * vec4(sampleWorld, 1.0);
     vec3 uvw = (voxel4.xyz + 0.5) / uDims;
 
-    if (any(lessThan(uvw, uvwMin)) || any(greaterThan(uvw, uvwMax))) {
+    // Far OOB: skip entirely (sample is well outside volume)
+    if (any(lessThan(uvw, farOobMin)) || any(greaterThan(uvw, farOobMax))) {
       continue;
     }
+
+    // Near edge: clamp UV to valid texel-center range
+    uvw = clamp(uvw, clampMin, clampMax);
 
     // HARDWARE TRILINEAR on raw stored values
     float rawVal = texture(uVolume, uvw).r;
@@ -136,12 +145,10 @@ void main() {
     // Apply rescale AFTER interpolation (like Cornerstone GPU pipeline)
     float hu = uApplyRescale ? rawVal * uRescaleSlope + uRescaleIntercept : rawVal;
 
-    // Clamp to practical dental HU band to suppress outlier-driven speckle.
-    hu = clamp(hu, -1500.0, 5000.0);
+    // Wide safety clamp: catches broken data, preserves legitimate CBCT range
+    hu = clamp(hu, -3000.0, 10000.0);
 
     float gw = exp(-(slabOffset * slabOffset) / gaussSigmaSq2);
-    huSum += hu * gw;
-    wSum += gw;
     huSamples[validCount] = hu;
     wSamples[validCount] = gw;
     validCount++;
@@ -149,7 +156,7 @@ void main() {
 
   float finalHu = -1000.0;
   if (validCount > 0) {
-    // Insertion sort by HU for robust trimmed mean aggregation.
+    // Insertion sort by HU for trimmed mean
     for (int i = 1; i < MAX_SLAB; i++) {
       if (i >= validCount) break;
       float keyHu = huSamples[i];
@@ -166,21 +173,27 @@ void main() {
       wSamples[j + 1] = keyW;
     }
 
-    int trimCount = validCount >= 7 ? max(1, int(floor(float(validCount) * 0.15))) : 0;
-    int keepLo = trimCount;
-    int keepHi = validCount - trimCount;
-
-    float robustHuSum = 0.0;
-    float robustWSum = 0.0;
-    for (int i = 0; i < MAX_SLAB; i++) {
-      if (i < keepLo || i >= keepHi) continue;
-      robustHuSum += huSamples[i] * wSamples[i];
-      robustWSum += wSamples[i];
+    // Winsorize top ~8%: clamp high outliers (metal/enamel spikes) to the
+    // value at the 92nd percentile to suppress them without removing samples
+    int trimHi = max(1, validCount / 12);  // ~8% of samples
+    int winsorIdx = validCount - 1 - trimHi;
+    if (winsorIdx >= 0 && winsorIdx < validCount) {
+      float winsorCap = huSamples[winsorIdx];
+      for (int i = winsorIdx + 1; i < MAX_SLAB; i++) {
+        if (i >= validCount) break;
+        huSamples[i] = winsorCap;
+      }
     }
 
-    finalHu = robustWSum > 0.0
-      ? (robustHuSum / robustWSum)
-      : (wSum > 0.0 ? huSum / wSum : -1000.0);
+    // Gaussian-weighted mean of winsorized samples
+    float wSum = 0.0;
+    float wTotal = 0.0;
+    for (int i = 0; i < MAX_SLAB; i++) {
+      if (i >= validCount) break;
+      wSum += huSamples[i] * wSamples[i];
+      wTotal += wSamples[i];
+    }
+    finalHu = wTotal > 0.0 ? wSum / wTotal : -1000.0;
   }
   fragColor = vec4(finalHu, 0.0, 0.0, 1.0);
 }
@@ -195,6 +208,7 @@ let _vao: WebGLVertexArrayObject | null = null;
 // Volume texture cache (avoid re-uploading for same volume)
 let _volumeTex: WebGLTexture | null = null;
 let _cachedVolumeId: string | null = null;
+let _cachedVolumeNormalizationSignature: string | null = null;
 
 let _splineTex: WebGLTexture | null = null;
 let _fbo: WebGLFramebuffer | null = null;
@@ -210,7 +224,6 @@ let _uVertHalfMm = -1;
 let _uVertCenterOffsetMm = -1;
 let _uSlabHalfMm = -1;
 let _uSlabSamples = -1;
-let _uGaussSigma = -1;
 let _uPanoWidth = -1;
 let _uPanoHeight = -1;
 let _uWorldToIndex = -1;
@@ -277,97 +290,6 @@ function computeMinMax(buffer: Float32Array): { minValue: number; maxValue: numb
         return { minValue: 0, maxValue: 0 };
     }
     return { minValue, maxValue };
-}
-
-function applyLightBilateralDenoise(
-    pixelData: Float32Array,
-    width: number,
-    height: number,
-    blendWeight = 0.5,
-    sigmaRange = 280,
-    passes = 2
-): void {
-    if (width < 3 || height < 3 || !pixelData.length || passes <= 0) return;
-
-    const blend = Math.max(0, Math.min(0.9, blendWeight));
-    const keep = 1 - blend;
-    const sigmaDen = 2 * sigmaRange * sigmaRange;
-    const neighbors: Array<[number, number, number]> = [
-        [-1, -1, 0.45], [0, -1, 0.7], [1, -1, 0.45],
-        [-1, 0, 0.7], [1, 0, 0.7],
-        [-1, 1, 0.45], [0, 1, 0.7], [1, 1, 0.45],
-    ];
-
-    for (let pass = 0; pass < passes; pass++) {
-        const src = new Float32Array(pixelData);
-        for (let row = 1; row < height - 1; row++) {
-            const rowOffset = row * width;
-            for (let col = 1; col < width - 1; col++) {
-                const idx = rowOffset + col;
-                const center = src[idx];
-                if (!Number.isFinite(center)) continue;
-
-                let weightedSum = center;
-                let weightTotal = 1;
-
-                for (let n = 0; n < neighbors.length; n++) {
-                    const [dx, dy, spatialWeight] = neighbors[n];
-                    const sample = src[idx + dy * width + dx];
-                    if (!Number.isFinite(sample)) continue;
-                    const diff = sample - center;
-                    const rangeWeight = Math.exp(-(diff * diff) / sigmaDen);
-                    const w = spatialWeight * rangeWeight;
-                    weightedSum += sample * w;
-                    weightTotal += w;
-                }
-
-                if (weightTotal <= 0) continue;
-                const filtered = weightedSum / weightTotal;
-                pixelData[idx] = keep * center + blend * filtered;
-            }
-        }
-    }
-}
-
-function applyMildUnsharpMask(
-    pixelData: Float32Array,
-    width: number,
-    height: number,
-    amount = 0.16,
-    thresholdHu = 42
-): void {
-    if (width < 3 || height < 3 || !pixelData.length || amount <= 0) return;
-
-    const boost = Math.max(0, Math.min(0.45, amount));
-    const threshold = Math.max(0, thresholdHu);
-    const minHu = -1500;
-    const maxHu = 5000;
-    const src = new Float32Array(pixelData);
-
-    for (let row = 1; row < height - 1; row++) {
-        const rowOffset = row * width;
-        for (let col = 1; col < width - 1; col++) {
-            const idx = rowOffset + col;
-            const center = src[idx];
-            if (!Number.isFinite(center)) continue;
-
-            const blurred =
-                (src[idx] * 4 +
-                    (src[idx - 1] + src[idx + 1] + src[idx - width] + src[idx + width]) * 2 +
-                    (src[idx - width - 1] +
-                        src[idx - width + 1] +
-                        src[idx + width - 1] +
-                        src[idx + width + 1])) / 16;
-
-            if (!Number.isFinite(blurred)) continue;
-
-            const detail = center - blurred;
-            if (Math.abs(detail) < threshold) continue;
-
-            const sharpened = center + detail * boost;
-            pixelData[idx] = Math.max(minHu, Math.min(maxHu, sharpened));
-        }
-    }
 }
 
 // ─── Init ────────────────────────────────────────────────────────────
@@ -441,7 +363,6 @@ function ensureGpuContext(): WebGL2RenderingContext {
     _uVertCenterOffsetMm = _gl.getUniformLocation(_program, 'uVertCenterOffsetMm') as number;
     _uSlabHalfMm = _gl.getUniformLocation(_program, 'uSlabHalfMm') as number;
     _uSlabSamples = _gl.getUniformLocation(_program, 'uSlabSamples') as number;
-    _uGaussSigma = _gl.getUniformLocation(_program, 'uGaussSigma') as number;
     _uPanoWidth = _gl.getUniformLocation(_program, 'uPanoWidth') as number;
     _uPanoHeight = _gl.getUniformLocation(_program, 'uPanoHeight') as number;
     _uWorldToIndex = _gl.getUniformLocation(_program, 'uWorldToIndex') as number;
@@ -462,10 +383,20 @@ function uploadVolumeTexture(
     gl: WebGL2RenderingContext,
     scalarData: Float32Array | Int16Array,
     dims: [number, number, number],
+    normalizationSignature?: string | null,
+    normalizeStoredSample?: (value: number) => number,
     volumeId?: string
 ): void {
+    const effectiveNormalizationSignature = normalizeStoredSample
+        ? (normalizationSignature ?? 'normalized:unspecified')
+        : 'raw';
     // Skip re-upload if same volume
-    if (volumeId && volumeId === _cachedVolumeId && _volumeTex) {
+    if (
+        volumeId &&
+        volumeId === _cachedVolumeId &&
+        _cachedVolumeNormalizationSignature === effectiveNormalizationSignature &&
+        _volumeTex
+    ) {
         return;
     }
 
@@ -485,14 +416,15 @@ function uploadVolumeTexture(
     // Allocate 3D texture storage (R32F for full precision — avoids half-float quantization)
     gl.texStorage3D(gl.TEXTURE_3D, 1, gl.R32F, nx, ny, nz);
 
-    // Upload RAW stored values slice-by-slice (NO rescale — rescale is done in shader)
+    // Upload source-domain values slice-by-slice (optionally normalized; no rescale here).
     const sliceSize = nx * ny;
     const sliceFloat = new Float32Array(sliceSize);
 
     for (let k = 0; k < nz; k++) {
         const offset = k * sliceSize;
         for (let i = 0; i < sliceSize; i++) {
-            sliceFloat[i] = scalarData[offset + i];
+            const sourceValue = scalarData[offset + i];
+            sliceFloat[i] = normalizeStoredSample ? normalizeStoredSample(sourceValue) : sourceValue;
         }
         gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, k, nx, ny, 1, gl.RED, gl.FLOAT, sliceFloat);
 
@@ -503,7 +435,7 @@ function uploadVolumeTexture(
                 if (sliceFloat[i] < sliceMin) sliceMin = sliceFloat[i];
                 if (sliceFloat[i] > sliceMax) sliceMax = sliceFloat[i];
             }
-            console.log('[CPR-GPU] Volume texture MIDDLE slice stats (raw, no rescale)', {
+            console.log('[CPR-GPU] Volume texture MIDDLE slice stats (upload domain, no rescale)', {
                 sliceK: k, sliceMin, sliceMax,
                 first5: Array.from(sliceFloat.subarray(0, 5)),
             });
@@ -511,7 +443,10 @@ function uploadVolumeTexture(
     }
 
     _cachedVolumeId = volumeId ?? null;
-    console.log(`[CPR-GPU] Volume texture uploaded: ${nx}×${ny}×${nz} (R32F, raw values)`);
+    _cachedVolumeNormalizationSignature = effectiveNormalizationSignature;
+    console.log(
+        `[CPR-GPU] Volume texture uploaded: ${nx}×${ny}×${nz} (R32F, ${effectiveNormalizationSignature})`
+    );
 }
 
 // ─── Spline Data Texture ────────────────────────────────────────────
@@ -609,14 +544,22 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         scalarData, dimensions, spacing, origin, direction, worldToIndex,
         frames, panoWidth, panoHeight,
         verticalDir, vertHalfMm, verticalCenterOffsetMm,
-        slabHalfThicknessMm, slabSamples, gaussSigma,
+        slabHalfThicknessMm, slabSamples,
         rescaleSlope, rescaleIntercept, applyRescale,
+        normalizationSignature,
         normalizeStoredSample,
     } = input;
     const t0 = performance.now();
 
     // 1. Upload volume texture with RAW values (cached by volumeId)
-    uploadVolumeTexture(gl, scalarData, dimensions, volumeId);
+    uploadVolumeTexture(
+        gl,
+        scalarData,
+        dimensions,
+        normalizationSignature,
+        normalizeStoredSample,
+        volumeId
+    );
 
     // 2. Upload spline data
     uploadSplineTexture(gl, frames, panoWidth);
@@ -654,7 +597,6 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
     gl.uniform1f(_uVertCenterOffsetMm, verticalCenterOffsetMm);
     gl.uniform1f(_uSlabHalfMm, slabHalfThicknessMm);
     gl.uniform1i(_uSlabSamples, slabSamples);
-    gl.uniform1f(_uGaussSigma, gaussSigma);
     gl.uniform1i(_uPanoWidth, panoWidth);
     gl.uniform1i(_uPanoHeight, panoHeight);
     gl.uniformMatrix4fv(_uWorldToIndex, false, w2iMat);
@@ -679,9 +621,7 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         pixelData[i] = rgba[i * 4];
     }
 
-    // Post-process in HU domain to reduce speckle while keeping tooth edges defined.
-    applyLightBilateralDenoise(pixelData, panoWidth, panoHeight, 0.5, 280, 2);
-    applyMildUnsharpMask(pixelData, panoWidth, panoHeight, 0.16, 42);
+    // No post-processing: Gaussian-weighted mean is clean from hardware trilinear + winsorization.
     const { minValue, maxValue } = computeMinMax(pixelData);
 
     const elapsed = performance.now() - t0;
@@ -736,6 +676,7 @@ export function disposeGpuPanoRenderer(): void {
     _gl = null;
     _canvas = null;
     _cachedVolumeId = null;
+    _cachedVolumeNormalizationSignature = null;
     _fboWidth = 0;
     _fboHeight = 0;
 }

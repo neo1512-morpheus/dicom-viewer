@@ -92,22 +92,21 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
     return true;
   }
 
-  const robustSpan = summary.p99 - summary.p01;
+  // Minimal sanity checks for MIP output.
+  // MIP naturally produces higher fractionAbove3000 (bone/enamel dominates), so the old
+  // looksMostlySaturatedHigh and speckle checks are removed — they were tuned for trimmed-mean.
   const hasExtremeOutliers = summary.min < -9000 || summary.max > 14000;
-  const looksMostlySaturatedHigh = summary.fractionAbove3000 > 0.6;
-  const isLowContrast = Number.isFinite(robustSpan) && robustSpan < 700;
-  const hasSplitTailDistribution =
-    summary.fractionBelowMinus950 > 0.5 && summary.fractionAbove3000 > 0.2;
-  const hasMedianOutOfTypicalRange = summary.p50 < -1800 || summary.p50 > 2600;
-  const hasStrongSpeckleNoise = summary.meanAbsDelta > 780;
+  const noUsableDynamicRange = (summary.max - summary.min) < 50;
+  const allAir = summary.fractionBelowMinus950 > 0.95;
+  const allHighSaturation = summary.fractionAbove3000 > 0.95;
+  const isAllNonFinite = !Number.isFinite(summary.min) || !Number.isFinite(summary.max);
 
   return (
     hasExtremeOutliers ||
-    looksMostlySaturatedHigh ||
-    isLowContrast ||
-    hasSplitTailDistribution ||
-    hasMedianOutOfTypicalRange ||
-    hasStrongSpeckleNoise
+    noUsableDynamicRange ||
+    allAir ||
+    allHighSaturation ||
+    isAllNonFinite
   );
 }
 
@@ -120,20 +119,22 @@ function getHardRejectReason(summary: FloatBufferDebugSummary | null): string | 
     return 'severely-corrupted';
   }
 
-  if (summary.meanAbsDelta > 760) {
-    return 'speckle-noise';
+  // Minimal sanity checks for MIP output.
+  // Old speckle/saturation heuristics removed — they were tuned for trimmed-mean aggregation.
+  if (!Number.isFinite(summary.min) || !Number.isFinite(summary.max)) {
+    return 'non-finite-range';
   }
 
-  if (summary.fractionAbove3000 > 0.35 && summary.p50 > 950) {
-    return 'high-saturation';
+  if ((summary.max - summary.min) < 50) {
+    return 'flat-image';
   }
 
-  if (summary.fractionBelowMinus950 < 0.003 && summary.p50 > 1200) {
-    return 'dense-fill';
+  if (summary.fractionBelowMinus950 > 0.95) {
+    return 'all-air';
   }
 
-  if (summary.p01 > -450 && summary.p50 > 900) {
-    return 'no-air-high-median';
+  if (summary.fractionAbove3000 > 0.95) {
+    return 'all-high-saturation';
   }
 
   return null;
@@ -1268,6 +1269,112 @@ function resolveEffectivePreScaledFlag(params: {
   return isHuLikeRange(scalarMin, scalarMax);
 }
 
+function createStoredValueNormalizer(params: {
+  scalarData: Float32Array | Int16Array;
+  scalarMin: number;
+  scalarMax: number;
+  bitsStored: number;
+  bitsAllocated: number;
+  highBit: number;
+  pixelRepresentation: number;
+  isPreScaled: boolean;
+}): {
+  allowStoredValueNormalization: boolean;
+  hasUnsignedPackedArtifact: boolean;
+  hasBitDepthRangeMismatch: boolean;
+  normalizationSignature: string | null;
+  normalizeStoredSample?: (value: number) => number;
+} {
+  const {
+    scalarData,
+    scalarMin,
+    scalarMax,
+    bitsStored,
+    bitsAllocated,
+    highBit,
+    pixelRepresentation,
+    isPreScaled,
+  } = params;
+
+  const nominalBitsStored =
+    Number.isFinite(bitsStored) && Number(bitsStored) > 0 ? Math.floor(Number(bitsStored)) : 16;
+  const nominalStoredMax =
+    nominalBitsStored > 0 && nominalBitsStored < 31 ? (1 << nominalBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
+  const nominalSignedMin =
+    nominalBitsStored > 0 && nominalBitsStored < 31 ? -(1 << (nominalBitsStored - 1)) : Number.MIN_SAFE_INTEGER;
+
+  const hasUnsignedPackedArtifact =
+    !isPreScaled &&
+    scalarData instanceof Int16Array &&
+    nominalBitsStored < 16 &&
+    Number(pixelRepresentation) === 0 &&
+    (scalarMin < -1 || scalarMax > nominalStoredMax + 8);
+
+  const hasBitDepthRangeMismatch =
+    !isPreScaled &&
+    scalarData instanceof Int16Array &&
+    nominalBitsStored < 16 &&
+    (scalarMin < nominalSignedMin - 8 || scalarMax > nominalStoredMax + 8);
+
+  const allowStoredValueNormalization =
+    !isPreScaled &&
+    scalarData instanceof Int16Array &&
+    nominalBitsStored > 0 &&
+    nominalBitsStored < 16 &&
+    (hasUnsignedPackedArtifact ||
+      hasBitDepthRangeMismatch ||
+      (Number(pixelRepresentation) === 0 && scalarMin >= 0 && scalarMax <= nominalStoredMax));
+
+  if (!allowStoredValueNormalization) {
+    return {
+      allowStoredValueNormalization,
+      hasUnsignedPackedArtifact,
+      hasBitDepthRangeMismatch,
+      normalizationSignature: null,
+    };
+  }
+
+  const safeBitsAllocated =
+    Number.isFinite(bitsAllocated) && Number(bitsAllocated) >= nominalBitsStored
+      ? Math.floor(Number(bitsAllocated))
+      : 16;
+  const safeHighBit =
+    Number.isFinite(highBit) && Number(highBit) >= 0 ? Math.floor(Number(highBit)) : nominalBitsStored - 1;
+  const normalizedHighBit = Math.max(0, Math.min(safeBitsAllocated - 1, safeHighBit));
+  const bitAlignmentShift = Math.max(-15, Math.min(15, normalizedHighBit + 1 - nominalBitsStored));
+  const storedMask = (1 << nominalBitsStored) - 1;
+  const storedSignBit = 1 << (nominalBitsStored - 1);
+  const storedRange = 1 << nominalBitsStored;
+  const normalizationSignature = `${nominalBitsStored}:${safeBitsAllocated}:${normalizedHighBit}:${Number(pixelRepresentation)}`;
+
+  const normalizeStoredSample = (value: number): number => {
+    if (!Number.isFinite(value)) {
+      return 0;
+    }
+    const intValue = Math.round(value);
+    const rawU16 = intValue & 0xffff;
+    let aligned = rawU16;
+    if (bitAlignmentShift > 0) {
+      aligned = rawU16 >>> bitAlignmentShift;
+    } else if (bitAlignmentShift < 0) {
+      aligned = (rawU16 << -bitAlignmentShift) & 0xffff;
+    }
+    let normalized = aligned & storedMask;
+    if (Number(pixelRepresentation) === 1 && (normalized & storedSignBit) !== 0) {
+      normalized -= storedRange;
+    }
+    return normalized;
+  };
+
+  return {
+    allowStoredValueNormalization,
+    hasUnsignedPackedArtifact,
+    hasBitDepthRangeMismatch,
+    normalizationSignature,
+    normalizeStoredSample,
+  };
+}
+
 function findViewportByLogicalId(
   servicesManager: any,
   logicalViewportId: string
@@ -2094,8 +2201,16 @@ export function useCPROrchestrator({
       const fastSlabSamples = 9;
       const meanFallbackSlabHalfThicknessMm = 1.0;
       const meanFallbackSlabSamples = 7;
-      const sharpMeanSlabHalfThicknessMm = 1.2;   // 2.4mm slab keeps teeth edges tighter
-      const sharpMeanSlabSamples = 7;
+      const sharpMeanSlabHalfThicknessMm = 3.5;   // 7mm total slab — balanced dental panoramic
+      const sharpMeanSlabSamples = (() => {
+        const targetStepMm = Math.max(0.2, minSpacing * 0.75);
+        const adaptive = Math.ceil((3.5 * 2) / targetStepMm) + 1;
+        const clamped = Math.max(9, Math.min(32, adaptive)); // Match GPU MAX_SLAB cap
+        if (adaptive > 32) {
+          console.warn(`[CPR][${debugRunId}] Slab sample count clamped from ${adaptive} to 32`);
+        }
+        return clamped;
+      })();
       const minimumPanoHeightPx = Math.max(160, Math.round(requestedPanoHeightPx * 0.55));
 
       const verticalDir = getSourceViewportVerticalDirection(
@@ -2449,9 +2564,19 @@ export function useCPROrchestrator({
             bitsStored: gpuPixStorage.bitsStored,
             pixelRepresentation: gpuPixStorage.pixelRepresentation,
           });
+          const gpuStoredValueNormalization = createStoredValueNormalizer({
+            scalarData: gpuScalarData,
+            scalarMin: gpuScalarMin,
+            scalarMax: gpuScalarMax,
+            bitsStored: gpuPixStorage.bitsStored,
+            bitsAllocated: gpuPixStorage.bitsAllocated,
+            highBit: gpuPixStorage.highBit,
+            pixelRepresentation: gpuPixStorage.pixelRepresentation,
+            isPreScaled: gpuIsPreScaled,
+          });
           // Use the same heuristic as the CPU worker for applying modality LUT.
-          // For GPU, prefer honoring raw volume.isPreScaled=true to avoid
-          // destructive double-rescale when range heuristics are ambiguous.
+          // Use effective preScaled status (not raw metadata) so implausible
+          // ranges can recover via normalization + LUT on GPU too.
           const gpuHeuristicApplyLut = shouldApplyModalityLutForCPR({
             slope: gpuRescaleSlope,
             intercept: gpuRescaleIntercept,
@@ -2459,10 +2584,10 @@ export function useCPROrchestrator({
             scalarMax: gpuScalarMax,
             bitsStored: gpuPixStorage.bitsStored,
             pixelRepresentation: gpuPixStorage.pixelRepresentation,
-            allowStoredValueNormalization: false,
+            allowStoredValueNormalization: gpuStoredValueNormalization.allowStoredValueNormalization,
             isPreScaled: gpuIsPreScaled,
           });
-          const gpuApplyRescale = gpuPixStorage.isPreScaled ? false : gpuHeuristicApplyLut;
+          const gpuApplyRescale = gpuIsPreScaled ? false : gpuHeuristicApplyLut;
           const gpuHasNonIdentityRescale =
             Math.abs(gpuRescaleSlope - 1) > 1e-6 || Math.abs(gpuRescaleIntercept) > 1e-6;
 
@@ -2477,6 +2602,10 @@ export function useCPROrchestrator({
             scalarMax: gpuScalarMax,
             bitsStored: gpuPixStorage.bitsStored,
             pixelRepresentation: gpuPixStorage.pixelRepresentation,
+            allowStoredValueNormalization: gpuStoredValueNormalization.allowStoredValueNormalization,
+            hasUnsignedPackedArtifact: gpuStoredValueNormalization.hasUnsignedPackedArtifact,
+            hasBitDepthRangeMismatch: gpuStoredValueNormalization.hasBitDepthRangeMismatch,
+            normalizationSignature: gpuStoredValueNormalization.normalizationSignature,
           });
 
           console.log(`[CPR][${debugRunId}] Attempting GPU panoramic render...`);
@@ -2520,10 +2649,11 @@ export function useCPROrchestrator({
                 verticalCenterOffsetMm: gpuVertCenterOffsetMm,
                 slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
                 slabSamples: sharpMeanSlabSamples,
-                gaussSigma: 0.55,
                 rescaleSlope: gpuRescaleSlope,
                 rescaleIntercept: gpuRescaleIntercept,
                 applyRescale: applyRescaleFlag,
+                normalizationSignature: gpuStoredValueNormalization.normalizationSignature,
+                normalizeStoredSample: gpuStoredValueNormalization.normalizeStoredSample,
               },
               sourceVolumeId
             );
@@ -2864,7 +2994,7 @@ export function useCPROrchestrator({
               verticalCenterOffsetMm: mandibularCenterOffsetMm,
               slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
               slabSamples: sharpMeanSlabSamples,
-              aggregation: 'MEAN',
+              aggregation: 'MIP',
             },
           },
         ];
@@ -3367,4 +3497,3 @@ export function useCPROrchestrator({
 
   return { onDone, onRedraw, onSliderChange, isGenerating, error };
 }
-

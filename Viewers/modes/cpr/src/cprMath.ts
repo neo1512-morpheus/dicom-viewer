@@ -194,10 +194,17 @@ export function buildRMFFrames(
   let S = initialBasis.S;
 
   let prevT = T0;
-  let prevNslab = toSlabNormal(N, S);
+  let prevNslab = projectPerpendicular(toSlabNormal(N, S), T0);
   if (normalizedVerticalDir) {
-    prevNslab = normalize(cross(T0, normalizedVerticalDir), prevNslab);
+    const initialU = projectPerpendicular(normalizedVerticalDir, T0);
+    if (norm(initialU) >= EPS) {
+      prevNslab = normalize(cross(T0, normalize(initialU, S)), prevNslab);
+    }
   }
+  if (norm(prevNslab) < EPS) {
+    prevNslab = pickStablePerpendicular(T0);
+  }
+  prevNslab = normalize(prevNslab, toSlabNormal(N, S));
 
   frames[0] = {
     index: 0,
@@ -216,24 +223,39 @@ export function buildRMFFrames(
 
     let transportedN = N;
     let transportedS = S;
+    let transportedNslab = prevNslab;
 
     if (axisLen >= EPS) {
       const angle = Math.atan2(axisLen, tangentDot);
       transportedN = rotateAroundAxis(N, axis, angle);
       transportedS = rotateAroundAxis(S, axis, angle);
+      transportedNslab = rotateAroundAxis(prevNslab, axis, angle);
     } else if (tangentDot < -0.9999) {
       const halfTurnAxis = pickStablePerpendicular(prevT);
       transportedN = rotateAroundAxis(N, halfTurnAxis, Math.PI);
       transportedS = rotateAroundAxis(S, halfTurnAxis, Math.PI);
+      transportedNslab = rotateAroundAxis(prevNslab, halfTurnAxis, Math.PI);
     }
 
     const basis = orthonormalizeFrame(T, transportedN, transportedS, N, S);
     const Ni = basis.N;
     const Si = basis.S;
 
-    let Nslab = toSlabNormal(Ni, Si);
+    let Nslab = projectPerpendicular(transportedNslab, T);
+    if (norm(Nslab) < EPS) {
+      Nslab = projectPerpendicular(toSlabNormal(Ni, Si), T);
+    }
     if (normalizedVerticalDir) {
-      Nslab = normalize(cross(T, normalizedVerticalDir), Nslab);
+      const targetU = projectPerpendicular(normalizedVerticalDir, T);
+      if (norm(targetU) >= EPS) {
+        const normalizedTargetU = normalize(targetU, Si);
+        const currentU = normalize(cross(Nslab, T), normalizedTargetU);
+        const blendedU = normalize(
+          add(scale(currentU, 0.95), scale(normalizedTargetU, 0.05)),
+          normalizedTargetU
+        );
+        Nslab = normalize(cross(T, blendedU), Nslab);
+      }
     }
     if (dot(Nslab, prevNslab) < 0) {
       Nslab = negate(Nslab);

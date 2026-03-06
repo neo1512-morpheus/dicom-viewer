@@ -26,6 +26,10 @@ interface FloatBufferDebugSummary {
   fractionBelowMinus950: number;
   fractionAbove3000: number;
   meanAbsDelta: number;
+  lowerBandP50: number;
+  lowerBandBrightFraction: number;
+  detailBandHorizontalEdgeMean: number;
+  detailBandVerticalEdgeMean: number;
 }
 
 interface PanoVoiSettings {
@@ -100,6 +104,17 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
   const hasMedianOutOfTypicalRange = summary.p50 < -1800 || summary.p50 > 2600;
   const hasStrongSpeckleNoise = summary.meanAbsDelta > 780;
   const hasModerateSpeckleNoise = summary.meanAbsDelta > 640;
+  const hasLowerBandFill =
+    summary.lowerBandP50 > 140 || summary.lowerBandBrightFraction > 0.7;
+  const detailAnisotropyRatio =
+    summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean);
+  const balancedDetailEdgeMean = Math.min(
+    summary.detailBandHorizontalEdgeMean,
+    summary.detailBandVerticalEdgeMean * 2.4
+  );
+  const hasWeakDentalSeparation = balancedDetailEdgeMean < 38;
+  const hasShearWarping =
+    summary.detailBandHorizontalEdgeMean > 220 && detailAnisotropyRatio > 3;
 
   return (
     hasExtremeOutliers ||
@@ -108,7 +123,10 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
     hasSplitTailDistribution ||
     hasMedianOutOfTypicalRange ||
     hasStrongSpeckleNoise ||
-    hasModerateSpeckleNoise
+    hasModerateSpeckleNoise ||
+    hasLowerBandFill ||
+    hasWeakDentalSeparation ||
+    hasShearWarping
   );
 }
 
@@ -125,6 +143,10 @@ function getHardRejectReason(summary: FloatBufferDebugSummary | null): string | 
     return 'speckle-noise';
   }
 
+  if (summary.lowerBandP50 > 260 && summary.lowerBandBrightFraction > 0.78) {
+    return 'lower-band-fill';
+  }
+
   if (summary.fractionAbove3000 > 0.35 && summary.p50 > 950) {
     return 'high-saturation';
   }
@@ -137,6 +159,12 @@ function getHardRejectReason(summary: FloatBufferDebugSummary | null): string | 
     return 'no-air-high-median';
   }
 
+  const detailAnisotropyRatio =
+    summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean);
+  if (summary.detailBandHorizontalEdgeMean > 320 && detailAnisotropyRatio > 4.8) {
+    return 'shear-warping';
+  }
+
   return null;
 }
 
@@ -146,12 +174,18 @@ function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
   }
 
   const robustSpan = summary.p99 - summary.p01;
+  const detailAnisotropyRatio =
+    summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean);
+  const balancedDetailEdgeMean = Math.min(
+    summary.detailBandHorizontalEdgeMean,
+    summary.detailBandVerticalEdgeMean * 2.4
+  );
   let score = 0;
 
   if (Number.isFinite(robustSpan)) {
-    if (robustSpan >= 1500 && robustSpan <= 6500) {
+    if (robustSpan >= 1300 && robustSpan <= 4200) {
       score += 4;
-    } else if (robustSpan >= 900 && robustSpan <= 9000) {
+    } else if (robustSpan >= 900 && robustSpan <= 5600) {
       score += 2;
     } else {
       score -= 2;
@@ -167,6 +201,42 @@ function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
     score -= Math.min(8, Math.abs(summary.p50 - 450) / 450);
   }
 
+  if (summary.lowerBandP50 <= -220) {
+    score += 4;
+  } else if (summary.lowerBandP50 <= -120) {
+    score += 2;
+  } else if (summary.lowerBandP50 <= -45) {
+    score += 0;
+  } else {
+    score -= Math.min(12, (summary.lowerBandP50 + 45) / 45);
+  }
+
+  if (summary.lowerBandBrightFraction <= 0.18) {
+    score += 4;
+  } else if (summary.lowerBandBrightFraction <= 0.32) {
+    score += 2;
+  } else if (summary.lowerBandBrightFraction <= 0.5) {
+    score += 0;
+  } else {
+    score -= Math.min(14, (summary.lowerBandBrightFraction - 0.5) * 28);
+  }
+
+  if (balancedDetailEdgeMean >= 70 && balancedDetailEdgeMean <= 220) {
+    score += 5;
+  } else if (balancedDetailEdgeMean >= 45) {
+    score += 2;
+  } else {
+    score -= 3;
+  }
+
+  if (summary.detailBandHorizontalEdgeMean > 260) {
+    score -= Math.min(6, (summary.detailBandHorizontalEdgeMean - 260) / 24);
+  }
+
+  if (detailAnisotropyRatio > 2.8) {
+    score -= Math.min(8, (detailAnisotropyRatio - 2.8) * 4.5);
+  }
+
   if (summary.fractionBelowMinus950 > 0.5 && summary.fractionAbove3000 > 0.2) {
     score -= 5;
   }
@@ -175,10 +245,12 @@ function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
     score -= Math.min(6, (robustSpan - 10000) / 1200);
   }
 
-  if (summary.meanAbsDelta <= 320) {
+  if (summary.meanAbsDelta <= 300) {
     score += 3;
-  } else if (summary.meanAbsDelta <= 520) {
-    score += 1;
+  } else if (summary.meanAbsDelta <= 430) {
+    score += 2;
+  } else if (summary.meanAbsDelta <= 560) {
+    score += 0;
   } else {
     score -= Math.min(12, (summary.meanAbsDelta - 520) / 80);
   }
@@ -245,7 +317,11 @@ function percentileFromSorted(values: number[], q: number): number {
   return values[lo] + t * (values[hi] - values[lo]);
 }
 
-function summarizeFloatBufferForDebug(buffer: Float32Array): FloatBufferDebugSummary | null {
+function summarizeFloatBufferForDebug(
+  buffer: Float32Array,
+  width?: number,
+  height?: number
+): FloatBufferDebugSummary | null {
   if (!buffer || buffer.length === 0) {
     return null;
   }
@@ -261,6 +337,14 @@ function summarizeFloatBufferForDebug(buffer: Float32Array): FloatBufferDebugSum
   let lastSampleValue: number | null = null;
   let absDeltaAccum = 0;
   let absDeltaCount = 0;
+  const hasGrid = !!width && !!height && width > 1 && height > 1 && width * height <= buffer.length;
+  const lowerBandSamples: number[] = [];
+  let lowerBandBrightCount = 0;
+  let lowerBandCount = 0;
+  let detailBandHorizontalEdgeAccum = 0;
+  let detailBandHorizontalEdgeCount = 0;
+  let detailBandVerticalEdgeAccum = 0;
+  let detailBandVerticalEdgeCount = 0;
 
   for (let i = 0; i < buffer.length; i += step) {
     const value = Number(buffer[i]);
@@ -288,11 +372,61 @@ function summarizeFloatBufferForDebug(buffer: Float32Array): FloatBufferDebugSum
     lastSampleValue = value;
   }
 
+  if (hasGrid) {
+    const safeWidth = Number(width);
+    const safeHeight = Number(height);
+    const rowStep = Math.max(1, Math.floor(safeHeight / 140));
+    const colStep = Math.max(1, Math.floor(safeWidth / 180));
+    const lowerBandStartRow = Math.max(0, Math.floor(safeHeight * 0.68));
+    const detailBandStartRow = Math.max(0, Math.floor(safeHeight * 0.12));
+    const detailBandEndRow = Math.min(safeHeight - 1, Math.ceil(safeHeight * 0.72));
+
+    for (let row = 0; row < safeHeight; row += rowStep) {
+      for (let col = 0; col < safeWidth; col += colStep) {
+        const index = row * safeWidth + col;
+        const value = Number(buffer[index]);
+        if (!Number.isFinite(value)) {
+          continue;
+        }
+
+        if (row >= lowerBandStartRow) {
+          lowerBandSamples.push(value);
+          lowerBandCount++;
+          if (value > -180) {
+            lowerBandBrightCount++;
+          }
+        }
+
+        if (row >= detailBandStartRow && row <= detailBandEndRow) {
+          const nextCol = col + colStep;
+          if (nextCol < safeWidth) {
+            const neighborValue = Number(buffer[row * safeWidth + nextCol]);
+            if (Number.isFinite(neighborValue)) {
+              detailBandHorizontalEdgeAccum += Math.abs(neighborValue - value);
+              detailBandHorizontalEdgeCount++;
+            }
+          }
+          const nextRow = row + rowStep;
+          if (nextRow <= detailBandEndRow) {
+            const neighborValue = Number(buffer[nextRow * safeWidth + col]);
+            if (Number.isFinite(neighborValue)) {
+              detailBandVerticalEdgeAccum += Math.abs(neighborValue - value);
+              detailBandVerticalEdgeCount++;
+            }
+          }
+        }
+      }
+    }
+  }
+
   if (!samples.length || !Number.isFinite(min) || !Number.isFinite(max)) {
     return null;
   }
 
   samples.sort((a, b) => a - b);
+  if (lowerBandSamples.length) {
+    lowerBandSamples.sort((a, b) => a - b);
+  }
   const sampledCount = samples.length;
 
   return {
@@ -305,6 +439,12 @@ function summarizeFloatBufferForDebug(buffer: Float32Array): FloatBufferDebugSum
     fractionBelowMinus950: belowCount / sampledCount,
     fractionAbove3000: aboveCount / sampledCount,
     meanAbsDelta: absDeltaCount > 0 ? absDeltaAccum / absDeltaCount : 0,
+    lowerBandP50: lowerBandSamples.length ? percentileFromSorted(lowerBandSamples, 0.5) : 0,
+    lowerBandBrightFraction: lowerBandCount > 0 ? lowerBandBrightCount / lowerBandCount : 0,
+    detailBandHorizontalEdgeMean:
+      detailBandHorizontalEdgeCount > 0 ? detailBandHorizontalEdgeAccum / detailBandHorizontalEdgeCount : 0,
+    detailBandVerticalEdgeMean:
+      detailBandVerticalEdgeCount > 0 ? detailBandVerticalEdgeAccum / detailBandVerticalEdgeCount : 0,
   };
 }
 
@@ -333,7 +473,7 @@ function computeAdaptivePanoVoi(
 
   // Avoid hard clipping by padding both sides of the robust percentile range.
   const robustSpan = Math.max(1, upper - lower);
-  const padding = Math.max(30, robustSpan * 0.05);
+  const padding = Math.max(20, robustSpan * 0.03);
   lower -= padding;
   upper += padding;
 
@@ -386,12 +526,29 @@ function computeAdaptivePanoVoi(
       };
     }
 
-    const MIN_HU_WINDOW_WIDTH = 2300;
-    const MAX_DENTAL_WINDOW_WIDTH = 3200;
+    if (summary && summary.lowerBandBrightFraction > 0.62) {
+      const targetWidth =
+        summary.detailBandHorizontalEdgeMean > 210 ? 1300 : 1450;
+      const targetCenter = Math.max(
+        120,
+        Math.min(260, 170 + (summary.lowerBandBrightFraction - 0.62) * 260 + Math.max(0, summary.p50) * 0.15)
+      );
+      return {
+        lower: targetCenter - targetWidth / 2,
+        upper: targetCenter + targetWidth / 2,
+        windowWidth: targetWidth,
+        windowCenter: targetCenter,
+      };
+    }
+
+    const MIN_HU_WINDOW_WIDTH =
+      summary && summary.detailBandHorizontalEdgeMean >= 85 ? 1600 : 1750;
+    const MAX_DENTAL_WINDOW_WIDTH =
+      summary && summary.lowerBandBrightFraction > 0.45 ? 2200 : 2500;
     const widthWithMin = Math.max(windowWidth, MIN_HU_WINDOW_WIDTH);
     const cappedWidth = Math.min(widthWithMin, MAX_DENTAL_WINDOW_WIDTH);
-    const dentalCenterMin = 300;
-    const dentalCenterMax = 800;
+    const dentalCenterMin = -120;
+    const dentalCenterMax = 380;
     const biasedCenter =
       windowCenter < dentalCenterMin
         ? windowCenter + (dentalCenterMin - windowCenter) * 0.4
@@ -2078,31 +2235,35 @@ export function useCPROrchestrator({
         CPR_PANO_DEFAULT_VERTICAL_HALF_MM,
         Math.min(CPR_PANO_MAX_VERTICAL_HALF_MM, autoVerticalHalfMm)
       );
-      const thinnerVerticalHalfMm = Math.max(12, Math.min(18, baseVerticalHalfMm * 0.74));
-      const narrowVerticalHalfMm = Math.max(10.5, Math.min(13.5, thinnerVerticalHalfMm * 0.78));
+      const thinnerVerticalHalfMm = Math.max(10.2, Math.min(14.2, baseVerticalHalfMm * 0.62));
+      const narrowVerticalHalfMm = Math.max(8.4, Math.min(10.6, thinnerVerticalHalfMm * 0.72));
+      const toothBandVerticalHalfMm = Math.max(7.8, Math.min(9.4, narrowVerticalHalfMm * 0.88));
       const mediumVerticalHalfMm = Math.max(
-        narrowVerticalHalfMm + 1.4,
-        Math.min(15.5, thinnerVerticalHalfMm * 0.92)
+        narrowVerticalHalfMm + 0.6,
+        Math.min(10.8, thinnerVerticalHalfMm * 0.84)
       );
       const broadVerticalHalfMm = Math.max(
-        mediumVerticalHalfMm + 1.4,
-        Math.min(18, thinnerVerticalHalfMm * 1.05)
+        mediumVerticalHalfMm + 0.8,
+        Math.min(11.8, thinnerVerticalHalfMm * 0.92)
       );
       const neutralVerticalCenterOffsetMm = 0;
-      const subtleMandibularCenterOffsetMm = -2.5;
-      const mandibularCenterOffsetMm = -4;
-      const strongMandibularCenterOffsetMm = -5.5;
-      const balancedSlabHalfThicknessMm = 2.0;
-      const balancedSlabSamples = 11;
+      const superiorMandibularCenterOffsetMm = -1.8;
+      const subtleMandibularCenterOffsetMm = -2.6;
+      const mandibularCenterOffsetMm = -3.4;
+      const strongMandibularCenterOffsetMm = -4.6;
+      const balancedSlabHalfThicknessMm = 1.6;
+      const balancedSlabSamples = 9;
       const fastSlabHalfThicknessMm = 1.2;
       const fastSlabSamples = 7;
-      const balancedMeanSlabHalfThicknessMm = 1.0;
-      const balancedMeanSlabSamples = 7;
-      const broadMeanSlabHalfThicknessMm = 1.4;
-      const broadMeanSlabSamples = 9;
-      const meanFallbackSlabHalfThicknessMm = 0.8;
+      const balancedMeanSlabHalfThicknessMm = 0.7;
+      const balancedMeanSlabSamples = 5;
+      const focusedMeanSlabHalfThicknessMm = 0.35;
+      const focusedMeanSlabSamples = 3;
+      const broadMeanSlabHalfThicknessMm = 1.0;
+      const broadMeanSlabSamples = 7;
+      const meanFallbackSlabHalfThicknessMm = 0.45;
       const meanFallbackSlabSamples = 5;
-      const sharpMeanSlabHalfThicknessMm = 0.25;   // ~2 voxels total slab
+      const sharpMeanSlabHalfThicknessMm = 0.2;   // ~2 voxels total slab
       const sharpMeanSlabSamples = 3;
       const minimumPanoHeightPx = Math.max(160, Math.round(requestedPanoHeightPx * 0.55));
 
@@ -2241,7 +2402,7 @@ export function useCPROrchestrator({
           }
         }
 
-        const summary = summarizeFloatBufferForDebug(result.pixelData);
+        const summary = summarizeFloatBufferForDebug(result.pixelData, finalPanoWidth, finalPanoHeight);
         const voi = computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
         const qualityBase = scorePanoQuality(summary);
         const splitPenalty = summary
@@ -2253,36 +2414,70 @@ export function useCPROrchestrator({
           Math.max(0, -9000 - summary.min) / 1500
           : 8;
         const denseFillPenalty = summary
-          ? Math.max(0, summary.p50 - 850) / 70 + Math.max(0, summary.p50 - 1150) / 45
+          ? Math.max(0, summary.p50 - 900) / 90 + Math.max(0, summary.p50 - 1200) / 55
           : 0;
-        const specklePenalty = summary ? Math.max(0, summary.meanAbsDelta - 420) / 45 : 0;
+        const specklePenalty = summary ? Math.max(0, summary.meanAbsDelta - 460) / 60 : 0;
         const focalTroughPenalty =
-          Math.max(0, actualVertHalfMm - 15) / 0.8 +
-          Math.max(0, requestedSlabHalfThicknessMm - 1.35) *
-            (requestedAggregation === 'MIP' ? 4.5 : 3);
+          Math.max(0, actualVertHalfMm - 10.8) / 0.45 +
+          Math.max(0, requestedSlabHalfThicknessMm - 0.8) *
+            (requestedAggregation === 'MIP' ? 5 : 3.5);
+        const lowerBandFillPenalty = summary
+          ? Math.max(0, summary.lowerBandP50 + 140) / 38 +
+            Math.max(0, summary.lowerBandBrightFraction - 0.24) * 24 +
+            Math.max(0, summary.lowerBandBrightFraction - 0.55) * 42
+          : 0;
+        const detailBalanceRatio = summary
+          ? summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean)
+          : 1;
+        const balancedDetailEdgeMean = summary
+          ? Math.min(summary.detailBandHorizontalEdgeMean, summary.detailBandVerticalEdgeMean * 2.4)
+          : 0;
+        const detailReward = summary
+          ? Math.max(-2.5, Math.min(4, (balancedDetailEdgeMean - 55) / 28)) -
+            Math.max(0, detailBalanceRatio - 2.6) * 2.2
+          : 0;
+        const deformationPenalty = summary
+          ? Math.max(0, detailBalanceRatio - 2.8) * 3.6 +
+            Math.max(0, summary.detailBandHorizontalEdgeMean - 240) / 28
+          : 0;
+        const tallFillPenalty = summary
+          ? Math.max(0, actualVertHalfMm - 9.8) * Math.max(0, summary.lowerBandBrightFraction - 0.45) * 28
+          : 0;
         const noAirPenalty = summary
           ? summary.fractionBelowMinus950 < 0.005
-            ? 6
+            ? 2
             : summary.fractionBelowMinus950 < 0.015
-              ? 3
+              ? 1
               : 0
           : 0;
         const elevatedP01Penalty = summary ? Math.max(0, summary.p01 + 780) / 80 : 0;
         const aggregationPenalty =
           requestedAggregation === 'MIP'
-            ? 2.5 + (summary ? Math.max(0, summary.meanAbsDelta - 340) / 55 : 0)
+            ? 4.5 + (summary ? Math.max(0, summary.meanAbsDelta - 300) / 45 : 0)
             : 0;
-        const hardRejectReason = getHardRejectReason(summary);
+        const baseHardRejectReason = getHardRejectReason(summary);
+        const hardRejectReason =
+          !baseHardRejectReason &&
+          !!summary &&
+          requestedAggregation === 'MEAN' &&
+          actualVertHalfMm > 10.4 &&
+          summary.lowerBandBrightFraction > 0.64
+            ? 'tall-lower-band-fill'
+            : baseHardRejectReason;
         const hardRejectPenalty = hardRejectReason ? 30 : 0;
         const qualityScore =
           qualityBase +
+          detailReward +
           (huDomain ? 0 : -100) -
           splitPenalty -
           denseFillPenalty -
           specklePenalty -
           focalTroughPenalty -
+          lowerBandFillPenalty -
           noAirPenalty -
           elevatedP01Penalty -
+          deformationPenalty -
+          tallFillPenalty -
           aggregationPenalty -
           hardRejectPenalty;
 
@@ -2296,6 +2491,10 @@ export function useCPROrchestrator({
           p50: summary?.p50,
           p99: summary?.p99,
           meanAbsDelta: summary?.meanAbsDelta,
+          lowerBandP50: summary?.lowerBandP50,
+          lowerBandBrightFraction: summary?.lowerBandBrightFraction,
+          detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean,
+          detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean,
           fractionBelowMinus950: summary?.fractionBelowMinus950,
           fractionAbove3000: summary?.fractionAbove3000,
           huDomain,
@@ -2317,6 +2516,10 @@ export function useCPROrchestrator({
           denseFillPenalty,
           specklePenalty,
           focalTroughPenalty,
+          lowerBandFillPenalty,
+          detailReward,
+          deformationPenalty,
+          tallFillPenalty,
           noAirPenalty,
           elevatedP01Penalty,
           hardRejectReason,
@@ -2345,12 +2548,20 @@ export function useCPROrchestrator({
             p50: summary?.p50 ?? null,
             p99: summary?.p99 ?? null,
             meanAbsDelta: summary?.meanAbsDelta ?? null,
+            lowerBandP50: summary?.lowerBandP50 ?? null,
+            lowerBandBrightFraction: summary?.lowerBandBrightFraction ?? null,
+            detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean ?? null,
+            detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean ?? null,
             fractionBelowMinus950: summary?.fractionBelowMinus950 ?? null,
             fractionAbove3000: summary?.fractionAbove3000 ?? null,
             splitPenalty,
             denseFillPenalty,
             specklePenalty,
             focalTroughPenalty,
+            lowerBandFillPenalty,
+            detailReward,
+            deformationPenalty,
+            tallFillPenalty,
             noAirPenalty,
             elevatedP01Penalty,
             hardRejectReason,
@@ -2398,6 +2609,10 @@ export function useCPROrchestrator({
         p50: number | null;
         p99: number | null;
         meanAbsDelta: number | null;
+        lowerBandP50: number | null;
+        lowerBandBrightFraction: number | null;
+        detailBandHorizontalEdgeMean: number | null;
+        detailBandVerticalEdgeMean: number | null;
         fractionBelowMinus950: number | null;
         fractionAbove3000: number | null;
       }> = [];
@@ -2427,17 +2642,21 @@ export function useCPROrchestrator({
           p50: attempt.summary?.p50 ?? null,
           p99: attempt.summary?.p99 ?? null,
           meanAbsDelta: attempt.summary?.meanAbsDelta ?? null,
+          lowerBandP50: attempt.summary?.lowerBandP50 ?? null,
+          lowerBandBrightFraction: attempt.summary?.lowerBandBrightFraction ?? null,
+          detailBandHorizontalEdgeMean: attempt.summary?.detailBandHorizontalEdgeMean ?? null,
+          detailBandVerticalEdgeMean: attempt.summary?.detailBandVerticalEdgeMean ?? null,
           fractionBelowMinus950: attempt.summary?.fractionBelowMinus950 ?? null,
           fractionAbove3000: attempt.summary?.fractionAbove3000 ?? null,
         });
       };
 
-      let bestAttempt = await runWorkerAttempt('primary-mean-balanced-narrow', {
+      let bestAttempt = await runWorkerAttempt('primary-mean-toothband-narrow', {
         modalityLutOverride: true,
-        verticalHalfMm: narrowVerticalHalfMm,
-        verticalCenterOffsetMm: mandibularCenterOffsetMm,
-        slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
-        slabSamples: balancedMeanSlabSamples,
+        verticalHalfMm: toothBandVerticalHalfMm,
+        verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+        slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+        slabSamples: focusedMeanSlabSamples,
         aggregation: 'MEAN',
       });
       recordAttemptAudit(bestAttempt);
@@ -2445,52 +2664,7 @@ export function useCPROrchestrator({
       const retryConfigs: Array<{
         label: string;
         overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
-      }> = [
-          {
-            label: 'retry-balanced-mip-narrow',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: narrowVerticalHalfMm,
-              verticalCenterOffsetMm: mandibularCenterOffsetMm,
-              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-              slabSamples: balancedSlabSamples,
-              aggregation: 'MIP',
-            },
-          },
-          {
-            label: 'retry-fast-mip-narrow',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: narrowVerticalHalfMm,
-              verticalCenterOffsetMm: mandibularCenterOffsetMm,
-              slabHalfThicknessMm: fastSlabHalfThicknessMm,
-              slabSamples: fastSlabSamples,
-              aggregation: 'MIP',
-            },
-          },
-          {
-            label: 'retry-balanced-mip-medium-strong-bias',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: mediumVerticalHalfMm,
-              verticalCenterOffsetMm: strongMandibularCenterOffsetMm,
-              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-              slabSamples: balancedSlabSamples,
-              aggregation: 'MIP',
-            },
-          },
-          {
-            label: 'retry-balanced-mip-broad-biased',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: broadVerticalHalfMm,
-              verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-              slabSamples: balancedSlabSamples,
-              aggregation: 'MIP',
-            },
-          },
-        ];
+      }> = [];
 
       if (bestAttempt.result.effectiveIsPreScaled) {
         // Evaluate a no-LUT variant when source appears pre-scaled.
@@ -2499,10 +2673,10 @@ export function useCPROrchestrator({
           overrides: {
             modalityLutOverride: false,
             forceDisableStoredValueNormalization: true,
-            verticalHalfMm: narrowVerticalHalfMm,
-            verticalCenterOffsetMm: mandibularCenterOffsetMm,
-            slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
-            slabSamples: balancedMeanSlabSamples,
+            verticalHalfMm: toothBandVerticalHalfMm,
+            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+            slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+            slabSamples: focusedMeanSlabSamples,
             aggregation: 'MEAN',
           },
         });
@@ -2512,16 +2686,49 @@ export function useCPROrchestrator({
           overrides: {
             modalityLutOverride: true,
             forceDisableStoredValueNormalization: true,
-            verticalHalfMm: narrowVerticalHalfMm,
-            verticalCenterOffsetMm: mandibularCenterOffsetMm,
-            slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
-            slabSamples: balancedMeanSlabSamples,
+            verticalHalfMm: toothBandVerticalHalfMm,
+            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+            slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+            slabSamples: focusedMeanSlabSamples,
             aggregation: 'MEAN',
           },
         });
       }
 
       // Balanced MEAN attempts for clinically readable tooth and background separation
+      retryConfigs.push({
+        label: 'retry-mean-toothband-superior',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: toothBandVerticalHalfMm,
+          verticalCenterOffsetMm: superiorMandibularCenterOffsetMm,
+          slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+          slabSamples: focusedMeanSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
+      retryConfigs.push({
+        label: 'retry-mean-toothband-balanced',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: toothBandVerticalHalfMm,
+          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+          slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
+          slabSamples: meanFallbackSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
+      retryConfigs.push({
+        label: 'retry-mean-toothband-rooted',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: narrowVerticalHalfMm,
+          verticalCenterOffsetMm: mandibularCenterOffsetMm,
+          slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+          slabSamples: focusedMeanSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
       retryConfigs.push({
         label: 'retry-mean-balanced-medium',
         overrides: {
@@ -2534,11 +2741,22 @@ export function useCPROrchestrator({
         },
       });
       retryConfigs.push({
+        label: 'retry-mean-balanced-medium-strong-bias',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: mediumVerticalHalfMm,
+          verticalCenterOffsetMm: strongMandibularCenterOffsetMm,
+          slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+          slabSamples: balancedMeanSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
+      retryConfigs.push({
         label: 'retry-mean-balanced-narrow',
         overrides: {
           modalityLutOverride: true,
           verticalHalfMm: narrowVerticalHalfMm,
-          verticalCenterOffsetMm: mandibularCenterOffsetMm,
+          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
           slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
           slabSamples: balancedMeanSlabSamples,
           aggregation: 'MEAN',
@@ -2572,8 +2790,8 @@ export function useCPROrchestrator({
         label: 'retry-mean-sharp-narrow',
         overrides: {
           modalityLutOverride: true,
-          verticalHalfMm: narrowVerticalHalfMm,
-          verticalCenterOffsetMm: mandibularCenterOffsetMm,
+          verticalHalfMm: toothBandVerticalHalfMm,
+          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
           slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
           slabSamples: sharpMeanSlabSamples,
           aggregation: 'MEAN',
@@ -2629,6 +2847,71 @@ export function useCPROrchestrator({
                 attempt.qualityBase > bestAttempt.qualityBase)))
         ) {
           bestAttempt = attempt;
+        }
+      }
+
+      const shouldRunMipFallbacks =
+        !!bestAttempt.hardRejectReason ||
+        isLikelyPoorPanoQuality(bestAttempt.summary) ||
+        !!(
+          bestAttempt.summary &&
+          (bestAttempt.summary.lowerBandBrightFraction > 0.55 || bestAttempt.summary.lowerBandP50 > 150)
+        );
+
+      if (shouldRunMipFallbacks) {
+        const mipFallbackConfigs: Array<{
+          label: string;
+          overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
+        }> = [
+          {
+            label: 'retry-balanced-mip-narrow-fallback',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: mandibularCenterOffsetMm,
+              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+              slabSamples: balancedSlabSamples,
+              aggregation: 'MIP',
+            },
+          },
+          {
+            label: 'retry-fast-mip-narrow-fallback',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: mandibularCenterOffsetMm,
+              slabHalfThicknessMm: fastSlabHalfThicknessMm,
+              slabSamples: fastSlabSamples,
+              aggregation: 'MIP',
+            },
+          },
+          {
+            label: 'retry-balanced-mip-medium-strong-bias-fallback',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: mediumVerticalHalfMm,
+              verticalCenterOffsetMm: strongMandibularCenterOffsetMm,
+              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+              slabSamples: balancedSlabSamples,
+              aggregation: 'MIP',
+            },
+          },
+        ];
+
+        for (const retryConfig of mipFallbackConfigs) {
+          const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
+          recordAttemptAudit(attempt);
+          const bestHardRejected = !!bestAttempt.hardRejectReason;
+          const attemptHardRejected = !!attempt.hardRejectReason;
+          if (
+            (bestHardRejected && !attemptHardRejected) ||
+            (bestHardRejected === attemptHardRejected &&
+              (attempt.qualityScore > bestAttempt.qualityScore ||
+                (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
+                  attempt.qualityBase > bestAttempt.qualityBase)))
+          ) {
+            bestAttempt = attempt;
+          }
         }
       }
 
@@ -2733,6 +3016,10 @@ export function useCPROrchestrator({
           p50: panoDebugSummary.p50,
           p99: panoDebugSummary.p99,
           max: panoDebugSummary.max,
+          lowerBandP50: panoDebugSummary.lowerBandP50,
+          lowerBandBrightFraction: panoDebugSummary.lowerBandBrightFraction,
+          detailBandHorizontalEdgeMean: panoDebugSummary.detailBandHorizontalEdgeMean,
+          detailBandVerticalEdgeMean: panoDebugSummary.detailBandVerticalEdgeMean,
           fractionBelowMinus950: panoDebugSummary.fractionBelowMinus950,
           fractionAbove3000: panoDebugSummary.fractionAbove3000,
           sampledCount: panoDebugSummary.sampledCount,

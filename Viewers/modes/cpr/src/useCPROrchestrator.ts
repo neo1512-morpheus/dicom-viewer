@@ -99,6 +99,7 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
     summary.fractionBelowMinus950 > 0.5 && summary.fractionAbove3000 > 0.2;
   const hasMedianOutOfTypicalRange = summary.p50 < -1800 || summary.p50 > 2600;
   const hasStrongSpeckleNoise = summary.meanAbsDelta > 780;
+  const hasModerateSpeckleNoise = summary.meanAbsDelta > 640;
 
   return (
     hasExtremeOutliers ||
@@ -106,7 +107,8 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
     isLowContrast ||
     hasSplitTailDistribution ||
     hasMedianOutOfTypicalRange ||
-    hasStrongSpeckleNoise
+    hasStrongSpeckleNoise ||
+    hasModerateSpeckleNoise
   );
 }
 
@@ -2076,24 +2078,31 @@ export function useCPROrchestrator({
         CPR_PANO_DEFAULT_VERTICAL_HALF_MM,
         Math.min(CPR_PANO_MAX_VERTICAL_HALF_MM, autoVerticalHalfMm)
       );
-      const thinnerVerticalHalfMm = Math.max(14, Math.min(24, baseVerticalHalfMm * 0.82));
-      const narrowVerticalHalfMm = Math.max(12, Math.min(16, thinnerVerticalHalfMm * 0.68));
+      const thinnerVerticalHalfMm = Math.max(12, Math.min(18, baseVerticalHalfMm * 0.74));
+      const narrowVerticalHalfMm = Math.max(10.5, Math.min(13.5, thinnerVerticalHalfMm * 0.78));
       const mediumVerticalHalfMm = Math.max(
-        narrowVerticalHalfMm + 1.2,
-        Math.min(18, thinnerVerticalHalfMm * 0.82)
+        narrowVerticalHalfMm + 1.4,
+        Math.min(15.5, thinnerVerticalHalfMm * 0.92)
       );
-      const broadVerticalHalfMm = thinnerVerticalHalfMm;
+      const broadVerticalHalfMm = Math.max(
+        mediumVerticalHalfMm + 1.4,
+        Math.min(18, thinnerVerticalHalfMm * 1.05)
+      );
       const neutralVerticalCenterOffsetMm = 0;
-      const subtleMandibularCenterOffsetMm = -2;
-      const mandibularCenterOffsetMm = -3.5;
-      const strongMandibularCenterOffsetMm = -5;
-      const balancedSlabHalfThicknessMm = 2.5;
-      const balancedSlabSamples = 13;
-      const fastSlabHalfThicknessMm = 1.5;
-      const fastSlabSamples = 9;
-      const meanFallbackSlabHalfThicknessMm = 1.0;
-      const meanFallbackSlabSamples = 7;
-      const sharpMeanSlabHalfThicknessMm = 0.3;   // ~2 voxels total slab
+      const subtleMandibularCenterOffsetMm = -2.5;
+      const mandibularCenterOffsetMm = -4;
+      const strongMandibularCenterOffsetMm = -5.5;
+      const balancedSlabHalfThicknessMm = 2.0;
+      const balancedSlabSamples = 11;
+      const fastSlabHalfThicknessMm = 1.2;
+      const fastSlabSamples = 7;
+      const balancedMeanSlabHalfThicknessMm = 1.0;
+      const balancedMeanSlabSamples = 7;
+      const broadMeanSlabHalfThicknessMm = 1.4;
+      const broadMeanSlabSamples = 9;
+      const meanFallbackSlabHalfThicknessMm = 0.8;
+      const meanFallbackSlabSamples = 5;
+      const sharpMeanSlabHalfThicknessMm = 0.25;   // ~2 voxels total slab
       const sharpMeanSlabSamples = 3;
       const minimumPanoHeightPx = Math.max(160, Math.round(requestedPanoHeightPx * 0.55));
 
@@ -2246,6 +2255,11 @@ export function useCPROrchestrator({
         const denseFillPenalty = summary
           ? Math.max(0, summary.p50 - 850) / 70 + Math.max(0, summary.p50 - 1150) / 45
           : 0;
+        const specklePenalty = summary ? Math.max(0, summary.meanAbsDelta - 420) / 45 : 0;
+        const focalTroughPenalty =
+          Math.max(0, actualVertHalfMm - 15) / 0.8 +
+          Math.max(0, requestedSlabHalfThicknessMm - 1.35) *
+            (requestedAggregation === 'MIP' ? 4.5 : 3);
         const noAirPenalty = summary
           ? summary.fractionBelowMinus950 < 0.005
             ? 6
@@ -2254,7 +2268,10 @@ export function useCPROrchestrator({
               : 0
           : 0;
         const elevatedP01Penalty = summary ? Math.max(0, summary.p01 + 780) / 80 : 0;
-        const aggregationPenalty = 0;
+        const aggregationPenalty =
+          requestedAggregation === 'MIP'
+            ? 2.5 + (summary ? Math.max(0, summary.meanAbsDelta - 340) / 55 : 0)
+            : 0;
         const hardRejectReason = getHardRejectReason(summary);
         const hardRejectPenalty = hardRejectReason ? 30 : 0;
         const qualityScore =
@@ -2262,6 +2279,8 @@ export function useCPROrchestrator({
           (huDomain ? 0 : -100) -
           splitPenalty -
           denseFillPenalty -
+          specklePenalty -
+          focalTroughPenalty -
           noAirPenalty -
           elevatedP01Penalty -
           aggregationPenalty -
@@ -2296,6 +2315,8 @@ export function useCPROrchestrator({
           slabSamples: requestedSlabSamples,
           splitPenalty,
           denseFillPenalty,
+          specklePenalty,
+          focalTroughPenalty,
           noAirPenalty,
           elevatedP01Penalty,
           hardRejectReason,
@@ -2328,6 +2349,8 @@ export function useCPROrchestrator({
             fractionAbove3000: summary?.fractionAbove3000 ?? null,
             splitPenalty,
             denseFillPenalty,
+            specklePenalty,
+            focalTroughPenalty,
             noAirPenalty,
             elevatedP01Penalty,
             hardRejectReason,
@@ -2409,13 +2432,13 @@ export function useCPROrchestrator({
         });
       };
 
-      let bestAttempt = await runWorkerAttempt('primary-balanced-mip-medium', {
+      let bestAttempt = await runWorkerAttempt('primary-mean-balanced-narrow', {
         modalityLutOverride: true,
-        verticalHalfMm: mediumVerticalHalfMm,
-        verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-        slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-        slabSamples: balancedSlabSamples,
-        aggregation: 'MIP',
+        verticalHalfMm: narrowVerticalHalfMm,
+        verticalCenterOffsetMm: mandibularCenterOffsetMm,
+        slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+        slabSamples: balancedMeanSlabSamples,
+        aggregation: 'MEAN',
       });
       recordAttemptAudit(bestAttempt);
 
@@ -2472,33 +2495,79 @@ export function useCPROrchestrator({
       if (bestAttempt.result.effectiveIsPreScaled) {
         // Evaluate a no-LUT variant when source appears pre-scaled.
         retryConfigs.push({
-          label: 'retry-no-lut-mip-medium',
+          label: 'retry-no-lut-mean-narrow',
           overrides: {
             modalityLutOverride: false,
             forceDisableStoredValueNormalization: true,
-            verticalHalfMm: mediumVerticalHalfMm,
-            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-            slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-            slabSamples: balancedSlabSamples,
-            aggregation: 'MIP',
+            verticalHalfMm: narrowVerticalHalfMm,
+            verticalCenterOffsetMm: mandibularCenterOffsetMm,
+            slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+            slabSamples: balancedMeanSlabSamples,
+            aggregation: 'MEAN',
           },
         });
       } else {
         retryConfigs.push({
-          label: 'retry-force-lut-mip-medium-no-normalization',
+          label: 'retry-force-lut-mean-narrow-no-normalization',
           overrides: {
             modalityLutOverride: true,
             forceDisableStoredValueNormalization: true,
-            verticalHalfMm: mediumVerticalHalfMm,
-            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-            slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-            slabSamples: balancedSlabSamples,
-            aggregation: 'MIP',
+            verticalHalfMm: narrowVerticalHalfMm,
+            verticalCenterOffsetMm: mandibularCenterOffsetMm,
+            slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+            slabSamples: balancedMeanSlabSamples,
+            aggregation: 'MEAN',
           },
         });
       }
 
-      // Sharp MEAN attempts — thin slab for maximum tooth separation
+      // Balanced MEAN attempts for clinically readable tooth and background separation
+      retryConfigs.push({
+        label: 'retry-mean-balanced-medium',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: mediumVerticalHalfMm,
+          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+          slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+          slabSamples: balancedMeanSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
+      retryConfigs.push({
+        label: 'retry-mean-balanced-narrow',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: narrowVerticalHalfMm,
+          verticalCenterOffsetMm: mandibularCenterOffsetMm,
+          slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+          slabSamples: balancedMeanSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
+      retryConfigs.push({
+        label: 'retry-mean-broad-medium',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: mediumVerticalHalfMm,
+          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+          slabHalfThicknessMm: broadMeanSlabHalfThicknessMm,
+          slabSamples: broadMeanSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
+      retryConfigs.push({
+        label: 'retry-mean-broad-biased',
+        overrides: {
+          modalityLutOverride: true,
+          verticalHalfMm: broadVerticalHalfMm,
+          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+          slabHalfThicknessMm: broadMeanSlabHalfThicknessMm,
+          slabSamples: broadMeanSlabSamples,
+          aggregation: 'MEAN',
+        },
+      });
+
+      // Sharp MEAN attempts - thin slab for maximum tooth separation
       retryConfigs.push({
         label: 'retry-mean-sharp-narrow',
         overrides: {

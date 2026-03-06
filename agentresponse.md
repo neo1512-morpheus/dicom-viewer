@@ -1,700 +1,481 @@
-Yes — here is the **minimal CPU-only implementation spec** for all three patches.
+Yes — the next change should be a **true two-pass worker**, but specifically a **per-slab-offset two-pass reconstruction**, not just “render one pano, make one row mask, render again.”
 
-I’ll keep this tightly scoped to the smallest safe algorithmic changes in the existing flow.
+That is the minimal deeper change that breaks the current math failure.
 
----
-
-# 1) Minimal one-pass contamination fix inside `sampleReducedPoint()` in `cprWorker.ts`
-
-## Goal
-
-Suppress **lower/background anatomy before reduction** while keeping true tooth, root, and cortical structure.
-
-The key is to add a **per-sample anatomy gate** before the MEAN reducer, not to retune winsorization again.
-
-## 1. Exact gating signals to use
-
-Use only signals already available during render:
-
-### A. Normalized vertical position relative to current local center
-
-For each slab sample, compute:
-
-```ts
-yNorm = (sampleRow - localCenterRow) / max(effectiveVerticalHalfHeight, 1)
-```
-
-Assumption: **positive `yNorm` means below the local center**.
-If your row convention is opposite, flip the sign.
-
-This is the most important signal. The current failure is overwhelmingly **lower-band contamination**, so this signal should dominate the gate.
-
-### B. Existing slab-depth Gaussian weight
-
-Keep the existing depth weighting:
-
-```ts
-wDepth = exp(-0.5 * (slabOffset / sigmaSlab)²)
-```
-
-Do not remove it. Just stop letting it be the only thing.
-
-### C. Local vertical-profile tooth-likeness / band confidence
-
-Use the same local vertical profile behavior already available in the worker to derive a simple confidence in `[0, 1]`:
-
-```ts
-profileConf = clamp(localToothBandConfidenceAtThisRow, 0, 1)
-```
-
-If you do not have a per-row confidence directly, use a cheaper proxy:
-
-```ts
-profileConf = clamp(1 - smoothstep(0.45, 1.10, abs(yNorm)), 0, 1)
-```
-
-That fallback is weaker, but still useful.
-
-### D. Sample intensity relative to the slab’s own robust bright level
-
-To preserve true roots/cortex, use a simple local brightness rescue.
-For the current sample set, compute a cheap robust threshold such as `q75` of the in-bounds sample intensities.
-
-You do **not** need a fancy model. Just:
-
-* collect in-bounds slab sample values
-* compute `q75`
-* optionally also compute `q90` if easy
-
-This is used only as a **rescue**, not as the main gate.
+The core issue now is exactly what you diagnosed: the current gate is mostly a **row-level multiplier shared by nearly all slab samples at a pixel**, so the weighted mean largely normalizes it away. To really clean the pano, the second pass must decide **which individual slab samples are eligible** before reduction.
 
 ---
 
-## 2. Weighting formula for each slab sample
+## 1) Minimal deeper architecture change
 
-Use this structure:
+### Recommended change
 
-```ts
-w = wDepth * wAnatomy
-```
+Implement a **two-pass worker with a small slab-depth stack**:
 
-where:
+* **Pass 1:** render and store the per-depth sample planes
+  `I[k][col,row]`, where `k` is the slab sample index / offset
+* derive a **sample-eligibility mask**
+  `M[k][col,row] ∈ {0,1}` or soft `[0,1]`
+* **Pass 2:** rebuild the pano using only eligible slab samples before reduction
 
-```ts
-wLower = yNorm <= 0
-  ? 1
-  : 1 - 0.85 * smoothstep(0.20, 0.90, yNorm)
+Because your slab sample count is small (`~3–6`), this is still CPU-friendly and memory-friendly enough.
 
-wProfile = 0.20 + 0.80 * profileConf
-```
+### Why this is the right minimal change
 
-Then apply a brightness rescue so real bright root/cortical structure is not over-suppressed:
+It directly fixes the current failure mode:
 
-```ts
-isBrightRescue = value >= q75
-```
+* current row-level gating applies almost the same multiplier to all slab samples at a pixel
+* the reducer then renormalizes those weights
+* so contamination survives
 
-Final anatomy weight:
+A per-depth stack lets you say:
 
-```ts
-wAnatomy = wLower * wProfile
-```
+* this depth sample belongs to anatomy
+* this one is lower/background contamination
+* reject one, keep the other
 
-Then enforce a rescue floor for bright structure below center:
+That is the first change that is truly **sample-specific**.
 
-```ts
-if (yNorm > 0.20 && isBrightRescue) {
-  wAnatomy = max(wAnatomy, 0.50)
-}
-```
+### What not to do
 
-Final per-sample weight:
+Do not spend another cycle mainly retuning:
 
-```ts
-w = wDepth * wAnatomy
-```
+* winsorization
+* bright rescue thresholds
+* post-hoc denoise weighting
+* VOI/global contrast
 
-This is intentionally simple. It is the smallest patch that directly attacks the real failure mode.
+Those are secondary now.
 
 ---
 
-## 3. What should be rejected vs only downweighted
+## 2) Exactly how the first pass should estimate tooth-band / root-band / lower-background
 
-### Hard reject
+The first pass should produce two things:
 
-Reject only obviously bad lower/background samples:
+1. a provisional composite pano `P[col,row]`
+2. the raw per-depth planes `I[k][col,row]`
 
-```ts
-if (
-  yNorm > 1.00 &&
-  profileConf < 0.20 &&
-  value < q75
-) reject sample
+Then estimate three structures:
+
+* **tooth-band seeds**
+* **root-band connected support**
+* **lower-background exclusion**
+
+### Pass 1A: render raw per-depth planes
+
+For each pano pixel `(c,r)` and each slab sample index `k`:
+
+* sample the volume at that slab offset
+* store raw intensity in `I[k][c,r]`
+
+Also compute a provisional composite:
+
+* `P[c,r] = current reducer over all in-bounds k`
+* this provisional pano is only for structure estimation
+
+### Pass 1B: compute center-relative coordinates
+
+Using the already selected local center / vertical profile logic, compute for each column:
+
+* `centerRow[c]`
+* `halfHeight[c]`
+
+Then for each row:
+
+```text
+yNorm(c,r) = (r - centerRow[c]) / max(halfHeight[c], 1)
 ```
 
-That means:
+Use that only for structure estimation in pass 1, not as the final gate itself.
 
-* deep below the current local center
-* poor tooth-band evidence
-* not one of the brighter local slab samples
+### Pass 1C: estimate tooth-band seed map
 
-Those are the samples currently polluting the pano.
+Create a **seed mask** `S[c,r]` from the provisional pano `P`:
 
-### Strong downweight
+A pixel is a tooth-band seed if all are true:
 
-If not bad enough for rejection, but still suspicious:
+* `-0.30 <= yNorm <= 0.45`
+* `profileConf(c,r) >= 0.55`
+* `P[c,r] >= Pfloor[c] + 0.30 * (Ppeak[c] - Pfloor[c])`
 
-```ts
-if (
-  yNorm > 0.55 &&
-  profileConf < 0.35 &&
-  value < q75
-) w *= 0.25
+Where:
+
+* `Ppeak[c] = P[c, centerRow[c]]` or local peak near center
+* `Pfloor[c] = lower quartile / local floor of the column profile window`
+* `profileConf(c,r) = clamp((P[c,r] - Pfloor[c]) / max(Ppeak[c]-Pfloor[c], eps), 0, 1)`
+
+This seed map is the “trusted tooth/root origin.”
+
+### Pass 1D: build per-depth foreground maps
+
+For each depth plane `k`, define a foreground candidate map `F[k][c,r]`.
+
+Use a **lower threshold for growth** than for seed:
+
+* seed threshold:
+
+  * `Tseed[c] = Pfloor[c] + 0.35 * (Ppeak[c] - Pfloor[c])`
+* growth threshold:
+
+  * `Tgrow[c] = Pfloor[c] + 0.18 * (Ppeak[c] - Pfloor[c])`
+
+Then:
+
+* `SeedK[k][c,r] = S[c,r] && I[k][c,r] >= Tseed[c]`
+* `F[k][c,r] = I[k][c,r] >= Tgrow[c]`
+
+This is a hysteresis-style design:
+
+* seed from strong central anatomy
+* allow weaker downward continuation for roots
+
+### Pass 1E: grow connected root-band support per depth plane
+
+For each `k`, run a small 2D connected growth / flood fill on that plane:
+
+Start from `SeedK[k]`, and grow through `F[k]` with constraints:
+
+* connectivity: 4-connected is enough
+* allowed vertical range:
+
+  * up to around `yNorm <= 1.15`
+* allowed upward range:
+
+  * maybe `yNorm >= -0.45`
+* optional small horizontal continuity:
+
+  * allow neighbor columns `c±1`
+
+Result:
+
+* `M[k][c,r] = 1` if that per-depth pixel is part of a connected component originating from the tooth-band seed
+* else `0`
+
+This is the critical step.
+
+### Why this works
+
+True teeth and roots will form components that:
+
+* start in the tooth band
+* continue downward coherently
+
+TV-static lower contamination may be bright, but it usually does **not** form a component that is connected back to the seed band in the same depth plane.
+
+### Pass 1F: define lower-background
+
+You do not need a separate complex classifier.
+
+Define lower background implicitly as:
+
+* rows in the lower region (`yNorm > 0.50`)
+* that are **not connected** to tooth-band seeds in `M[k]`
+
+So lower/background is basically:
+
+```text
+B[k][c,r] = (yNorm > 0.50) && (M[k][c,r] == 0)
 ```
 
-### Leave mostly intact
-
-Do **not** aggressively suppress:
-
-* samples at or above local center
-* bright samples even slightly below center
-* anything with decent profile confidence
-
-That is how you avoid killing real teeth and roots.
+That is enough for the second pass.
 
 ---
 
-## 4. How to preserve true root / cortical signal
+## 3) Exactly how the second pass should use that information at slab-sample level before reduction
 
-This is the main place people overdo the gate and destroy anatomy.
+Second pass should be simple:
 
-Use these rules:
+For each pano pixel `(c,r)`:
 
-### A. Never hard-reject based on “below center” alone
+* look at each slab sample index `k`
+* if `M[k][c,r] == 0`, reject that sample before reduction
+* if `M[k][c,r] == 1`, keep it with normal slab-depth weight
 
-Roots often extend below the center estimate.
-So **depth below center is not enough**.
+### Final per-sample rule
 
-### B. Bright rescue wins over lower suppression
+For each sample `k`:
 
-If a sample is in the upper quartile of the local slab (`value >= q75`), keep a meaningful weight floor:
+```text
+baseWeight = GaussianDepthWeight(k)
 
-```ts
-wAnatomy = max(wAnatomy, 0.50)
-```
-
-This preserves:
-
-* root cortex
-* lamina-like bright boundaries
-* strong enamel/dentin interfaces that dip low locally
-
-### C. Keep the central band untouched
-
-For `yNorm <= 0.20`, do not suppress at all except normal slab Gaussian.
-
-That avoids flattening the main tooth body.
-
-### D. Use hard reject only for deep-lower + low-confidence + non-bright
-
-That combination is the contamination, not the anatomy.
-
----
-
-## 5. Debug counters to log
-
-Add counters that tell you whether the gate is doing useful work and whether it is too aggressive.
-
-### Sample counters
-
-* `gateInBoundsSampleCount`
-* `gateRejectedSampleCount`
-* `gateDownweightedSampleCount`
-* `gateBrightRescueCount`
-* `gateBelowCenterSampleCount`
-* `gateBelowCenterRejectedCount`
-* `gateBelowCenterRescuedCount`
-
-### Weight diagnostics
-
-* `gateMeanAnatomyWeight`
-* `gateMeanFinalWeight`
-* `gateMeanWeightBelowCenter`
-* `gateMeanWeightAboveCenter`
-
-### Decision-shape diagnostics
-
-* `gateDeepLowerLowConfCount`
-* `gateDeepLowerBrightRescueCount`
-* `gateNoSurvivorColumnCount`
-  This one is important. If it rises, the gate is too aggressive.
-
-### Optional percentile diagnostics
-
-* `gateSlabQ75Mean`
-* `gateRejectedBelowQ75Count`
-
----
-
-## 6. What log values should improve first if this works
-
-### Should improve first
-
-These are the primary acceptance metrics:
-
-* `lowerBandBrightFraction` should drop first and most
-
-  * from ~`0.75` toward something much lower
-* `lowerBandP50` should drop
-
-  * from ~`16` toward low single digits or clearly lower than current
-* `qualityScore` should improve materially
-
-### Likely secondary movement
-
-* `detailBandHorizontalEdgeMean` should drop somewhat
-
-  * because polluted background texture is contributing a lot of false horizontal edge energy right now
-* `detailBandVerticalEdgeMean` may stay similar at first or rise slightly
-
-### Failure sign the gate is too aggressive
-
-If this happens, you overdid it:
-
-* `lowerBandBrightFraction` improves, **but**
-* teeth or roots start disappearing
-* `detailBandVerticalEdgeMean` drops
-* `gateNoSurvivorColumnCount` rises
-* anterior/posterior root thickness visibly collapses
-
-That would mean the reject rule is too hard or the rescue floor is too low.
-
----
-
-## Minimal pseudocode sketch
-
-```ts
-collect inBounds samples: { value, slabOffset, sampleRow, profileConf }
-
-compute q75 over sample values
-
-for each sample:
-  wDepth = gaussian(slabOffset)
-
-  yNorm = (sampleRow - localCenterRow) / effectiveVerticalHalfHeight
-
-  wLower =
-    yNorm <= 0
-      ? 1
-      : 1 - 0.85 * smoothstep(0.20, 0.90, yNorm)
-
-  wProfile = 0.20 + 0.80 * profileConf
-  wAnatomy = wLower * wProfile
-
-  if (yNorm > 0.20 && value >= q75) {
-    wAnatomy = max(wAnatomy, 0.50)
-    brightRescueCount++
-  }
-
-  if (yNorm > 1.00 && profileConf < 0.20 && value < q75) {
+if M[k][c,r] == 0:
     reject
-    continue
-  }
-
-  if (yNorm > 0.55 && profileConf < 0.35 && value < q75) {
-    wAnatomy *= 0.25
-    downweightedCount++
-  }
-
-  finalWeight = wDepth * wAnatomy
-  keep sample with finalWeight
+else:
+    keep with weight = baseWeight
 ```
 
-That is the smallest useful one-pass gate.
+Optional soft version:
+
+```text
+weight = baseWeight * (0.75 + 0.25 * supportScore[k][c,r])
+```
+
+But for the first real reconstruction fix, **hard eligibility is better** than another soft attenuator.
+
+### Safety fallback
+
+If no sample is eligible at `(c,r)`:
+
+Fallback in this order:
+
+1. keep the **central-most in-bounds slab sample**
+2. else use the old ungated reducer result for that pixel
+
+This avoids holes.
+
+### Why this fixes the current failure
+
+Now the reducer is no longer averaging “all slab samples with slightly different weights.”
+
+It is averaging a **subset** of slab samples chosen by anatomy support.
+
+That is the first mechanism that can actually make the background disappear.
 
 ---
 
-# 2) Minimal safe transported-frame patch in `buildRMFFrames()` in `cprMath.ts`
+## 4) How to preserve true root/cortical signal while excluding contaminated lower anatomy
 
-## Goal
+This is where the design needs to be careful.
 
-Stop re-anchoring every frame to one global vertical.
-Transport the slab frame from one point to the next with **minimal rotation**.
+The right preservation rule is:
 
-This is the smallest real fix for the anterior shear.
+### Preserve roots by connectivity, not by raw brightness alone
 
----
+The current bright rescue is too blunt because bright contamination also gets rescued.
 
-## 1. Exact algorithm step-by-step
+Instead:
 
-For each spline sample `i`, you already have tangent `T[i]`.
+* preserve a lower sample only if it is **connected to a tooth-band seed**
+* not merely because it is bright
 
-### Step 1: initialize frame 0
+That is why the connected-component design matters.
 
-Use the global vertical only once to seed the first frame.
+### Use hysteresis thresholds
 
-Let:
+This is essential.
 
-```ts
-T0 = normalize(T[0])
-Utarget0 = normalize(verticalDir - dot(verticalDir, T0) * T0)
-```
+* **High threshold** to create tooth-band seeds
+* **Lower threshold** to grow roots downward
 
-If that degenerates, use a fallback axis least aligned with `T0`.
+So roots can remain visible even when weaker than crowns.
 
-Then:
+### Cap downward growth
 
-```ts
-N0 = normalize(cross(T0, Utarget0))
-U0 = normalize(cross(N0, T0))
-```
+Do not allow root-band growth indefinitely downward.
 
-Use the handedness that matches your current conventions.
+Recommended limit:
 
-### Step 2: for each next frame, transport previous normal
+* `yNorm <= 1.10–1.20`
 
-For `i > 0`:
+That keeps true roots while excluding deep lower anatomy.
 
-```ts
-Tprev = normalize(T[i - 1])
-Tcur  = normalize(T[i])
-Nprev = N[i - 1]
-```
+### Optional rescue for thin bright cortices
 
-Compute the minimal rotation from `Tprev` to `Tcur`:
+If you want one extra safeguard:
 
-```ts
-axis = cross(Tprev, Tcur)
-s = length(axis)
-c = clamp(dot(Tprev, Tcur), -1, 1)
-```
+If a sample is just outside the component but:
 
-If `s > eps`, rotate `Nprev` around `axis / s` by angle `atan2(s, c)` using Rodrigues rotation.
+* `0.45 < yNorm < 1.0`
+* and it is a local vertical maximum in its depth plane
+* and adjacent rows in the same depth plane show connected support
 
-If `s <= eps`, just carry `Nprev` forward.
+then allow it as a one-step border dilation of `M`.
 
-That gives:
+But do not use brightness alone anymore as the main rescue rule.
 
-```ts
-Ntransport
-```
+### Summary of preservation principle
 
-### Step 3: re-orthogonalize to current tangent
+Keep lower anatomy when it is:
 
-Project out any tangent component:
+* connected upward to tooth-band seeds
+* inside the root-band depth window
+* supported by the same depth plane’s continuity
 
-```ts
-Ncur = normalize(Ntransport - dot(Ntransport, Tcur) * Tcur)
-```
+Reject lower bright anatomy when it is:
 
-If degenerate, fall back once to a seed from global vertical for that frame only.
+* isolated
+* deep
+* unconnected to tooth-band support
 
-### Step 4: rebuild vertical axis from transported normal
-
-```ts
-Ucur = normalize(cross(Ncur, Tcur))
-```
-
-Again, match your handedness.
-
-### Step 5: optional tiny soft bias to global vertical
-
-Only after transport, apply a **small** drift correction, not a re-anchoring.
-
-Compute:
-
-```ts
-Utarget = normalize(verticalDir - dot(verticalDir, Tcur) * Tcur)
-```
-
-Then:
-
-```ts
-alpha = 0.05
-Ubiased = normalize((1 - alpha) * Ucur + alpha * Utarget)
-Nbiased = normalize(cross(Tcur, Ubiased))
-```
-
-Store `Nbiased`, `Ubiased`.
-
-This keeps long-run roll drift under control without reintroducing the old shear bug.
+That is the correct anatomy-aware separation.
 
 ---
 
-## 2. How to initialize the first frame
+## 5) Should the reducer itself change again?
 
-Use global vertical **only at frame 0**:
+**No major reducer redesign should be the next step.**
 
-```ts
-U0 = orthogonalized global vertical against T0
-N0 = cross(T0, U0)
-```
+The main fix is now **sample eligibility before reduction**.
 
-That is correct and safe.
+Keep the reducer mostly as-is:
 
-The bug is not using global vertical at all.
-The bug is using it to **rebuild every frame**.
+* `computeWinsorizedWeightedMean()` over the **eligible** samples only
 
----
+Maybe add one small safety rule:
 
-## 3. How to transport `N_slab` from frame i-1 to i
+* if eligible sample count is 1, return that sample directly
+* if eligible sample count is 2+, use the current robust mean
+* if eligible sample count is 0, use fallback
 
-Use minimal rotation between neighboring tangents.
+That is enough.
 
-In words:
+### Why not retune the reducer again
 
-* compute the rotation that aligns `T[i-1]` to `T[i]`
-* apply that same rotation to `N[i-1]`
-* then re-orthogonalize against `T[i]`
+Your latest logs already show the problem is upstream:
 
-That is the actual transported frame.
+* the gate changed total weight a lot
+* but contamination remained severe
 
-Do **not** compute:
-
-```ts
-N_slab = normalize(cross(T, normalizedVerticalDir), fallback)
-```
-
-per frame anymore.
-
-That is exactly what is shearing the anterior.
-
----
-
-## 4. Whether to keep any soft bias to global vertical
-
-Yes, but tiny.
-
-Recommended:
-
-```ts
-alpha = 0.03 to 0.07
-```
-
-I would start at:
-
-```ts
-alpha = 0.05
-```
-
-Rules:
-
-* apply it only **after** transport
-* bias the vertical axis `U`, not rebuild `N` from scratch from global vertical
-* keep it constant and small for the first patch
-
-This keeps posterior regression risk low.
-
----
-
-## 5. Diagnostics to log
-
-You want diagnostics that prove the frame is transported and not flipping/twisting.
-
-### Geometry diagnostics
-
-* `rmfTurnAngleMean`
-* `rmfTurnAngleMax`
-* `rmfTransportedNormalDeltaMean`
-* `rmfTransportedNormalDeltaMax`
-* `rmfVerticalBiasCorrectionMeanDeg`
-* `rmfVerticalBiasCorrectionMaxDeg`
-
-### Stability diagnostics
-
-* `rmfNormalFlipCount`
-
-  * count if `dot(N[i], N[i-1]) < 0`
-* `rmfOrthoErrorMax`
-
-  * max of `abs(dot(T,N))`, `abs(dot(T,U))`, `abs(dot(N,U))`
-* `rmfFallbackCount`
-
-### Optional regional diagnostic
-
-Log the same deltas in the anterior third only:
-
-* `rmfAnteriorNormalDeltaMean`
-* `rmfAnteriorBiasCorrectionMeanDeg`
-
-That is where the bug is most obvious.
-
----
-
-## 6. What existing image/log metrics should improve if this fixes the anterior
-
-### Should improve
-
-* `detailBandVerticalEdgeMean` should rise
-* horizontal/vertical edge imbalance should shrink
-* `qualityScore` should improve
-* visible anterior teeth should stop looking stretched/sheared/alien
-
-### Should not move much
-
-* `lowerBandBrightFraction`
-* `lowerBandP50`
-
-Those are contamination metrics, not frame metrics.
-
-So if the frame patch is working, the image should look better in the anterior even if lower-band pollution is still partly present.
-
----
-
-# 3) Minimal curvature-aware replacement for local-center candidate scoring in `cprWorker.ts`
-
-## Goal
-
-Let the center tracker breathe in curved anterior regions without destabilizing straighter posterior regions.
-
-The safest change is:
-
-* compute a curvature factor from tangent turn angle
-* reduce the priors only where curvature is high
-* widen search only modestly with the same factor
-
----
-
-## 1. Exact formula using tangent delta / turn angle
-
-For column `i`, compute:
-
-```ts
-turnAngleRad = acos(clamp(dot(T[i - 1], T[i]), -1, 1))
-turnAngleDeg = turnAngleRad * 180 / Math.PI
-```
-
-Then convert to a curvature-relaxation factor:
-
-```ts
-k = smoothstep(2.0, 8.0, turnAngleDeg)
-```
+That means the reducer is not the bottleneck anymore.
+The bottleneck is that contaminated samples are still being allowed to participate.
 
 So:
 
-* `k = 0` in nearly straight zones
-* `k -> 1` in higher-curvature anterior zones
-
-Then keep your existing evidence term, but replace fixed penalties with:
-
-```ts
-wGlobal = 26 * (1 - 0.70 * k)
-wPrev   = 18 * (1 - 0.45 * k)
-```
-
-So at high curvature:
-
-* global-center penalty drops from `26` to about `7.8`
-* previous-column penalty drops from `18` to about `9.9`
-
-That is the right asymmetry: relax global more than continuity.
-
-Then score as:
-
-```ts
-score(candidate) =
-  evidenceScore(candidate)
-  - wGlobal * abs(candidateCenter - globalCenter)
-  - wPrev   * abs(candidateCenter - prevCenter)
-```
-
-If your current code uses squared distances, keep squared distances.
-The important patch is changing the **weights**, not the distance form.
+* **eligibility is the main fix**
+* reducer tuning is now secondary
 
 ---
 
-## 2. How much to reduce each penalty in high-curvature zones
+## 6) Should the curvature-aware center prior thresholds be revised?
 
-Recommended first patch:
+**Yes, but this is secondary to the reconstruction fix.**
 
-### Global-center penalty
+Your current logs:
 
-Reduce by **70% at full curvature factor**
+* `turnAngleMaxDeg ≈ 1.306`
+* onset was `2°`
+* so curvature logic never engaged
 
-```ts
-26 -> 7.8
-```
+That means the threshold is too high for this scan.
 
-### Previous-column penalty
+### Recommended revision
 
-Reduce by **45% at full curvature factor**
+After the reconstruction change, lower the curvature onset to something like:
 
-```ts
-18 -> 9.9
-```
+* `smoothstep(0.25°, 1.0°)`
+  or slightly more conservative:
+* `smoothstep(0.35°, 1.2°)`
 
-Why this split:
+But smooth the turn-angle over neighboring columns first, or you risk wobble.
 
-* global prior is the more harmful one in the anterior
-* previous-column continuity is still useful and should not be weakened as much
+### Why revise it
 
-This is the smallest safe bias change.
+If your scan’s true curvature only reaches ~1.3°, a 2° onset guarantees no effect.
 
----
+So yes, that threshold should be revised.
 
-## 3. Should search half-range and maxDeviation widen with the same factor?
+### But priority
 
-Yes, but only modestly.
+Do it **after** or alongside the two-pass eligibility change, not instead of it.
 
-Use the same `k`, with smaller multipliers:
-
-```ts
-searchHalfRange = baseSearchHalfRange * (1 + 0.30 * k)
-maxDeviation    = baseMaxDeviation    * (1 + 0.25 * k)
-```
-
-So in straight posterior zones, nothing changes.
-In the anterior, the tracker gets a bit more room.
-
-Do **not** widen aggressively on the first patch.
-The main fix is relaxed penalties, not a huge search explosion.
+Because your contamination numbers are too severe to be explained by center priors alone.
 
 ---
 
-## 4. What log fields should move if the change is working
+## 7) Which exact log values should move if the deeper change is working
 
-### Add these if you can
+These should move first and clearly.
 
-* `centerTurnAngleMeanDeg`
-* `centerTurnAngleMaxDeg`
-* `centerCurvatureRelaxationMean`
-* `centerCurvatureRelaxationMax`
-* `centerChosenAbsGlobalDeviationMean`
-* `centerChosenAbsGlobalDeviationAnteriorMean`
-* `centerChosenPrevDeltaMean`
-* `centerChosenPrevDeltaAnteriorMean`
-* `centerBoundaryHitCount`
-* `centerMaxDeviationClampCount`
+### Main acceptance metrics
 
-### Existing metrics likely to improve
+* `lowerBandBrightFraction`
 
-* `detailBandVerticalEdgeMean` should rise
-* `qualityScore` should improve
-* anterior teeth should look less flattened/sheared
-* `lowerBandBrightFraction` may improve slightly if the band stops drifting low, but that is secondary
+  * should drop **a lot**
+  * from `0.8636` toward something far lower
+* `lowerBandP50`
 
-### Good sign
+  * should collapse sharply
+  * from `136.13` toward something much closer to the true background floor
+* `selectedQualityScore`
 
-* chosen center deviates more from the global center in the anterior
-* boundary/clamp hits go down
-* vertical edge strength goes up
+  * should improve materially
+  * current `-32.81` should move upward
 
-### Bad sign
+### Edge metrics
 
-* posterior starts wobbling
-* center jitter rises everywhere
-* boundary hits increase instead of decrease
+* `detailBandHorizontalEdgeMean`
 
-If that happens, the search widening is too much or the continuity penalty was relaxed too hard.
+  * should decrease
+  * because a lot of its current strength is just polluted lower/static texture
+* `detailBandVerticalEdgeMean`
+
+  * should hold or improve
+  * if roots and tooth walls are preserved properly
+
+The most important pattern is:
+
+* **horizontal clutter energy down**
+* **vertical tooth structure preserved or up**
+
+### New logs you should add
+
+For the two-pass design, log these:
+
+#### Pass 1 structure logs
+
+* `pass1SeedPixelCount`
+* `pass1RootSupportPixelCount`
+* `pass1LowerRejectedPixelCount`
+* `pass1ConnectedComponentCountMean`
+* `pass1ConnectedRootDepthCoverageMean`
+
+#### Pass 2 eligibility logs
+
+* `eligibleSampleCount`
+* `rejectedSampleCount`
+* `eligibleSampleFraction`
+* `fallbackNoEligiblePixelCount`
+* `rootConnectedRescueCount`
+
+#### Crucial sanity metric
+
+* `lowerBandEligibleFraction`
+
+If the fix is working, **lower-band eligible fraction should drop hard**.
+
+### What failure would look like
+
+If the change is too aggressive:
+
+* `lowerBandBrightFraction` drops
+* but `detailBandVerticalEdgeMean` also drops
+* roots become thin or broken
+* `fallbackNoEligiblePixelCount` becomes high
+
+If that happens:
+
+* growth threshold is too strict
+* downward range is too short
+* or connected growth is too brittle
 
 ---
 
-# Recommended implementation order
+# Bottom line
 
-1. **One-pass anatomy-aware gating in `sampleReducedPoint()`**
-2. **Transported frame in `buildRMFFrames()`**
-3. **Curvature-aware center-prior relaxation**
-4. Only then revisit spline sampling if residual softness remains
+The next deeper CPU-only fix should be:
 
-That order is still the right one.
+## A true two-pass reconstruction with per-slab-depth eligibility masks
 
+Not:
+
+* more row-level gating
+* more winsor tweaks
+* more post-hoc denoise weighting
+
+### The right structure is:
+
+1. **Pass 1:** render per-depth planes `I[k]` and provisional pano `P`
+2. seed tooth band from the provisional pano
+3. grow connected root support per depth plane
+4. define lower background as lower, unconnected samples
+5. **Pass 2:** reduce only eligible slab samples
+
+That is the minimal architecture change that can actually turn the current noisy lower “TV static” into real background while keeping teeth and roots bright.
+
+If you want, I can now turn this into a concrete patch plan for:
+
+* `cprWorker.ts` pass-1 buffers
+* mask construction loops
+* pass-2 eligibility logic
+* exact fallback behavior and counters

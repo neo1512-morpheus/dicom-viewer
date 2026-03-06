@@ -85,6 +85,16 @@ interface CPRWorkerError {
   message: string;
 }
 
+interface SampleReductionGateContext {
+  mode: 'centerSearch' | 'finalRender';
+  sampleRow?: number;
+  localCenterRow?: number;
+  effectiveVerticalHalfHeight?: number;
+  profileValueAtRow?: number;
+  profilePeakValue?: number;
+  profileFloorValue?: number;
+}
+
 function normalize3(v: [number, number, number]): [number, number, number] {
   const len = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
   if (len < 1e-10) {
@@ -508,6 +518,60 @@ function meanFloatWindow(values: Float32Array, startIndex: number, endIndex: num
 function smoothstep01(value: number): number {
   const t = clampNumber(value, 0, 1);
   return t * t * (3 - 2 * t);
+}
+
+function smoothstepRange(edge0: number, edge1: number, value: number): number {
+  if (!Number.isFinite(edge0) || !Number.isFinite(edge1) || Math.abs(edge1 - edge0) < 1e-6) {
+    return value >= edge1 ? 1 : 0;
+  }
+  return smoothstep01((value - edge0) / (edge1 - edge0));
+}
+
+function angleDegreesBetween3(a: [number, number, number], b: [number, number, number]): number {
+  const dotValue = dot3(normalize3(a), normalize3(b));
+  return (Math.acos(clampNumber(dotValue, -1, 1)) * 180) / Math.PI;
+}
+
+function sampleProfileValueAtRow(
+  profileValues: Float32Array,
+  profileCount: number,
+  row: number,
+  rowDenominator: number,
+  startOffset: number = 0
+): number {
+  if (profileCount <= 0) {
+    return 0;
+  }
+  if (profileCount === 1 || rowDenominator <= 0) {
+    return Number(profileValues[startOffset]);
+  }
+  const fraction = clampNumber(row / rowDenominator, 0, 1);
+  const profileIndex = fraction * (profileCount - 1);
+  const lowIndex = Math.max(0, Math.min(profileCount - 1, Math.floor(profileIndex)));
+  const highIndex = Math.max(lowIndex, Math.min(profileCount - 1, Math.ceil(profileIndex)));
+  if (lowIndex === highIndex) {
+    return Number(profileValues[startOffset + lowIndex]);
+  }
+  const t = profileIndex - lowIndex;
+  return Number(profileValues[startOffset + lowIndex]) * (1 - t) + Number(profileValues[startOffset + highIndex]) * t;
+}
+
+function sortedQuantile(values: Float32Array, count: number, quantile: number): number {
+  if (count <= 0) {
+    return -1000;
+  }
+  if (count === 1) {
+    return Number(values[0]);
+  }
+  const q = clampNumber(quantile, 0, 1);
+  const index = q * (count - 1);
+  const lowIndex = Math.floor(index);
+  const highIndex = Math.min(count - 1, Math.ceil(index));
+  if (lowIndex === highIndex) {
+    return Number(values[lowIndex]);
+  }
+  const t = index - lowIndex;
+  return Number(values[lowIndex]) * (1 - t) + Number(values[highIndex]) * t;
 }
 
 function suppressLowerBackground(
@@ -1079,8 +1143,27 @@ function generatePanorama(input: CPRWorkerInput): {
     brightTailPreservedCount: 0,
     brightClusterPreservedCount: 0,
   };
+  const anatomyGateDiagnostics = {
+    sampleReduceCenterSearchCallCount: 0,
+    sampleReduceFinalRenderCallCount: 0,
+    anatGateAppliedCount: 0,
+    anatGateRejectedSampleCount: 0,
+    anatGateDownweightedSampleCount: 0,
+    anatGateBrightRescueCount: 0,
+    anatGateSmallNSkipHardRejectCount: 0,
+    anatGateNoValidWeightedSampleFallbackCount: 0,
+    anatGateBelowCenterSampleCount: 0,
+    anatGateDeepLowerRejectCount: 0,
+    anatGateWeightSumBefore: 0,
+    anatGateWeightSumAfter: 0,
+    anatGateRejectedYNormSum: 0,
+  };
   const slabValueBuffer = new Float32Array(slabSampleCount);
   const slabWeightBuffer = new Float32Array(slabSampleCount);
+  const slabUngatedValueBuffer = new Float32Array(slabSampleCount);
+  const slabUngatedWeightBuffer = new Float32Array(slabSampleCount);
+  const slabGatedValueBuffer = new Float32Array(slabSampleCount);
+  const slabGatedWeightBuffer = new Float32Array(slabSampleCount);
   const adaptiveCenterSearchHalfRangeMm = Math.min(
     isMeanAggregation ? 2.4 : 1.8,
     Math.max(isMeanAggregation ? 0.9 : 0.7, effectiveVerticalHalfMm * (isMeanAggregation ? 0.16 : 0.11))
@@ -1097,7 +1180,7 @@ function generatePanorama(input: CPRWorkerInput): {
   const adaptiveProfileUpperBandCount = Math.max(5, Math.ceil(adaptiveProfileSampleCount * 0.55));
   const adaptiveCenterSmoothingRadiusCols = Math.max(8, Math.min(18, Math.round(panoWidth / 40)));
   const adaptiveCenterGlobalBlend = isMeanAggregation ? 0.34 : 0.42;
-  const adaptiveCenterMaxDeviationMm = Math.min(
+  const baseAdaptiveCenterMaxDeviationMm = Math.min(
     isMeanAggregation ? 1.35 : 1.1,
     Math.max(isMeanAggregation ? 0.75 : 0.6, effectiveVerticalHalfMm * (isMeanAggregation ? 0.1 : 0.08))
   );
@@ -1108,10 +1191,60 @@ function generatePanorama(input: CPRWorkerInput): {
   const adaptiveContinuityPenaltyScale = isMeanAggregation ? 18 : 14;
   const profileSampleBuffer = new Float32Array(adaptiveProfileSampleCount);
   const profileSampleScratch = new Float32Array(adaptiveProfileSampleCount);
+  const finalRenderProfileValues = new Float32Array(panoWidth * adaptiveProfileSampleCount);
+  const finalRenderProfilePeakValues = new Float32Array(panoWidth);
+  const finalRenderProfileFloorValues = new Float32Array(panoWidth);
   const localCenterOffsetsMm = new Float32Array(panoWidth);
   const localCenterMinOffsetsMm = new Float32Array(panoWidth);
   const localCenterMaxOffsetsMm = new Float32Array(panoWidth);
   const localCenterScratch = new Float32Array(panoWidth);
+  const curvatureFactorRaw = new Float32Array(panoWidth);
+  const curvatureFactorByCol = new Float32Array(panoWidth);
+  const curvatureScratch = new Float32Array(panoWidth);
+  const adaptiveCenterSearchHalfRangeByCol = new Float32Array(panoWidth);
+  const adaptiveCenterMaxDeviationByCol = new Float32Array(panoWidth);
+  const turnAngleDegreesByCol = new Float32Array(panoWidth);
+  const centerSearchGateCtx: SampleReductionGateContext = { mode: 'centerSearch' };
+  for (let col = 0; col < panoWidth; col++) {
+    let turnAngleAccumDeg = 0;
+    let turnAngleCount = 0;
+    if (col > 0) {
+      turnAngleAccumDeg += angleDegreesBetween3(frames[col - 1].T, frames[col].T);
+      turnAngleCount++;
+    }
+    if (col + 1 < panoWidth) {
+      turnAngleAccumDeg += angleDegreesBetween3(frames[col].T, frames[col + 1].T);
+      turnAngleCount++;
+    }
+    const turnAngleDeg = turnAngleCount > 0 ? turnAngleAccumDeg / turnAngleCount : 0;
+    turnAngleDegreesByCol[col] = turnAngleDeg;
+    curvatureFactorRaw[col] = smoothstepRange(2, 7, turnAngleDeg);
+  }
+  if (panoWidth > 1) {
+    for (let col = 0; col < panoWidth; col++) {
+      let weightedSum = Number(curvatureFactorRaw[col]) * 0.5;
+      let weightTotal = 0.5;
+      if (col > 0) {
+        weightedSum += Number(curvatureFactorRaw[col - 1]) * 0.25;
+        weightTotal += 0.25;
+      }
+      if (col + 1 < panoWidth) {
+        weightedSum += Number(curvatureFactorRaw[col + 1]) * 0.25;
+        weightTotal += 0.25;
+      }
+      curvatureScratch[col] = weightTotal > 0 ? weightedSum / weightTotal : Number(curvatureFactorRaw[col]);
+    }
+    curvatureFactorByCol.set(curvatureScratch);
+  } else {
+    curvatureFactorByCol.set(curvatureFactorRaw);
+  }
+  for (let col = 0; col < panoWidth; col++) {
+    const curvatureFactor = Number(curvatureFactorByCol[col]);
+    adaptiveCenterSearchHalfRangeByCol[col] =
+      adaptiveCenterSearchHalfRangeMm * (1 + 0.2 * curvatureFactor);
+    adaptiveCenterMaxDeviationByCol[col] =
+      baseAdaptiveCenterMaxDeviationMm * (1 + 0.15 * curvatureFactor);
+  }
   const sampleReducedPoint = (
     bx: number,
     by: number,
@@ -1120,8 +1253,15 @@ function generatePanorama(input: CPRWorkerInput): {
     slabDirY: number,
     slabDirZ: number,
     recordOobStats: boolean,
-    debugCaptureRow: number | null
+    debugCaptureRow: number | null,
+    gateCtx: SampleReductionGateContext = centerSearchGateCtx
   ): number => {
+    const gateMode = gateCtx?.mode === 'finalRender' ? 'finalRender' : 'centerSearch';
+    if (gateMode === 'finalRender') {
+      anatomyGateDiagnostics.sampleReduceFinalRenderCallCount++;
+    } else {
+      anatomyGateDiagnostics.sampleReduceCenterSearchCallCount++;
+    }
     let validSampleCount = 0;
 
     for (let s = 0; s < slabSampleCount; s++) {
@@ -1199,7 +1339,24 @@ function generatePanorama(input: CPRWorkerInput): {
     }
 
     sortSamplePairsAscending(slabValueBuffer, slabWeightBuffer, validSampleCount);
-    if (isMeanAggregation) {
+    if (!isMeanAggregation) {
+      return computeWeightedHighBandMean(
+        slabValueBuffer,
+        slabWeightBuffer,
+        validSampleCount,
+        robustMipTopCount
+      );
+    }
+
+    const hasGateContext =
+      gateMode === 'finalRender' &&
+      Number.isFinite(gateCtx.sampleRow) &&
+      Number.isFinite(gateCtx.localCenterRow) &&
+      Number.isFinite(gateCtx.effectiveVerticalHalfHeight) &&
+      Number.isFinite(gateCtx.profileValueAtRow) &&
+      Number.isFinite(gateCtx.profilePeakValue) &&
+      Number.isFinite(gateCtx.profileFloorValue);
+    if (!hasGateContext) {
       return computeWinsorizedWeightedMean(
         slabValueBuffer,
         slabWeightBuffer,
@@ -1208,11 +1365,108 @@ function generatePanorama(input: CPRWorkerInput): {
       );
     }
 
-    return computeWeightedHighBandMean(
-      slabValueBuffer,
-      slabWeightBuffer,
-      validSampleCount,
-      robustMipTopCount
+    anatomyGateDiagnostics.anatGateAppliedCount++;
+    slabUngatedValueBuffer.set(slabValueBuffer.subarray(0, validSampleCount), 0);
+    slabUngatedWeightBuffer.set(slabWeightBuffer.subarray(0, validSampleCount), 0);
+    const ungatedMeanValue = computeWinsorizedWeightedMean(
+      slabUngatedValueBuffer,
+      slabUngatedWeightBuffer,
+      validSampleCount
+    );
+
+    const sampleRow = Number(gateCtx.sampleRow);
+    const localCenterRow = Number(gateCtx.localCenterRow);
+    const effectiveVerticalHalfHeight = Math.max(1, Number(gateCtx.effectiveVerticalHalfHeight));
+    const profileValueAtRow = Number(gateCtx.profileValueAtRow);
+    const profilePeakValue = Number(gateCtx.profilePeakValue);
+    const profileFloorValue = Number(gateCtx.profileFloorValue);
+    const profileConf = clampNumber(
+      (profileValueAtRow - profileFloorValue) / Math.max(profilePeakValue - profileFloorValue, 1e-6),
+      0,
+      1
+    );
+    const yNorm = (sampleRow - localCenterRow) / effectiveVerticalHalfHeight;
+    if (yNorm > 0) {
+      anatomyGateDiagnostics.anatGateBelowCenterSampleCount += validSampleCount;
+    }
+
+    let brightRef = NaN;
+    let allowHardReject = false;
+    let allowBrightRescue = false;
+    if (validSampleCount >= 5) {
+      brightRef = sortedQuantile(slabValueBuffer, validSampleCount, 0.75);
+      allowHardReject = true;
+      allowBrightRescue = true;
+    } else if (validSampleCount === 4) {
+      brightRef = Number(slabValueBuffer[validSampleCount - 2]);
+      allowHardReject = true;
+      allowBrightRescue = true;
+    } else if (validSampleCount === 3) {
+      brightRef = Number(slabValueBuffer[validSampleCount - 1]);
+      allowBrightRescue = true;
+      anatomyGateDiagnostics.anatGateSmallNSkipHardRejectCount++;
+    } else {
+      anatomyGateDiagnostics.anatGateSmallNSkipHardRejectCount++;
+    }
+
+    const wLower = yNorm <= 0 ? 1 : 1 - 0.8 * smoothstepRange(0.2, 0.95, yNorm);
+    const wProfile = 0.25 + 0.75 * profileConf;
+
+    let gatedSampleCount = 0;
+    let gatedWeightTotal = 0;
+    for (let sampleIndex = 0; sampleIndex < validSampleCount; sampleIndex++) {
+      const value = Number(slabValueBuffer[sampleIndex]);
+      const depthWeight = Number(slabWeightBuffer[sampleIndex]);
+      anatomyGateDiagnostics.anatGateWeightSumBefore += depthWeight;
+
+      const isBrightRescue =
+        allowBrightRescue && Number.isFinite(brightRef) ? value >= brightRef : false;
+      let anatomyWeight = wLower * wProfile;
+      if (yNorm > 0.2 && isBrightRescue) {
+        anatomyWeight = Math.max(anatomyWeight, 0.5);
+        anatomyGateDiagnostics.anatGateBrightRescueCount++;
+      }
+      const shouldReject =
+        allowHardReject &&
+        yNorm > 1 &&
+        profileConf < 0.15 &&
+        Number.isFinite(brightRef) &&
+        value < brightRef;
+      if (shouldReject) {
+        anatomyGateDiagnostics.anatGateRejectedSampleCount++;
+        anatomyGateDiagnostics.anatGateRejectedYNormSum += yNorm;
+        if (yNorm > 1) {
+          anatomyGateDiagnostics.anatGateDeepLowerRejectCount++;
+        }
+        continue;
+      }
+      if (yNorm > 0.55 && profileConf < 0.3 && !isBrightRescue) {
+        anatomyWeight *= 0.25;
+      }
+      const gatedWeight = depthWeight * anatomyWeight;
+      if (gatedWeight < depthWeight - 1e-6) {
+        anatomyGateDiagnostics.anatGateDownweightedSampleCount++;
+      }
+      if (!(gatedWeight > 1e-6)) {
+        continue;
+      }
+      slabGatedValueBuffer[gatedSampleCount] = value;
+      slabGatedWeightBuffer[gatedSampleCount] = gatedWeight;
+      gatedSampleCount++;
+      gatedWeightTotal += gatedWeight;
+      anatomyGateDiagnostics.anatGateWeightSumAfter += gatedWeight;
+    }
+
+    if (gatedSampleCount <= 0 || gatedWeightTotal <= 1e-6) {
+      anatomyGateDiagnostics.anatGateNoValidWeightedSampleFallbackCount++;
+      return ungatedMeanValue;
+    }
+
+    return computeWinsorizedWeightedMean(
+      slabGatedValueBuffer,
+      slabGatedWeightBuffer,
+      gatedSampleCount,
+      reductionDiagnostics
     );
   };
 
@@ -1220,20 +1474,24 @@ function generatePanorama(input: CPRWorkerInput): {
     const frame = frames[col];
     const [px, py, pz] = frame.position;
     const [slabDirX, slabDirY, slabDirZ] = slabDirs[col];
+    const localSearchHalfRangeMm = Number(adaptiveCenterSearchHalfRangeByCol[col]);
+    const curvatureFactor = Number(curvatureFactorByCol[col]);
+    const globalCenterPenaltyWeight = 26 * (1 - 0.65 * curvatureFactor);
+    const continuityPenaltyWeight = adaptiveContinuityPenaltyScale * (1 - 0.35 * curvatureFactor);
     const frameProjection = dot3(frame.position, effectiveVerticalDir);
     const perFrameMinCenterOffsetMm = Number.isFinite(volumeMinProjection)
       ? volumeMinProjection + effectiveVerticalHalfMm - frameProjection
-      : verticalCenterOffsetMm - adaptiveCenterSearchHalfRangeMm;
+      : verticalCenterOffsetMm - localSearchHalfRangeMm;
     const perFrameMaxCenterOffsetMm = Number.isFinite(volumeMaxProjection)
       ? volumeMaxProjection - effectiveVerticalHalfMm - frameProjection
-      : verticalCenterOffsetMm + adaptiveCenterSearchHalfRangeMm;
+      : verticalCenterOffsetMm + localSearchHalfRangeMm;
     const searchMinCenterOffsetMm = Math.max(
       perFrameMinCenterOffsetMm,
-      verticalCenterOffsetMm - adaptiveCenterSearchHalfRangeMm
+      verticalCenterOffsetMm - localSearchHalfRangeMm
     );
     const searchMaxCenterOffsetMm = Math.min(
       perFrameMaxCenterOffsetMm,
-      verticalCenterOffsetMm + adaptiveCenterSearchHalfRangeMm
+      verticalCenterOffsetMm + localSearchHalfRangeMm
     );
 
     const safeSearchMin = Number.isFinite(searchMinCenterOffsetMm)
@@ -1285,7 +1543,8 @@ function generatePanorama(input: CPRWorkerInput): {
           slabDirY,
           slabDirZ,
           false,
-          null
+          null,
+          centerSearchGateCtx
         );
       }
 
@@ -1335,8 +1594,8 @@ function generatePanorama(input: CPRWorkerInput): {
         Math.max(0, upperBandMax - profileP50) * 0.12 -
         Math.max(0, lowerBandP50 + 200) * 1.55 -
         lowerBandBrightFraction * 280 -
-        Math.abs(candidateCenterOffsetMm - verticalCenterOffsetMm) * 26 -
-        Math.abs(candidateCenterOffsetMm - previousCenterOffsetMm) * adaptiveContinuityPenaltyScale;
+        Math.abs(candidateCenterOffsetMm - verticalCenterOffsetMm) * globalCenterPenaltyWeight -
+        Math.abs(candidateCenterOffsetMm - previousCenterOffsetMm) * continuityPenaltyWeight;
 
       if (candidateScore > bestCandidateScore) {
         bestCandidateScore = candidateScore;
@@ -1377,11 +1636,11 @@ function generatePanorama(input: CPRWorkerInput): {
   for (let col = 0; col < panoWidth; col++) {
     const regularizedMinCenterOffsetMm = Math.max(
       localCenterMinOffsetsMm[col],
-      verticalCenterOffsetMm - adaptiveCenterMaxDeviationMm
+      verticalCenterOffsetMm - adaptiveCenterMaxDeviationByCol[col]
     );
     const regularizedMaxCenterOffsetMm = Math.min(
       localCenterMaxOffsetsMm[col],
-      verticalCenterOffsetMm + adaptiveCenterMaxDeviationMm
+      verticalCenterOffsetMm + adaptiveCenterMaxDeviationByCol[col]
     );
     const blendedCenterOffsetMm =
       verticalCenterOffsetMm +
@@ -1398,11 +1657,11 @@ function generatePanorama(input: CPRWorkerInput): {
       for (let col = 1; col < panoWidth; col++) {
         const regularizedMinCenterOffsetMm = Math.max(
           localCenterMinOffsetsMm[col],
-          verticalCenterOffsetMm - adaptiveCenterMaxDeviationMm
+          verticalCenterOffsetMm - adaptiveCenterMaxDeviationByCol[col]
         );
         const regularizedMaxCenterOffsetMm = Math.min(
           localCenterMaxOffsetsMm[col],
-          verticalCenterOffsetMm + adaptiveCenterMaxDeviationMm
+          verticalCenterOffsetMm + adaptiveCenterMaxDeviationByCol[col]
         );
         const minAllowedCenterOffsetMm = Math.max(
           regularizedMinCenterOffsetMm,
@@ -1422,11 +1681,11 @@ function generatePanorama(input: CPRWorkerInput): {
       for (let col = panoWidth - 2; col >= 0; col--) {
         const regularizedMinCenterOffsetMm = Math.max(
           localCenterMinOffsetsMm[col],
-          verticalCenterOffsetMm - adaptiveCenterMaxDeviationMm
+          verticalCenterOffsetMm - adaptiveCenterMaxDeviationByCol[col]
         );
         const regularizedMaxCenterOffsetMm = Math.min(
           localCenterMaxOffsetsMm[col],
-          verticalCenterOffsetMm + adaptiveCenterMaxDeviationMm
+          verticalCenterOffsetMm + adaptiveCenterMaxDeviationByCol[col]
         );
         const minAllowedCenterOffsetMm = Math.max(
           regularizedMinCenterOffsetMm,
@@ -1466,12 +1725,66 @@ function generatePanorama(input: CPRWorkerInput): {
     }
   }
   const meanLocalCenterOffsetMm = panoWidth > 0 ? localCenterOffsetSumMm / panoWidth : verticalCenterOffsetMm;
+  const panoCenterRow = panoHeightDen / 2;
+  for (let col = 0; col < panoWidth; col++) {
+    const frame = frames[col];
+    const [px, py, pz] = frame.position;
+    const [slabDirX, slabDirY, slabDirZ] = slabDirs[col];
+    const columnVerticalCenterOffsetMm = localCenterOffsetsMm[col];
+    for (let sampleIndex = 0; sampleIndex < adaptiveProfileSampleCount; sampleIndex++) {
+      const fraction =
+        adaptiveProfileSampleCount <= 1
+          ? 0.5
+          : sampleIndex / Math.max(1, adaptiveProfileSampleCount - 1);
+      const relativeOffsetMm = effectiveVerticalHalfMm - fraction * (effectiveVerticalHalfMm * 2);
+      const sampleOffsetMm = columnVerticalCenterOffsetMm + relativeOffsetMm;
+      const bx = px + sampleOffsetMm * effectiveVerticalDir[0];
+      const by = py + sampleOffsetMm * effectiveVerticalDir[1];
+      const bz = pz + sampleOffsetMm * effectiveVerticalDir[2];
+      profileSampleBuffer[sampleIndex] = sampleReducedPoint(
+        bx,
+        by,
+        bz,
+        slabDirX,
+        slabDirY,
+        slabDirZ,
+        false,
+        null,
+        centerSearchGateCtx
+      );
+    }
+    smoothFloatSeries(
+      profileSampleBuffer,
+      adaptiveProfileSampleCount,
+      profileSampleScratch,
+      isMeanAggregation ? 2 : 1
+    );
+    const profileOffset = col * adaptiveProfileSampleCount;
+    finalRenderProfileValues.set(profileSampleBuffer.subarray(0, adaptiveProfileSampleCount), profileOffset);
+    finalRenderProfilePeakValues[col] = sampleProfileValueAtRow(
+      profileSampleBuffer,
+      adaptiveProfileSampleCount,
+      panoCenterRow,
+      panoHeightDen
+    );
+    const profileValues = Array.from(profileSampleBuffer.subarray(0, adaptiveProfileSampleCount));
+    finalRenderProfileFloorValues[col] = percentile(profileValues, 0.25);
+  }
+
+  const finalRenderGateCtx: SampleReductionGateContext = {
+    mode: 'finalRender',
+    localCenterRow: panoCenterRow,
+    effectiveVerticalHalfHeight: Math.max(1, panoCenterRow),
+  };
 
   for (let col = 0; col < panoWidth; col++) {
     const frame = frames[col];
     const [px, py, pz] = frame.position;
     const [slabDirX, slabDirY, slabDirZ] = slabDirs[col];
     const columnVerticalCenterOffsetMm = localCenterOffsetsMm[col];
+    const profileOffset = col * adaptiveProfileSampleCount;
+    finalRenderGateCtx.profilePeakValue = Number(finalRenderProfilePeakValues[col]);
+    finalRenderGateCtx.profileFloorValue = Number(finalRenderProfileFloorValues[col]);
 
     for (let row = 0; row < panoHeight; row++) {
       const vertOffsetMm = columnVerticalCenterOffsetMm + (effectiveVerticalHalfMm - row * vertStepMm);
@@ -1479,6 +1792,14 @@ function generatePanorama(input: CPRWorkerInput): {
       const bx = px + vertOffsetMm * effectiveVerticalDir[0];
       const by = py + vertOffsetMm * effectiveVerticalDir[1];
       const bz = pz + vertOffsetMm * effectiveVerticalDir[2];
+      finalRenderGateCtx.sampleRow = row;
+      finalRenderGateCtx.profileValueAtRow = sampleProfileValueAtRow(
+        finalRenderProfileValues,
+        adaptiveProfileSampleCount,
+        row,
+        panoHeightDen,
+        profileOffset
+      );
       const pixelValueRaw = sampleReducedPoint(
         bx,
         by,
@@ -1487,7 +1808,8 @@ function generatePanorama(input: CPRWorkerInput): {
         slabDirY,
         slabDirZ,
         true,
-        col === 0 && row < 5 ? row : null
+        col === 0 && row < 5 ? row : null,
+        finalRenderGateCtx
       );
       const pixelValue = Number.isFinite(pixelValueRaw) ? pixelValueRaw : -1000;
 
@@ -1530,6 +1852,31 @@ function generatePanorama(input: CPRWorkerInput): {
     maxValue = denoisedRange.maxValue;
   }
 
+  let meanTurnAngleDeg = 0;
+  let maxTurnAngleDeg = 0;
+  let meanCurvatureFactor = 0;
+  let maxCurvatureFactor = 0;
+  let minSearchHalfRangeMm = Infinity;
+  let maxSearchHalfRangeMm = -Infinity;
+  let minMaxDeviationMm = Infinity;
+  let maxMaxDeviationMm = -Infinity;
+  for (let col = 0; col < panoWidth; col++) {
+    const turnAngleDeg = Number(turnAngleDegreesByCol[col]);
+    const curvatureFactor = Number(curvatureFactorByCol[col]);
+    const searchHalfRangeMm = Number(adaptiveCenterSearchHalfRangeByCol[col]);
+    const maxDeviationMm = Number(adaptiveCenterMaxDeviationByCol[col]);
+    meanTurnAngleDeg += turnAngleDeg;
+    maxTurnAngleDeg = Math.max(maxTurnAngleDeg, turnAngleDeg);
+    meanCurvatureFactor += curvatureFactor;
+    maxCurvatureFactor = Math.max(maxCurvatureFactor, curvatureFactor);
+    minSearchHalfRangeMm = Math.min(minSearchHalfRangeMm, searchHalfRangeMm);
+    maxSearchHalfRangeMm = Math.max(maxSearchHalfRangeMm, searchHalfRangeMm);
+    minMaxDeviationMm = Math.min(minMaxDeviationMm, maxDeviationMm);
+    maxMaxDeviationMm = Math.max(maxMaxDeviationMm, maxDeviationMm);
+  }
+  meanTurnAngleDeg = panoWidth > 0 ? meanTurnAngleDeg / panoWidth : 0;
+  meanCurvatureFactor = panoWidth > 0 ? meanCurvatureFactor / panoWidth : 0;
+
   const diagnosticPayload = {
     oobRate: {
       checked: _dbgChecked,
@@ -1571,8 +1918,18 @@ function generatePanorama(input: CPRWorkerInput): {
       profileSamples: adaptiveProfileSampleCount,
       smoothingRadiusCols: adaptiveCenterSmoothingRadiusCols,
       globalBlend: adaptiveCenterGlobalBlend,
-      maxDeviationMm: adaptiveCenterMaxDeviationMm,
+      maxDeviationMm: baseAdaptiveCenterMaxDeviationMm,
       maxAdjacentDeltaMm: adaptiveCenterMaxAdjacentDeltaMm,
+    },
+    curvatureAwarePriors: {
+      turnAngleMeanDeg: meanTurnAngleDeg,
+      turnAngleMaxDeg: maxTurnAngleDeg,
+      curvatureFactorMean: meanCurvatureFactor,
+      curvatureFactorMax: maxCurvatureFactor,
+      halfRangeMmMin: Number.isFinite(minSearchHalfRangeMm) ? minSearchHalfRangeMm : adaptiveCenterSearchHalfRangeMm,
+      halfRangeMmMax: Number.isFinite(maxSearchHalfRangeMm) ? maxSearchHalfRangeMm : adaptiveCenterSearchHalfRangeMm,
+      maxDeviationMmMin: Number.isFinite(minMaxDeviationMm) ? minMaxDeviationMm : baseAdaptiveCenterMaxDeviationMm,
+      maxDeviationMmMax: Number.isFinite(maxMaxDeviationMm) ? maxMaxDeviationMm : baseAdaptiveCenterMaxDeviationMm,
     },
     slabSampling: {
       requestedSamples: baseSlabSampleCount,
@@ -1588,6 +1945,7 @@ function generatePanorama(input: CPRWorkerInput): {
     },
     toothBandBottomRowStats,
     backgroundSuppression,
+    anatomyGateDiagnostics,
     reductionDiagnostics,
     firstFrameWorldPos: frames?.[0]?.position ?? null,
     lastFrameWorldPos: frames?.[frames.length - 1]?.position ?? null,

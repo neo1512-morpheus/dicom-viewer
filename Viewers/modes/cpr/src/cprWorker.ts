@@ -332,6 +332,82 @@ function computeArrayMinMax(buffer: Float32Array): { minValue: number; maxValue:
   return { minValue, maxValue };
 }
 
+function sortSamplePairsAscending(
+  values: Float32Array,
+  weights: Float32Array,
+  count: number
+): void {
+  for (let i = 1; i < count; i++) {
+    const keyValue = values[i];
+    const keyWeight = weights[i];
+    let j = i - 1;
+    while (j >= 0 && values[j] > keyValue) {
+      values[j + 1] = values[j];
+      weights[j + 1] = weights[j];
+      j--;
+    }
+    values[j + 1] = keyValue;
+    weights[j + 1] = keyWeight;
+  }
+}
+
+function computeWinsorizedWeightedMean(
+  values: Float32Array,
+  weights: Float32Array,
+  count: number
+): number {
+  if (count <= 0) {
+    return -1000;
+  }
+
+  const trimHi = count >= 6 ? Math.max(1, Math.floor(count / 12)) : 0;
+  const winsorIndex = count - 1 - trimHi;
+  if (trimHi > 0 && winsorIndex >= 0 && winsorIndex < count) {
+    const winsorCap = values[winsorIndex];
+    for (let i = winsorIndex + 1; i < count; i++) {
+      values[i] = winsorCap;
+    }
+  }
+
+  let weightedSum = 0;
+  let weightTotal = 0;
+  for (let i = 0; i < count; i++) {
+    const weight = Number.isFinite(weights[i]) && weights[i] > 0 ? weights[i] : 1;
+    weightedSum += values[i] * weight;
+    weightTotal += weight;
+  }
+
+  return weightTotal > 0 ? weightedSum / weightTotal : values[count - 1];
+}
+
+function computeWeightedHighBandMean(
+  values: Float32Array,
+  weights: Float32Array,
+  count: number,
+  topCount: number
+): number {
+  if (count <= 0) {
+    return -1000;
+  }
+
+  if (count > 1 && Number.isFinite(values[count - 2]) && values[count - 1] - values[count - 2] > 850) {
+    values[count - 1] = 0.5 * (values[count - 1] + values[count - 2]);
+  }
+
+  const effectiveTopCount = Math.max(1, Math.min(count, topCount));
+  const startIndex = count - effectiveTopCount;
+  let weightedSum = 0;
+  let weightTotal = 0;
+
+  for (let i = startIndex; i < count; i++) {
+    const weight = Number.isFinite(weights[i]) && weights[i] > 0 ? weights[i] : 1;
+    weightedSum += values[i] * weight;
+    weightTotal += weight;
+  }
+
+  return weightTotal > 0 ? weightedSum / weightTotal : values[count - 1];
+}
+
 function computeOutputSignature(buffer: Float32Array): {
   sampledCount: number;
   checksum: number;
@@ -569,6 +645,11 @@ function generatePanorama(input: CPRWorkerInput): {
               : 2;
   }
   const slabStepMm = slabSampleCount > 1 ? (slabHalfThicknessMm * 2) / (slabSampleCount - 1) : 0;
+  const focalTroughSigmaMm =
+    slabHalfThicknessMm > 0
+      ? Math.max(0.35, minVolumeSpacingMm * 0.6, slabHalfThicknessMm * (isMeanAggregation ? 0.52 : 0.48))
+      : 0.35;
+  const focalTroughSigmaSq2 = 2 * focalTroughSigmaMm * focalTroughSigmaMm;
   const [nx, ny, nz] = dimensions;
 
   // Compute a global center offset along vertical direction to keep the
@@ -667,6 +748,8 @@ function generatePanorama(input: CPRWorkerInput): {
   const _dbgFirstFive: Array<{ row: number; vi: number; vj: number; vk: number; sample: number }> = [];
   let _dbgChecked = 0;
   let _dbgOob = 0;
+  const slabValueBuffer = new Float32Array(slabSampleCount);
+  const slabWeightBuffer = new Float32Array(slabSampleCount);
   for (let col = 0; col < panoWidth; col++) {
     const frame = frames[col];
     const [px, py, pz] = frame.position;
@@ -679,11 +762,7 @@ function generatePanorama(input: CPRWorkerInput): {
       const by = py + vertOffsetMm * effectiveVerticalDir[1];
       const bz = pz + vertOffsetMm * effectiveVerticalDir[2];
 
-      let accumulator = 0;
-      let max1 = -Infinity;
-      let max2 = -Infinity;
-      let max3 = -Infinity;
-      let max4 = -Infinity;
+      let validSampleCount = 0;
 
       for (let s = 0; s < slabSampleCount; s++) {
         const slabOffset = slabSampleCount > 1 ? -slabHalfThicknessMm + s * slabStepMm : 0;
@@ -715,6 +794,16 @@ function generatePanorama(input: CPRWorkerInput): {
             _dbgOob++;
           }
         }
+        if (
+          vi < -0.5 ||
+          vj < -0.5 ||
+          vk < -0.5 ||
+          vi > dimensions[0] - 0.5 ||
+          vj > dimensions[1] - 0.5 ||
+          vk > dimensions[2] - 0.5
+        ) {
+          continue;
+        }
         let sample = trilinear(
           scalarData,
           dimensions,
@@ -734,42 +823,32 @@ function generatePanorama(input: CPRWorkerInput): {
           sample = -1000;
         }
 
-        if (isMeanAggregation) {
-          accumulator += sample;
-        } else if (sample >= max1) {
-          max4 = max3;
-          max3 = max2;
-          max2 = max1;
-          max1 = sample;
-        } else if (sample >= max2) {
-          max4 = max3;
-          max3 = max2;
-          max2 = sample;
-        } else if (sample >= max3) {
-          max4 = max3;
-          max3 = sample;
-        } else if (sample > max4) {
-          max4 = sample;
-        }
+        const focalWeight =
+          slabSampleCount > 1 ? Math.exp(-(slabOffset * slabOffset) / focalTroughSigmaSq2) : 1;
+        slabValueBuffer[validSampleCount] = sample;
+        slabWeightBuffer[validSampleCount] = focalWeight;
+        validSampleCount++;
       }
 
-      let pixelValueRaw: number;
-      if (isMeanAggregation) {
-        pixelValueRaw = accumulator / slabSampleCount;
-      } else {
-        if (Number.isFinite(max2) && max1 - max2 > 850) {
-          // Suppress isolated bright spikes that dominate strict MIP.
-          max1 = 0.5 * (max1 + max2);
-        }
-        if (robustMipTopCount >= 4 && Number.isFinite(max4)) {
-          pixelValueRaw = 0.25 * (max1 + max2 + max3 + max4);
-        } else if (robustMipTopCount >= 3 && Number.isFinite(max3)) {
-          pixelValueRaw = (max1 + max2 + max3) / 3;
-        } else if (robustMipTopCount >= 2 && Number.isFinite(max2)) {
-          pixelValueRaw = 0.5 * (max1 + max2);
+      let pixelValueRaw = -1000;
+      if (validSampleCount > 0) {
+        sortSamplePairsAscending(slabValueBuffer, slabWeightBuffer, validSampleCount);
+        if (isMeanAggregation) {
+          pixelValueRaw = computeWinsorizedWeightedMean(
+            slabValueBuffer,
+            slabWeightBuffer,
+            validSampleCount
+          );
         } else {
-          pixelValueRaw = max1;
+          pixelValueRaw = computeWeightedHighBandMean(
+            slabValueBuffer,
+            slabWeightBuffer,
+            validSampleCount,
+            robustMipTopCount
+          );
         }
+      } else {
+        pixelValueRaw = -1000;
       }
       const pixelValue = Number.isFinite(pixelValueRaw) ? pixelValueRaw : -1000;
 
@@ -823,6 +902,8 @@ function generatePanorama(input: CPRWorkerInput): {
       effectiveSamples: slabSampleCount,
       slabHalfThicknessMm,
       aggregation: aggregationMode,
+      focalTroughSigmaMm,
+      reduction: isMeanAggregation ? 'winsorized-weighted-mean' : 'weighted-high-band-mean',
     },
     denoise: {
       blend: denoiseBlend,

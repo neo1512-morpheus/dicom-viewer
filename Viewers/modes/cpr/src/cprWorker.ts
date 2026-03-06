@@ -253,7 +253,8 @@ function applyLightBilateralDenoise(
   pixelData: Float32Array,
   width: number,
   height: number,
-  blendWeight: number
+  blendWeight: number,
+  backgroundWeights?: Float32Array
 ): boolean {
   if (width < 3 || height < 3 || blendWeight <= 0) {
     return false;
@@ -263,7 +264,6 @@ function applyLightBilateralDenoise(
   const sigmaRange = 220;
   const sigmaRangeDen = 2 * sigmaRange * sigmaRange;
   const clampedBlend = Math.max(0, Math.min(0.6, blendWeight));
-  const keepWeight = 1 - clampedBlend;
 
   const neighbors: Array<[number, number, number]> = [
     [-1, -1, 0.45],
@@ -284,6 +284,16 @@ function applyLightBilateralDenoise(
         continue;
       }
 
+      const backgroundWeight =
+        backgroundWeights && backgroundWeights.length === pixelData.length
+          ? clampNumber(Number(backgroundWeights[index]), 0, 1)
+          : 1;
+      const localBlend = clampedBlend * backgroundWeight;
+      if (localBlend <= 0.001) {
+        continue;
+      }
+      const keepWeight = 1 - localBlend;
+
       let weightedSum = center;
       let weightTotal = 1;
 
@@ -301,7 +311,7 @@ function applyLightBilateralDenoise(
       }
 
       const filtered = weightTotal > 0 ? weightedSum / weightTotal : center;
-      pixelData[index] = keepWeight * center + clampedBlend * filtered;
+      pixelData[index] = keepWeight * center + localBlend * filtered;
     }
   }
 
@@ -354,7 +364,13 @@ function sortSamplePairsAscending(
 function computeWinsorizedWeightedMean(
   values: Float32Array,
   weights: Float32Array,
-  count: number
+  count: number,
+  diagnostics?: {
+    brightTailEvaluatedCount: number;
+    brightTailCappedCount: number;
+    brightTailPreservedCount: number;
+    brightClusterPreservedCount: number;
+  }
 ): number {
   if (count <= 0) {
     return -1000;
@@ -364,8 +380,39 @@ function computeWinsorizedWeightedMean(
   const winsorIndex = count - 1 - trimHi;
   if (trimHi > 0 && winsorIndex >= 0 && winsorIndex < count) {
     const winsorCap = values[winsorIndex];
-    for (let i = winsorIndex + 1; i < count; i++) {
-      values[i] = winsorCap;
+    const highValue = values[count - 1];
+    const secondHighestValue = count > 1 ? values[count - 2] : highValue;
+    const robustSpan = Math.max(80, highValue - values[0]);
+    const topGap = highValue - secondHighestValue;
+    const capGap = highValue - winsorCap;
+    const clusterTolerance = Math.max(110, robustSpan * 0.16);
+    let clusterStart = count - 1;
+    while (clusterStart > 0 && highValue - values[clusterStart - 1] <= clusterTolerance) {
+      clusterStart--;
+    }
+    const brightClusterSize = count - clusterStart;
+    const hasCoherentBrightCluster =
+      brightClusterSize >= 2 && topGap <= Math.max(180, robustSpan * 0.22);
+    const hasMaterialTail = capGap > Math.max(100, robustSpan * 0.12);
+    const isIsolatedTop = topGap > Math.max(160, robustSpan * 0.2);
+    const shouldCapTail = hasMaterialTail && isIsolatedTop && !hasCoherentBrightCluster;
+
+    if (diagnostics) {
+      diagnostics.brightTailEvaluatedCount++;
+    }
+
+    if (shouldCapTail) {
+      for (let i = winsorIndex + 1; i < count; i++) {
+        values[i] = winsorCap;
+      }
+      if (diagnostics) {
+        diagnostics.brightTailCappedCount++;
+      }
+    } else if (diagnostics) {
+      diagnostics.brightTailPreservedCount++;
+      if (hasCoherentBrightCluster) {
+        diagnostics.brightClusterPreservedCount++;
+      }
     }
   }
 
@@ -440,6 +487,250 @@ function smoothFloatSeries(
   if (source !== values) {
     values.set(source.subarray(0, count), 0);
   }
+}
+
+function meanFloatWindow(values: Float32Array, startIndex: number, endIndex: number): number {
+  const clampedStart = Math.max(0, Math.min(values.length - 1, Math.floor(startIndex)));
+  const clampedEnd = Math.max(clampedStart, Math.min(values.length - 1, Math.floor(endIndex)));
+  let sum = 0;
+  let count = 0;
+  for (let index = clampedStart; index <= clampedEnd; index++) {
+    const value = Number(values[index]);
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    sum += value;
+    count++;
+  }
+  return count > 0 ? sum / count : 0;
+}
+
+function smoothstep01(value: number): number {
+  const t = clampNumber(value, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function suppressLowerBackground(
+  pixelData: Float32Array,
+  width: number,
+  height: number,
+  rowSpacingMm: number
+): {
+  suppressionWeights: Float32Array;
+  toothBandBottomRows: Float32Array;
+  toothBandBottomRowStats: {
+    min: number;
+    max: number;
+    mean: number;
+    first8: number[];
+  };
+  backgroundSuppression: {
+    coverageFraction: number;
+    meanAttenuation: number;
+    maxAttenuation: number;
+  };
+} {
+  const suppressionWeights = new Float32Array(pixelData.length);
+  const toothBandBottomRows = new Float32Array(width);
+  if (width <= 0 || height < 8) {
+    return {
+      suppressionWeights,
+      toothBandBottomRows,
+      toothBandBottomRowStats: {
+        min: 0,
+        max: 0,
+        mean: 0,
+        first8: [],
+      },
+      backgroundSuppression: {
+        coverageFraction: 0,
+        meanAttenuation: 0,
+        maxAttenuation: 0,
+      },
+    };
+  }
+
+  const source = new Float32Array(pixelData);
+  const columnValues = new Float32Array(height);
+  const columnScratch = new Float32Array(height);
+  const columnGradient = new Float32Array(height);
+  const rowScratchA = new Float32Array(width);
+  const rowScratchB = new Float32Array(width);
+  const columnEdgeProtectThresholds = new Float32Array(width);
+  const columnIntensityProtectThresholds = new Float32Array(width);
+  const rowSearchStart = Math.max(2, Math.floor(height * 0.24));
+  const rowSearchEnd = Math.max(rowSearchStart + 2, Math.min(height - 4, Math.floor(height * 0.9)));
+
+  for (let col = 0; col < width; col++) {
+    const columnArray = new Array<number>(height);
+    for (let row = 0; row < height; row++) {
+      const value = Number(source[row * width + col]);
+      columnValues[row] = Number.isFinite(value) ? value : -1000;
+      columnArray[row] = columnValues[row];
+    }
+
+    smoothFloatSeries(columnValues, height, columnScratch, 2);
+
+    const sortedColumnValues = columnArray.slice().sort((a, b) => a - b);
+    const columnP25 = percentile(sortedColumnValues, 0.25);
+    const columnP45 = percentile(sortedColumnValues, 0.45);
+    const columnP7 = percentile(sortedColumnValues, 0.7);
+    const columnP82 = percentile(sortedColumnValues, 0.82);
+    const intensityScale = Math.max(120, columnP82 - columnP25);
+
+    const gradientValues = new Array<number>(height);
+    for (let row = 0; row < height; row++) {
+      const prevValue = row > 0 ? columnValues[row - 1] : columnValues[row];
+      const nextValue = row < height - 1 ? columnValues[row + 1] : columnValues[row];
+      const gradient = Math.max(
+        Math.abs(columnValues[row] - prevValue),
+        Math.abs(nextValue - columnValues[row])
+      );
+      columnGradient[row] = gradient;
+      gradientValues[row] = gradient;
+    }
+    const sortedGradientValues = gradientValues.slice().sort((a, b) => a - b);
+    const edgeP5 = percentile(sortedGradientValues, 0.5);
+    const edgeP82 = percentile(sortedGradientValues, 0.82);
+    const edgeScale = Math.max(24, edgeP82 - edgeP5);
+
+    let bestRow = Math.floor(height * 0.6);
+    let bestScore = -Infinity;
+    for (let row = rowSearchStart; row <= rowSearchEnd; row++) {
+      const upperMean = meanFloatWindow(columnValues, row - 2, row);
+      const lowerMean = meanFloatWindow(columnValues, row + 1, row + 4);
+      const upperEdge = meanFloatWindow(columnGradient, row - 2, row + 1);
+      const lowerEdge = meanFloatWindow(columnGradient, row + 1, row + 4);
+      const localIntensity = clampNumber(
+        (upperMean - (columnP45 - intensityScale * 0.08)) / Math.max(90, intensityScale * 0.85),
+        0,
+        1.5
+      );
+      const transitionContrast = clampNumber(
+        (upperMean - lowerMean + 70) / Math.max(90, intensityScale * 0.7),
+        0,
+        1.5
+      );
+      const edgeSupport = clampNumber(
+        (upperEdge - lowerEdge * 0.35 - edgeP5) / Math.max(18, edgeScale * 1.15),
+        0,
+        1.5
+      );
+      const depthBias = (row - rowSearchStart) / Math.max(1, rowSearchEnd - rowSearchStart);
+      const candidateScore =
+        localIntensity * 0.34 +
+        transitionContrast * 0.38 +
+        edgeSupport * 0.38 +
+        depthBias * 0.12;
+      if (candidateScore > bestScore) {
+        bestScore = candidateScore;
+        bestRow = row;
+      }
+    }
+
+    toothBandBottomRows[col] = bestRow;
+    columnEdgeProtectThresholds[col] = edgeP5 + Math.max(12, edgeScale * 0.3);
+    columnIntensityProtectThresholds[col] = Math.max(columnP7, columnP45 + intensityScale * 0.28);
+  }
+
+  if (width > 2) {
+    smoothFloatSeries(toothBandBottomRows, width, rowScratchA, 3);
+    smoothFloatSeries(toothBandBottomRows, width, rowScratchB, 2);
+    for (let col = 0; col < width; col++) {
+      toothBandBottomRows[col] = clampNumber(toothBandBottomRows[col], rowSearchStart, rowSearchEnd);
+    }
+  }
+
+  const rootPreserveRows = Math.max(2, Math.round(1.4 / Math.max(0.2, rowSpacingMm)));
+  const taperRows = Math.max(rootPreserveRows + 6, Math.round(5.8 / Math.max(0.2, rowSpacingMm)));
+  let attenuatedPixelCount = 0;
+  let attenuationSum = 0;
+  let maxAttenuation = 0;
+
+  for (let col = 0; col < width; col++) {
+    const bandBottomRow = Number(toothBandBottomRows[col]);
+    const edgeProtectThreshold = Number(columnEdgeProtectThresholds[col]);
+    const intensityProtectThreshold = Number(columnIntensityProtectThresholds[col]);
+    for (let row = 0; row < height; row++) {
+      const depthRows = row - bandBottomRow - 0.5;
+      if (depthRows <= 0) {
+        continue;
+      }
+
+      const baseSuppression = smoothstep01(
+        (depthRows - rootPreserveRows) / Math.max(1, taperRows - rootPreserveRows)
+      );
+      if (baseSuppression <= 0) {
+        continue;
+      }
+
+      const pixelIndex = row * width + col;
+      const value = Number(source[pixelIndex]);
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+
+      const prevValue = row > 0 ? Number(source[pixelIndex - width]) : value;
+      const nextValue = row < height - 1 ? Number(source[pixelIndex + width]) : value;
+      const localEdge = Math.max(Math.abs(value - prevValue), Math.abs(nextValue - value));
+      const edgeProtect = clampNumber(
+        (localEdge - edgeProtectThreshold) / Math.max(20, edgeProtectThreshold * 0.75),
+        0,
+        1
+      );
+      const intensityProtect = clampNumber(
+        (value - intensityProtectThreshold) /
+          Math.max(80, Math.abs(intensityProtectThreshold) * 0.25 + 120),
+        0,
+        1
+      );
+      const structureProtect = Math.min(1, Math.max(edgeProtect, intensityProtect * 0.85));
+      const attenuation = baseSuppression * (1 - 0.88 * structureProtect);
+      if (attenuation <= 0.005) {
+        continue;
+      }
+      suppressionWeights[pixelIndex] = attenuation;
+      attenuatedPixelCount++;
+      attenuationSum += attenuation;
+      if (attenuation > maxAttenuation) {
+        maxAttenuation = attenuation;
+      }
+    }
+  }
+
+  let minBandBottomRow = Infinity;
+  let maxBandBottomRow = -Infinity;
+  let bandBottomRowSum = 0;
+  for (let col = 0; col < width; col++) {
+    const value = Number(toothBandBottomRows[col]);
+    if (value < minBandBottomRow) {
+      minBandBottomRow = value;
+    }
+    if (value > maxBandBottomRow) {
+      maxBandBottomRow = value;
+    }
+    bandBottomRowSum += value;
+  }
+
+  return {
+    suppressionWeights,
+    toothBandBottomRows,
+    toothBandBottomRowStats: {
+      min: Number.isFinite(minBandBottomRow) ? Math.round(minBandBottomRow * 1000) / 1000 : 0,
+      max: Number.isFinite(maxBandBottomRow) ? Math.round(maxBandBottomRow * 1000) / 1000 : 0,
+      mean: width > 0 ? Math.round((bandBottomRowSum / width) * 1000) / 1000 : 0,
+      first8: Array.from(toothBandBottomRows.subarray(0, Math.min(8, toothBandBottomRows.length))).map(
+        value => Math.round(Number(value) * 1000) / 1000
+      ),
+    },
+    backgroundSuppression: {
+      coverageFraction:
+        pixelData.length > 0 ? Math.round((attenuatedPixelCount / pixelData.length) * 100000) / 100000 : 0,
+      meanAttenuation:
+        attenuatedPixelCount > 0 ? Math.round((attenuationSum / attenuatedPixelCount) * 100000) / 100000 : 0,
+      maxAttenuation: Math.round(maxAttenuation * 100000) / 100000,
+    },
+  };
 }
 
 function computeOutputSignature(buffer: Float32Array): {
@@ -782,6 +1073,12 @@ function generatePanorama(input: CPRWorkerInput): {
   const _dbgFirstFive: Array<{ row: number; vi: number; vj: number; vk: number; sample: number }> = [];
   let _dbgChecked = 0;
   let _dbgOob = 0;
+  const reductionDiagnostics = {
+    brightTailEvaluatedCount: 0,
+    brightTailCappedCount: 0,
+    brightTailPreservedCount: 0,
+    brightClusterPreservedCount: 0,
+  };
   const slabValueBuffer = new Float32Array(slabSampleCount);
   const slabWeightBuffer = new Float32Array(slabSampleCount);
   const adaptiveCenterSearchHalfRangeMm = Math.min(
@@ -903,7 +1200,12 @@ function generatePanorama(input: CPRWorkerInput): {
 
     sortSamplePairsAscending(slabValueBuffer, slabWeightBuffer, validSampleCount);
     if (isMeanAggregation) {
-      return computeWinsorizedWeightedMean(slabValueBuffer, slabWeightBuffer, validSampleCount);
+      return computeWinsorizedWeightedMean(
+        slabValueBuffer,
+        slabWeightBuffer,
+        validSampleCount,
+        reductionDiagnostics
+      );
     }
 
     return computeWeightedHighBandMean(
@@ -1201,6 +1503,15 @@ function generatePanorama(input: CPRWorkerInput): {
     }
   }
 
+  const backgroundSuppressionResult = suppressLowerBackground(
+    pixelData,
+    panoWidth,
+    panoHeight,
+    vertStepMm
+  );
+  const { toothBandBottomRowStats, backgroundSuppression, suppressionWeights } =
+    backgroundSuppressionResult;
+
   const denoiseBlend = isMeanAggregation
     ? slabHalfThicknessMm <= 0.35
       ? 0
@@ -1211,7 +1522,8 @@ function generatePanorama(input: CPRWorkerInput): {
           : 0.1
     : 0.12 * Math.min(1, slabHalfThicknessMm / 1.5);
   const denoiseApplied =
-    denoiseBlend > 0 && applyLightBilateralDenoise(pixelData, panoWidth, panoHeight, denoiseBlend);
+    denoiseBlend > 0 &&
+    applyLightBilateralDenoise(pixelData, panoWidth, panoHeight, denoiseBlend, suppressionWeights);
   if (denoiseApplied) {
     const denoisedRange = computeArrayMinMax(pixelData);
     minValue = denoisedRange.minValue;
@@ -1274,6 +1586,9 @@ function generatePanorama(input: CPRWorkerInput): {
       blend: denoiseBlend,
       applied: denoiseApplied,
     },
+    toothBandBottomRowStats,
+    backgroundSuppression,
+    reductionDiagnostics,
     firstFrameWorldPos: frames?.[0]?.position ?? null,
     lastFrameWorldPos: frames?.[frames.length - 1]?.position ?? null,
   };

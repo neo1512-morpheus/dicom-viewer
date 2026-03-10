@@ -85,8 +85,8 @@ const CROSSSECTION_SERIES_INSTANCE_UID_PREFIX = 'CPR_CROSSSECTION_SERIES';
 const CROSSSECTION_STUDY_INSTANCE_UID = 'CPR_CROSSSECTION_STUDY_INSTANCE';
 const CROSSSECTION_FRAME_OF_REFERENCE_UID = 'CPR_CROSSSECTION_FRAME_OF_REFERENCE';
 const CROSSSECTION_IMAGE_CACHE_LIMIT = 48;
-const CROSSSECTION_THROUGH_PLANE_HALF_THICKNESS_MM = 0.5;
-const CROSSSECTION_THROUGH_PLANE_SAMPLES = 5;
+const CROSSSECTION_THROUGH_PLANE_HALF_THICKNESS_MM = 1.5;
+const CROSSSECTION_THROUGH_PLANE_SAMPLES = 11;
 const CROSSSECTION_THROUGH_PLANE_AGGREGATION: 'MEAN' | 'MIP' = 'MEAN';
 const CROSSSECTION_ENABLE_DENOISE = false;
 const EPS = 1e-8;
@@ -867,9 +867,9 @@ function applyLightBilateralDenoise(
   }
 
   const source = new Float32Array(pixelData);
-  const sigmaRange = 220;
+  const sigmaRange = 120;
   const sigmaRangeDen = 2 * sigmaRange * sigmaRange;
-  const clampedBlend = Math.max(0, Math.min(0.18, blendWeight));
+  const clampedBlend = Math.min(1.0, blendWeight);
   const neighbors: Array<[number, number, number]> = [
     [-1, -1, 0.45],
     [0, -1, 0.7],
@@ -1004,11 +1004,15 @@ function computeCrossSectionImage(
       : undefined;
   const invDirection = invertMatrix3(direction);
   const { normal, right, up } = buildCrossSectionBasis(frame);
-  const width = CROSSSECTION_CANONICAL_GRID_SIZE;
-  const height = CROSSSECTION_CANONICAL_GRID_SIZE;
-  const columnPixelSpacing = CROSSSECTION_CANONICAL_PIXEL_SPACING_MM;
-  const rowPixelSpacing = CROSSSECTION_CANONICAL_PIXEL_SPACING_MM;
-  const gridCenterIndex = (CROSSSECTION_CANONICAL_GRID_SIZE - 1) * 0.5;
+  const width = seriesPayload.width;
+  const height = seriesPayload.height;
+  const columnPixelSpacing = seriesPayload.columnPixelSpacing;
+  const rowPixelSpacing = seriesPayload.rowPixelSpacing;
+  console.log(
+    `CPR Grid: ${JSON.stringify({ width, height, rowPixelSpacing, columnPixelSpacing })}`
+  );
+  const columnCenterIndex = (width - 1) * 0.5;
+  const rowCenterIndex = (height - 1) * 0.5;
   const frameCenter =
     Math.abs(seriesPayload.verticalCenterOffsetMm) > EPS
       ? add(frame.position, scale(up, seriesPayload.verticalCenterOffsetMm))
@@ -1019,7 +1023,7 @@ function computeCrossSectionImage(
     : huDomain
       ? -1000
       : seriesPayload.minValue;
-  const pixelData = new Float32Array(CROSSSECTION_CANONICAL_GRID_SIZE * CROSSSECTION_CANONICAL_GRID_SIZE);
+  const pixelData = new Float32Array(width * height);
   let minValue = Infinity;
   let maxValue = -Infinity;
   const throughPlaneStepMm =
@@ -1028,11 +1032,11 @@ function computeCrossSectionImage(
         (CROSSSECTION_THROUGH_PLANE_SAMPLES - 1)
       : 0;
 
-  for (let row = 0; row < CROSSSECTION_CANONICAL_GRID_SIZE; row++) {
-    const rowOffsetMm = (gridCenterIndex - row) * rowPixelSpacing;
+  for (let row = 0; row < height; row++) {
+    const rowOffsetMm = (rowCenterIndex - row) * rowPixelSpacing;
 
-    for (let column = 0; column < CROSSSECTION_CANONICAL_GRID_SIZE; column++) {
-      const columnOffsetMm = (column - gridCenterIndex) * columnPixelSpacing;
+    for (let column = 0; column < width; column++) {
+      const columnOffsetMm = (column - columnCenterIndex) * columnPixelSpacing;
       const baseX =
         frameCenter[0] + up[0] * rowOffsetMm + right[0] * columnOffsetMm;
       const baseY =
@@ -1124,11 +1128,25 @@ function computeCrossSectionImage(
     maxValue = seriesPayload.maxValue;
   }
 
-  if (CROSSSECTION_ENABLE_DENOISE && applyLightBilateralDenoise(pixelData, width, height, 0.04)) {
-    const denoisedRange = computeExactScalarRange(pixelData);
-    minValue = denoisedRange.minValue;
-    maxValue = denoisedRange.maxValue;
+  console.log(
+    `CPR MinMax BEFORE Denoise: ${JSON.stringify(computeExactScalarRange(pixelData))}`
+  );
+
+  if (CROSSSECTION_ENABLE_DENOISE) {
+    const firstPassDenoised = applyLightBilateralDenoise(pixelData, width, height, 0.65);
+    const secondPassDenoised = applyLightBilateralDenoise(pixelData, width, height, 0.65);
+    const denoised = firstPassDenoised || secondPassDenoised;
+
+    if (denoised) {
+      const denoisedRange = computeExactScalarRange(pixelData);
+      minValue = denoisedRange.minValue;
+      maxValue = denoisedRange.maxValue;
+    }
   }
+
+  console.log(
+    `CPR MinMax AFTER Denoise: ${JSON.stringify(computeExactScalarRange(pixelData))}`
+  );
 
   const exactRange = computeExactScalarRange(pixelData);
   minValue = exactRange.minValue;
@@ -1157,14 +1175,23 @@ function createCrossSectionImageObject(
     throw new Error('Dimension mismatch');
   }
 
+  const resolved = getCrossSectionSeriesPayloadForImage(imageId);
+  if (!resolved) {
+    throw new Error(
+      `[crossSectionImageLoader] No series payload cached for imageId "${imageId}" when creating image object.`
+    );
+  }
+
+  const { seriesPayload } = resolved;
+
   return {
     imageId,
     minPixelValue: payload.minValue,
     maxPixelValue: payload.maxValue,
     slope: 1,
     intercept: 0,
-    windowCenter: payload.windowCenter,
-    windowWidth: payload.windowWidth,
+    windowCenter: seriesPayload.windowCenter,
+    windowWidth: seriesPayload.windowWidth,
     voiLUTFunction: 'LINEAR_EXACT',
     getPixelData: () => payload.pixelData,
     getCanvas: () => null,
@@ -1301,11 +1328,9 @@ function crossSectionMetadataProvider(type: string, imageId: string) {
   }
 
   if (type === 'voiLutModule') {
-    const windowCenter = imagePayload?.windowCenter ?? seriesPayload.windowCenter;
-    const windowWidth = imagePayload?.windowWidth ?? seriesPayload.windowWidth;
     return {
-      windowCenter: [windowCenter],
-      windowWidth: [windowWidth],
+      windowCenter: [seriesPayload.windowCenter],
+      windowWidth: [seriesPayload.windowWidth],
       voiLUTFunction: 'LINEAR_EXACT',
     };
   }
@@ -1371,6 +1396,31 @@ export function setCrossSectionSeriesPayload(
   payload: CrossSectionSeriesPayload
 ): void {
   crossSectionSeriesCache.set(seriesId, resolveSeriesPayload(payload));
+}
+
+export function updateCrossSectionSeriesDisplayDefaults(
+  seriesId: string,
+  voiRange: { lower: number; upper: number }
+): void {
+  const seriesPayload = crossSectionSeriesCache.get(seriesId);
+  if (!seriesPayload) {
+    return;
+  }
+
+  const lower = Number(voiRange.lower);
+  const upper = Number(voiRange.upper);
+  if (!Number.isFinite(lower) || !Number.isFinite(upper)) {
+    return;
+  }
+
+  const windowWidth = Math.max(1, upper - lower);
+  const windowCenter = lower + windowWidth * 0.5;
+
+  crossSectionSeriesCache.set(seriesId, {
+    ...seriesPayload,
+    windowWidth,
+    windowCenter,
+  });
 }
 
 export function clearCrossSectionImageCache(): void {

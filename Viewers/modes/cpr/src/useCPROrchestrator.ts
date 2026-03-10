@@ -14,8 +14,8 @@ import {
   clearCrossSectionImageCache,
   createCrossSectionImageIds,
   createCrossSectionSeriesId,
-  getCrossSectionCanonicalGridConfig,
   setCrossSectionSeriesPayload,
+  updateCrossSectionSeriesDisplayDefaults,
 } from './crossSectionImageLoader';
 import { buildRMFFrames } from './cprMath';
 import { CPR_CROSSSECTION_SYNC_EVENT, CPRCrossSectionSyncDetail } from './cprEvents';
@@ -1986,6 +1986,27 @@ function getCurrentStackImageId(viewport: cornerstone.Types.IViewport | null): s
   return imageIds[safeIndex] ?? null;
 }
 
+function getCurrentCrossSectionSeriesId(
+  viewport: cornerstone.Types.IViewport | null
+): string | null {
+  if (!viewport || !isStackViewportLike(viewport)) {
+    return null;
+  }
+
+  const imageId = getCurrentStackImageId(viewport) ?? viewport.getImageIds?.()?.[0] ?? null;
+  if (typeof imageId !== 'string' || !imageId.startsWith('cross://')) {
+    return null;
+  }
+
+  const remainder = imageId.slice('cross://'.length);
+  const separatorIndex = remainder.lastIndexOf('/');
+  if (separatorIndex <= 0) {
+    return null;
+  }
+
+  return remainder.slice(0, separatorIndex) || null;
+}
+
 function toFiniteNumber(value: unknown): number | undefined {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : undefined;
@@ -2486,6 +2507,11 @@ function setCrossSectionForFrame(
       );
       pendingCrossSectionVoiReapplyListeners.set(crossViewport.element, onTargetImageRendered);
       applyCrossSectionDisplaySettings(crossViewport, preservedDisplaySettings);
+      const crossSectionSeriesId = getCurrentCrossSectionSeriesId(crossViewport);
+      const savedVoi = preservedDisplaySettings?.voiRange;
+      if (crossSectionSeriesId && savedVoi) {
+        updateCrossSectionSeriesDisplayDefaults(crossSectionSeriesId, savedVoi);
+      }
 
       cornerstoneTools.utilities.jumpToSlice(crossViewport.element, {
         imageIndex: frame.index,
@@ -2519,7 +2545,21 @@ function buildCrossSectionStackConfig(
   horizontalHalfWidthMm: number;
   verticalHalfHeightMm: number;
 } {
-  return getCrossSectionCanonicalGridConfig();
+  const width = 256;
+  const height = 256;
+  const rowPixelSpacing = 0.16;
+  const columnPixelSpacing = 0.16;
+  const horizontalHalfWidthMm = columnPixelSpacing * Math.max(0, width - 1) * 0.5;
+  const verticalHalfHeightMm = rowPixelSpacing * Math.max(0, height - 1) * 0.5;
+
+  return {
+    width,
+    height,
+    rowPixelSpacing,
+    columnPixelSpacing,
+    horizontalHalfWidthMm,
+    verticalHalfHeightMm,
+  };
 }
 
 type VolumeLoadStatusLike = {

@@ -3038,14 +3038,14 @@ export function useCPROrchestrator({
       const balancedSlabSamples = 9;
       const fastSlabHalfThicknessMm = 1.2;
       const fastSlabSamples = 7;
-      const balancedMeanSlabHalfThicknessMm = 0.7;
-      const balancedMeanSlabSamples = 5;
+      const balancedMeanSlabHalfThicknessMm = 1.5;
+      const balancedMeanSlabSamples = 11;
       const focusedMeanSlabHalfThicknessMm = 0.35;
       const focusedMeanSlabSamples = 3;
-      const broadMeanSlabHalfThicknessMm = 1.0;
-      const broadMeanSlabSamples = 7;
-      const meanFallbackSlabHalfThicknessMm = 0.45;
-      const meanFallbackSlabSamples = 5;
+      const broadMeanSlabHalfThicknessMm = 2.0;
+      const broadMeanSlabSamples = 15;
+      const meanFallbackSlabHalfThicknessMm = 1.0;
+      const meanFallbackSlabSamples = 9;
       const sharpMeanSlabHalfThicknessMm = 0.2;   // ~2 voxels total slab
       const sharpMeanSlabSamples = 3;
       const minimumPanoHeightPx = Math.max(160, Math.round(requestedPanoHeightPx * 0.55));
@@ -4327,6 +4327,12 @@ export function useCPROrchestrator({
         selectedColumnPixelSpacing = phase2BaseAttempt.columnPixelSpacing;
         selectedRowPixelSpacing = phase2BaseAttempt.rowPixelSpacing;
       }
+      adaptiveVoi = {
+        lower: CPR_PANO_DEFAULT_WINDOW_CENTER - CPR_PANO_DEFAULT_WINDOW_WIDTH / 2,
+        upper: CPR_PANO_DEFAULT_WINDOW_CENTER + CPR_PANO_DEFAULT_WINDOW_WIDTH / 2,
+        windowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
+        windowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
+      };
       const displayedWorkerDebugPayload =
         phase2VirtualPano.usedAsDisplayedOutput
           ? phase2WorkerResult?.workerDebugPayload ?? null

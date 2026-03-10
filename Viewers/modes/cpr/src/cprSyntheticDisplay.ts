@@ -11,8 +11,8 @@ interface SyntheticCprVoiOptions {
   intensityDomain?: SyntheticCprIntensityDomain;
 }
 
-const CPR_SYNTHETIC_FALLBACK_WINDOW_WIDTH = 3000;
-const CPR_SYNTHETIC_FALLBACK_WINDOW_CENTER = 400;
+const CPR_SYNTHETIC_FALLBACK_WINDOW_WIDTH = 3500;
+const CPR_SYNTHETIC_FALLBACK_WINDOW_CENTER = 850;
 
 function clampNumber(value: number, minValue: number, maxValue: number): number {
   return Math.max(minValue, Math.min(maxValue, value));

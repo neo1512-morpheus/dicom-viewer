@@ -22,8 +22,8 @@ import { CPR_CROSSSECTION_SYNC_EVENT, CPRCrossSectionSyncDetail } from './cprEve
 import { buildCrossSectionCameraForFrame } from './cprCrossSectionCamera';
 import type { CPRFrame } from './cprMath';
 
-const CPR_PANO_DEFAULT_WINDOW_WIDTH = 3000;
-const CPR_PANO_DEFAULT_WINDOW_CENTER = 400;
+const CPR_PANO_DEFAULT_WINDOW_WIDTH = 3500;
+const CPR_PANO_DEFAULT_WINDOW_CENTER = 850;
 const CPR_PANO_MAX_DIMENSION = 4096;
 const CPR_PANO_DEFAULT_VERTICAL_HALF_MM = 18;
 const CPR_PANO_MAX_VERTICAL_HALF_MM = 28;

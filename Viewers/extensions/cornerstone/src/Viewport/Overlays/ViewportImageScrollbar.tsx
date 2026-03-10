@@ -73,6 +73,19 @@ function CornerstoneImageScrollbar({
         return;
       }
 
+      if (isCPRCrossSectionViewport() && cprStateService.hasData()) {
+        const viewportImageIds = viewport.getImageIds?.() || [];
+        const frameCount = Math.max(
+          viewportImageIds.length,
+          cprStateService.getFrames().length
+        );
+        setImageSliceData({
+          imageIndex: cprStateService.getCurrentFrameIndex(),
+          numberOfSlices: frameCount,
+        });
+        return;
+      }
+
       const imageIndex = viewport.getCurrentImageIdIndex();
 
       setImageSliceData({
@@ -115,12 +128,24 @@ function CornerstoneImageScrollbar({
       return;
     }
 
+    const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
+    if (!viewport) {
+      return;
+    }
+
     const updateStackIndex = event => {
       const { newImageIdIndex } = event.detail;
+      if (isCPRCrossSectionViewport() && cprStateService.hasData()) {
+        cprStateService.setCurrentFrameIndex(newImageIdIndex);
+      }
       // find the index of imageId in the imageIds
+      const numberOfSlices =
+        isCPRCrossSectionViewport() && cprStateService.hasData()
+          ? Math.max(viewport.getImageIds?.()?.length || 0, cprStateService.getFrames().length)
+          : viewportData.data[0].imageIds.length;
       setImageSliceData({
         imageIndex: newImageIdIndex,
-        numberOfSlices: viewportData.data[0].imageIds.length,
+        numberOfSlices,
       });
     };
 

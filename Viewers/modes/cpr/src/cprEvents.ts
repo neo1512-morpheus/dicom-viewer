@@ -8,5 +8,6 @@ export interface CPRCrossSectionSyncDetail {
 }
 
 export function emitCPRCrossSectionSync(detail: CPRCrossSectionSyncDetail): void {
+  console.log('[CPR-CROSSSECTION-SYNC]', detail);
   eventTarget.dispatchEvent(new CustomEvent(CPR_CROSSSECTION_SYNC_EVENT, { detail }));
 }

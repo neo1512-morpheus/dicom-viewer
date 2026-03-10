@@ -808,6 +808,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
 
     console.log('[DEBUG] _setStackViewport called, setting stack with', imageIds.length, 'images');
     const isCPRPanoViewport = viewport.id === 'cpr-pano';
+    const isCPRCrossSectionViewport = viewport.id === 'cpr-crosssection';
     if (isCPRPanoViewport) {
       console.log('[CPR-TRACE] CornerstoneViewportService entering _setStackViewport for cpr-pano', {
         initialImageIndexToUse,
@@ -818,8 +819,8 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       });
     }
 
-    // Avoid #2d parallel cache rewriting on cpr-pano to reduce duplicate decode churn.
-    const shouldUseParallel2dCache = !isCPRPanoViewport;
+    // Avoid #2d parallel cache rewriting on synthetic CPR stacks to keep their custom schemes intact.
+    const shouldUseParallel2dCache = !isCPRPanoViewport && !isCPRCrossSectionViewport;
     const stackImageIds = shouldUseParallel2dCache
       ? imageIds.map((imageId: string) => {
           if (imageId.endsWith('#2d')) {
@@ -834,8 +835,9 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         `[GEMINI FIX] Parallel Cache: Using #2d suffixed imageIds (${stackImageIds.length} images)`
       );
     } else {
-      console.log('[CPR-TRACE] cpr-pano using original stack imageIds (no #2d suffix)', {
+      console.log('[CPR-TRACE] synthetic CPR stack using original imageIds (no #2d suffix)', {
         firstStackImageId: stackImageIds?.[0],
+        viewportId: viewport.id,
       });
     }
 
@@ -844,6 +846,16 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       if (!firstImageId.startsWith('pano://')) {
         console.log(
           '[CPR] _setStackViewport: blocking non-pano:// stack load into cpr-pano. Orchestrator will set the correct pano:// stack.'
+        );
+        return Promise.resolve();
+      }
+    }
+
+    if (viewport.id === 'cpr-crosssection') {
+      const firstImageId = stackImageIds?.[0] ?? '';
+      if (!firstImageId.startsWith('cross://')) {
+        console.log(
+          '[CPR] _setStackViewport: blocking non-cross:// stack load into cpr-crosssection. Orchestrator will set the correct cross:// stack.'
         );
         return Promise.resolve();
       }
@@ -876,7 +888,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         });
       }
 
-      if (!isCPRPanoViewport) {
+      if (!isCPRPanoViewport && !isCPRCrossSectionViewport) {
         // [GEMINI FIX] Recalculate VOI based on ACTUAL pixel data (Corrected for Slope/Intercept)
         try {
           const imageData = viewport.getImageData();

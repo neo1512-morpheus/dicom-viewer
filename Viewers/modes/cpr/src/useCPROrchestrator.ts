@@ -5,16 +5,29 @@ import { vec3 } from 'gl-matrix';
 
 import { cprStateService } from './CPRStateService';
 import { setPanoImagePayload, createPanoImageId, clearPanoImageCache } from './panoImageLoader';
+import {
+  SyntheticCprIntensityDomain,
+  classifySyntheticCprIntensityDomain,
+  isSyntheticCprHuDomain,
+} from './cprSyntheticDisplay';
+import {
+  clearCrossSectionImageCache,
+  createCrossSectionImageIds,
+  createCrossSectionSeriesId,
+  getCrossSectionCanonicalGridConfig,
+  setCrossSectionSeriesPayload,
+} from './crossSectionImageLoader';
 import { buildRMFFrames } from './cprMath';
 import { CPR_CROSSSECTION_SYNC_EVENT, CPRCrossSectionSyncDetail } from './cprEvents';
+import { buildCrossSectionCameraForFrame } from './cprCrossSectionCamera';
 import type { CPRFrame } from './cprMath';
 
 const CPR_PANO_DEFAULT_WINDOW_WIDTH = 3000;
-const CPR_PANO_DEFAULT_WINDOW_CENTER = 600;
+const CPR_PANO_DEFAULT_WINDOW_CENTER = 400;
 const CPR_PANO_MAX_DIMENSION = 4096;
-const CPR_PANO_DEFAULT_VERTICAL_HALF_MM = 20;
-const CPR_PANO_MAX_VERTICAL_HALF_MM = 26;
-const CPR_PANO_TARGET_ASPECT = 1.35;
+const CPR_PANO_DEFAULT_VERTICAL_HALF_MM = 18;
+const CPR_PANO_MAX_VERTICAL_HALF_MM = 28;
+const CPR_PANO_TARGET_ASPECT = 3.2;
 
 interface FloatBufferDebugSummary {
   sampledCount: number;
@@ -26,6 +39,10 @@ interface FloatBufferDebugSummary {
   fractionBelowMinus950: number;
   fractionAbove3000: number;
   meanAbsDelta: number;
+  toothBandMean: number;
+  toothBandP10: number;
+  toothBandP90: number;
+  toothBandBrightFraction: number;
   lowerBandP50: number;
   lowerBandBrightFraction: number;
   detailBandHorizontalEdgeMean: number;
@@ -46,31 +63,6 @@ function isHuLikeRange(minValue: number, maxValue: number): boolean {
     minValue >= -5000 &&
     maxValue <= 7000
   );
-}
-
-function isLikelyStoredValueRange(
-  minValue: number,
-  maxValue: number,
-  bitsStored: number,
-  pixelRepresentation: number
-): boolean {
-  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
-    return false;
-  }
-
-  const safeBitsStored =
-    Number.isFinite(bitsStored) && bitsStored >= 1 && bitsStored <= 31 ? Math.floor(bitsStored) : 16;
-  const isSigned = Number(pixelRepresentation) === 1;
-
-  if (isSigned) {
-    const signedMin = safeBitsStored < 31 ? -(1 << (safeBitsStored - 1)) : Number.MIN_SAFE_INTEGER;
-    const signedMax =
-      safeBitsStored < 31 ? (1 << (safeBitsStored - 1)) - 1 : Number.MAX_SAFE_INTEGER;
-    return minValue >= signedMin - 8 && maxValue <= signedMax + 8;
-  }
-
-  const unsignedMax = safeBitsStored < 31 ? (1 << safeBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
-  return minValue >= -1 && maxValue <= unsignedMax + 8;
 }
 
 function isSeverelyCorruptedPanoOutput(summary: FloatBufferDebugSummary | null): boolean {
@@ -112,6 +104,13 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
     summary.detailBandHorizontalEdgeMean,
     summary.detailBandVerticalEdgeMean * 2.4
   );
+  const toothBandContrastRange = summary.toothBandP90 - summary.toothBandP10;
+  const hasToothBandSaturation = summary.toothBandP10 > 220 || summary.toothBandMean > 880;
+  const hasWhiteBlobArtifact =
+    summary.toothBandBrightFraction > 0.36 &&
+    summary.toothBandP10 > 120 &&
+    summary.toothBandP90 > 1450;
+  const hasWeakToothBandContrast = toothBandContrastRange < 260;
   const hasWeakDentalSeparation = balancedDetailEdgeMean < 38;
   const hasShearWarping =
     summary.detailBandHorizontalEdgeMean > 220 && detailAnisotropyRatio > 3;
@@ -125,6 +124,9 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
     hasStrongSpeckleNoise ||
     hasModerateSpeckleNoise ||
     hasLowerBandFill ||
+    hasToothBandSaturation ||
+    hasWhiteBlobArtifact ||
+    hasWeakToothBandContrast ||
     hasWeakDentalSeparation ||
     hasShearWarping
   );
@@ -141,6 +143,18 @@ function getHardRejectReason(summary: FloatBufferDebugSummary | null): string | 
 
   if (summary.meanAbsDelta > 760) {
     return 'speckle-noise';
+  }
+
+  if (summary.toothBandP10 > 280 && summary.toothBandMean > 950) {
+    return 'tooth-band-saturation';
+  }
+
+  if (
+    summary.toothBandBrightFraction > 0.42 &&
+    summary.toothBandP10 > 120 &&
+    summary.toothBandP90 > 1550
+  ) {
+    return 'white-blob-artifact';
   }
 
   if (summary.lowerBandP50 > 260 && summary.lowerBandBrightFraction > 0.78) {
@@ -180,6 +194,7 @@ function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
     summary.detailBandHorizontalEdgeMean,
     summary.detailBandVerticalEdgeMean * 2.4
   );
+  const toothBandContrastRange = summary.toothBandP90 - summary.toothBandP10;
   let score = 0;
 
   if (Number.isFinite(robustSpan)) {
@@ -229,6 +244,36 @@ function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
     score -= 3;
   }
 
+  if (summary.toothBandMean >= 160 && summary.toothBandMean <= 760) {
+    score += 3;
+  } else {
+    score -= Math.min(10, Math.abs(summary.toothBandMean - 460) / 110);
+  }
+
+  if (summary.toothBandP10 <= -120) {
+    score += 2;
+  } else if (summary.toothBandP10 <= 80) {
+    score += 1;
+  } else {
+    score -= Math.min(12, (summary.toothBandP10 - 80) / 32);
+  }
+
+  if (summary.toothBandBrightFraction <= 0.14) {
+    score += 2;
+  } else if (summary.toothBandBrightFraction <= 0.24) {
+    score += 1;
+  } else {
+    score -= Math.min(14, (summary.toothBandBrightFraction - 0.24) * 24);
+  }
+
+  if (toothBandContrastRange >= 360 && toothBandContrastRange <= 1700) {
+    score += 3;
+  } else if (toothBandContrastRange >= 240) {
+    score += 1;
+  } else {
+    score -= Math.min(8, (240 - toothBandContrastRange) / 36);
+  }
+
   if (summary.detailBandHorizontalEdgeMean > 260) {
     score -= Math.min(6, (summary.detailBandHorizontalEdgeMean - 260) / 24);
   }
@@ -258,45 +303,26 @@ function scorePanoQuality(summary: FloatBufferDebugSummary | null): number {
   return score;
 }
 
-function applyLinearRescaleToPixelData(
-  source: Float32Array,
-  slope: number,
-  intercept: number
-): { pixelData: Float32Array; minValue: number; maxValue: number } | null {
-  const safeSlope = Number.isFinite(slope) && Math.abs(Number(slope)) > 1e-8 ? Number(slope) : 1;
-  const safeIntercept = Number.isFinite(intercept) ? Number(intercept) : 0;
-  const hasNonIdentityRescale = Math.abs(safeSlope - 1) > 1e-6 || Math.abs(safeIntercept) > 1e-6;
-
-  if (!hasNonIdentityRescale || !source || source.length === 0) {
-    return null;
+function scoreHardRejectedPanoFallback(summary: FloatBufferDebugSummary | null): number {
+  if (!summary || summary.sampledCount < 100) {
+    return -Infinity;
   }
 
-  const converted = new Float32Array(source.length);
-  let minValue = Infinity;
-  let maxValue = -Infinity;
+  const toothBandContrastRange = summary.toothBandP90 - summary.toothBandP10;
+  const detailRatio =
+    summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean);
 
-  for (let i = 0; i < source.length; i++) {
-    const value = Number(source[i]);
-    const transformed = Number.isFinite(value) ? value * safeSlope + safeIntercept : -1000;
-    const safeValue = Number.isFinite(transformed) ? transformed : -1000;
-    converted[i] = safeValue;
-    if (safeValue < minValue) {
-      minValue = safeValue;
-    }
-    if (safeValue > maxValue) {
-      maxValue = safeValue;
-    }
-  }
-
-  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
-    return null;
-  }
-
-  return {
-    pixelData: converted,
-    minValue,
-    maxValue,
-  };
+  let score = 0;
+  score -= Math.max(0, summary.lowerBandP50 + 160) / 45;
+  score -= Math.max(0, summary.lowerBandBrightFraction - 0.28) * 30;
+  score -= Math.max(0, summary.toothBandMean - 760) / 80;
+  score -= Math.max(0, summary.toothBandP10 - 80) / 30;
+  score -= Math.max(0, summary.toothBandBrightFraction - 0.24) * 26;
+  score += Math.max(-6, Math.min(6, (toothBandContrastRange - 320) / 90));
+  score -= Math.max(0, detailRatio - 2.8) * 3.2;
+  score -= Math.max(0, summary.meanAbsDelta - 520) / 90;
+  score -= Math.max(0, summary.fractionAbove3000 - 0.005) * 120;
+  return score;
 }
 
 function percentileFromSorted(values: number[], q: number): number {
@@ -338,6 +364,10 @@ function summarizeFloatBufferForDebug(
   let absDeltaAccum = 0;
   let absDeltaCount = 0;
   const hasGrid = !!width && !!height && width > 1 && height > 1 && width * height <= buffer.length;
+  const toothBandSamples: number[] = [];
+  let toothBandBrightCount = 0;
+  let toothBandCount = 0;
+  let toothBandSum = 0;
   const lowerBandSamples: number[] = [];
   let lowerBandBrightCount = 0;
   let lowerBandCount = 0;
@@ -377,7 +407,15 @@ function summarizeFloatBufferForDebug(
     const safeHeight = Number(height);
     const rowStep = Math.max(1, Math.floor(safeHeight / 140));
     const colStep = Math.max(1, Math.floor(safeWidth / 180));
-    const lowerBandStartRow = Math.max(0, Math.floor(safeHeight * 0.68));
+    const panoCenterRow = (safeHeight - 1) / 2;
+    const rowFromNormalizedOffset = (yNorm: number): number => {
+      const row = Math.round(panoCenterRow + yNorm * panoCenterRow);
+      return Math.max(0, Math.min(safeHeight - 1, row));
+    };
+    const toothBandStartRow = Math.min(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
+    const toothBandEndRow = Math.max(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
+    const lowerBandStartRow = Math.min(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
+    const lowerBandEndRow = Math.max(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
     const detailBandStartRow = Math.max(0, Math.floor(safeHeight * 0.12));
     const detailBandEndRow = Math.min(safeHeight - 1, Math.ceil(safeHeight * 0.72));
 
@@ -389,11 +427,20 @@ function summarizeFloatBufferForDebug(
           continue;
         }
 
-        if (row >= lowerBandStartRow) {
+        if (row >= lowerBandStartRow && row <= lowerBandEndRow) {
           lowerBandSamples.push(value);
           lowerBandCount++;
           if (value > -180) {
             lowerBandBrightCount++;
+          }
+        }
+
+        if (row >= toothBandStartRow && row <= toothBandEndRow) {
+          toothBandSamples.push(value);
+          toothBandCount++;
+          toothBandSum += value;
+          if (value > 1200) {
+            toothBandBrightCount++;
           }
         }
 
@@ -424,6 +471,9 @@ function summarizeFloatBufferForDebug(
   }
 
   samples.sort((a, b) => a - b);
+  if (toothBandSamples.length) {
+    toothBandSamples.sort((a, b) => a - b);
+  }
   if (lowerBandSamples.length) {
     lowerBandSamples.sort((a, b) => a - b);
   }
@@ -439,6 +489,10 @@ function summarizeFloatBufferForDebug(
     fractionBelowMinus950: belowCount / sampledCount,
     fractionAbove3000: aboveCount / sampledCount,
     meanAbsDelta: absDeltaCount > 0 ? absDeltaAccum / absDeltaCount : 0,
+    toothBandMean: toothBandCount > 0 ? toothBandSum / toothBandCount : 0,
+    toothBandP10: toothBandSamples.length ? percentileFromSorted(toothBandSamples, 0.1) : 0,
+    toothBandP90: toothBandSamples.length ? percentileFromSorted(toothBandSamples, 0.9) : 0,
+    toothBandBrightFraction: toothBandCount > 0 ? toothBandBrightCount / toothBandCount : 0,
     lowerBandP50: lowerBandSamples.length ? percentileFromSorted(lowerBandSamples, 0.5) : 0,
     lowerBandBrightFraction: lowerBandCount > 0 ? lowerBandBrightCount / lowerBandCount : 0,
     detailBandHorizontalEdgeMean:
@@ -458,41 +512,37 @@ function computeAdaptivePanoVoi(
 
   const safeMin = Number.isFinite(minValue) ? Number(minValue) : fallbackLower;
   const safeMax = Number.isFinite(maxValue) ? Number(maxValue) : fallbackUpper;
-  const rangeLow = Math.min(safeMin, safeMax);
-  const rangeHigh = Math.max(safeMin, safeMax);
+  const lower = Math.min(safeMin, safeMax);
+  const upper = Math.max(safeMin, safeMax);
   const p01 = summary?.p01;
   const p99 = summary?.p99;
 
-  let lower = Number.isFinite(p01) ? Number(p01) : rangeLow;
-  let upper = Number.isFinite(p99) ? Number(p99) : rangeHigh;
+  let adaptiveLower = Number.isFinite(p01) ? Number(p01) : lower;
+  let adaptiveUpper = Number.isFinite(p99) ? Number(p99) : upper;
 
-  if (!Number.isFinite(lower) || !Number.isFinite(upper) || upper <= lower) {
-    lower = rangeLow;
-    upper = rangeHigh;
+  if (!Number.isFinite(adaptiveLower) || !Number.isFinite(adaptiveUpper) || adaptiveUpper <= adaptiveLower) {
+    adaptiveLower = lower;
+    adaptiveUpper = upper;
   }
 
-  // Avoid hard clipping by padding both sides of the robust percentile range.
-  const robustSpan = Math.max(1, upper - lower);
+  const robustSpan = Math.max(1, adaptiveUpper - adaptiveLower);
   const padding = Math.max(20, robustSpan * 0.03);
-  lower -= padding;
-  upper += padding;
+  adaptiveLower -= padding;
+  adaptiveUpper += padding;
 
-  if (!Number.isFinite(lower) || !Number.isFinite(upper) || upper <= lower) {
-    lower = fallbackLower;
-    upper = fallbackUpper;
+  if (!Number.isFinite(adaptiveLower) || !Number.isFinite(adaptiveUpper) || adaptiveUpper <= adaptiveLower) {
+    adaptiveLower = fallbackLower;
+    adaptiveUpper = fallbackUpper;
   }
 
-  const windowWidth = Math.max(1, upper - lower);
-  const windowCenter = lower + windowWidth / 2;
+  const windowWidth = Math.max(1, adaptiveUpper - adaptiveLower);
+  const windowCenter = adaptiveLower + windowWidth / 2;
 
-  // If robust VOI lands outside plausible HU-like bounds with split tails,
-  // avoid hard fallback to fixed dental VOI (which can produce white/black
-  // banding). Instead use a bounded robust window around the median.
   const hasSplitOutliers =
     !!summary &&
     summary.fractionBelowMinus950 > 0.4 &&
     summary.fractionAbove3000 > 0.15;
-  const isExtremeWindow = lower < -5000 || upper > 7000;
+  const isExtremeWindow = adaptiveLower < -5000 || adaptiveUpper > 7000;
   if (hasSplitOutliers && isExtremeWindow) {
     const robustCenter = Number.isFinite(summary?.p50) ? Number(summary?.p50) : windowCenter;
     const boundedWidth = Math.max(2500, Math.min(12000, robustSpan * 1.2));
@@ -507,9 +557,7 @@ function computeAdaptivePanoVoi(
     };
   }
 
-  // Guardrail: if the data appears HU-like, avoid very narrow windows that
-  // can make CPR pano look "washed white with black speckles".
-  const looksLikeHU = isHuLikeRange(rangeLow, rangeHigh);
+  const looksLikeHU = isHuLikeRange(lower, upper);
 
   if (looksLikeHU) {
     const denseHighNoAir =
@@ -541,12 +589,12 @@ function computeAdaptivePanoVoi(
       };
     }
 
-    const MIN_HU_WINDOW_WIDTH =
+    const minHuWindowWidth =
       summary && summary.detailBandHorizontalEdgeMean >= 85 ? 1600 : 1750;
-    const MAX_DENTAL_WINDOW_WIDTH =
+    const maxDentalWindowWidth =
       summary && summary.lowerBandBrightFraction > 0.45 ? 2200 : 2500;
-    const widthWithMin = Math.max(windowWidth, MIN_HU_WINDOW_WIDTH);
-    const cappedWidth = Math.min(widthWithMin, MAX_DENTAL_WINDOW_WIDTH);
+    const widthWithMin = Math.max(windowWidth, minHuWindowWidth);
+    const cappedWidth = Math.min(widthWithMin, maxDentalWindowWidth);
     const dentalCenterMin = -120;
     const dentalCenterMax = 380;
     const biasedCenter =
@@ -565,7 +613,7 @@ function computeAdaptivePanoVoi(
     };
   }
 
-  return { lower, upper, windowWidth, windowCenter };
+  return { lower: adaptiveLower, upper: adaptiveUpper, windowWidth, windowCenter };
 }
 
 function catmullRomPoint(
@@ -646,92 +694,109 @@ function normalize3(v: [number, number, number]): [number, number, number] {
   return [out[0], out[1], out[2]];
 }
 
-function sanitizeCameraBasis(
-  normalIn: [number, number, number],
-  upIn: [number, number, number],
-  previousCamera?: {
-    viewPlaneNormal?: cornerstone.Types.Point3;
-    viewUp?: cornerstone.Types.Point3;
-  }
+function dot3(a: [number, number, number], b: [number, number, number]): number {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function projectPointOntoPlane(
+  point: [number, number, number],
+  planePoint: [number, number, number],
+  planeNormal: [number, number, number]
+): [number, number, number] {
+  const normalizedPlaneNormal = normalize3(planeNormal);
+  const delta: [number, number, number] = [
+    point[0] - planePoint[0],
+    point[1] - planePoint[1],
+    point[2] - planePoint[2],
+  ];
+  const distanceToPlane = dot3(delta, normalizedPlaneNormal);
+
+  return [
+    point[0] - normalizedPlaneNormal[0] * distanceToPlane,
+    point[1] - normalizedPlaneNormal[1] * distanceToPlane,
+    point[2] - normalizedPlaneNormal[2] * distanceToPlane,
+  ];
+}
+
+function projectControlPointsOntoSlicePlane(
+  points: [number, number, number][],
+  planePointLike: unknown,
+  planeNormalLike: unknown
 ): {
-  viewPlaneNormal: [number, number, number];
-  viewUp: [number, number, number];
+  points: [number, number, number][];
+  diagnostics: {
+    projected: boolean;
+    maxDistanceMm: number;
+    meanDistanceMm: number;
+  };
 } {
-  const EPS = 1e-6;
-  const normal = vec3.fromValues(
-    Number(normalIn[0] ?? 0),
-    Number(normalIn[1] ?? 0),
-    Number(normalIn[2] ?? 0)
-  );
-
-  if (!Number.isFinite(normal[0]) || !Number.isFinite(normal[1]) || !Number.isFinite(normal[2])) {
-    vec3.set(normal, 1, 0, 0);
-  }
-  if (vec3.length(normal) < EPS) {
-    vec3.set(normal, 1, 0, 0);
-  }
-  vec3.normalize(normal, normal);
-
-  const up = vec3.fromValues(Number(upIn[0] ?? 0), Number(upIn[1] ?? 0), Number(upIn[2] ?? 1));
-  if (!Number.isFinite(up[0]) || !Number.isFinite(up[1]) || !Number.isFinite(up[2])) {
-    vec3.set(up, 0, 0, 1);
+  if (
+    !Array.isArray(planePointLike) ||
+    !Array.isArray(planeNormalLike) ||
+    planePointLike.length < 3 ||
+    planeNormalLike.length < 3
+  ) {
+    return {
+      points,
+      diagnostics: {
+        projected: false,
+        maxDistanceMm: 0,
+        meanDistanceMm: 0,
+      },
+    };
   }
 
-  // Enforce strict orthogonality: viewUp = viewUp - dot(viewUp, N) * N.
-  const upProjection = vec3.scale(vec3.create(), normal, vec3.dot(up, normal));
-  vec3.subtract(up, up, upProjection);
-
-  if (vec3.length(up) < EPS) {
-    const fallbackAxis = Math.abs(normal[2]) < 0.9 ? vec3.fromValues(0, 0, 1) : vec3.fromValues(0, 1, 0);
-    vec3.cross(up, fallbackAxis, normal);
+  const planePoint: [number, number, number] = [
+    Number(planePointLike[0] ?? 0),
+    Number(planePointLike[1] ?? 0),
+    Number(planePointLike[2] ?? 0),
+  ];
+  const planeNormal: [number, number, number] = [
+    Number(planeNormalLike[0] ?? 0),
+    Number(planeNormalLike[1] ?? 0),
+    Number(planeNormalLike[2] ?? 0),
+  ];
+  if (
+    !Number.isFinite(planePoint[0]) ||
+    !Number.isFinite(planePoint[1]) ||
+    !Number.isFinite(planePoint[2]) ||
+    !Number.isFinite(planeNormal[0]) ||
+    !Number.isFinite(planeNormal[1]) ||
+    !Number.isFinite(planeNormal[2])
+  ) {
+    return {
+      points,
+      diagnostics: {
+        projected: false,
+        maxDistanceMm: 0,
+        meanDistanceMm: 0,
+      },
+    };
   }
-  if (vec3.length(up) < EPS) {
-    vec3.cross(up, vec3.fromValues(1, 0, 0), normal);
-  }
-  vec3.normalize(up, up);
 
-  if (previousCamera?.viewPlaneNormal && previousCamera?.viewUp) {
-    const prevNormal = vec3.fromValues(
-      Number(previousCamera.viewPlaneNormal[0] ?? 0),
-      Number(previousCamera.viewPlaneNormal[1] ?? 0),
-      Number(previousCamera.viewPlaneNormal[2] ?? 0)
-    );
-    const prevUp = vec3.fromValues(
-      Number(previousCamera.viewUp[0] ?? 0),
-      Number(previousCamera.viewUp[1] ?? 0),
-      Number(previousCamera.viewUp[2] ?? 0)
-    );
-
-    if (
-      Number.isFinite(prevNormal[0]) &&
-      Number.isFinite(prevNormal[1]) &&
-      Number.isFinite(prevNormal[2]) &&
-      vec3.length(prevNormal) >= EPS &&
-      Number.isFinite(prevUp[0]) &&
-      Number.isFinite(prevUp[1]) &&
-      Number.isFinite(prevUp[2]) &&
-      vec3.length(prevUp) >= EPS
-    ) {
-      vec3.normalize(prevNormal, prevNormal);
-
-      const prevUpProjection = vec3.scale(vec3.create(), prevNormal, vec3.dot(prevUp, prevNormal));
-      vec3.subtract(prevUp, prevUp, prevUpProjection);
-      if (vec3.length(prevUp) >= EPS) {
-        vec3.normalize(prevUp, prevUp);
-      }
-
-      // Keep orientation sign continuous across frame updates to avoid mirror flips.
-      const continuityScore = vec3.dot(normal, prevNormal) + vec3.dot(up, prevUp);
-      if (continuityScore < 0) {
-        vec3.scale(normal, normal, -1);
-        vec3.scale(up, up, -1);
-      }
-    }
-  }
+  let maxDistanceMm = 0;
+  let totalDistanceMm = 0;
+  const normalizedPlaneNormal = normalize3(planeNormal);
+  const projectedPoints = points.map(point => {
+    const delta: [number, number, number] = [
+      point[0] - planePoint[0],
+      point[1] - planePoint[1],
+      point[2] - planePoint[2],
+    ];
+    const distanceToPlane = dot3(delta, normalizedPlaneNormal);
+    const absDistance = Math.abs(distanceToPlane);
+    maxDistanceMm = Math.max(maxDistanceMm, absDistance);
+    totalDistanceMm += absDistance;
+    return projectPointOntoPlane(point, planePoint, normalizedPlaneNormal);
+  });
 
   return {
-    viewPlaneNormal: [normal[0], normal[1], normal[2]],
-    viewUp: [up[0], up[1], up[2]],
+    points: projectedPoints,
+    diagnostics: {
+      projected: true,
+      maxDistanceMm,
+      meanDistanceMm: projectedPoints.length ? totalDistanceMm / projectedPoints.length : 0,
+    },
   };
 }
 
@@ -753,6 +818,136 @@ function addPhantomEndpoints(pts: [number, number, number][]): [number, number, 
   ];
 
   return [phantomStart, ...pts, phantomEnd];
+}
+
+function median(values: number[]): number {
+  if (!values.length) {
+    return 0;
+  }
+
+  const sorted = values.slice().sort((a, b) => a - b);
+  const centerIndex = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[centerIndex];
+  }
+
+  return (sorted[centerIndex - 1] + sorted[centerIndex]) * 0.5;
+}
+
+function computeSplineEdgeLengths(points: [number, number, number][]): number[] {
+  const edgeLengths: number[] = [];
+
+  for (let i = 1; i < points.length; i++) {
+    edgeLengths.push(dist3(points[i - 1], points[i]));
+  }
+
+  return edgeLengths;
+}
+
+function sanitizeSplineControlPoints(
+  rawPoints: [number, number, number][],
+  minSpacingMm: number
+): {
+  points: [number, number, number][];
+  diagnostics: {
+    inputCount: number;
+    outputCount: number;
+    consecutiveDuplicateRemoved: number;
+    loopbackToStartRemoved: number;
+    terminalClosureRemoved: boolean;
+    dedupeThresholdMm: number;
+    closureThresholdMm: number;
+    suspiciousJumpThresholdMm: number;
+    medianEdgeLengthMm: number;
+    maxEdgeLengthMm: number;
+    suspiciousJumpCount: number;
+    severeJumpDetected: boolean;
+  };
+} {
+  const safeMinSpacingMm = Math.max(0.2, toPositiveFinite(minSpacingMm, 0.3));
+  const rawEdgeLengths = computeSplineEdgeLengths(rawPoints).filter(length => Number.isFinite(length) && length > 0);
+  const medianRawEdgeLengthMm = median(rawEdgeLengths);
+  const dedupeThresholdMm = Math.max(
+    safeMinSpacingMm * 1.25,
+    Math.min(1.25, medianRawEdgeLengthMm > 0 ? medianRawEdgeLengthMm * 0.22 : safeMinSpacingMm * 1.6)
+  );
+  const closureThresholdMm = Math.max(
+    dedupeThresholdMm * 1.5,
+    Math.min(2.4, medianRawEdgeLengthMm > 0 ? medianRawEdgeLengthMm * 0.55 : dedupeThresholdMm * 2.2)
+  );
+  const suspiciousJumpThresholdMm = Math.max(
+    12,
+    medianRawEdgeLengthMm > 0 ? medianRawEdgeLengthMm * 5.5 : safeMinSpacingMm * 14
+  );
+
+  const sanitized: [number, number, number][] = [];
+  let consecutiveDuplicateRemoved = 0;
+  let loopbackToStartRemoved = 0;
+
+  for (let index = 0; index < rawPoints.length; index++) {
+    const candidate = rawPoints[index];
+    if (!sanitized.length) {
+      sanitized.push(candidate);
+      continue;
+    }
+
+    const previous = sanitized[sanitized.length - 1];
+    if (dist3(previous, candidate) <= dedupeThresholdMm) {
+      consecutiveDuplicateRemoved++;
+      continue;
+    }
+
+    const isInteriorPoint = index < rawPoints.length - 1;
+    if (
+      isInteriorPoint &&
+      sanitized.length >= 3 &&
+      dist3(candidate, sanitized[0]) <= closureThresholdMm
+    ) {
+      loopbackToStartRemoved++;
+      continue;
+    }
+
+    sanitized.push(candidate);
+  }
+
+  let terminalClosureRemoved = false;
+  if (
+    sanitized.length >= 3 &&
+    dist3(sanitized[0], sanitized[sanitized.length - 1]) <= closureThresholdMm
+  ) {
+    sanitized.pop();
+    terminalClosureRemoved = true;
+  }
+
+  const sanitizedEdgeLengths = computeSplineEdgeLengths(sanitized).filter(
+    length => Number.isFinite(length) && length > 0
+  );
+  const medianEdgeLengthMm = median(sanitizedEdgeLengths);
+  const maxEdgeLengthMm = sanitizedEdgeLengths.length ? Math.max(...sanitizedEdgeLengths) : 0;
+  const suspiciousJumpCount = sanitizedEdgeLengths.filter(
+    length => length >= suspiciousJumpThresholdMm
+  ).length;
+  const severeJumpDetected =
+    suspiciousJumpCount > 0 &&
+    maxEdgeLengthMm >= Math.max(24, medianEdgeLengthMm > 0 ? medianEdgeLengthMm * 8 : 24);
+
+  return {
+    points: sanitized,
+    diagnostics: {
+      inputCount: rawPoints.length,
+      outputCount: sanitized.length,
+      consecutiveDuplicateRemoved,
+      loopbackToStartRemoved,
+      terminalClosureRemoved,
+      dedupeThresholdMm,
+      closureThresholdMm,
+      suspiciousJumpThresholdMm,
+      medianEdgeLengthMm,
+      maxEdgeLengthMm,
+      suspiciousJumpCount,
+      severeJumpDetected,
+    },
+  };
 }
 
 function computeSplineTotalArcLength(rawPoints: [number, number, number][]): number {
@@ -874,6 +1069,8 @@ interface CPRWorkerLaunchResult {
   height: number;
   minValue: number;
   maxValue: number;
+  windowWidth: number;
+  windowCenter: number;
   modalityLutApplied: boolean;
   requestedModalityLutApplied: boolean;
   storedValueNormalizationApplied: boolean;
@@ -894,6 +1091,113 @@ interface CPRWorkerLaunchResult {
   };
 }
 
+interface CPRWorkerInitSuccessMessage {
+  type: 'INIT_SUCCESS';
+  sessionKey: string;
+}
+
+interface CPRWorkerSuccessMessage {
+  type: 'SUCCESS';
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  minValue: number;
+  maxValue: number;
+  windowWidth: number;
+  windowCenter: number;
+  modalityLutApplied: boolean;
+  requestedModalityLutApplied: boolean;
+  storedValueNormalizationApplied: boolean;
+  unsignedPackedArtifactDetected: boolean;
+  debugPayload?: CPRWorkerLaunchResult['workerDebugPayload'];
+}
+
+interface CPRWorkerErrorMessage {
+  type: 'ERROR';
+  message: string;
+}
+
+type CPRWorkerResponseMessage =
+  | CPRWorkerInitSuccessMessage
+  | CPRWorkerSuccessMessage
+  | CPRWorkerErrorMessage;
+
+interface CPRWorkerSession {
+  worker: Worker;
+  volumeKey: string;
+  sessionKey: string;
+}
+
+let activeCPRWorkerSession: CPRWorkerSession | null = null;
+
+function buildCPRWorkerVolumeKey(params: {
+  volume: cornerstone.Types.IImageVolume;
+  dimensions: [number, number, number];
+  spacing: [number, number, number];
+  origin: [number, number, number];
+  scalarLength: number;
+  scalarType: string;
+  rescaleSlope: number;
+  rescaleIntercept: number;
+}): string {
+  const volumeId = (params.volume as { volumeId?: string | null }).volumeId ?? 'unknown-volume';
+  return [
+    volumeId,
+    params.dimensions.join('x'),
+    params.spacing.map(v => Number(v).toFixed(4)).join(','),
+    params.origin.map(v => Number(v).toFixed(4)).join(','),
+    params.scalarLength,
+    params.scalarType,
+    Number(params.rescaleSlope).toFixed(6),
+    Number(params.rescaleIntercept).toFixed(6),
+  ].join('|');
+}
+
+function terminateCPRWorkerSession(): void {
+  if (activeCPRWorkerSession) {
+    activeCPRWorkerSession.worker.terminate();
+    activeCPRWorkerSession = null;
+  }
+}
+
+function postMessageToCPRWorker<T extends CPRWorkerResponseMessage>(
+  worker: Worker,
+  payload: unknown,
+  transferList?: Transferable[]
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      worker.removeEventListener('message', handleMessage as EventListener);
+      worker.removeEventListener('error', handleError as EventListener);
+    };
+    const handleMessage = (event: MessageEvent<CPRWorkerResponseMessage>) => {
+      cleanup();
+      const data = event.data;
+      if (!data || typeof data !== 'object') {
+        reject(new Error('[cprWorker] Invalid worker response.'));
+        return;
+      }
+      if (data.type === 'ERROR') {
+        reject(new Error(`[cprWorker] ${data.message}`));
+        return;
+      }
+      resolve(data as T);
+    };
+    const handleError = (event: ErrorEvent) => {
+      cleanup();
+      reject(new Error(`[cprWorker] Uncaught worker error: ${event.message}`));
+    };
+
+    worker.addEventListener('message', handleMessage as EventListener);
+    worker.addEventListener('error', handleError as EventListener);
+    if (transferList && transferList.length > 0) {
+      worker.postMessage(payload, transferList);
+    } else {
+      worker.postMessage(payload);
+    }
+  });
+}
+
 function launchCPRWorker(params: {
   volume: cornerstone.Types.IImageVolume;
   frames: CPRFrame[];
@@ -908,12 +1212,11 @@ function launchCPRWorker(params: {
   forceDisableStoredValueNormalization?: boolean;
   verticalHalfMm?: number;
   verticalCenterOffsetMm?: number;
+  rigidVerticalSliceMode?: boolean;
   debugRunId?: string;
+  reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
 }): Promise<CPRWorkerLaunchResult> {
-  return new Promise((resolve, reject) => {
-    // @ts-expect-error Vite/webpack handles import.meta.url worker URLs at build time.
-    const worker = new Worker(new URL('./cprWorker.ts', import.meta.url), { type: 'module' });
-
+  return new Promise(async (resolve, reject) => {
     const {
       volume,
       frames,
@@ -928,198 +1231,263 @@ function launchCPRWorker(params: {
       forceDisableStoredValueNormalization,
       verticalHalfMm,
       verticalCenterOffsetMm,
+      rigidVerticalSliceMode = false,
       debugRunId,
+      reconstructionMode = 'legacy',
     } = params;
     const logPrefix = debugRunId ? `[CPR][${debugRunId}]` : '[CPR]';
 
-    const scalarData = volume.imageData.getPointData().getScalars().getData() as
-      | Float32Array
-      | Int16Array;
-    const dimensions = volume.imageData.getDimensions() as [number, number, number];
-    const spacing = volume.imageData.getSpacing() as [number, number, number];
-    const worldToIndexMatrix =
-      (volume.imageData as { getWorldToIndex?: () => ArrayLike<number> | null | undefined })
-        .getWorldToIndex?.() ?? null;
-    const worldToIndexCandidate = worldToIndexMatrix
-      ? Array.from(worldToIndexMatrix).slice(0, 16)
-      : null;
-    const hasWorldToIndex =
-      !!worldToIndexCandidate &&
-      worldToIndexCandidate.length >= 16 &&
-      worldToIndexCandidate.every(value => Number.isFinite(value));
-    const worldToIndex = hasWorldToIndex ? worldToIndexCandidate : undefined;
-    const panoHeight = Math.max(1, Math.floor(Number(requestedPanoHeight) || 1));
-    const dynamicVertHalfMm =
-      Number.isFinite(verticalHalfMm) && Number(verticalHalfMm) > 0 ? Number(verticalHalfMm) : 15;
-    console.log('[CPR] vertical sampling config', {
-      requestedPanoHeight,
-      panoHeight,
-      dynamicVertHalfMm,
-      verticalHalfMmOverride: verticalHalfMm,
-      verticalCenterOffsetMmOverride: verticalCenterOffsetMm,
-    });
-    const { minValue: scalarMin, maxValue: scalarMax } = estimateScalarRange(scalarData);
-    const { slope: rescaleSlope, intercept: rescaleIntercept } = getVolumeRescale(volume);
-    const { bitsStored, bitsAllocated, highBit, pixelRepresentation, isPreScaled: rawIsPreScaled } =
-      getVolumePixelStorage(volume);
-    const effectiveIsPreScaled = resolveEffectivePreScaledFlag({
-      isPreScaled: rawIsPreScaled,
-      scalarMin,
-      scalarMax,
-      slope: rescaleSlope,
-      intercept: rescaleIntercept,
-      bitsStored,
-      pixelRepresentation,
-    });
-
-    const scalarType =
-      (scalarData as { constructor?: { name?: string } })?.constructor?.name || 'UnknownTypedArray';
-
-    if (rawIsPreScaled && !effectiveIsPreScaled) {
-      console.warn(
-        `${logPrefix} volume.isPreScaled=true but scalar range is not HU-like with non-identity rescale; ` +
-        'overriding preScaled flag for CPR worker.'
-      );
-    }
-
-    if (
-      !effectiveIsPreScaled &&
-      Number.isFinite(bitsStored) &&
-      Number(bitsStored) > 0 &&
-      Number(bitsStored) < 16 &&
-      scalarMax > (1 << Number(bitsStored)) - 1
-    ) {
-      console.warn(`${logPrefix} Source scalar range exceeds nominal bitsStored range.`, {
+    try {
+      const scalarData = volume.imageData.getPointData().getScalars().getData() as
+        | Float32Array
+        | Int16Array;
+      const dimensions = volume.imageData.getDimensions() as [number, number, number];
+      const spacing = volume.imageData.getSpacing() as [number, number, number];
+      const origin = volume.imageData.getOrigin() as [number, number, number];
+      const direction = Array.from(volume.imageData.getDirection());
+      const worldToIndexMatrix =
+        (volume.imageData as { getWorldToIndex?: () => ArrayLike<number> | null | undefined })
+          .getWorldToIndex?.() ?? null;
+      const worldToIndexCandidate = worldToIndexMatrix
+        ? Array.from(worldToIndexMatrix).slice(0, 16)
+        : null;
+      const hasWorldToIndex =
+        !!worldToIndexCandidate &&
+        worldToIndexCandidate.length >= 16 &&
+        worldToIndexCandidate.every(value => Number.isFinite(value));
+      const worldToIndex = hasWorldToIndex ? worldToIndexCandidate : undefined;
+      const panoHeight = Math.max(1, Math.floor(Number(requestedPanoHeight) || 1));
+      const dynamicVertHalfMm =
+        Number.isFinite(verticalHalfMm) && Number(verticalHalfMm) > 0 ? Number(verticalHalfMm) : 15;
+      console.log('[CPR] vertical sampling config', {
+        requestedPanoHeight,
+        panoHeight,
+        dynamicVertHalfMm,
+        verticalHalfMmOverride: verticalHalfMm,
+        verticalCenterOffsetMmOverride: verticalCenterOffsetMm,
+        rigidVerticalSliceMode,
+      });
+      const { minValue: scalarMin, maxValue: scalarMax } = estimateScalarRange(scalarData);
+      const { slope: rescaleSlope, intercept: rescaleIntercept } = getVolumeRescale(volume);
+      const { bitsStored, bitsAllocated, highBit, pixelRepresentation, isPreScaled: rawIsPreScaled } =
+        getVolumePixelStorage(volume);
+      const effectiveIsPreScaled = resolveEffectivePreScaledFlag({
+        isPreScaled: rawIsPreScaled,
+        scalarMin,
         scalarMax,
+        slope: rescaleSlope,
+        intercept: rescaleIntercept,
         bitsStored,
-        bitsAllocated,
-        highBit,
         pixelRepresentation,
       });
-    }
 
-    const nominalBitsStored =
-      Number.isFinite(bitsStored) && Number(bitsStored) > 0 ? Math.floor(Number(bitsStored)) : 16;
-    const nominalStoredMax =
-      nominalBitsStored > 0 && nominalBitsStored < 31 ? (1 << nominalBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
-    const nominalSignedMin =
-      nominalBitsStored > 0 && nominalBitsStored < 31 ? -(1 << (nominalBitsStored - 1)) : Number.MIN_SAFE_INTEGER;
-    const hasUnsignedPackedArtifact =
-      !effectiveIsPreScaled &&
-      scalarData instanceof Int16Array &&
-      nominalBitsStored < 16 &&
-      Number(pixelRepresentation) === 0 &&
-      (scalarMin < -1 || scalarMax > nominalStoredMax + 8);
-    const hasBitDepthRangeMismatch =
-      !effectiveIsPreScaled &&
-      scalarData instanceof Int16Array &&
-      nominalBitsStored < 16 &&
-      (scalarMin < nominalSignedMin - 8 || scalarMax > nominalStoredMax + 8);
-    const allowStoredValueNormalization =
-      !forceDisableStoredValueNormalization &&
-      !effectiveIsPreScaled &&
-      scalarData instanceof Int16Array &&
-      nominalBitsStored < 16 &&
-      (hasUnsignedPackedArtifact ||
-        hasBitDepthRangeMismatch ||
-        (Number(pixelRepresentation) === 0 && scalarMin >= 0 && scalarMax <= nominalStoredMax));
-    const heuristicApplyModalityLut = shouldApplyModalityLutForCPR({
-      slope: rescaleSlope,
-      intercept: rescaleIntercept,
-      scalarMin,
-      scalarMax,
-      bitsStored,
-      pixelRepresentation,
-      allowStoredValueNormalization,
-      isPreScaled: effectiveIsPreScaled,
-    });
-    const applyModalityLut =
-      typeof modalityLutOverride === 'boolean'
-        ? modalityLutOverride
-        : forceApplyModalityLut
-          ? true
-          : heuristicApplyModalityLut;
+      const scalarType =
+        (scalarData as { constructor?: { name?: string } })?.constructor?.name || 'UnknownTypedArray';
+      const volumeKey = buildCPRWorkerVolumeKey({
+        volume,
+        dimensions,
+        spacing,
+        origin,
+        scalarLength: scalarData.length,
+        scalarType,
+        rescaleSlope,
+        rescaleIntercept,
+      });
 
-    console.log(`${logPrefix} launchCPRWorker intensity normalization decision`, {
-      scalarType,
-      scalarMin,
-      scalarMax,
-      rescaleSlope,
-      rescaleIntercept,
-      bitsStored,
-      bitsAllocated,
-      highBit,
-      pixelRepresentation,
-      rawIsPreScaled,
-      effectiveIsPreScaled,
-      forceApplyModalityLut: !!forceApplyModalityLut,
-      modalityLutOverride,
-      forceDisableStoredValueNormalization: !!forceDisableStoredValueNormalization,
-      heuristicApplyModalityLut,
-      applyModalityLut,
-      allowStoredValueNormalization,
-      hasUnsignedPackedArtifact,
-      hasBitDepthRangeMismatch,
-      modalityLutPolicy: 'HEURISTIC_APPLY_FOR_STORED_VALUES',
-      aggregation,
-      hasWorldToIndex,
-      requestedPanoHeight,
-      finalPanoHeight: panoHeight,
-      dynamicVertHalfMm,
-      voiWindowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
-      voiWindowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
-    });
+      if (rawIsPreScaled && !effectiveIsPreScaled) {
+        console.warn(
+          `${logPrefix} volume.isPreScaled=true but scalar range is not HU-like with non-identity rescale; ` +
+          'overriding preScaled flag for CPR worker.'
+        );
+      }
 
-    if (
-      !effectiveIsPreScaled &&
-      !applyModalityLut &&
-      (Math.abs(rescaleSlope - 1) > 1e-6 || Math.abs(rescaleIntercept) > 1e-6)
-    ) {
-      console.warn(
-        `${logPrefix} applyModalityLut=false while source metadata has non-identity rescale. ` +
-        'If source pixels are stored values (not HU), fixed WW/WL may cause washed-out pano.'
-      );
-    }
-    if (
-      !effectiveIsPreScaled &&
-      !applyModalityLut &&
-      Math.abs(rescaleIntercept) > 1e-6 &&
-      scalarMin >= 0 &&
-      scalarMax <= 5000
-    ) {
-      console.error(`${logPrefix} RESCALE_BYPASS_DETECTED`, {
+      if (
+        !effectiveIsPreScaled &&
+        Number.isFinite(bitsStored) &&
+        Number(bitsStored) > 0 &&
+        Number(bitsStored) < 16 &&
+        scalarMax > (1 << Number(bitsStored)) - 1
+      ) {
+        console.warn(`${logPrefix} Source scalar range exceeds nominal bitsStored range.`, {
+          scalarMax,
+          bitsStored,
+          bitsAllocated,
+          highBit,
+          pixelRepresentation,
+        });
+      }
+
+      const nominalBitsStored =
+        Number.isFinite(bitsStored) && Number(bitsStored) > 0 ? Math.floor(Number(bitsStored)) : 16;
+      const nominalStoredMax =
+        nominalBitsStored > 0 && nominalBitsStored < 31 ? (1 << nominalBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
+      const nominalSignedMin =
+        nominalBitsStored > 0 && nominalBitsStored < 31 ? -(1 << (nominalBitsStored - 1)) : Number.MIN_SAFE_INTEGER;
+      const hasUnsignedPackedArtifact =
+        !effectiveIsPreScaled &&
+        scalarData instanceof Int16Array &&
+        nominalBitsStored < 16 &&
+        Number(pixelRepresentation) === 0 &&
+        (scalarMin < -1 || scalarMax > nominalStoredMax + 8);
+      const hasBitDepthRangeMismatch =
+        !effectiveIsPreScaled &&
+        scalarData instanceof Int16Array &&
+        nominalBitsStored < 16 &&
+        (scalarMin < nominalSignedMin - 8 || scalarMax > nominalStoredMax + 8);
+      const allowStoredValueNormalization =
+        !forceDisableStoredValueNormalization &&
+        !effectiveIsPreScaled &&
+        scalarData instanceof Int16Array &&
+        nominalBitsStored < 16 &&
+        (hasUnsignedPackedArtifact ||
+          hasBitDepthRangeMismatch ||
+          (Number(pixelRepresentation) === 0 && scalarMin >= 0 && scalarMax <= nominalStoredMax));
+      const heuristicApplyModalityLut = shouldApplyModalityLutForCPR({
+        slope: rescaleSlope,
+        intercept: rescaleIntercept,
+        scalarMin,
+        scalarMax,
+        bitsStored,
+        pixelRepresentation,
+        allowStoredValueNormalization,
+        isPreScaled: effectiveIsPreScaled,
+      });
+      const applyModalityLut =
+        typeof modalityLutOverride === 'boolean'
+          ? modalityLutOverride
+          : forceApplyModalityLut
+            ? true
+            : heuristicApplyModalityLut;
+
+      console.log(`${logPrefix} launchCPRWorker intensity normalization decision`, {
+        scalarType,
         scalarMin,
         scalarMax,
         rescaleSlope,
         rescaleIntercept,
+        bitsStored,
+        bitsAllocated,
+        highBit,
+        pixelRepresentation,
+        rawIsPreScaled,
+        effectiveIsPreScaled,
+        forceApplyModalityLut: !!forceApplyModalityLut,
+        modalityLutOverride,
+        forceDisableStoredValueNormalization: !!forceDisableStoredValueNormalization,
+        heuristicApplyModalityLut,
+        applyModalityLut,
+        allowStoredValueNormalization,
+        hasUnsignedPackedArtifact,
+        hasBitDepthRangeMismatch,
+        modalityLutPolicy: 'HEURISTIC_APPLY_FOR_STORED_VALUES',
+        aggregation,
+        hasWorldToIndex,
+        requestedPanoHeight,
+        finalPanoHeight: panoHeight,
+        dynamicVertHalfMm,
+        voiWindowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
+        voiWindowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
       });
-    }
 
-    const isSharedArrayBuffer = scalarData.buffer instanceof SharedArrayBuffer;
-    const dataToSend = isSharedArrayBuffer
-      ? scalarData
-      : (scalarData.slice(0) as Float32Array | Int16Array);
-
-    const serializedFrames = frames.map(f => ({
-      position: Array.from(f.position) as [number, number, number],
-      T: Array.from(f.T) as [number, number, number],
-      N_slab: Array.from(f.N_slab) as [number, number, number],
-    }));
-
-    worker.onmessage = event => {
-      worker.terminate();
-      const data = event.data;
-
-      if (data.type === 'ERROR') {
-        reject(new Error(`[cprWorker] ${data.message}`));
-        return;
+      if (
+        !effectiveIsPreScaled &&
+        !applyModalityLut &&
+        (Math.abs(rescaleSlope - 1) > 1e-6 || Math.abs(rescaleIntercept) > 1e-6)
+      ) {
+        console.warn(
+          `${logPrefix} applyModalityLut=false while source metadata has non-identity rescale. ` +
+          'If source pixels are stored values (not HU), fixed WW/WL may cause washed-out pano.'
+        );
       }
+      if (
+        !effectiveIsPreScaled &&
+        !applyModalityLut &&
+        Math.abs(rescaleIntercept) > 1e-6 &&
+        scalarMin >= 0 &&
+        scalarMax <= 5000
+      ) {
+        console.error(`${logPrefix} RESCALE_BYPASS_DETECTED`, {
+          scalarMin,
+          scalarMax,
+          rescaleSlope,
+          rescaleIntercept,
+        });
+      }
+
+      if (!activeCPRWorkerSession || activeCPRWorkerSession.volumeKey !== volumeKey) {
+        terminateCPRWorkerSession();
+        const worker = new Worker(new URL('./cprWorker.ts', import.meta.url), { type: 'module' });
+        const sessionKey = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const isSharedArrayBuffer = scalarData.buffer instanceof SharedArrayBuffer;
+        const initScalarData = isSharedArrayBuffer
+          ? scalarData
+          : (scalarData.slice(0) as Float32Array | Int16Array);
+        const initPayload = {
+          type: 'INIT_VOLUME' as const,
+          sessionKey,
+          scalarData: initScalarData,
+          isSharedArrayBuffer,
+          dimensions,
+          spacing,
+          origin,
+          direction,
+          worldToIndex,
+          rescaleSlope,
+          rescaleIntercept,
+          bitsStored,
+          bitsAllocated,
+          highBit,
+          pixelRepresentation,
+          isPreScaled: effectiveIsPreScaled,
+        };
+        const transferList =
+          isSharedArrayBuffer || !initScalarData.buffer ? undefined : [initScalarData.buffer];
+        await postMessageToCPRWorker<CPRWorkerInitSuccessMessage>(worker, initPayload, transferList);
+        activeCPRWorkerSession = {
+          worker,
+          volumeKey,
+          sessionKey,
+        };
+      }
+
+      const serializedFrames = frames.map(f => ({
+        position: Array.from(f.position) as [number, number, number],
+        T: Array.from(f.T) as [number, number, number],
+        N_slab: Array.from(f.N_slab) as [number, number, number],
+        S: Array.from(f.S) as [number, number, number],
+      }));
+
+      const data = await postMessageToCPRWorker<CPRWorkerSuccessMessage>(
+        activeCPRWorkerSession.worker,
+        {
+          type: 'RENDER' as const,
+          sessionKey: activeCPRWorkerSession.sessionKey,
+          frames: serializedFrames,
+          panoWidth,
+          panoHeight,
+          vertHalfMm: dynamicVertHalfMm,
+          verticalCenterOffsetMm,
+          rigidVerticalSliceMode,
+          slabHalfThicknessMm,
+          slabSamples,
+          aggregation,
+          verticalDir,
+          applyModalityLut,
+          allowStoredValueNormalization,
+          disableStoredValueNormalization:
+            forceDisableStoredValueNormalization === true ? true : undefined,
+          debugRunId,
+          reconstructionMode,
+        }
+      );
 
       console.log(`${logPrefix} [CPR-WORKER-MESSAGE-JSON]`, JSON.stringify({
         width: data.panoWidth,
         height: data.panoHeight,
         minValue: data.minValue,
         maxValue: data.maxValue,
+        windowWidth: data.windowWidth,
+        windowCenter: data.windowCenter,
         modalityLutApplied: data.modalityLutApplied === true,
         requestedModalityLutApplied: data.requestedModalityLutApplied === true,
         storedValueNormalizationApplied: data.storedValueNormalizationApplied === true,
@@ -1133,6 +1501,8 @@ function launchCPRWorker(params: {
         height: data.panoHeight,
         minValue: data.minValue,
         maxValue: data.maxValue,
+        windowWidth: data.windowWidth,
+        windowCenter: data.windowCenter,
         modalityLutApplied: data.modalityLutApplied === true,
         requestedModalityLutApplied: data.requestedModalityLutApplied === true,
         storedValueNormalizationApplied: data.storedValueNormalizationApplied === true,
@@ -1145,43 +1515,12 @@ function launchCPRWorker(params: {
         workerDebugPayload:
           data.debugPayload && typeof data.debugPayload === 'object' ? data.debugPayload : undefined,
       });
-    };
-
-    worker.onerror = err => {
-      worker.terminate();
-      reject(new Error(`[cprWorker] Uncaught worker error: ${err.message}`));
-    };
-
-    worker.postMessage({
-      scalarData: dataToSend,
-      isSharedArrayBuffer,
-      dimensions,
-      spacing,
-      origin: volume.imageData.getOrigin(),
-      direction: volume.imageData.getDirection(),
-      worldToIndex,
-      frames: serializedFrames,
-      panoWidth,
-      panoHeight,
-      vertHalfMm: dynamicVertHalfMm,
-      verticalCenterOffsetMm,
-      slabHalfThicknessMm,
-      slabSamples,
-      aggregation,
-      verticalDir,
-      applyModalityLut,
-      allowStoredValueNormalization,
-      disableStoredValueNormalization:
-        forceDisableStoredValueNormalization === true ? true : undefined,
-      rescaleSlope,
-      rescaleIntercept,
-      bitsStored,
-      bitsAllocated,
-      highBit,
-      pixelRepresentation,
-      isPreScaled: effectiveIsPreScaled,
-      debugRunId,
-    });
+    } catch (error) {
+      if (activeCPRWorkerSession) {
+        terminateCPRWorkerSession();
+      }
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
   });
 }
 
@@ -1466,6 +1805,96 @@ function findViewportByLogicalId(
   return null;
 }
 
+async function waitForVolumeToFullyLoad(
+  volume: LoadableImageVolume,
+  debugRunId: string,
+  timeoutMs = 45000
+): Promise<void> {
+  const volumeId = volume.volumeId || 'unknown-volume';
+  const initialStatus = {
+    volumeId,
+    loaded: volume.loadStatus?.loaded === true,
+    loading: volume.loadStatus?.loading === true,
+    timeoutMs,
+  };
+
+  console.log(`[CPR][${debugRunId}] source volume readiness check`, initialStatus);
+  console.log('[CPR-SOURCE-VOLUME-LOAD-JSON]', JSON.stringify({
+    runId: debugRunId,
+    status: initialStatus.loaded ? 'already-loaded' : 'waiting',
+    ...initialStatus,
+  }));
+
+  if (!volume.loadStatus || volume.loadStatus.loaded === true || typeof volume.load !== 'function') {
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timeoutHandle = 0;
+
+    const cleanup = () => {
+      cornerstone.eventTarget.removeEventListener(
+        cornerstone.Enums.Events.IMAGE_VOLUME_LOADING_COMPLETED,
+        onVolumeLoadCompleted as EventListener
+      );
+      window.clearTimeout(timeoutHandle);
+    };
+
+    const finish = (status: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      console.log('[CPR-SOURCE-VOLUME-LOAD-JSON]', JSON.stringify({
+        runId: debugRunId,
+        status,
+        volumeId,
+        loaded: volume.loadStatus?.loaded === true,
+        loading: volume.loadStatus?.loading === true,
+      }));
+      resolve();
+    };
+
+    const onVolumeLoadCompleted = (event: Event) => {
+      const detail = (event as CustomEvent<{ volumeId?: string }>).detail;
+      if (detail?.volumeId && detail.volumeId !== volumeId) {
+        return;
+      }
+      finish('loaded');
+    };
+
+    cornerstone.eventTarget.addEventListener(
+      cornerstone.Enums.Events.IMAGE_VOLUME_LOADING_COMPLETED,
+      onVolumeLoadCompleted as EventListener
+    );
+
+    timeoutHandle = window.setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(new Error(`[CPR] Timed out waiting for source volume "${volumeId}" to fully load.`));
+    }, timeoutMs);
+
+    if (volume.loadStatus?.loaded === true) {
+      finish('loaded-before-wait');
+      return;
+    }
+
+    if (!volume.loadStatus?.loading) {
+      volume.load();
+      console.log('[CPR-SOURCE-VOLUME-LOAD-JSON]', JSON.stringify({
+        runId: debugRunId,
+        status: 'triggered-load',
+        volumeId,
+      }));
+    }
+  });
+}
+
 function isStackViewportLike(
   viewport: cornerstone.Types.IViewport | null
 ): viewport is cornerstone.Types.IStackViewport {
@@ -1500,15 +1929,16 @@ async function waitForViewportByLogicalId(
   return null;
 }
 
-async function waitForPanoStackViewport(
+async function waitForStackViewportByLogicalId(
   servicesManager: any,
+  logicalViewportId: string,
   timeoutMs = 12000
 ): Promise<cornerstone.Types.IStackViewport> {
   const startedAt = Date.now();
   let lastViewportType = 'none';
 
   while (Date.now() - startedAt < timeoutMs) {
-    const viewport = findViewportByLogicalId(servicesManager, 'cpr-pano');
+    const viewport = findViewportByLogicalId(servicesManager, logicalViewportId);
     if (viewport) {
       lastViewportType = viewport.constructor?.name || 'unknown';
 
@@ -1521,8 +1951,22 @@ async function waitForPanoStackViewport(
   }
 
   throw new Error(
-    `[CPR] cpr-pano viewport not ready within timeout. Last resolved type: ${lastViewportType}`
+    `[CPR] ${logicalViewportId} stack viewport not ready within timeout. Last resolved type: ${lastViewportType}`
   );
+}
+
+async function waitForPanoStackViewport(
+  servicesManager: any,
+  timeoutMs = 12000
+): Promise<cornerstone.Types.IStackViewport> {
+  return waitForStackViewportByLogicalId(servicesManager, 'cpr-pano', timeoutMs);
+}
+
+async function waitForCrossSectionStackViewport(
+  servicesManager: any,
+  timeoutMs = 12000
+): Promise<cornerstone.Types.IStackViewport> {
+  return waitForStackViewportByLogicalId(servicesManager, 'cpr-crosssection', timeoutMs);
 }
 
 function getCurrentStackImageId(viewport: cornerstone.Types.IViewport | null): string | null {
@@ -1713,6 +2157,145 @@ function applyPanoDisplaySettings(
   }));
 }
 
+type PreservedCrossSectionDisplaySettings = {
+  voiRange: {
+    lower: number;
+    upper: number;
+  };
+  VOILUTFunction: string;
+};
+
+const pendingCrossSectionVoiReapplyListeners = new WeakMap<
+  EventTarget,
+  EventListenerOrEventListenerObject
+>();
+
+function captureCrossSectionDisplaySettings(
+  viewport: cornerstone.Types.IStackViewport | null
+): PreservedCrossSectionDisplaySettings | null {
+  if (!viewport) {
+    return null;
+  }
+
+  const properties = ((viewport as { getProperties?: () => unknown }).getProperties?.() || {}) as {
+    voiRange?: { lower?: number; upper?: number };
+    VOILUTFunction?: unknown;
+  };
+  const lower = toFiniteNumber(properties.voiRange?.lower);
+  const upper = toFiniteNumber(properties.voiRange?.upper);
+  if (lower === undefined || upper === undefined) {
+    return null;
+  }
+
+  return {
+    voiRange: { lower, upper },
+    VOILUTFunction:
+      typeof properties.VOILUTFunction === 'string' && properties.VOILUTFunction
+        ? properties.VOILUTFunction
+        : 'LINEAR_EXACT',
+  };
+}
+
+function applyCrossSectionDisplaySettings(
+  viewport: cornerstone.Types.IViewport | null,
+  settings: PreservedCrossSectionDisplaySettings | null
+): void {
+  if (!settings || !viewport || !isStackViewportLike(viewport)) {
+    return;
+  }
+
+  viewport.setProperties({
+    isComputedVOI: false,
+    voiRange: {
+      lower: settings.voiRange.lower,
+      upper: settings.voiRange.upper,
+    },
+    VOILUTFunction: settings.VOILUTFunction,
+  } as any);
+}
+
+function applyCrossSectionCameraAlignment(
+  viewport: cornerstone.Types.IViewport | null,
+  frame: CPRFrame,
+  verticalCenterOffsetMm?: number,
+  previousCameraOverride?: ReturnType<typeof cloneCameraState> | null
+): void {
+  if (!viewport) {
+    return;
+  }
+
+  const previousCamera = previousCameraOverride ?? viewport.getCamera?.();
+  const nextCamera = buildCrossSectionCameraForFrame(
+    frame,
+    previousCamera,
+    20,
+    toFiniteNumber(verticalCenterOffsetMm) ?? 0
+  );
+  viewport.setCamera?.(nextCamera);
+
+  const appliedCamera = viewport.getCamera?.();
+  const requestedRight = normalize3([
+    nextCamera.viewUp[1] * nextCamera.viewPlaneNormal[2] -
+      nextCamera.viewUp[2] * nextCamera.viewPlaneNormal[1],
+    nextCamera.viewUp[2] * nextCamera.viewPlaneNormal[0] -
+      nextCamera.viewUp[0] * nextCamera.viewPlaneNormal[2],
+    nextCamera.viewUp[0] * nextCamera.viewPlaneNormal[1] -
+      nextCamera.viewUp[1] * nextCamera.viewPlaneNormal[0],
+  ]);
+  const cameraAxis = normalize3([frame.N_camera[0], frame.N_camera[1], frame.N_camera[2]]);
+  const appliedRight =
+    appliedCamera?.viewUp && appliedCamera?.viewPlaneNormal
+      ? normalize3([
+        appliedCamera.viewUp[1] * appliedCamera.viewPlaneNormal[2] -
+          appliedCamera.viewUp[2] * appliedCamera.viewPlaneNormal[1],
+        appliedCamera.viewUp[2] * appliedCamera.viewPlaneNormal[0] -
+          appliedCamera.viewUp[0] * appliedCamera.viewPlaneNormal[2],
+        appliedCamera.viewUp[0] * appliedCamera.viewPlaneNormal[1] -
+          appliedCamera.viewUp[1] * appliedCamera.viewPlaneNormal[0],
+      ])
+      : null;
+
+  console.log('[CPR-CROSSSECTION-CAMERA]', {
+    frameIndex: frame.index,
+    viewportId: viewport.id,
+    verticalCenterOffsetMm: toFiniteNumber(verticalCenterOffsetMm) ?? 0,
+    requested: {
+      focalPoint: nextCamera.focalPoint,
+      position: nextCamera.position,
+      viewPlaneNormal: nextCamera.viewPlaneNormal,
+      viewUp: nextCamera.viewUp,
+      viewRight: requestedRight,
+      parallelScale: nextCamera.parallelScale,
+      flipHorizontal: nextCamera.flipHorizontal,
+      flipVertical: nextCamera.flipVertical,
+      dotRightCamera:
+        requestedRight[0] * cameraAxis[0] +
+        requestedRight[1] * cameraAxis[1] +
+        requestedRight[2] * cameraAxis[2],
+    },
+    applied: appliedCamera
+      ? {
+        focalPoint: appliedCamera.focalPoint,
+        position: appliedCamera.position,
+        viewPlaneNormal: appliedCamera.viewPlaneNormal,
+        viewUp: appliedCamera.viewUp,
+        viewRight: appliedRight,
+        parallelScale: appliedCamera.parallelScale,
+        flipHorizontal: appliedCamera.flipHorizontal,
+        flipVertical: appliedCamera.flipVertical,
+        dotRightCamera:
+          appliedRight
+            ? (
+              appliedRight[0] * cameraAxis[0] +
+              appliedRight[1] * cameraAxis[1] +
+              appliedRight[2] * cameraAxis[2]
+            )
+            : null,
+      }
+      : null,
+  });
+}
+
 function cloneCameraState(
   viewport: cornerstone.Types.IViewport
 ): Record<string, cornerstone.Types.Point3 | number | boolean | undefined> | null {
@@ -1842,71 +2425,177 @@ function clearActiveManipulationPreservingSpline(
   }
 }
 
-function setCrossSectionForFrame(frame: CPRFrame, servicesManager: any): void {
+function setCrossSectionForFrame(
+  frame: CPRFrame,
+  servicesManager: any,
+  verticalCenterOffsetMm?: number
+): void {
   const crossViewport = findViewportByLogicalId(servicesManager, 'cpr-crosssection');
   if (!crossViewport) {
     return;
   }
 
-  const previousCamera = crossViewport.getCamera?.();
-  const basis = sanitizeCameraBasis(
-    Array.from(frame.T) as [number, number, number],
-    Array.from(frame.S) as [number, number, number],
-    previousCamera
-  );
-  const previousParallelScale = Number(previousCamera?.parallelScale);
-  const parallelScale =
-    Number.isFinite(previousParallelScale) && previousParallelScale > 0
-      ? previousParallelScale
-      : 20;
+  if (isStackViewportLike(crossViewport)) {
+    if (crossViewport.element) {
+      const pendingListener = pendingCrossSectionVoiReapplyListeners.get(crossViewport.element);
+      if (pendingListener) {
+        crossViewport.element.removeEventListener(
+          cornerstone.Enums.Events.IMAGE_RENDERED,
+          pendingListener
+        );
+        pendingCrossSectionVoiReapplyListeners.delete(crossViewport.element);
+      }
+    }
 
-  crossViewport.setCamera({
-    focalPoint: Array.from(frame.position) as [number, number, number],
-    viewPlaneNormal: basis.viewPlaneNormal,
-    viewUp: basis.viewUp,
-    parallelScale,
-    parallelProjection: true,
-  });
+    const preservedDisplaySettings = captureCrossSectionDisplaySettings(crossViewport);
+    const preservedCamera = cloneCameraState(crossViewport);
+    const currentImageIndex = Number(crossViewport.getCurrentImageIdIndex?.());
+    const safeCurrentIndex = Number.isFinite(currentImageIndex) ? Math.floor(currentImageIndex) : -1;
 
+    if (crossViewport.element && safeCurrentIndex !== frame.index) {
+      const targetImageIndex = frame.index;
+      const onTargetImageRendered: EventListener = () => {
+        const liveViewport = findViewportByLogicalId(servicesManager, 'cpr-crosssection');
+        if (!liveViewport || !isStackViewportLike(liveViewport)) {
+          return;
+        }
+
+        const renderedImageIndex = Number(liveViewport.getCurrentImageIdIndex?.());
+        if (!Number.isFinite(renderedImageIndex) || Math.floor(renderedImageIndex) !== targetImageIndex) {
+          return;
+        }
+
+        crossViewport.element.removeEventListener(
+          cornerstone.Enums.Events.IMAGE_RENDERED,
+          onTargetImageRendered
+        );
+        pendingCrossSectionVoiReapplyListeners.delete(crossViewport.element);
+        applyCrossSectionCameraAlignment(
+          liveViewport,
+          frame,
+          verticalCenterOffsetMm,
+          preservedCamera
+        );
+        applyCrossSectionDisplaySettings(liveViewport, preservedDisplaySettings);
+        liveViewport.render?.();
+      };
+
+      crossViewport.element.addEventListener(
+        cornerstone.Enums.Events.IMAGE_RENDERED,
+        onTargetImageRendered
+      );
+      pendingCrossSectionVoiReapplyListeners.set(crossViewport.element, onTargetImageRendered);
+      applyCrossSectionDisplaySettings(crossViewport, preservedDisplaySettings);
+
+      cornerstoneTools.utilities.jumpToSlice(crossViewport.element, {
+        imageIndex: frame.index,
+        debounceLoading: true,
+      });
+    } else {
+      applyCrossSectionDisplaySettings(crossViewport, preservedDisplaySettings);
+      applyCrossSectionCameraAlignment(
+        crossViewport,
+        frame,
+        verticalCenterOffsetMm,
+        preservedCamera
+      );
+    }
+    crossViewport.render?.();
+    return;
+  }
+
+  applyCrossSectionCameraAlignment(crossViewport, frame, verticalCenterOffsetMm);
   crossViewport.render();
 }
 
-function initializeCrossSection(
-  frames: CPRFrame[],
-  servicesManager: any
-): void {
-  const { syncGroupService } = servicesManager.services;
+function buildCrossSectionStackConfig(
+  _sourceVolumeId: string,
+  _verticalHalfHeightMm?: number
+): {
+  width: number;
+  height: number;
+  rowPixelSpacing: number;
+  columnPixelSpacing: number;
+  horizontalHalfWidthMm: number;
+  verticalHalfHeightMm: number;
+} {
+  return getCrossSectionCanonicalGridConfig();
+}
 
-  const crossViewport = findViewportByLogicalId(servicesManager, 'cpr-crosssection');
-  if (!crossViewport) {
-    console.error('[CPR] cpr-crosssection viewport not found after HP switch.');
-    return;
-  }
+type VolumeLoadStatusLike = {
+  loaded?: boolean;
+  loading?: boolean;
+};
+
+type LoadableImageVolume = cornerstone.Types.IImageVolume & {
+  loadStatus?: VolumeLoadStatusLike;
+  load?: (callback?: (...args: unknown[]) => void) => void;
+};
+
+async function initializeCrossSection(
+  frames: CPRFrame[],
+  sourceVolumeId: string,
+  verticalHalfHeightMm: number | undefined,
+  verticalCenterOffsetMm: number | undefined,
+  samplingOffsetsActive: boolean,
+  servicesManager: any
+): Promise<void> {
+  const { syncGroupService } = servicesManager.services;
+  const crossViewport = await waitForCrossSectionStackViewport(servicesManager);
 
   const initialFrameIndex = Math.max(
     0,
     Math.min(cprStateService.getCurrentFrameIndex(), Math.max(0, frames.length - 1))
   );
-  setCrossSectionForFrame(frames[initialFrameIndex], servicesManager);
+  const stackConfig = buildCrossSectionStackConfig(sourceVolumeId, verticalHalfHeightMm);
+  const crossSeriesId = createCrossSectionSeriesId();
+  const crossImageIds = createCrossSectionImageIds(crossSeriesId, frames.length);
 
-  // Hardening #2: idempotency guard for sync group insertion.
+  clearCrossSectionImageCache();
+  setCrossSectionSeriesPayload(crossSeriesId, {
+    sourceVolumeId,
+    frames,
+    width: stackConfig.width,
+    height: stackConfig.height,
+    rowPixelSpacing: stackConfig.rowPixelSpacing,
+    columnPixelSpacing: stackConfig.columnPixelSpacing,
+    horizontalHalfWidthMm: stackConfig.horizontalHalfWidthMm,
+    verticalHalfHeightMm: stackConfig.verticalHalfHeightMm,
+    verticalCenterOffsetMm: toFiniteNumber(verticalCenterOffsetMm) ?? 0,
+  });
+  console.log('[CPR-CROSSSECTION-CONFIG-JSON]', JSON.stringify({
+    sourceVolumeId,
+    frameCount: frames.length,
+    initialFrameIndex,
+    width: stackConfig.width,
+    height: stackConfig.height,
+    rowPixelSpacing: stackConfig.rowPixelSpacing,
+    columnPixelSpacing: stackConfig.columnPixelSpacing,
+    horizontalHalfWidthMm: stackConfig.horizontalHalfWidthMm,
+    verticalHalfHeightMm: stackConfig.verticalHalfHeightMm,
+    verticalCenterOffsetMm: toFiniteNumber(verticalCenterOffsetMm) ?? 0,
+    geometryMode: 'fixed-grid-rigid-world',
+    samplingOffsetsActive,
+  }));
+
+  await crossViewport.setStack(crossImageIds, initialFrameIndex);
+  crossViewport.resetProperties?.();
+  crossViewport.setProperties?.({
+    invert: false,
+    VOILUTFunction: 'LINEAR_EXACT',
+  } as any);
+  crossViewport.resetCamera?.();
+  applyCrossSectionCameraAlignment(
+    crossViewport,
+    frames[initialFrameIndex],
+    verticalCenterOffsetMm
+  );
+  crossViewport.render?.();
+
   const syncId = 'cpr-crosssection-sync';
-  const existingSync = syncGroupService.getSynchronizer(syncId);
   const renderingEngineId = crossViewport.getRenderingEngine().id;
   const crossViewportId = crossViewport.id;
-  const alreadyInSync =
-    !!existingSync &&
-    (existingSync.hasTargetViewport(renderingEngineId, crossViewportId) ||
-      existingSync.hasSourceViewport(renderingEngineId, crossViewportId));
-
-  if (!alreadyInSync) {
-    syncGroupService.addViewportToSyncGroup(crossViewportId, renderingEngineId, {
-      type: 'imageslice',
-      id: syncId,
-      source: false,
-      target: true,
-    });
-  }
+  syncGroupService.removeViewportFromSyncGroup(crossViewportId, renderingEngineId, syncId);
 }
 
 interface UseCPROrchestratorProps {
@@ -2047,6 +2736,9 @@ export function useCPROrchestrator({
   const hpTimeoutRef = useRef<number | null>(null);
   const isMountedRef = useRef(true);
   const lastSetupCleanupRef = useRef<string | null>(null);
+  const sliderAnimationFrameRef = useRef<number | null>(null);
+  const pendingSliderFrameIndexRef = useRef<number | null>(null);
+  const crossSectionVerticalCenterOffsetMmRef = useRef(0);
 
   const clearProtocolListener = useCallback(() => {
     if (hpSubscriptionRef.current) {
@@ -2076,6 +2768,10 @@ export function useCPROrchestrator({
   useEffect(() => {
     return () => {
       isMountedRef.current = false;
+      if (sliderAnimationFrameRef.current != null) {
+        window.cancelAnimationFrame(sliderAnimationFrameRef.current);
+        sliderAnimationFrameRef.current = null;
+      }
       clearProtocolListener();
     };
   }, [clearProtocolListener]);
@@ -2182,11 +2878,11 @@ export function useCPROrchestrator({
 
       // Hardening #4: tolerate both [x,y,z] arrays and {x,y,z} point objects.
       const rawPoints = (latestAnnotation?.data?.handles?.points ?? []) as PointLike[];
-      const rawControlPoints: [number, number, number][] = rawPoints
+      const rawControlPointsWorld: [number, number, number][] = rawPoints
         .map(toXYZTuple)
         .filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]) && Number.isFinite(p[2]));
 
-      if (rawControlPoints.length < 2) {
+      if (rawControlPointsWorld.length < 2) {
         throw new Error('Arch annotation needs at least 2 valid points.');
       }
 
@@ -2200,6 +2896,7 @@ export function useCPROrchestrator({
       if (!volume) {
         throw new Error(`Volume ${sourceVolumeId} not found in cache.`);
       }
+      await waitForVolumeToFullyLoad(volume as LoadableImageVolume, debugRunId);
       console.log(`[CPR][${debugRunId}] source volume resolved`, {
         sourceVolumeId,
       });
@@ -2218,7 +2915,49 @@ export function useCPROrchestrator({
       const spacingY = toPositiveFinite(rawVolumeSpacing?.[1], 1);
       const spacingZ = toPositiveFinite(rawVolumeSpacing?.[2], 1);
       const minSpacing = Math.min(spacingX, spacingY, spacingZ);
-      const totalArcLength = computeSplineTotalArcLength(rawControlPoints);
+      const projectedSpline = projectControlPointsOntoSlicePlane(
+        rawControlPointsWorld,
+        preservedAxialCamera?.focalPoint,
+        preservedAxialCamera?.viewPlaneNormal
+      );
+      const rawControlPoints = projectedSpline.points;
+      console.log('[CPR-SPLINE-PLANE-JSON]', JSON.stringify({
+        runId: debugRunId,
+        rawPointCount: rawControlPointsWorld.length,
+        projectedPointCount: rawControlPoints.length,
+        projected: projectedSpline.diagnostics.projected,
+        maxDistanceMm: projectedSpline.diagnostics.maxDistanceMm,
+        meanDistanceMm: projectedSpline.diagnostics.meanDistanceMm,
+      }));
+      console.log('[CPR-RIGID-SLICE-JSON]', JSON.stringify({
+        runId: debugRunId,
+        enabled: true,
+        slicePlanePoint: preservedAxialCamera?.focalPoint ?? null,
+        slicePlaneNormal: preservedAxialCamera?.viewPlaneNormal ?? null,
+        usesProjectedSplinePlane: projectedSpline.diagnostics.projected,
+        projectedMaxDistanceMm: projectedSpline.diagnostics.maxDistanceMm,
+        projectedMeanDistanceMm: projectedSpline.diagnostics.meanDistanceMm,
+        rigidVerticalCenterOffsetMm: 0,
+      }));
+      const sanitizedSpline = sanitizeSplineControlPoints(rawControlPoints, minSpacing);
+      const controlPoints = sanitizedSpline.points;
+      console.log('[CPR-SPLINE-SANITIZED-JSON]', JSON.stringify({
+        runId: debugRunId,
+        rawPointCount: rawControlPointsWorld.length,
+        sanitizedPointCount: controlPoints.length,
+        diagnostics: sanitizedSpline.diagnostics,
+      }));
+      if (sanitizedSpline.diagnostics.severeJumpDetected) {
+        console.warn(
+          `[CPR][${debugRunId}] Spline contains one or more suspicious long edges; proceeding with sanitized control points.`,
+          sanitizedSpline.diagnostics
+        );
+      }
+      if (controlPoints.length < 2) {
+        throw new Error('Arch annotation collapsed after sanitization. Please redraw the arch.');
+      }
+
+      const totalArcLength = computeSplineTotalArcLength(controlPoints);
       const safeTotalArcLength = Math.max(minSpacing, toPositiveFinite(totalArcLength, minSpacing));
       const idealPanoWidth = Math.round(safeTotalArcLength / minSpacing);
       const minimumPanoWidthPx = Math.max(320, Math.round(requestedPanoWidthPx * 0.6));
@@ -2233,24 +2972,28 @@ export function useCPROrchestrator({
       );
       const baseVerticalHalfMm = Math.max(
         CPR_PANO_DEFAULT_VERTICAL_HALF_MM,
-        Math.min(CPR_PANO_MAX_VERTICAL_HALF_MM, autoVerticalHalfMm)
+        Math.min(CPR_PANO_MAX_VERTICAL_HALF_MM, autoVerticalHalfMm * 0.84)
       );
-      const thinnerVerticalHalfMm = Math.max(10.2, Math.min(14.2, baseVerticalHalfMm * 0.62));
-      const narrowVerticalHalfMm = Math.max(8.4, Math.min(10.6, thinnerVerticalHalfMm * 0.72));
-      const toothBandVerticalHalfMm = Math.max(7.8, Math.min(9.4, narrowVerticalHalfMm * 0.88));
+      const thinnerVerticalHalfMm = Math.max(14, Math.min(19, baseVerticalHalfMm * 0.82));
+      const narrowVerticalHalfMm = Math.max(11.5, Math.min(15.5, thinnerVerticalHalfMm * 0.86));
+      const toothBandVerticalHalfMm = Math.max(10, Math.min(13.5, narrowVerticalHalfMm * 0.9));
       const mediumVerticalHalfMm = Math.max(
-        narrowVerticalHalfMm + 0.6,
-        Math.min(10.8, thinnerVerticalHalfMm * 0.84)
+        narrowVerticalHalfMm + 1.25,
+        Math.min(18, baseVerticalHalfMm * 0.92)
       );
       const broadVerticalHalfMm = Math.max(
-        mediumVerticalHalfMm + 0.8,
-        Math.min(11.8, thinnerVerticalHalfMm * 0.92)
+        mediumVerticalHalfMm + 1.5,
+        Math.min(22, mediumVerticalHalfMm * 1.14)
       );
       const neutralVerticalCenterOffsetMm = 0;
-      const superiorMandibularCenterOffsetMm = -1.8;
-      const subtleMandibularCenterOffsetMm = -2.6;
-      const mandibularCenterOffsetMm = -3.4;
-      const strongMandibularCenterOffsetMm = -4.6;
+      const rigidSliceVerticalCenterOffsetMm = 0;
+      const rigidVerticalSliceModeEnabled = false;
+      const mildSuperiorCenterOffsetMm = 1.4;
+      const strongSuperiorCenterOffsetMm = 2.6;
+      const superiorMandibularCenterOffsetMm = -2.4;
+      const subtleMandibularCenterOffsetMm = -3.8;
+      const mandibularCenterOffsetMm = -5.2;
+      const strongMandibularCenterOffsetMm = -6.6;
       const balancedSlabHalfThicknessMm = 1.6;
       const balancedSlabSamples = 9;
       const fastSlabHalfThicknessMm = 1.2;
@@ -2271,9 +3014,11 @@ export function useCPROrchestrator({
         axialViewport,
         volume.imageData?.getDirection?.()
       );
-      const { positions, tangents } = buildArcLengthSpline(rawControlPoints, finalPanoWidth);
+      const { positions, tangents } = buildArcLengthSpline(controlPoints, finalPanoWidth);
       const frames = buildRMFFrames(positions, tangents, verticalDir);
       console.log(`[CPR][${debugRunId}] frame geometry summary`, {
+        rawControlPointCount: rawControlPoints.length,
+        controlPointCount: controlPoints.length,
         totalArcLength: safeTotalArcLength,
         minSpacing,
         idealPanoWidth,
@@ -2290,6 +3035,10 @@ export function useCPROrchestrator({
 
       // Precompute pano before stage switch so cpr-pano does not visibly flash
       // the source stack before the pano:// image arrives.
+      const panoAttemptSequenceStartMs = performance.now();
+      let launchedAttemptCount = 0;
+      let launchedMipFallbackCount = 0;
+      let earlyExitReason: string | null = null;
       const workerInput = {
         volume,
         frames,
@@ -2298,7 +3047,8 @@ export function useCPROrchestrator({
         aggregation,
         verticalDir,
         verticalHalfMm: baseVerticalHalfMm,
-        verticalCenterOffsetMm: neutralVerticalCenterOffsetMm,
+        verticalCenterOffsetMm: rigidSliceVerticalCenterOffsetMm,
+        rigidVerticalSliceMode: rigidVerticalSliceModeEnabled,
         debugRunId,
       };
       const runWorkerAttempt = async (
@@ -2310,6 +3060,7 @@ export function useCPROrchestrator({
         workerDebugPayload?: CPRWorkerLaunchResult['workerDebugPayload'];
         summary: FloatBufferDebugSummary | null;
         voi: PanoVoiSettings;
+        intensityDomain: SyntheticCprIntensityDomain;
         qualityBase: number;
         qualityScore: number;
         hardRejectReason: string | null;
@@ -2325,7 +3076,19 @@ export function useCPROrchestrator({
         aggregation: 'MIP' | 'MEAN';
         slabHalfThicknessMm: number;
         slabSamples: number;
+        durationMs: number;
+        requestOverrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
+        workerTimingMs?: {
+          adaptiveCenterSearch?: number;
+          pass1And2TwoPassRender?: number;
+          virtualPanoPhase12?: number;
+          suppressionAndDenoise?: number;
+          diagnosticAssembly?: number;
+          total?: number;
+        } | null;
       }> => {
+        launchedAttemptCount++;
+        const attemptStartMs = performance.now();
         const requestedAggregation = (overrides.aggregation ?? workerInput.aggregation) === 'MEAN' ? 'MEAN' : 'MIP';
         const requestedSlabHalfThicknessMm = toPositiveFinite(
           overrides.slabHalfThicknessMm,
@@ -2338,8 +3101,10 @@ export function useCPROrchestrator({
           )
         );
         const requestedVerticalCenterOffsetMm = toFiniteNumber(
-          overrides.verticalCenterOffsetMm ?? workerInput.verticalCenterOffsetMm
-        ) ?? 0;
+          rigidVerticalSliceModeEnabled
+            ? rigidSliceVerticalCenterOffsetMm
+            : overrides.verticalCenterOffsetMm ?? workerInput.verticalCenterOffsetMm
+        ) ?? rigidSliceVerticalCenterOffsetMm;
         const overrideVerticalHalfMm = Number(overrides.verticalHalfMm);
         const actualVertHalfMm =
           Number.isFinite(overrideVerticalHalfMm) && overrideVerticalHalfMm > 0
@@ -2361,50 +3126,43 @@ export function useCPROrchestrator({
           panoHeight: finalPanoHeight,
           verticalHalfMm: actualVertHalfMm,
           verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
+          rigidVerticalSliceMode: rigidVerticalSliceModeEnabled,
         });
-        let result = rawResult;
+        const result = rawResult;
         const hasIdentityRescaleMetadata =
           Math.abs(result.rescaleSlope - 1) <= 1e-6 && Math.abs(result.rescaleIntercept) <= 1e-6;
-        let huDomain =
-          result.modalityLutApplied || result.effectiveIsPreScaled || hasIdentityRescaleMetadata;
-        let convertedToHu = false;
-        let rescaleSkippedAsUnsafe = false;
-
-        if (!huDomain) {
-          const canSafelyApplyRescale = isLikelyStoredValueRange(
-            result.minValue,
-            result.maxValue,
-            result.bitsStored,
-            result.pixelRepresentation
-          );
-          if (canSafelyApplyRescale) {
-            const converted = applyLinearRescaleToPixelData(
-              result.pixelData,
-              result.rescaleSlope,
-              result.rescaleIntercept
-            );
-            if (converted) {
-              result = {
-                ...result,
-                pixelData: converted.pixelData,
-                minValue: converted.minValue,
-                maxValue: converted.maxValue,
-                modalityLutApplied: true,
-              };
-              huDomain = true;
-              convertedToHu = true;
-            }
-          } else {
-            // Metadata appears inconsistent with sampled intensity domain;
-            // avoid applying potentially destructive linear rescale.
-            huDomain = false;
-            rescaleSkippedAsUnsafe = true;
-          }
-        }
-
+        const intensityDomain = classifySyntheticCprIntensityDomain({
+          modalityLutApplied: result.modalityLutApplied,
+          effectiveIsPreScaled: result.effectiveIsPreScaled,
+          minValue: result.minValue,
+          maxValue: result.maxValue,
+        });
+        const huDomain = isSyntheticCprHuDomain(intensityDomain);
+        const convertedToHu = false;
+        const rescaleSkippedAsUnsafe = intensityDomain === 'unknown';
         const summary = summarizeFloatBufferForDebug(result.pixelData, finalPanoWidth, finalPanoHeight);
         const voi = computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
         const qualityBase = scorePanoQuality(summary);
+        const workerDiagnostic =
+          result.workerDebugPayload &&
+            typeof result.workerDebugPayload === 'object' &&
+            result.workerDebugPayload.diagnostic &&
+            typeof result.workerDebugPayload.diagnostic === 'object'
+            ? (result.workerDebugPayload.diagnostic as Record<string, unknown>)
+            : null;
+        const actualVerticalCenterOffsetMm = toFiniteNumber(workerDiagnostic?.verticalCenterOffsetMm);
+        const baseVerticalCenterOffsetMm = toFiniteNumber(workerDiagnostic?.baseVerticalCenterOffsetMm);
+        const fittedVerticalCenterOffsetMm = toFiniteNumber(
+          workerDiagnostic?.fittedVerticalCenterOffsetMm ?? workerDiagnostic?.globalVerticalCenterOffsetMm
+        );
+        const actualCenterDriftMm =
+          actualVerticalCenterOffsetMm !== undefined
+            ? Math.abs(actualVerticalCenterOffsetMm - requestedVerticalCenterOffsetMm)
+            : 0;
+        const baseCenterDriftMm =
+          baseVerticalCenterOffsetMm !== undefined
+            ? Math.abs(baseVerticalCenterOffsetMm - requestedVerticalCenterOffsetMm)
+            : actualCenterDriftMm;
         const splitPenalty = summary
           ? Math.max(0, summary.fractionBelowMinus950 - 0.3) * 8 +
           Math.max(0, summary.fractionAbove3000 - 0.2) * 10 +
@@ -2418,13 +3176,18 @@ export function useCPROrchestrator({
           : 0;
         const specklePenalty = summary ? Math.max(0, summary.meanAbsDelta - 460) / 60 : 0;
         const focalTroughPenalty =
-          Math.max(0, actualVertHalfMm - 10.8) / 0.45 +
+          Math.max(0, actualVertHalfMm - 45) / 2.0 +
           Math.max(0, requestedSlabHalfThicknessMm - 0.8) *
-            (requestedAggregation === 'MIP' ? 5 : 3.5);
+          (requestedAggregation === 'MIP' ? 5 : 3.5);
         const lowerBandFillPenalty = summary
           ? Math.max(0, summary.lowerBandP50 + 140) / 38 +
-            Math.max(0, summary.lowerBandBrightFraction - 0.24) * 24 +
-            Math.max(0, summary.lowerBandBrightFraction - 0.55) * 42
+          Math.max(0, summary.lowerBandBrightFraction - 0.24) * 24 +
+          Math.max(0, summary.lowerBandBrightFraction - 0.55) * 42
+          : 0;
+        const toothBandSaturationPenalty = summary
+          ? Math.max(0, summary.toothBandMean - 760) / 65 +
+          Math.max(0, summary.toothBandP10 - 80) / 28 +
+          Math.max(0, summary.toothBandBrightFraction - 0.24) * 22
           : 0;
         const detailBalanceRatio = summary
           ? summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean)
@@ -2432,16 +3195,17 @@ export function useCPROrchestrator({
         const balancedDetailEdgeMean = summary
           ? Math.min(summary.detailBandHorizontalEdgeMean, summary.detailBandVerticalEdgeMean * 2.4)
           : 0;
+        const toothBandContrastRange = summary ? summary.toothBandP90 - summary.toothBandP10 : 0;
         const detailReward = summary
           ? Math.max(-2.5, Math.min(4, (balancedDetailEdgeMean - 55) / 28)) -
-            Math.max(0, detailBalanceRatio - 2.6) * 2.2
+          Math.max(0, detailBalanceRatio - 2.6) * 2.2
           : 0;
         const deformationPenalty = summary
           ? Math.max(0, detailBalanceRatio - 2.8) * 3.6 +
-            Math.max(0, summary.detailBandHorizontalEdgeMean - 240) / 28
+          Math.max(0, summary.detailBandHorizontalEdgeMean - 240) / 28
           : 0;
         const tallFillPenalty = summary
-          ? Math.max(0, actualVertHalfMm - 9.8) * Math.max(0, summary.lowerBandBrightFraction - 0.45) * 28
+          ? Math.max(0, actualVertHalfMm - 42) * Math.max(0, summary.lowerBandBrightFraction - 0.45) * 28
           : 0;
         const noAirPenalty = summary
           ? summary.fractionBelowMinus950 < 0.005
@@ -2451,37 +3215,68 @@ export function useCPROrchestrator({
               : 0
           : 0;
         const elevatedP01Penalty = summary ? Math.max(0, summary.p01 + 780) / 80 : 0;
+        const centerDriftPenalty =
+          Math.max(0, actualCenterDriftMm - 1.5) * 6 +
+          Math.max(0, baseCenterDriftMm - 1.0) * 8;
         const aggregationPenalty =
           requestedAggregation === 'MIP'
             ? 4.5 + (summary ? Math.max(0, summary.meanAbsDelta - 300) / 45 : 0)
             : 0;
         const baseHardRejectReason = getHardRejectReason(summary);
+        const excessiveCenterDrift =
+          actualCenterDriftMm > Math.max(4, actualVertHalfMm * 0.2) ||
+          baseCenterDriftMm > Math.max(3.5, actualVertHalfMm * 0.16);
         const hardRejectReason =
-          !baseHardRejectReason &&
-          !!summary &&
-          requestedAggregation === 'MEAN' &&
-          actualVertHalfMm > 10.4 &&
-          summary.lowerBandBrightFraction > 0.64
-            ? 'tall-lower-band-fill'
-            : baseHardRejectReason;
+          !baseHardRejectReason && excessiveCenterDrift
+            ? 'vertical-center-drift'
+            : !baseHardRejectReason &&
+                !!summary &&
+                requestedAggregation === 'MEAN' &&
+                actualVertHalfMm > 45 &&
+                summary.lowerBandBrightFraction > 0.64
+              ? 'tall-lower-band-fill'
+              : baseHardRejectReason;
         const hardRejectPenalty = hardRejectReason ? 30 : 0;
+        const intensityDomainPenalty = intensityDomain === 'unknown' ? 12 : 0;
         const qualityScore =
           qualityBase +
           detailReward +
-          (huDomain ? 0 : -100) -
+          (huDomain ? 2 : 0) -
           splitPenalty -
           denseFillPenalty -
           specklePenalty -
           focalTroughPenalty -
           lowerBandFillPenalty -
+          toothBandSaturationPenalty -
           noAirPenalty -
           elevatedP01Penalty -
+          centerDriftPenalty -
           deformationPenalty -
           tallFillPenalty -
+          intensityDomainPenalty -
           aggregationPenalty -
           hardRejectPenalty;
+        const attemptDurationMs = performance.now() - attemptStartMs;
+        const workerTimingMs =
+          result.workerDebugPayload &&
+            typeof result.workerDebugPayload === 'object' &&
+            result.workerDebugPayload.diagnostic &&
+            typeof result.workerDebugPayload.diagnostic === 'object' &&
+            (result.workerDebugPayload.diagnostic as Record<string, unknown>).timingMs &&
+            typeof (result.workerDebugPayload.diagnostic as Record<string, unknown>).timingMs === 'object'
+            ? ((result.workerDebugPayload.diagnostic as Record<string, unknown>).timingMs as {
+              adaptiveCenterSearch?: number;
+              pass1And2TwoPassRender?: number;
+              virtualPanoPhase12?: number;
+              suppressionAndDenoise?: number;
+              diagnosticAssembly?: number;
+              total?: number;
+            })
+            : null;
 
         console.log(`[CPR][${debugRunId}] pano attempt ${label}`, {
+          durationMs: Math.round(attemptDurationMs),
+          workerTimingMs,
           qualityBase,
           qualityScore,
           aggregation: requestedAggregation,
@@ -2497,6 +3292,12 @@ export function useCPROrchestrator({
           detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean,
           fractionBelowMinus950: summary?.fractionBelowMinus950,
           fractionAbove3000: summary?.fractionAbove3000,
+          actualVerticalCenterOffsetMm,
+          baseVerticalCenterOffsetMm,
+          fittedVerticalCenterOffsetMm,
+          actualCenterDriftMm,
+          baseCenterDriftMm,
+          intensityDomain,
           huDomain,
           convertedToHu,
           rescaleSkippedAsUnsafe,
@@ -2506,6 +3307,7 @@ export function useCPROrchestrator({
           effectiveIsPreScaled: result.effectiveIsPreScaled,
           rescaleSlope: result.rescaleSlope,
           rescaleIntercept: result.rescaleIntercept,
+          intensityDomainPenalty,
           actualVertHalfMm,
           verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
           idealPanoHeight,
@@ -2517,11 +3319,18 @@ export function useCPROrchestrator({
           specklePenalty,
           focalTroughPenalty,
           lowerBandFillPenalty,
+          toothBandSaturationPenalty,
           detailReward,
           deformationPenalty,
           tallFillPenalty,
           noAirPenalty,
           elevatedP01Penalty,
+          centerDriftPenalty,
+          toothBandMean: summary?.toothBandMean,
+          toothBandP10: summary?.toothBandP10,
+          toothBandP90: summary?.toothBandP90,
+          toothBandBrightFraction: summary?.toothBandBrightFraction,
+          toothBandContrastRange,
           hardRejectReason,
           hardRejectPenalty,
           columnPixelSpacing,
@@ -2539,6 +3348,9 @@ export function useCPROrchestrator({
             slabHalfThicknessMm: requestedSlabHalfThicknessMm,
             slabSamples: requestedSlabSamples,
             verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
+            durationMs: Math.round(attemptDurationMs),
+            workerTimingMs,
+            intensityDomain,
             huDomain,
             convertedToHu,
             rescaleSkippedAsUnsafe,
@@ -2548,10 +3360,15 @@ export function useCPROrchestrator({
             p50: summary?.p50 ?? null,
             p99: summary?.p99 ?? null,
             meanAbsDelta: summary?.meanAbsDelta ?? null,
+            toothBandMean: summary?.toothBandMean ?? null,
+            toothBandP10: summary?.toothBandP10 ?? null,
+            toothBandP90: summary?.toothBandP90 ?? null,
+            toothBandBrightFraction: summary?.toothBandBrightFraction ?? null,
             lowerBandP50: summary?.lowerBandP50 ?? null,
             lowerBandBrightFraction: summary?.lowerBandBrightFraction ?? null,
             detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean ?? null,
             detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean ?? null,
+            toothBandSaturationPenalty,
             fractionBelowMinus950: summary?.fractionBelowMinus950 ?? null,
             fractionAbove3000: summary?.fractionAbove3000 ?? null,
             splitPenalty,
@@ -2564,6 +3381,12 @@ export function useCPROrchestrator({
             tallFillPenalty,
             noAirPenalty,
             elevatedP01Penalty,
+            actualVerticalCenterOffsetMm,
+            baseVerticalCenterOffsetMm,
+            fittedVerticalCenterOffsetMm,
+            actualCenterDriftMm,
+            baseCenterDriftMm,
+            centerDriftPenalty,
             hardRejectReason,
             hardRejectPenalty,
             voi,
@@ -2577,6 +3400,7 @@ export function useCPROrchestrator({
           workerDebugPayload: result.workerDebugPayload,
           summary,
           voi,
+          intensityDomain,
           qualityBase,
           qualityScore,
           hardRejectReason,
@@ -2592,6 +3416,9 @@ export function useCPROrchestrator({
           aggregation: requestedAggregation,
           slabHalfThicknessMm: requestedSlabHalfThicknessMm,
           slabSamples: requestedSlabSamples,
+          durationMs: attemptDurationMs,
+          requestOverrides: { ...overrides },
+          workerTimingMs,
         };
       };
 
@@ -2604,18 +3431,36 @@ export function useCPROrchestrator({
         slabHalfThicknessMm: number;
         slabSamples: number;
         verticalCenterOffsetMm: number;
+        intensityDomain: SyntheticCprIntensityDomain;
         huDomain: boolean;
+        sampledCount: number | null;
+        min: number | null;
+        max: number | null;
         p01: number | null;
         p50: number | null;
         p99: number | null;
         meanAbsDelta: number | null;
+        toothBandMean: number | null;
+        toothBandP10: number | null;
+        toothBandP90: number | null;
+        toothBandBrightFraction: number | null;
         lowerBandP50: number | null;
         lowerBandBrightFraction: number | null;
         detailBandHorizontalEdgeMean: number | null;
         detailBandVerticalEdgeMean: number | null;
         fractionBelowMinus950: number | null;
         fractionAbove3000: number | null;
+        durationMs: number;
+        workerTimingMs?: {
+          adaptiveCenterSearch?: number;
+          pass1And2TwoPassRender?: number;
+          virtualPanoPhase12?: number;
+          suppressionAndDenoise?: number;
+          diagnosticAssembly?: number;
+          total?: number;
+        } | null;
       }> = [];
+      const attemptResults: Array<Awaited<ReturnType<typeof runWorkerAttempt>>> = [];
       const recordAttemptAudit = (attempt: {
         label: string;
         qualityBase: number;
@@ -2625,8 +3470,18 @@ export function useCPROrchestrator({
         slabHalfThicknessMm: number;
         slabSamples: number;
         verticalCenterOffsetMm: number;
+        intensityDomain: SyntheticCprIntensityDomain;
         huDomain: boolean;
         summary: FloatBufferDebugSummary | null;
+        durationMs: number;
+        workerTimingMs?: {
+          adaptiveCenterSearch?: number;
+          pass1And2TwoPassRender?: number;
+          virtualPanoPhase12?: number;
+          suppressionAndDenoise?: number;
+          diagnosticAssembly?: number;
+          total?: number;
+        } | null;
       }): void => {
         attemptAudit.push({
           label: attempt.label,
@@ -2637,18 +3492,108 @@ export function useCPROrchestrator({
           slabHalfThicknessMm: attempt.slabHalfThicknessMm,
           slabSamples: attempt.slabSamples,
           verticalCenterOffsetMm: attempt.verticalCenterOffsetMm,
+          intensityDomain: attempt.intensityDomain,
           huDomain: attempt.huDomain,
+          sampledCount: attempt.summary?.sampledCount ?? null,
+          min: attempt.summary?.min ?? null,
+          max: attempt.summary?.max ?? null,
           p01: attempt.summary?.p01 ?? null,
           p50: attempt.summary?.p50 ?? null,
           p99: attempt.summary?.p99 ?? null,
           meanAbsDelta: attempt.summary?.meanAbsDelta ?? null,
+          toothBandMean: attempt.summary?.toothBandMean ?? null,
+          toothBandP10: attempt.summary?.toothBandP10 ?? null,
+          toothBandP90: attempt.summary?.toothBandP90 ?? null,
+          toothBandBrightFraction: attempt.summary?.toothBandBrightFraction ?? null,
           lowerBandP50: attempt.summary?.lowerBandP50 ?? null,
           lowerBandBrightFraction: attempt.summary?.lowerBandBrightFraction ?? null,
           detailBandHorizontalEdgeMean: attempt.summary?.detailBandHorizontalEdgeMean ?? null,
           detailBandVerticalEdgeMean: attempt.summary?.detailBandVerticalEdgeMean ?? null,
           fractionBelowMinus950: attempt.summary?.fractionBelowMinus950 ?? null,
           fractionAbove3000: attempt.summary?.fractionAbove3000 ?? null,
+          durationMs: Math.round(attempt.durationMs),
+          workerTimingMs: attempt.workerTimingMs ?? null,
         });
+      };
+      const recordAttempt = (attempt: Awaited<ReturnType<typeof runWorkerAttempt>>): void => {
+        attemptResults.push(attempt);
+        recordAttemptAudit(attempt);
+      };
+      const isGoodEnoughPanoAttempt = (attempt: {
+        qualityScore: number;
+        hardRejectReason: string | null;
+        summary: FloatBufferDebugSummary | null;
+      }): boolean => {
+        const summary = attempt.summary;
+        if (!summary || !!attempt.hardRejectReason) {
+          return false;
+        }
+        const detailRatio =
+          summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean);
+        const hasCleanLowerBand =
+          summary.lowerBandBrightFraction <= 0.32 && summary.lowerBandP50 <= -120;
+        const hasCleanToothBand =
+          summary.toothBandBrightFraction <= 0.26 &&
+          summary.toothBandP10 <= 140 &&
+          summary.toothBandMean <= 820;
+        const hasVeryStrongOverallScore =
+          attempt.qualityScore >= 24 &&
+          summary.lowerBandBrightFraction <= 0.4 &&
+          summary.lowerBandP50 <= -60 &&
+          hasCleanToothBand &&
+          detailRatio <= 3.4;
+        return (
+          hasVeryStrongOverallScore ||
+          (
+            attempt.qualityScore >= 16 &&
+            hasCleanLowerBand &&
+            hasCleanToothBand &&
+            summary.meanAbsDelta <= 520 &&
+            summary.fractionAbove3000 <= 0.005 &&
+            detailRatio <= 3.4
+          )
+        );
+      };
+      const needsFallbackAttempt = (attempt: {
+        qualityScore: number;
+        hardRejectReason: string | null;
+        summary: FloatBufferDebugSummary | null;
+      }): boolean => {
+        const summary = attempt.summary;
+        if (!summary || !!attempt.hardRejectReason) {
+          return true;
+        }
+        const detailRatio =
+          summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean);
+        return (
+          attempt.qualityScore < 2 ||
+          summary.lowerBandBrightFraction > 0.62 ||
+          summary.lowerBandP50 > 120 ||
+          summary.meanAbsDelta > 680 ||
+          detailRatio > 4.2
+        );
+      };
+      const needsExtendedMeanRetrySearch = (attempt: {
+        qualityScore: number;
+        hardRejectReason: string | null;
+        summary: FloatBufferDebugSummary | null;
+      }): boolean => {
+        const summary = attempt.summary;
+        if (!summary || !!attempt.hardRejectReason) {
+          return true;
+        }
+        const detailRatio =
+          summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean);
+        return (
+          attempt.qualityScore < 10 ||
+          summary.toothBandBrightFraction > 0.3 ||
+          summary.toothBandP10 > 180 ||
+          summary.toothBandMean > 860 ||
+          summary.lowerBandBrightFraction > 0.42 ||
+          summary.lowerBandP50 > -40 ||
+          summary.meanAbsDelta > 560 ||
+          detailRatio > 3.6
+        );
       };
 
       let bestAttempt = await runWorkerAttempt('primary-mean-toothband-narrow', {
@@ -2659,203 +3604,286 @@ export function useCPROrchestrator({
         slabSamples: focusedMeanSlabSamples,
         aggregation: 'MEAN',
       });
-      recordAttemptAudit(bestAttempt);
+      recordAttempt(bestAttempt);
 
-      const retryConfigs: Array<{
-        label: string;
-        overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
-      }> = [];
-
-      if (bestAttempt.result.effectiveIsPreScaled) {
-        // Evaluate a no-LUT variant when source appears pre-scaled.
-        retryConfigs.push({
-          label: 'retry-no-lut-mean-narrow',
-          overrides: {
-            modalityLutOverride: false,
-            forceDisableStoredValueNormalization: true,
-            verticalHalfMm: toothBandVerticalHalfMm,
-            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-            slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
-            slabSamples: focusedMeanSlabSamples,
-            aggregation: 'MEAN',
-          },
-        });
+      if (isGoodEnoughPanoAttempt(bestAttempt)) {
+        earlyExitReason = 'primary-good-enough';
       } else {
+        const retryConfigs: Array<{
+          label: string;
+          overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
+        }> = [];
+
+        if (bestAttempt.result.effectiveIsPreScaled && needsExtendedMeanRetrySearch(bestAttempt)) {
+          // Evaluate a no-LUT variant when source appears pre-scaled.
+          retryConfigs.push({
+            label: 'retry-no-lut-mean-narrow',
+            overrides: {
+              modalityLutOverride: false,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: toothBandVerticalHalfMm,
+              verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+              slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+              slabSamples: focusedMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+        } else if (needsExtendedMeanRetrySearch(bestAttempt)) {
+          retryConfigs.push({
+            label: 'retry-force-lut-mean-narrow-no-normalization',
+            overrides: {
+              modalityLutOverride: true,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: toothBandVerticalHalfMm,
+              verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+              slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+              slabSamples: focusedMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+        }
+
+        // Balanced MEAN attempts for clinically readable tooth and background separation
         retryConfigs.push({
-          label: 'retry-force-lut-mean-narrow-no-normalization',
+          label: 'retry-mean-toothband-neutral',
           overrides: {
             modalityLutOverride: true,
-            forceDisableStoredValueNormalization: true,
             verticalHalfMm: toothBandVerticalHalfMm,
-            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+            verticalCenterOffsetMm: neutralVerticalCenterOffsetMm,
             slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
             slabSamples: focusedMeanSlabSamples,
             aggregation: 'MEAN',
           },
         });
-      }
+        retryConfigs.push({
+          label: 'retry-mean-toothband-superior',
+          overrides: {
+            modalityLutOverride: true,
+            verticalHalfMm: toothBandVerticalHalfMm,
+            verticalCenterOffsetMm: superiorMandibularCenterOffsetMm,
+            slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+            slabSamples: focusedMeanSlabSamples,
+            aggregation: 'MEAN',
+          },
+        });
+        retryConfigs.push({
+          label: 'retry-mean-toothband-balanced',
+          overrides: {
+            modalityLutOverride: true,
+            verticalHalfMm: toothBandVerticalHalfMm,
+            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+            slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
+            slabSamples: meanFallbackSlabSamples,
+            aggregation: 'MEAN',
+          },
+        });
+        retryConfigs.push({
+          label: 'retry-mean-toothband-rooted',
+          overrides: {
+            modalityLutOverride: true,
+            verticalHalfMm: narrowVerticalHalfMm,
+            verticalCenterOffsetMm: mandibularCenterOffsetMm,
+            slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+            slabSamples: focusedMeanSlabSamples,
+            aggregation: 'MEAN',
+          },
+        });
+        retryConfigs.push({
+          label: 'retry-mean-balanced-medium',
+          overrides: {
+            modalityLutOverride: true,
+            verticalHalfMm: mediumVerticalHalfMm,
+            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+            slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+            slabSamples: balancedMeanSlabSamples,
+            aggregation: 'MEAN',
+          },
+        });
+        retryConfigs.push({
+          label: 'retry-mean-balanced-medium-strong-bias',
+          overrides: {
+            modalityLutOverride: true,
+            verticalHalfMm: mediumVerticalHalfMm,
+            verticalCenterOffsetMm: strongMandibularCenterOffsetMm,
+            slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+            slabSamples: balancedMeanSlabSamples,
+            aggregation: 'MEAN',
+          },
+        });
+        // Sharp MEAN attempts - thin slab for maximum tooth separation
+        retryConfigs.push({
+          label: 'retry-mean-sharp-narrow',
+          overrides: {
+            modalityLutOverride: true,
+            verticalHalfMm: toothBandVerticalHalfMm,
+            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+            slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
+            slabSamples: sharpMeanSlabSamples,
+            aggregation: 'MEAN',
+          },
+        });
+        // Softer MEAN fallback attempt only when the primary/core search is still poor.
+        if (needsFallbackAttempt(bestAttempt)) {
+          retryConfigs.push({
+            label: 'retry-mean-fallback-narrow',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: mandibularCenterOffsetMm,
+              slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
+              slabSamples: meanFallbackSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+        }
+        if (needsExtendedMeanRetrySearch(bestAttempt)) {
+          retryConfigs.push({
+            label: 'retry-mean-balanced-narrow',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+              slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+              slabSamples: balancedMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-mean-balanced-neutral',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: neutralVerticalCenterOffsetMm,
+              slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+              slabSamples: balancedMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-mean-balanced-mild-superior',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: mildSuperiorCenterOffsetMm,
+              slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+              slabSamples: balancedMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-mean-broad-medium',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: mediumVerticalHalfMm,
+              verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+              slabHalfThicknessMm: broadMeanSlabHalfThicknessMm,
+              slabSamples: broadMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-mean-broad-neutral',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: mediumVerticalHalfMm,
+              verticalCenterOffsetMm: neutralVerticalCenterOffsetMm,
+              slabHalfThicknessMm: broadMeanSlabHalfThicknessMm,
+              slabSamples: broadMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-mean-broad-superior',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: mediumVerticalHalfMm,
+              verticalCenterOffsetMm: strongSuperiorCenterOffsetMm,
+              slabHalfThicknessMm: broadMeanSlabHalfThicknessMm,
+              slabSamples: broadMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-mean-sharp-medium',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: mediumVerticalHalfMm,
+              verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+              slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
+              slabSamples: sharpMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-mean-broad-biased',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: broadVerticalHalfMm,
+              verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+              slabHalfThicknessMm: broadMeanSlabHalfThicknessMm,
+              slabSamples: broadMeanSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+          retryConfigs.push({
+            label: 'retry-mean-fallback-narrow-no-normalization',
+            overrides: {
+              modalityLutOverride: true,
+              forceDisableStoredValueNormalization: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: mandibularCenterOffsetMm,
+              slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
+              slabSamples: meanFallbackSlabSamples,
+              aggregation: 'MEAN',
+            },
+          });
+        }
 
-      // Balanced MEAN attempts for clinically readable tooth and background separation
-      retryConfigs.push({
-        label: 'retry-mean-toothband-superior',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: toothBandVerticalHalfMm,
-          verticalCenterOffsetMm: superiorMandibularCenterOffsetMm,
-          slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
-          slabSamples: focusedMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-toothband-balanced',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: toothBandVerticalHalfMm,
-          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-          slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
-          slabSamples: meanFallbackSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-toothband-rooted',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: narrowVerticalHalfMm,
-          verticalCenterOffsetMm: mandibularCenterOffsetMm,
-          slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
-          slabSamples: focusedMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-balanced-medium',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: mediumVerticalHalfMm,
-          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-          slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
-          slabSamples: balancedMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-balanced-medium-strong-bias',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: mediumVerticalHalfMm,
-          verticalCenterOffsetMm: strongMandibularCenterOffsetMm,
-          slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
-          slabSamples: balancedMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-balanced-narrow',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: narrowVerticalHalfMm,
-          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-          slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
-          slabSamples: balancedMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-broad-medium',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: mediumVerticalHalfMm,
-          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-          slabHalfThicknessMm: broadMeanSlabHalfThicknessMm,
-          slabSamples: broadMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-broad-biased',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: broadVerticalHalfMm,
-          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-          slabHalfThicknessMm: broadMeanSlabHalfThicknessMm,
-          slabSamples: broadMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-
-      // Sharp MEAN attempts - thin slab for maximum tooth separation
-      retryConfigs.push({
-        label: 'retry-mean-sharp-narrow',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: toothBandVerticalHalfMm,
-          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-          slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
-          slabSamples: sharpMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-sharp-medium',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: mediumVerticalHalfMm,
-          verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-          slabHalfThicknessMm: sharpMeanSlabHalfThicknessMm,
-          slabSamples: sharpMeanSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-
-      // Softer MEAN fallback attempts for comparison
-      retryConfigs.push({
-        label: 'retry-mean-fallback-narrow',
-        overrides: {
-          modalityLutOverride: true,
-          verticalHalfMm: narrowVerticalHalfMm,
-          verticalCenterOffsetMm: mandibularCenterOffsetMm,
-          slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
-          slabSamples: meanFallbackSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-      retryConfigs.push({
-        label: 'retry-mean-fallback-narrow-no-normalization',
-        overrides: {
-          modalityLutOverride: true,
-          forceDisableStoredValueNormalization: true,
-          verticalHalfMm: narrowVerticalHalfMm,
-          verticalCenterOffsetMm: mandibularCenterOffsetMm,
-          slabHalfThicknessMm: meanFallbackSlabHalfThicknessMm,
-          slabSamples: meanFallbackSlabSamples,
-          aggregation: 'MEAN',
-        },
-      });
-
-      for (const retryConfig of retryConfigs) {
-        const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
-        recordAttemptAudit(attempt);
-        const bestHardRejected = !!bestAttempt.hardRejectReason;
-        const attemptHardRejected = !!attempt.hardRejectReason;
-        if (
-          (bestHardRejected && !attemptHardRejected) ||
-          (bestHardRejected === attemptHardRejected &&
-            (attempt.qualityScore > bestAttempt.qualityScore ||
-              (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
-                attempt.qualityBase > bestAttempt.qualityBase)))
-        ) {
-          bestAttempt = attempt;
+        for (const retryConfig of retryConfigs) {
+          const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
+          recordAttempt(attempt);
+          const bestHardRejected = !!bestAttempt.hardRejectReason;
+          const attemptHardRejected = !!attempt.hardRejectReason;
+          const bestFallbackScore = scoreHardRejectedPanoFallback(bestAttempt.summary);
+          const attemptFallbackScore = scoreHardRejectedPanoFallback(attempt.summary);
+          if (
+            (bestHardRejected && !attemptHardRejected) ||
+            (bestHardRejected === attemptHardRejected &&
+              (bestHardRejected
+                ? (
+                  attemptFallbackScore > bestFallbackScore ||
+                  (Math.abs(attemptFallbackScore - bestFallbackScore) < 1e-6 &&
+                    (attempt.qualityScore > bestAttempt.qualityScore ||
+                      (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
+                        attempt.qualityBase > bestAttempt.qualityBase)))
+                )
+                : (
+                  attempt.qualityScore > bestAttempt.qualityScore ||
+                  (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
+                    attempt.qualityBase > bestAttempt.qualityBase)
+                )))
+          ) {
+            bestAttempt = attempt;
+          }
+          if (isGoodEnoughPanoAttempt(bestAttempt)) {
+            earlyExitReason = `retry-good-enough:${bestAttempt.label}`;
+            break;
+          }
         }
       }
 
       const shouldRunMipFallbacks =
-        !!bestAttempt.hardRejectReason ||
-        isLikelyPoorPanoQuality(bestAttempt.summary) ||
-        !!(
-          bestAttempt.summary &&
-          (bestAttempt.summary.lowerBandBrightFraction > 0.55 || bestAttempt.summary.lowerBandP50 > 150)
+        !earlyExitReason &&
+        (
+          !!bestAttempt.hardRejectReason ||
+          (bestAttempt.qualityScore < 0 && isLikelyPoorPanoQuality(bestAttempt.summary)) ||
+          !!(
+            bestAttempt.summary &&
+            (
+              bestAttempt.summary.lowerBandBrightFraction > 0.78 ||
+              bestAttempt.summary.lowerBandP50 > 260
+            )
+          )
         );
 
       if (shouldRunMipFallbacks) {
@@ -2863,44 +3891,23 @@ export function useCPROrchestrator({
           label: string;
           overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
         }> = [
-          {
-            label: 'retry-balanced-mip-narrow-fallback',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: narrowVerticalHalfMm,
-              verticalCenterOffsetMm: mandibularCenterOffsetMm,
-              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-              slabSamples: balancedSlabSamples,
-              aggregation: 'MIP',
+            {
+              label: 'retry-balanced-mip-narrow-fallback',
+              overrides: {
+                modalityLutOverride: true,
+                verticalHalfMm: narrowVerticalHalfMm,
+                verticalCenterOffsetMm: mandibularCenterOffsetMm,
+                slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+                slabSamples: balancedSlabSamples,
+                aggregation: 'MIP',
+              },
             },
-          },
-          {
-            label: 'retry-fast-mip-narrow-fallback',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: narrowVerticalHalfMm,
-              verticalCenterOffsetMm: mandibularCenterOffsetMm,
-              slabHalfThicknessMm: fastSlabHalfThicknessMm,
-              slabSamples: fastSlabSamples,
-              aggregation: 'MIP',
-            },
-          },
-          {
-            label: 'retry-balanced-mip-medium-strong-bias-fallback',
-            overrides: {
-              modalityLutOverride: true,
-              verticalHalfMm: mediumVerticalHalfMm,
-              verticalCenterOffsetMm: strongMandibularCenterOffsetMm,
-              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-              slabSamples: balancedSlabSamples,
-              aggregation: 'MIP',
-            },
-          },
-        ];
+          ];
 
         for (const retryConfig of mipFallbackConfigs) {
+          launchedMipFallbackCount++;
           const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
-          recordAttemptAudit(attempt);
+          recordAttempt(attempt);
           const bestHardRejected = !!bestAttempt.hardRejectReason;
           const attemptHardRejected = !!attempt.hardRejectReason;
           if (
@@ -2912,9 +3919,202 @@ export function useCPROrchestrator({
           ) {
             bestAttempt = attempt;
           }
+          if (isGoodEnoughPanoAttempt(bestAttempt)) {
+            earlyExitReason = `mip-good-enough:${bestAttempt.label}`;
+            break;
+          }
         }
       }
 
+      const totalAttemptDurationMs = performance.now() - panoAttemptSequenceStartMs;
+      const phase2BaseAttempt = attemptResults
+        .filter(attempt => attempt.aggregation === 'MEAN')
+        .sort((a, b) => {
+          const aHardRejected = !!a.hardRejectReason;
+          const bHardRejected = !!b.hardRejectReason;
+          if (aHardRejected !== bHardRejected) {
+            return aHardRejected ? 1 : -1;
+          }
+          return (b.qualityScore - a.qualityScore) || (b.qualityBase - a.qualityBase);
+        })[0] || null;
+      const phase1VirtualPano: {
+        executed: boolean;
+        skippedReason: string | null;
+        error: string | null;
+        timingMs: Record<string, unknown> | null;
+        diagnostics: Record<string, unknown> | null;
+      } = {
+        executed: false,
+        skippedReason: null,
+        error: null,
+        timingMs: null,
+        diagnostics: null,
+      };
+      if (!phase2BaseAttempt) {
+        phase1VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
+      } else {
+        try {
+          const phase1Result = await launchCPRWorker({
+            ...workerInput,
+            ...phase2BaseAttempt.requestOverrides,
+            panoWidth: phase2BaseAttempt.panoWidth,
+            panoHeight: phase2BaseAttempt.panoHeight,
+            verticalHalfMm: phase2BaseAttempt.actualVertHalfMm,
+            verticalCenterOffsetMm: phase2BaseAttempt.verticalCenterOffsetMm,
+            slabHalfThicknessMm: phase2BaseAttempt.slabHalfThicknessMm,
+            slabSamples: phase2BaseAttempt.slabSamples,
+            aggregation: phase2BaseAttempt.aggregation,
+            debugRunId: `${debugRunId}-phase1`,
+            reconstructionMode: 'virtualPanoPhase1',
+          });
+          const phase1DiagnosticPayload =
+            phase1Result.workerDebugPayload &&
+              typeof phase1Result.workerDebugPayload === 'object' &&
+              phase1Result.workerDebugPayload.diagnostic &&
+              typeof phase1Result.workerDebugPayload.diagnostic === 'object'
+              ? (phase1Result.workerDebugPayload.diagnostic as Record<string, unknown>)
+              : null;
+          phase1VirtualPano.executed = true;
+          phase1VirtualPano.timingMs =
+            phase1DiagnosticPayload &&
+              phase1DiagnosticPayload.timingMs &&
+              typeof phase1DiagnosticPayload.timingMs === 'object'
+              ? (phase1DiagnosticPayload.timingMs as Record<string, unknown>)
+              : null;
+          phase1VirtualPano.diagnostics =
+            phase1DiagnosticPayload &&
+              phase1DiagnosticPayload.virtualPanoPhase12 &&
+              typeof phase1DiagnosticPayload.virtualPanoPhase12 === 'object'
+              ? (phase1DiagnosticPayload.virtualPanoPhase12 as Record<string, unknown>)
+              : null;
+        } catch (phase1Error) {
+          phase1VirtualPano.error =
+            phase1Error instanceof Error ? phase1Error.message : String(phase1Error);
+        }
+      }
+      console.log(
+        '[CPR-PHASE1-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          selectedLabel: phase2BaseAttempt?.label ?? null,
+          selectedAggregation: phase2BaseAttempt?.aggregation ?? null,
+          phase1VirtualPano,
+        })
+      );
+      const phase2VirtualPano: {
+        executed: boolean;
+        skippedReason: string | null;
+        error: string | null;
+        timingMs: Record<string, unknown> | null;
+        diagnostics: Record<string, unknown> | null;
+        summary: FloatBufferDebugSummary | null;
+        voi: PanoVoiSettings | null;
+        usedAsDisplayedOutput: boolean;
+        borderlineAcceptedReason: string | null;
+      } = {
+        executed: false,
+        skippedReason: null,
+        error: null,
+        timingMs: null,
+        diagnostics: null,
+        summary: null,
+        voi: null,
+        usedAsDisplayedOutput: false,
+        borderlineAcceptedReason: null,
+      };
+      let phase2WorkerResult: CPRWorkerLaunchResult | null = null;
+      if (!phase2BaseAttempt) {
+        phase2VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
+      } else {
+        try {
+          const phase2Result = await launchCPRWorker({
+            ...workerInput,
+            ...phase2BaseAttempt.requestOverrides,
+            panoWidth: phase2BaseAttempt.panoWidth,
+            panoHeight: phase2BaseAttempt.panoHeight,
+            verticalHalfMm: phase2BaseAttempt.actualVertHalfMm,
+            verticalCenterOffsetMm: phase2BaseAttempt.verticalCenterOffsetMm,
+            slabHalfThicknessMm: phase2BaseAttempt.slabHalfThicknessMm,
+            slabSamples: phase2BaseAttempt.slabSamples,
+            aggregation: phase2BaseAttempt.aggregation,
+            debugRunId: `${debugRunId}-phase2`,
+            reconstructionMode: 'virtualPano',
+          });
+          const phase2DiagnosticPayload =
+            phase2Result.workerDebugPayload &&
+              typeof phase2Result.workerDebugPayload === 'object' &&
+              phase2Result.workerDebugPayload.diagnostic &&
+              typeof phase2Result.workerDebugPayload.diagnostic === 'object'
+              ? (phase2Result.workerDebugPayload.diagnostic as Record<string, unknown>)
+              : null;
+          const phase2Summary = summarizeFloatBufferForDebug(
+            phase2Result.pixelData,
+            phase2BaseAttempt.panoWidth,
+            phase2BaseAttempt.panoHeight
+          );
+          const phase2Voi = computeAdaptivePanoVoi(
+            phase2Summary,
+            phase2Result.minValue,
+            phase2Result.maxValue
+          );
+          const phase2RenderDiagnostics =
+            phase2DiagnosticPayload &&
+              phase2DiagnosticPayload.virtualPanoRender &&
+              typeof phase2DiagnosticPayload.virtualPanoRender === 'object'
+              ? (phase2DiagnosticPayload.virtualPanoRender as Record<string, unknown>)
+              : null;
+
+          phase2VirtualPano.executed = true;
+          phase2VirtualPano.timingMs =
+            phase2DiagnosticPayload &&
+              phase2DiagnosticPayload.timingMs &&
+              typeof phase2DiagnosticPayload.timingMs === 'object'
+              ? (phase2DiagnosticPayload.timingMs as Record<string, unknown>)
+              : null;
+          phase2VirtualPano.diagnostics = phase2RenderDiagnostics;
+          phase2VirtualPano.summary = phase2Summary;
+          phase2VirtualPano.voi = phase2Voi;
+          const phase2RejectReasons =
+            phase2RenderDiagnostics && Array.isArray(phase2RenderDiagnostics.rejectReasons)
+              ? phase2RenderDiagnostics.rejectReasons.filter(
+                reason => typeof reason === 'string'
+              )
+              : [];
+          phase2VirtualPano.usedAsDisplayedOutput =
+            !!phase2RenderDiagnostics &&
+            phase2RenderDiagnostics.usedAsOutput === true;
+          const acceptedByLowerBandTolerance =
+            !!phase2RenderDiagnostics &&
+            phase2RenderDiagnostics.acceptedByLowerBandTolerance === true;
+          if (phase2VirtualPano.usedAsDisplayedOutput && acceptedByLowerBandTolerance) {
+            phase2VirtualPano.borderlineAcceptedReason = 'lower-band-tolerated-in-worker';
+          } else if (
+            phase2VirtualPano.usedAsDisplayedOutput &&
+            phase2RejectReasons.length === 1 &&
+            phase2RejectReasons[0] === 'lower-band-bright-fraction-too-high'
+          ) {
+            phase2VirtualPano.borderlineAcceptedReason = 'lower-band-bright-fraction-only-rejected';
+          } else if (
+            phase2RenderDiagnostics &&
+            phase2RenderDiagnostics.usedAsOutput !== true
+          ) {
+            phase2VirtualPano.borderlineAcceptedReason = 'phase2-rejected-by-worker';
+          }
+          phase2WorkerResult = phase2Result;
+        } catch (phase2Error) {
+          phase2VirtualPano.error =
+            phase2Error instanceof Error ? phase2Error.message : String(phase2Error);
+        }
+      }
+      console.log(
+        '[CPR-PHASE2-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          selectedLabel: phase2BaseAttempt?.label ?? null,
+          selectedAggregation: phase2BaseAttempt?.aggregation ?? null,
+          phase2VirtualPano,
+        })
+      );
       const rankedAttempts = attemptAudit
         .slice()
         .sort((a, b) => {
@@ -2922,6 +4122,50 @@ export function useCPROrchestrator({
           const bHardRejected = !!b.hardRejectReason;
           if (aHardRejected !== bHardRejected) {
             return aHardRejected ? 1 : -1;
+          }
+          if (aHardRejected && bHardRejected) {
+            const fallbackDelta =
+              scoreHardRejectedPanoFallback({
+                sampledCount: a.sampledCount ?? 0,
+                min: a.min ?? 0,
+                max: a.max ?? 0,
+                p01: a.p01 ?? 0,
+                p50: a.p50 ?? 0,
+                p99: a.p99 ?? 0,
+                fractionBelowMinus950: a.fractionBelowMinus950 ?? 0,
+                fractionAbove3000: a.fractionAbove3000 ?? 0,
+                meanAbsDelta: a.meanAbsDelta ?? 0,
+                toothBandMean: a.toothBandMean ?? 0,
+                toothBandP10: a.toothBandP10 ?? 0,
+                toothBandP90: a.toothBandP90 ?? 0,
+                toothBandBrightFraction: a.toothBandBrightFraction ?? 0,
+                lowerBandP50: a.lowerBandP50 ?? 0,
+                lowerBandBrightFraction: a.lowerBandBrightFraction ?? 0,
+                detailBandHorizontalEdgeMean: a.detailBandHorizontalEdgeMean ?? 0,
+                detailBandVerticalEdgeMean: a.detailBandVerticalEdgeMean ?? 0,
+              }) -
+              scoreHardRejectedPanoFallback({
+                sampledCount: b.sampledCount ?? 0,
+                min: b.min ?? 0,
+                max: b.max ?? 0,
+                p01: b.p01 ?? 0,
+                p50: b.p50 ?? 0,
+                p99: b.p99 ?? 0,
+                fractionBelowMinus950: b.fractionBelowMinus950 ?? 0,
+                fractionAbove3000: b.fractionAbove3000 ?? 0,
+                meanAbsDelta: b.meanAbsDelta ?? 0,
+                toothBandMean: b.toothBandMean ?? 0,
+                toothBandP10: b.toothBandP10 ?? 0,
+                toothBandP90: b.toothBandP90 ?? 0,
+                toothBandBrightFraction: b.toothBandBrightFraction ?? 0,
+                lowerBandP50: b.lowerBandP50 ?? 0,
+                lowerBandBrightFraction: b.lowerBandBrightFraction ?? 0,
+                detailBandHorizontalEdgeMean: b.detailBandHorizontalEdgeMean ?? 0,
+                detailBandVerticalEdgeMean: b.detailBandVerticalEdgeMean ?? 0,
+              });
+            if (Math.abs(fallbackDelta) > 1e-6) {
+              return fallbackDelta > 0 ? -1 : 1;
+            }
           }
           return (b.qualityScore - a.qualityScore) || (b.qualityBase - a.qualityBase);
         });
@@ -2933,6 +4177,12 @@ export function useCPROrchestrator({
           runId: debugRunId,
           attempts: attemptAudit,
           selectedLabel: bestAttempt.label,
+          attemptExecution: {
+            attemptCount: launchedAttemptCount,
+            mipFallbackCount: launchedMipFallbackCount,
+            totalDurationMs: Math.round(totalAttemptDurationMs),
+            earlyExitReason,
+          },
         })
       );
       console.log(
@@ -2940,16 +4190,40 @@ export function useCPROrchestrator({
         JSON.stringify({
           runId: debugRunId,
           selectedLabel: bestAttempt.label,
+          displayedOutputMode: phase2VirtualPano.usedAsDisplayedOutput ? 'virtualPanoPhase2' : 'legacy',
+          displayedSourceLabel: phase2VirtualPano.usedAsDisplayedOutput
+            ? phase2BaseAttempt?.label ?? bestAttempt.label
+            : bestAttempt.label,
+          displayedSourceAggregation: phase2VirtualPano.usedAsDisplayedOutput
+            ? phase2BaseAttempt?.aggregation ?? bestAttempt.aggregation
+            : bestAttempt.aggregation,
           selectedAggregation: bestAttempt.aggregation,
+          selectedActualVertHalfMm: bestAttempt.actualVertHalfMm,
           selectedSlabHalfThicknessMm: bestAttempt.slabHalfThicknessMm,
           selectedSlabSamples: bestAttempt.slabSamples,
           selectedVerticalCenterOffsetMm: bestAttempt.verticalCenterOffsetMm,
+          selectedColumnPixelSpacing: bestAttempt.columnPixelSpacing,
+          selectedRowPixelSpacing: bestAttempt.rowPixelSpacing,
           selectedHardRejectReason: bestAttempt.hardRejectReason,
           selectedQualityScore: bestAttempt.qualityScore,
           selectedQualityBase: bestAttempt.qualityBase,
-          selectedSummary: bestAttempt.summary,
-          selectedVoi: bestAttempt.voi,
-          selectedWorkerDebugPayload: bestAttempt.workerDebugPayload ?? null,
+          selectedSummary: phase2VirtualPano.usedAsDisplayedOutput
+            ? phase2VirtualPano.summary
+            : bestAttempt.summary,
+          selectedVoi: phase2VirtualPano.usedAsDisplayedOutput
+            ? phase2VirtualPano.voi
+            : bestAttempt.voi,
+          selectedWorkerDebugPayload: phase2VirtualPano.usedAsDisplayedOutput
+            ? phase2WorkerResult?.workerDebugPayload ?? null
+            : bestAttempt.workerDebugPayload ?? null,
+          phase1VirtualPano,
+          phase2VirtualPano,
+          attemptExecution: {
+            attemptCount: launchedAttemptCount,
+            mipFallbackCount: launchedMipFallbackCount,
+            totalDurationMs: Math.round(totalAttemptDurationMs),
+            earlyExitReason,
+          },
           runnerUp: runnerUpAttempt,
           scoreDeltaToRunnerUp:
             runnerUpAttempt ? bestAttempt.qualityScore - runnerUpAttempt.qualityScore : null,
@@ -2959,13 +4233,14 @@ export function useCPROrchestrator({
         })
       );
 
-      if (!bestAttempt.huDomain) {
+      if (bestAttempt.intensityDomain === 'unknown') {
         console.warn(
-          `[CPR][${debugRunId}] Selected panoramic attempt is not in HU domain and could not be safely normalized.`,
+          `[CPR][${debugRunId}] Selected panoramic attempt remains in an unknown intensity domain.`,
           {
             label: bestAttempt.label,
             qualityBase: bestAttempt.qualityBase,
             qualityScore: bestAttempt.qualityScore,
+            intensityDomain: bestAttempt.intensityDomain,
           }
         );
       }
@@ -2985,17 +4260,74 @@ export function useCPROrchestrator({
       let panoWorkerResult = bestAttempt.result;
       let panoDebugSummary = bestAttempt.summary;
       let adaptiveVoi = bestAttempt.voi;
-      const selectedPanoWidth = bestAttempt.panoWidth;
-      const selectedPanoHeight = bestAttempt.panoHeight;
-      const selectedActualVertHalfMm = bestAttempt.actualVertHalfMm;
-      const selectedColumnPixelSpacing = bestAttempt.columnPixelSpacing;
-      const selectedRowPixelSpacing = bestAttempt.rowPixelSpacing;
+      let displayedOutputMode: 'legacy' | 'virtualPanoPhase2' = 'legacy';
+      let displayedSourceLabel = bestAttempt.label;
+      let displayedSourceAggregation = bestAttempt.aggregation;
+      let selectedPanoWidth = bestAttempt.panoWidth;
+      let selectedPanoHeight = bestAttempt.panoHeight;
+      let selectedActualVertHalfMm = bestAttempt.actualVertHalfMm;
+      let selectedColumnPixelSpacing = bestAttempt.columnPixelSpacing;
+      let selectedRowPixelSpacing = bestAttempt.rowPixelSpacing;
+      if (
+        phase2VirtualPano.usedAsDisplayedOutput &&
+        phase2WorkerResult &&
+        phase2VirtualPano.summary &&
+        phase2VirtualPano.voi &&
+        phase2BaseAttempt
+      ) {
+        panoWorkerResult = phase2WorkerResult;
+        panoDebugSummary = phase2VirtualPano.summary;
+        adaptiveVoi = phase2VirtualPano.voi;
+        displayedOutputMode = 'virtualPanoPhase2';
+        displayedSourceLabel = phase2BaseAttempt.label;
+        displayedSourceAggregation = phase2BaseAttempt.aggregation;
+        selectedPanoWidth = phase2BaseAttempt.panoWidth;
+        selectedPanoHeight = phase2BaseAttempt.panoHeight;
+        selectedActualVertHalfMm = phase2BaseAttempt.actualVertHalfMm;
+        selectedColumnPixelSpacing = phase2BaseAttempt.columnPixelSpacing;
+        selectedRowPixelSpacing = phase2BaseAttempt.rowPixelSpacing;
+      }
+      const displayedWorkerDebugPayload =
+        phase2VirtualPano.usedAsDisplayedOutput
+          ? phase2WorkerResult?.workerDebugPayload ?? null
+          : bestAttempt.workerDebugPayload ?? null;
+      const displayedWorkerDiagnostic =
+        displayedWorkerDebugPayload &&
+          typeof displayedWorkerDebugPayload === 'object' &&
+          displayedWorkerDebugPayload.diagnostic &&
+          typeof displayedWorkerDebugPayload.diagnostic === 'object'
+          ? (displayedWorkerDebugPayload.diagnostic as Record<string, unknown>)
+          : null;
+      const selectedLocalCenterOffsetsMm = Array.isArray(displayedWorkerDiagnostic?.localCenterOffsetsMm)
+        ? displayedWorkerDiagnostic.localCenterOffsetsMm
+          .map(value => Number(value))
+          .filter(value => Number.isFinite(value))
+        : [];
+      const crossSectionVerticalCenterOffsetMm =
+        (phase2VirtualPano.usedAsDisplayedOutput
+          ? phase2BaseAttempt?.verticalCenterOffsetMm
+          : bestAttempt.verticalCenterOffsetMm) ?? 0;
+      crossSectionVerticalCenterOffsetMmRef.current = crossSectionVerticalCenterOffsetMm;
+      console.log('[CPR-CROSSSECTION-GEOMETRY-JSON]', JSON.stringify({
+        runId: debugRunId,
+        displayedOutputMode,
+        correctedFrameCount: frames.length,
+        sourceFrameCount: frames.length,
+        usingWorkerLocalCenterOffsets: selectedLocalCenterOffsetsMm.length === frames.length,
+        crossSectionVerticalCenterOffsetMm,
+        localCenterOffsetsFirst8: selectedLocalCenterOffsetsMm.slice(0, 8),
+        geometryPolicy: 'worker-offsets-render-only',
+      }));
       console.log(`[CPR][${debugRunId}] selected pano attempt`, {
         label: bestAttempt.label,
+        displayedOutputMode,
+        displayedSourceLabel,
+        displayedSourceAggregation,
         qualityBase: bestAttempt.qualityBase,
         qualityScore: bestAttempt.qualityScore,
         hardRejectReason: bestAttempt.hardRejectReason,
         aggregation: bestAttempt.aggregation,
+        intensityDomain: bestAttempt.intensityDomain,
         huDomain: bestAttempt.huDomain,
         convertedToHu: bestAttempt.convertedToHu,
         rescaleSkippedAsUnsafe: bestAttempt.rescaleSkippedAsUnsafe,
@@ -3016,6 +4348,10 @@ export function useCPROrchestrator({
           p50: panoDebugSummary.p50,
           p99: panoDebugSummary.p99,
           max: panoDebugSummary.max,
+          toothBandMean: panoDebugSummary.toothBandMean,
+          toothBandP10: panoDebugSummary.toothBandP10,
+          toothBandP90: panoDebugSummary.toothBandP90,
+          toothBandBrightFraction: panoDebugSummary.toothBandBrightFraction,
           lowerBandP50: panoDebugSummary.lowerBandP50,
           lowerBandBrightFraction: panoDebugSummary.lowerBandBrightFraction,
           detailBandHorizontalEdgeMean: panoDebugSummary.detailBandHorizontalEdgeMean,
@@ -3037,7 +4373,7 @@ export function useCPROrchestrator({
 
       // Keep exactly one arch annotation to avoid stale/ghost spline overlays.
       removeSplineAnnotationsExcept(latestAnnotationUID);
-      cprStateService.setArchData(rawControlPoints, frames, sourceVolumeId, latestAnnotationUID);
+      cprStateService.setArchData(controlPoints, frames, sourceVolumeId, latestAnnotationUID);
 
       clearProtocolListener();
 
@@ -3060,8 +4396,10 @@ export function useCPROrchestrator({
                 4000
               );
               if (axialViewportAfterSwitch && preservedAxialCamera) {
+                const { parallelScale: _ignoredParallelScale, ...cameraWithoutParallelScale } =
+                  preservedAxialCamera;
                 axialViewportAfterSwitch.setCamera(
-                  preservedAxialCamera as Partial<ReturnType<typeof axialViewportAfterSwitch.getCamera>>
+                  cameraWithoutParallelScale as Partial<ReturnType<typeof axialViewportAfterSwitch.getCamera>>
                 );
                 axialViewportAfterSwitch.render();
                 cornerstoneTools.utilities.triggerAnnotationRender(axialViewportAfterSwitch.element);
@@ -3074,6 +4412,10 @@ export function useCPROrchestrator({
             }
           })();
 
+          if (panoWorkerResult.pixelData.length !== panoWorkerResult.width * panoWorkerResult.height) {
+            throw new Error('Dimension mismatch');
+          }
+
           clearPanoImageCache();
           setPanoImagePayload(panoImageId, {
             pixelData: panoWorkerResult.pixelData,
@@ -3082,6 +4424,7 @@ export function useCPROrchestrator({
             minValue: panoWorkerResult.minValue,
             maxValue: panoWorkerResult.maxValue,
             huDomain: bestAttempt.huDomain,
+            intensityDomain: bestAttempt.intensityDomain,
             windowWidth: adaptiveVoi.windowWidth,
             windowCenter: adaptiveVoi.windowCenter,
             slope: 1,
@@ -3091,9 +4434,11 @@ export function useCPROrchestrator({
           });
 
           console.log(`[CPR][${debugRunId}] Pano payload metadata pushed to loader`, {
+            displayedOutputMode,
             panoImageId,
             minValue: panoWorkerResult.minValue,
             maxValue: panoWorkerResult.maxValue,
+            intensityDomain: bestAttempt.intensityDomain,
             windowWidth: adaptiveVoi.windowWidth,
             windowCenter: adaptiveVoi.windowCenter,
             voiLower: adaptiveVoi.lower,
@@ -3107,9 +4452,11 @@ export function useCPROrchestrator({
           });
           console.log('[CPR-LOADER-METADATA-JSON]', JSON.stringify({
             runId: debugRunId,
+            displayedOutputMode,
             panoImageId,
             minValue: panoWorkerResult.minValue,
             maxValue: panoWorkerResult.maxValue,
+            intensityDomain: bestAttempt.intensityDomain,
             windowWidth: adaptiveVoi.windowWidth,
             windowCenter: adaptiveVoi.windowCenter,
             voiLower: adaptiveVoi.lower,
@@ -3192,13 +4539,27 @@ export function useCPROrchestrator({
             }, delayMs);
           });
 
-          commandsManager.runCommand('setToolActive', {
-            toolName: 'CPRCursor',
-            toolGroupId: 'cprPano',
-          });
           cornerstoneTools.utilities.triggerAnnotationRender(panoViewport.element);
 
-          initializeCrossSection(frames, servicesManager);
+          await new Promise<void>((resolve, reject) => {
+            window.setTimeout(() => {
+              if (!isMountedRef.current) {
+                resolve();
+                return;
+              }
+
+              void initializeCrossSection(
+                frames,
+                sourceVolumeId,
+                selectedActualVertHalfMm,
+                crossSectionVerticalCenterOffsetMm,
+                selectedLocalCenterOffsetsMm.length === frames.length,
+                servicesManager
+              )
+                .then(resolve)
+                .catch(reject);
+            }, 50);
+          });
         } catch (innerErr) {
           const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
           console.error(`[CPR][${debugRunId}] Pipeline failed after HP switch:`, msg);
@@ -3342,6 +4703,81 @@ export function useCPROrchestrator({
     }
   }, [servicesManager, commandsManager, clearProtocolListener]);
 
+  const flushSliderFrameChange = useCallback(() => {
+    sliderAnimationFrameRef.current = null;
+
+    if (!cprStateService.hasData()) {
+      pendingSliderFrameIndexRef.current = null;
+      return;
+    }
+
+    const frames = cprStateService.getFrames();
+    if (!frames.length) {
+      pendingSliderFrameIndexRef.current = null;
+      return;
+    }
+
+    const requestedIndex = pendingSliderFrameIndexRef.current;
+    if (requestedIndex == null) {
+      return;
+    }
+    pendingSliderFrameIndexRef.current = null;
+
+    const clampedIndex = Math.max(0, Math.min(requestedIndex, frames.length - 1));
+    cprStateService.setCurrentFrameIndex(clampedIndex);
+    const frame = frames[clampedIndex];
+
+    const centroid = frames.reduce<[number, number, number]>(
+      (acc, currentFrame) => [
+        acc[0] + currentFrame.position[0],
+        acc[1] + currentFrame.position[1],
+        acc[2] + currentFrame.position[2],
+      ],
+      [0, 0, 0]
+    );
+    centroid[0] /= frames.length;
+    centroid[1] /= frames.length;
+    centroid[2] /= frames.length;
+
+    const radial = normalize3([
+      frame.position[0] - centroid[0],
+      frame.position[1] - centroid[1],
+      frame.position[2] - centroid[2],
+    ]);
+    const tangent = normalize3([frame.T[0], frame.T[1], frame.T[2]]);
+    const nCamera = normalize3([frame.N_camera[0], frame.N_camera[1], frame.N_camera[2]]);
+    const nSlab = normalize3([frame.N_slab[0], frame.N_slab[1], frame.N_slab[2]]);
+    const s = normalize3([frame.S[0], frame.S[1], frame.S[2]]);
+    console.log('[CPR-CROSSSECTION-FRAME]', {
+      frameIndex: clampedIndex,
+      position: frame.position,
+      tangent,
+      nCamera,
+      nSlab,
+      s,
+      radial,
+      dotCameraRadial:
+        nCamera[0] * radial[0] + nCamera[1] * radial[1] + nCamera[2] * radial[2],
+      dotSlabRadial: nSlab[0] * radial[0] + nSlab[1] * radial[1] + nSlab[2] * radial[2],
+      dotTCamera:
+        tangent[0] * nCamera[0] + tangent[1] * nCamera[1] + tangent[2] * nCamera[2],
+      dotTSlab: tangent[0] * nSlab[0] + tangent[1] * nSlab[1] + tangent[2] * nSlab[2],
+      dotTS: tangent[0] * s[0] + tangent[1] * s[1] + tangent[2] * s[2],
+      dotCameraS: nCamera[0] * s[0] + nCamera[1] * s[1] + nCamera[2] * s[2],
+      dotSlabS: nSlab[0] * s[0] + nSlab[1] * s[1] + nSlab[2] * s[2],
+    });
+
+    setCrossSectionForFrame(
+      frame,
+      servicesManager,
+      crossSectionVerticalCenterOffsetMmRef.current
+    );
+    const panoViewport = findViewportByLogicalId(servicesManager, 'cpr-pano');
+    if (panoViewport?.element) {
+      cornerstoneTools.utilities.triggerAnnotationRender(panoViewport.element);
+    }
+  }, [servicesManager]);
+
   const onSliderChange = useCallback(
     (frameIndex: number) => {
       if (!cprStateService.hasData()) {
@@ -3349,11 +4785,20 @@ export function useCPROrchestrator({
       }
 
       const frames = cprStateService.getFrames();
-      const clampedIndex = Math.max(0, Math.min(frameIndex, frames.length - 1));
-      cprStateService.setCurrentFrameIndex(clampedIndex);
-      setCrossSectionForFrame(frames[clampedIndex], servicesManager);
+      if (!frames.length) {
+        return;
+      }
+
+      pendingSliderFrameIndexRef.current = Math.max(0, Math.min(frameIndex, frames.length - 1));
+      if (sliderAnimationFrameRef.current != null) {
+        return;
+      }
+
+      sliderAnimationFrameRef.current = window.requestAnimationFrame(() => {
+        flushSliderFrameChange();
+      });
     },
-    [servicesManager]
+    [flushSliderFrameChange]
   );
 
   useEffect(() => {

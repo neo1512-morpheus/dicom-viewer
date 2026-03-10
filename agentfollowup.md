@@ -1,711 +1,425 @@
-Below is the **tightened implementation spec** for the three patches, with the current call architecture in mind.
+Below is the reconstruction change I would make.
 
-I’ll assume `sampleRow` increases downward. If your row axis is inverted, flip the sign in the `yNorm` formulas.
+## Core shift
 
----
+Stop treating panorama generation as:
 
-# 1) `sampleReducedPoint()` one-pass contamination gate
+`curved slab sample -> wide depth reduction -> try to reject junk afterward`
 
-## A. Extra parameters to add
+and change it to:
 
-Do **not** add several new positional args. Add one optional context object so the existing two call sites stay readable.
+`curved volume sample -> estimate tooth support surface first -> flatten around that surface -> do only narrow local reduction`
 
-### New signature
-
-```ts
-sampleReducedPoint(
-  bx, by, bz,
-  slabDirX, slabDirY, slabDirZ,
-  recordOobStats,
-  debugCaptureRow,
-  gateCtx?: {
-    mode: 'centerSearch' | 'finalRender';
-
-    // only used in finalRender mode
-    sampleRow?: number;
-    localCenterRow?: number;
-    effectiveVerticalHalfHeight?: number;
-
-    // derived from the already-computed local vertical profile at this column
-    profileValueAtRow?: number;
-    profilePeakValue?: number;
-    profileFloorValue?: number;
-  }
-)
-```
-
-## B. What runs in center-search vs final-render
-
-### 1. During center-search calls
-
-Use **no center-dependent anatomy gate**.
-
-Keep exactly:
-
-* in-bounds filtering
-* existing Gaussian slab-depth weighting
-* current MEAN / `computeWinsorizedWeightedMean()`
-
-Reason: during center search, any gate that depends on `candidateCenterRow` or vertical position relative to center will bias the search toward its own prior.
-
-So for `gateCtx.mode === 'centerSearch'`:
-
-* **do not** use `sampleRow`
-* **do not** use `localCenterRow`
-* **do not** use `profileConf`
-* only increment a call counter and return the current behavior
-
-### 2. During final pano render
-
-Apply the anatomy-aware gate.
-
-This is safe because the center has already been selected, so the gate is no longer participating in center selection.
+That is the key difference between the current CPR-style strip and a more proper CPU virtual panoramic reconstruction.
 
 ---
 
-## C. How to avoid circular dependence
+## 1. Estimate a patient-specific focal trough / support surface around the arch
 
-Use this rule:
+### A. Build a curved reformat volume, not just a reduced strip
 
-* **Center-search path:** no center-dependent gate
-* **Final-render path:** gate allowed, using the already-chosen `localCenterRow` and the already-computed vertical profile for that column
+Using the existing arch curve and current CPR sampling machinery, resample the CBCT into a curved coordinate system:
 
-That breaks the circular loop cleanly.
+* `c`: pano column along arch centerline
+* `d`: depth across the arch normal (buccal↔lingual / inside↔outside of trough)
+* `r`: pano row (superior↔inferior)
 
-In other words:
+Define:
 
-* center search chooses the center from the raw/current profile logic
-* final render uses that chosen center to suppress lower/background slab samples
+`R[c,d,r] = V( C(c) + u(d) * N(c) + y(r) * Z )`
 
-Do **not** feed the gated reducer back into candidate scoring in this first patch.
+Where:
 
----
+* `C(c)` = 3D point on arch
+* `N(c)` = in-plane arch normal
+* `Z` = volume superior/inferior axis
+* `u(d)` = depth offset in mm
+* `y(r)` = row height in mm
 
-## D. Exact `profileConf` formula from current worker signals
+This is still CPU-only trilinear interpolation.
+It is the same geometry you already have, but you keep the depth dimension instead of reducing it immediately.
 
-Use the already-computed local vertical profile for the current column.
+### B. Score which depth actually corresponds to the tooth-bearing zone
 
-Let:
+For each `(c,d)`, score how “tooth-like and useful” that depth is.
 
-* `P(r)` = smoothed local vertical profile value at row `r`
-* `c` = chosen local center row
-* `sampleRow` = pano row currently being rendered
-* `Ppeak = P(c)`
-* `Pfloor = q25(P over the current center-search row window)`
-  computed once per column and reused for all rows in that column
-* `Prow = P(sampleRow)` using linear interpolation if needed
+Use a tooth band and a lower-suppression band in row space:
+
+* `B_tooth`: rows covering crowns + roots
+* `B_low`: rows below likely root/apex region
+
+Then compute:
+
+`Hard(c,d) = mean over r in B_tooth of hardResponse(R[c,d,r])`
+
+`Grad(c,d) = mean over r in B_tooth of gradientResponse(R[c,d,r])`
+
+`Low(c,d) = mean over r in B_low of hardResponse(R[c,d,r])`
+
+A good first scoring function is:
+
+`Score(c,d) = w1 * Hard(c,d) + w2 * Grad(c,d) - w3 * Low(c,d)`
+
+Where:
+
+* `hardResponse(I)` should rise with dentin/enamel/bone-like signal
+* `gradientResponse(I)` should rise where tooth/bone boundaries are crisp
+* `Low(c,d)` penalizes depth planes that mostly explain inferior junk / mandible background instead of teeth
+
+### C. Make the thresholds adaptive to the scan
+
+Do not hardcode global HU-like constants unless your volume normalization is already stable.
+
+Use curved volume statistics:
+
+* `T_soft = percentile(R in B_tooth, 60)`
+* `T_hard = percentile(R in B_tooth, 85)`
 
 Then:
 
-```ts
-profileConf = clamp(
-  (Prow - Pfloor) / max(Ppeak - Pfloor, 1e-6),
-  0,
-  1
-)
-```
+`hardResponse(I) = clamp((I - T_soft) / (T_hard - T_soft), 0, 1)`
 
-### What to pass into `sampleReducedPoint()`
+For gradient:
 
-In the final-render caller, pass:
+`gradientResponse(I[c,d,r]) = clamp( abs(R[c,d+1,r] - R[c,d-1,r]) + 0.5 * abs(R[c,d,r+1] - R[c,d,r-1]), 0, G_cap ) / G_cap`
 
-* `profileValueAtRow = Prow`
-* `profilePeakValue = Ppeak`
-* `profileFloorValue = Pfloor`
+This keeps the method scan-adaptive.
 
-Then inside `sampleReducedPoint()`:
+### D. Select one smooth depth path across columns
 
-```ts
-profileConf =
-  clamp(
-    (profileValueAtRow - profileFloorValue) /
-    Math.max(profilePeakValue - profileFloorValue, 1e-6),
-    0,
-    1
-  )
-```
+For each column, keep the top `K` depth candidates by `Score(c,d)`.
+Then choose a smooth path `D[c]` across columns with dynamic programming.
 
-This uses only signals already present in the worker and keeps `sampleReducedPoint()` simple.
+Use energy:
+
+`E = sum_c ( -Score(c, D[c]) ) + λ1 * sum_c |D[c] - D[c-1]| + λ2 * sum_c |D[c] - 2D[c-1] + D[c-2]|`
+
+This avoids:
+
+* per-column jitter
+* sudden jumps into background
+* noisy local maxima
+
+This is the correct place to use dynamic programming.
+
+### E. Support surface, not only one depth per column
+
+Minimal useful version:
+
+`S[c,r] = D[c] + A[c] * (r - r_mid)`
+
+Where `A[c]` is a small per-column vertical tilt term.
+
+Estimate `A[c]` by splitting the tooth band into upper and lower halves:
+
+* `D_top[c] = best depth using upper tooth rows`
+* `D_bot[c] = best depth using lower tooth rows`
+
+Then:
+
+`A[c] = clamp( (D_bot[c] - D_top[c]) / (r_bot - r_top), -A_max, A_max )`
+
+This already handles tooth/root inclination much better than a pure columnwise constant depth.
+
+### F. Optional later upgrade: full 2D surface
+
+If residual distortion remains after the minimal version, move from:
+
+`S[c,r] = D[c] + linear tilt`
+
+to a full coarse 2D support surface solved on anchor rows:
+
+`S[c,k]` on 6–10 vertical anchors, with smoothness in both `c` and `k`, then bilinear interpolate to all rows.
+
+But I would not start there.
 
 ---
 
-## E. Exact gating formula in final-render mode
+## 2. Choose the correct depth per pano location before reduction
 
-For each slab sample, keep the existing slab-depth Gaussian:
+This is the most important change.
 
-```ts
-wDepth = exp(-0.5 * (slabOffset / sigmaSlab) ** 2)
-```
+At the moment, the pipeline reduces a wide depth slab and tries to filter afterward.
+That is backwards.
 
-Compute normalized vertical position:
+Instead:
 
-```ts
-yNorm =
-  (sampleRow - localCenterRow) /
-  Math.max(effectiveVerticalHalfHeight, 1)
-```
+1. compute `S[c,r]` first
+2. only then reduce a narrow local neighborhood around that selected depth
 
-Where:
+For each output pixel `(c,r)`, define local flattened coordinates:
 
-* `yNorm <= 0`: at/above center
-* `yNorm > 0`: below center
+`δ = d - S[c,r]`
 
-### Lower-band attenuation
+Then only samples with small `|δ|` are allowed to contribute.
 
-```ts
-wLower =
-  yNorm <= 0
-    ? 1
-    : 1 - 0.80 * smoothstep(0.20, 0.95, yNorm)
-```
+That is what turns this into a virtual pano instead of a curved slab average.
+
+---
+
+## 3. Preserve tooth/root visibility while suppressing lower/background anatomy
+
+### A. Flatten around the selected support surface
+
+Create a locally aligned depth stack:
+
+`F[c,r,δ] = R[c, S[c,r] + δ, r]`
+
+Now the tooth-bearing structure is centered around `δ = 0`, while off-trough clutter is displaced away from center.
+
+### B. Use a narrow row-dependent trough width
+
+Use a half-width `τ(r)` in mm, not a fixed full slab.
+
+Recommended behavior:
+
+* crown/root band: wider
+* upper soft tissue band: narrower
+* lower/inferior band: much narrower
+
+For example:
+
+* `τ_tooth ≈ 3–4 mm`
+* `τ_upper ≈ 1.5–2 mm`
+* `τ_lower ≈ 0.75–1.25 mm`
 
 So:
 
-* near/above center: unchanged
-* moderately below center: progressively reduced
-* deep lower band: strongly reduced, not automatically zero
+`eligible if |δ| <= τ(r)`
 
-### Profile confidence weight
+### C. Make the reducer root-preserving, not mean-like
 
-```ts
-wProfile = 0.25 + 0.75 * profileConf
-```
+Do not use a plain mean.
+That is exactly what turns the background into static and blurs roots.
 
-This ensures low-confidence rows are suppressed, but never annihilated by profile term alone.
+Use a weighted upper-tail reducer on eligible samples:
 
-### Base anatomy weight
+1. collect eligible `F[c,r,δ_j]`
+2. weight by closeness to center:
 
-```ts
-wAnatomy = wLower * wProfile
-```
+`w_j = exp( -0.5 * (δ_j / σ(r))^2 )`
 
----
+3. sort by intensity
+4. keep only the top `q` weighted mass, e.g. top `30–40%`
+5. return weighted mean of that retained set
 
-## F. What to do when slab sample count is too small for stable `q75`
+This gives you:
 
-Let `n` be the number of in-bounds slab samples collected for this reduce point.
+* more root retention than mean
+* much less sparkle than max
+* less overprojection than MIP
 
-### Bright reference rule
+If you want the simplest first implementation, use a weighted 75th–85th percentile instead.
 
-Use a brightness-rescue reference only in final render:
+### D. Add a lower-band aggressiveness increase
 
-* `n >= 5`
-  `brightRef = q75(values)`
-* `n == 4`
-  `brightRef = secondHighest(values)`
-* `n == 3`
-  `brightRef = max(values)` and **disable hard reject**
-* `n <= 2`
-  **disable hard reject and brightness rescue thresholding entirely**
+For rows below the inferred apex zone:
 
-This is the safest small-`n` rule.
+* shrink `τ(r)`
+* raise the minimum hard-response requirement slightly
 
-Why:
+So the lower band becomes harder to enter even if some noisy bright voxels exist.
 
-* with `3–6` samples, `q75` is noisy
-* for `n <= 3`, hard rejection becomes too brittle
-* the first patch should prefer **downweighting** over aggressive deletion when evidence is thin
+### E. Fallback behavior
+
+If no sample is eligible:
+
+* use `F[c,r,0]` directly
+
+That is better than reverting to a wide-slab mean.
 
 ---
 
-## G. Exact reject vs downweight logic
+## 4. Use per-column depth selection, surface flattening, dynamic programming, or something else?
 
-### Bright rescue
+Use all three, in this order:
 
-If the sample is bright enough, keep it from being crushed:
+### Recommended architecture
 
-```ts
-isBrightRescue =
-  n >= 5 ? value >= brightRef
-  : n == 4 ? value >= brightRef
-  : n == 3 ? value >= brightRef   // only the max sample
-  : false
-```
+1. **Per-column candidate scoring**
+2. **Dynamic-programming path selection across columns**
+3. **Support surface construction**
 
-If:
+   * start with `D[c] + tilt`
+4. **Surface flattening**
+5. **Narrow local reduction around the surface**
 
-* `yNorm > 0.20`
-* and `isBrightRescue`
+### What not to do
 
-then:
+* do not keep tuning the current wide slab mean
+* do not rely on post-hoc eligibility alone
+* do not start with full segmentation
+* do not use GAN/image-generation cleanup
 
-```ts
-wAnatomy = Math.max(wAnatomy, 0.50)
-```
+### Why this is the right minimal architecture
 
-This is the main protection for true root/cortical signal.
+It fixes the actual failure mode:
 
-### Hard reject
-
-Only allow hard reject when evidence is strong enough:
-
-```ts
-allowHardReject = n >= 4
-```
-
-Then reject only if all are true:
-
-```ts
-allowHardReject &&
-yNorm > 1.00 &&
-profileConf < 0.15 &&
-value < brightRef
-```
-
-That targets:
-
-* deep below-center samples
-* weak tooth-band support
-* not among the brighter local slab samples
-
-### Strong downweight
-
-If not rejected, but still suspicious:
-
-```ts
-if (
-  yNorm > 0.55 &&
-  profileConf < 0.30 &&
-  (!isBrightRescue)
-) {
-  wAnatomy *= 0.25
-}
-```
-
-### Final weight
-
-```ts
-wFinal = wDepth * wAnatomy
-```
-
-If every sample ends up rejected or near-zero weighted:
-
-* fall back to the **original ungated reducer result** for that point
-* increment a fallback counter
-
-That keeps the first patch safe.
+The current method mixes anatomy from the wrong depth first, and only then tries to reject it.
+The new method selects the right depth first, so the reducer has much less junk to fight.
 
 ---
 
-## H. How true root / cortical signal is preserved
+## 5. Minimal implementation path in this codebase
 
-Three explicit safeguards:
+Given your current `cprWorker.ts` setup, I would implement this in the smallest possible sequence.
 
-### 1. No hard reject for small `n`
+### Phase 1 — new mode beside current CPR
 
-For `n <= 3`, never hard-reject.
+Add a new reconstruction mode, something like:
 
-### 2. Bright rescue floor
+`mode: 'virtualPanoCpu'`
 
-Any bright lower sample keeps a nontrivial weight floor:
+Do not mutate the current CPR path first.
+Keep old output for A/B testing.
 
-```ts
-wAnatomy >= 0.50
-```
+### Phase 2 — reuse current arch and sampler
 
-That preserves:
+Reuse:
 
-* bright root cortex
-* strong cortical boundaries
-* real bright dental structure dipping below the center band
+* current arch centerline
+* current tangent/normal computation
+* current trilinear volume sampling
 
-### 3. Upper/central band untouched
+Add a function that builds the curved reformat volume:
 
-For `yNorm <= 0.20`, lower suppression barely engages.
+`buildCurvedVolume(volume, arch, panoWidth, panoHeight, depthSamples, depthRangeMm) -> Float32Array R`
 
-That avoids flattening the main tooth body.
+### Phase 3 — depth scoring and DP path
 
----
+Add:
 
-## I. Exact debug counters to add
+* `computeDepthScores(R, rowBands, thresholds) -> scores[c,d]`
+* `selectDepthPathDP(scores, smoothnessParams) -> D[c]`
+* `estimateColumnTilt(R, D, rowBands) -> A[c]`
 
-Add these to the worker diagnostics.
+### Phase 4 — flatten and reduce
 
-### Call-path counters
+Add:
 
-* `sampleReduceCenterSearchCallCount`
-* `sampleReduceFinalRenderCallCount`
+* `renderFlattenedVirtualPano(R, D, A, rowPolicy, reducerPolicy) -> pano`
 
-### Gate action counters
+Where `rowPolicy` contains:
 
-* `anatGateAppliedCount`
-* `anatGateRejectedSampleCount`
-* `anatGateDownweightedSampleCount`
-* `anatGateBrightRescueCount`
-* `anatGateSmallNSkipHardRejectCount`
-* `anatGateNoValidWeightedSampleFallbackCount`
+* `τ(r)`
+* `σ(r)`
+* lower-band penalties
 
-### Region counters
+and `reducerPolicy` is:
 
-* `anatGateBelowCenterSampleCount`
-* `anatGateDeepLowerRejectCount`
+* weighted upper-mean or weighted percentile
 
-### Small scalar accumulators
+### Phase 5 — only if needed later
 
-* `anatGateWeightSumBefore`
-* `anatGateWeightSumAfter`
-* `anatGateRejectedYNormSum`
+If distortion remains:
 
-From those you can derive:
+* replace `A[c]` linear tilt with a coarse 2D surface `S[c,k]`
 
-* mean retained weight ratio
-* mean `yNorm` of rejected samples
+But do not start with that.
 
 ---
 
-## J. What existing logs should improve first
+## 6. What new logs should improve if it works
 
-If this patch is working, the first metrics that should move are:
+Your current logs should move in the right direction, but some new logs are more important.
+
+### Existing logs that should improve
+
+These should all go down materially:
 
 * `lowerBandBrightFraction`
-  should drop first and most
 * `lowerBandP50`
-  should drop
-* `qualityScore`
-  should improve materially
+* `twoPassEligibilityDiagnostics.lowerBandEligibleFraction`
 
-Likely secondary:
+If the support surface is working, the lower band should stop looking like a retained bright fog.
 
-* `detailBandHorizontalEdgeMean` should come down somewhat
-* `detailBandVerticalEdgeMean` may hold or rise slightly
+### New logs to add
 
-If `lowerBandBrightFraction` drops but teeth/roots thin out, the gate is too aggressive.
+#### A. Surface/path quality
 
----
+* `supportSurface.depthMinMm`
+* `supportSurface.depthMaxMm`
+* `supportSurface.depthStdMm`
+* `supportSurface.pathJumpP95Mm`
+* `supportSurface.curvatureP95`
+* `supportSurface.candidateMarginMean`
 
-# 2) `buildRMFFrames()` transported slab-frame patch
+  * mean(bestScore - secondBestScore)
 
-## A. Frame 0 initialization
+Good behavior:
 
-Replace the first-frame setup with:
+* low path jumps
+* nontrivial but smooth depth variation
+* positive candidate margin
 
-```ts
-T0 = normalize(T[0])
+#### B. Flattening quality
 
-Useed = normalizedVerticalDir - dot(normalizedVerticalDir, T0) * T0
+* `flattened.centerMassFraction`
 
-if (length(Useed) < eps) {
-  // pick fallback axis least aligned with T0, then project it off T0
-  fallback = leastAlignedCardinalAxis(T0)
-  Useed = fallback - dot(fallback, T0) * T0
-}
+  * fraction of retained energy within `|δ| < 1.5 mm`
+* `flattened.offTroughEnergyRatio`
 
-U0 = normalize(Useed)
+  * energy outside trough / energy inside trough
+* `flattened.emptyFallbackFraction`
 
-// preserve current handedness convention
-N0 = normalize(cross(T0, U0))
+Good behavior:
 
-// re-orthogonalize once
-U0 = normalize(cross(N0, T0))
-```
+* center mass fraction rises
+* off-trough ratio falls
+* empty fallback fraction stays low
 
-This keeps the initial orientation compatible with the old convention while only using global vertical once.
+#### C. Anatomy/readability quality
 
----
+* `toothBandEdgeEnergy`
 
-## B. Exact transport update from frame `i-1` to `i`
+  * mean local gradient magnitude in tooth band
+* `rootBandContrast`
 
-For each `i >= 1`:
+  * median(tooth/root rows) - median(lower rows)
+* `columnSharpnessP50`
 
-```ts
-Tprev = normalize(T[i - 1])
-Tcur  = normalize(T[i])
+  * vertical edge energy by column
+* `lowerSuppressionRatio`
 
-Nprev = N[i - 1]
-Uprev = U[i - 1]
+  * median(lower band) / median(tooth band)
 
-axis = cross(Tprev, Tcur)
-s = length(axis)
-c = clamp(dot(Tprev, Tcur), -1, 1)
-```
+Good behavior:
 
-### If the tangent changed meaningfully
+* tooth/root edge energy rises
+* lower suppression ratio falls
+* roots stay visible without background grain exploding
 
-If `s > 1e-6`:
+#### D. Surface engagement replaces old curvature prior story
 
-```ts
-k = axis / s
-theta = atan2(s, c)
+Right now you have:
 
-Ncand = rodriguesRotate(Nprev, k, theta)
-Ucand = rodriguesRotate(Uprev, k, theta)
-```
+* `curvatureFactorMax = 0`
 
-### If the tangent barely changed
+That should become much less important.
+The new method should log actual data-driven surface motion, e.g.:
 
-Else:
+* `supportSurface.depthRangeMm`
+* `supportSurface.tiltRangeMmPerRow`
 
-```ts
-Ncand = Nprev
-Ucand = Uprev
-```
-
-Transporting both `N` and `U` is slightly safer than transporting only `N`.
+Those should be nonzero on real scans even when old curvature priors never engaged.
 
 ---
 
-## C. Exact re-orthogonalization steps
+## Recommended first implementation target
 
-After transport:
+If I had to choose the smallest version that is still worth building, it would be this:
 
-```ts
-Nproj = Ncand - dot(Ncand, Tcur) * Tcur
-if (length(Nproj) < eps) {
-  // rare fallback
-  Useed = normalizedVerticalDir - dot(normalizedVerticalDir, Tcur) * Tcur
-  if (length(Useed) < eps) {
-    fallback = leastAlignedCardinalAxis(Tcur)
-    Useed = fallback - dot(fallback, Tcur) * Tcur
-  }
-  Utmp = normalize(Useed)
-  Nproj = normalize(cross(Tcur, Utmp))
-}
+1. build `R[c,d,r]`
+2. compute `Score(c,d)` from tooth-band hard response + gradient - lower-band penalty
+3. pick smooth `D[c]` with DP
+4. estimate simple per-column tilt `A[c]`
+5. flatten around `S[c,r] = D[c] + A[c](r-r_mid)`
+6. render with narrow row-dependent trough width and weighted upper-tail reducer
 
-Ncur = normalize(Nproj)
-Ucur = normalize(cross(Ncur, Tcur))
-```
+That is the minimal jump from “curved slab reduction” to “CPU virtual panoramic reconstruction”.
 
-This restores an orthonormal frame even after numeric drift.
+It is still fully CPU-only, implementation-feasible in your worker, and much more aligned with how a readable panoramic projection should be formed.
 
----
+The attached clean pano is exactly the kind of target behavior this should move toward: teeth and roots remain coherent, while inferior/background anatomy stops contaminating the whole strip.
 
-## D. Soft bias to global vertical
-
-Yes, keep it, but very small.
-
-### Recommended alpha
-
-```ts
-alpha = 0.05
-```
-
-Do **not** recompute `N` from `cross(T, globalVertical)`.
-
-Bias only the vertical-like axis `Ucur` toward the global-up projection:
-
-```ts
-Utarget = normalizedVerticalDir - dot(normalizedVerticalDir, Tcur) * Tcur
-
-if (length(Utarget) >= eps) {
-  Utarget = normalize(Utarget)
-
-  Ublend = normalize((1 - alpha) * Ucur + alpha * Utarget)
-  Nblend = normalize(cross(Tcur, Ublend))
-  Ublend = normalize(cross(Nblend, Tcur))
-
-  Ncur = Nblend
-  Ucur = Ublend
-}
-```
-
-That limits long-run roll drift without reintroducing the old frame re-anchoring bug.
-
----
-
-## E. Preserve sign continuity of `N_slab`
-
-After re-orthogonalization and soft bias, enforce sign continuity:
-
-```ts
-if (dot(Ncur, Nprev) < 0) {
-  Ncur = -Ncur
-  Ucur = -Ucur
-}
-```
-
-Flip both axes together so handedness stays consistent.
-
-This is important because a numerically valid frame can still flip sign from one sample to the next, which looks like shear/twist.
-
----
-
-## F. Diagnostics to log
-
-Add these to confirm the transported frame is stable:
-
-* `rmfTurnAngleMeanDeg`
-* `rmfTurnAngleMaxDeg`
-* `rmfNormalDeltaMeanDeg`
-* `rmfNormalDeltaMaxDeg`
-* `rmfBiasCorrectionMeanDeg`
-* `rmfBiasCorrectionMaxDeg`
-* `rmfFlipCorrectionCount`
-* `rmfFallbackCount`
-* `rmfOrthoErrorMax`
-
-Where:
-
-* `normalDeltaDeg = acos(clamp(dot(Ncur, Nprev), -1, 1)) * 180 / PI`
-* `biasCorrectionDeg = acos(clamp(dot(UcurBeforeBias, UcurAfterBias), -1, 1)) * 180 / PI`
-* `orthoErrorMax` is the max absolute value of:
-
-  * `dot(Tcur, Ncur)`
-  * `dot(Tcur, Ucur)`
-  * `dot(Ncur, Ucur)`
-
-If you want one targeted metric for the bug region, also log the same `normalDelta` stats for the central/anterior third of the arch.
-
----
-
-# 3) Curvature-aware local-center priors
-
-## A. Exact turn-angle computation
-
-Use a small local average so the curvature estimate does not flicker.
-
-For column `j`:
-
-```ts
-a0 = angleDeg(T[j - 1], T[j])       // if j > 0
-a1 = angleDeg(T[j], T[j + 1])       // if j + 1 < count
-turnAngleDeg = mean(of available a0, a1)
-```
-
-Where:
-
-```ts
-angleDeg(A, B) =
-  acos(clamp(dot(normalize(A), normalize(B)), -1, 1)) * 180 / Math.PI
-```
-
-This is more stable than using only one side.
-
-If only one neighbor exists, use the one-sided angle.
-
----
-
-## B. Recommended `smoothstep` range
-
-For dental CPR, keep the onset conservative:
-
-```ts
-kRaw = smoothstep(2.0, 7.0, turnAngleDeg)
-```
-
-Then smooth it across columns to avoid wobble:
-
-```ts
-k =
-  0.25 * kRaw[j - 1] +
-  0.50 * kRaw[j] +
-  0.25 * kRaw[j + 1]
-```
-
-Use edge-safe handling at the ends.
-
-This is the simplest way to avoid per-column oscillation.
-
----
-
-## C. Exact new penalty formulas
-
-Keep the same score structure. Only replace the fixed weights.
-
-### New global-center penalty
-
-```ts
-wGlobal = 26 * (1 - 0.65 * k)
-```
-
-Range:
-
-* straight zones: `26`
-* high-curvature zones: about `9.1`
-
-### New previous-column continuity penalty
-
-```ts
-wPrev = 18 * (1 - 0.35 * k)
-```
-
-Range:
-
-* straight zones: `18`
-* high-curvature zones: about `11.7`
-
-This is intentionally asymmetric:
-
-* relax global-center prior more
-* keep continuity prior stronger to prevent wobble
-
----
-
-## D. Should `searchHalfRange` and `maxDeviationMm` widen?
-
-Yes, but modestly.
-
-### Search half-range
-
-```ts
-searchHalfRange =
-  Math.round(baseSearchHalfRange * (1 + 0.20 * k))
-```
-
-### Max deviation
-
-```ts
-maxDeviationMm =
-  baseMaxDeviationMm * (1 + 0.15 * k)
-```
-
-Do not widen more than this in the first patch.
-
-The main effect should come from lighter penalties, not from a huge search expansion.
-
----
-
-## E. Which current log values should improve first
-
-If this patch is working:
-
-* `detailBandVerticalEdgeMean` should improve first
-* `qualityScore` should improve
-* the anterior should look less flattened / less off-center
-
-Possible smaller secondary changes:
-
-* `lowerBandBrightFraction` may improve a little if the center stops drifting downward
-* `lowerBandP50` may improve slightly
-
-But the main observable gain should be **vertical tooth structure**.
-
----
-
-## F. How to avoid making posterior columns wobble
-
-Use all four safeguards together:
-
-### 1. Smoothed curvature factor
-
-Use the 3-column smoothing on `k`.
-
-### 2. Conservative continuity relaxation
-
-Do not relax `wPrev` more than 35%.
-
-### 3. Modest search widening only
-
-Keep the widening to:
-
-* `+20%` for `searchHalfRange`
-* `+15%` for `maxDeviationMm`
-
-### 4. Keep posterior nearly unchanged
-
-Because `k` is near zero in straighter regions, posterior columns stay very close to the old behavior.
-
-That is the minimal safe way to free the anterior without destabilizing the posterior.
-
----
-
-# Recommended patch order
-
-1. `sampleReducedPoint()`
-   one-pass gate in **final-render mode only**
-2. `buildRMFFrames()`
-   true transported frames + sign continuity
-3. local-center priors
-   curvature-aware relaxation with smoothed `k`
-
-That is still the smallest safe sequence.
-
+If you want, I can turn this into a code-agent-ready implementation spec for `cprWorker.ts` with concrete buffer shapes, function signatures, and pass order.

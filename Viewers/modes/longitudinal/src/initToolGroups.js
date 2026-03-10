@@ -303,7 +303,7 @@ function initCPRPanoToolGroup(extensionManager, toolGroupService) {
   const tools = {
     active: [
       {
-        toolName: toolNames.CPRCursor,
+        toolName: toolNames.WindowLevel,
         bindings: [{ mouseButton: Enums.MouseBindings.Primary }],
       },
       {
@@ -318,8 +318,7 @@ function initCPRPanoToolGroup(extensionManager, toolGroupService) {
     ],
     passive: [
       { toolName: toolNames.StackScroll },
-      // Keep CPRCursor as default primary tool, but allow activating WL from toolbar.
-      { toolName: toolNames.WindowLevel },
+      { toolName: toolNames.CPRCursor },
     ],
   };
 

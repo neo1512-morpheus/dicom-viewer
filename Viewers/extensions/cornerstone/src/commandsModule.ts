@@ -24,6 +24,8 @@ import { getFirstAnnotationSelected } from './utils/measurementServiceMappings/u
 import getActiveViewportEnabledElement from './utils/getActiveViewportEnabledElement';
 import toggleVOISliceSync from './utils/toggleVOISliceSync';
 import { cprStateService } from '../../../modes/cpr/src/CPRStateService';
+import { buildCrossSectionCameraForFrame } from '../../../modes/cpr/src/cprCrossSectionCamera';
+import { getDefaultCrossSectionVoiRange } from '../../../modes/cpr/src/crossSectionImageLoader';
 
 const toggleSyncFunctions = {
   imageSlice: toggleImageSliceSync,
@@ -684,15 +686,31 @@ function commandsModule({
       if (logicalViewportId === 'cpr-crosssection' && cprStateService.hasData()) {
         const frames = cprStateService.getFrames();
         if (frames.length > 0) {
-          const frame = frames[0];
+          const frameIndex = Math.max(
+            0,
+            Math.min(cprStateService.getCurrentFrameIndex(), frames.length - 1)
+          );
+          if (viewport instanceof StackViewport) {
+            const crossSectionVoiRange = getDefaultCrossSectionVoiRange();
+            viewport.resetProperties?.();
+            viewport.setProperties?.({
+              isComputedVOI: false,
+              voiRange: crossSectionVoiRange,
+              invert: false,
+              VOILUTFunction: 'LINEAR_EXACT',
+            } as any);
+            if (viewport.element) {
+              cstUtils.jumpToSlice(viewport.element, { imageIndex: frameIndex });
+            }
+            viewport.resetCamera?.();
+            viewport.render();
+            return;
+          }
+
+          const frame = frames[frameIndex];
+          const previousCamera = viewport.getCamera?.();
           viewport.resetProperties?.();
-          viewport.setCamera({
-            focalPoint: Array.from(frame.position) as [number, number, number],
-            viewPlaneNormal: Array.from(frame.N_camera) as [number, number, number],
-            viewUp: Array.from(frame.S) as [number, number, number],
-            parallelScale: 20,
-            parallelProjection: true,
-          });
+          viewport.setCamera(buildCrossSectionCameraForFrame(frame, previousCamera));
           viewport.render();
           return;
         }

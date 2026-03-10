@@ -37,6 +37,7 @@ import ViewportActionCornersService from './services/ViewportActionCornersServic
 import { ViewportActionCornersProvider } from './contextProviders/ViewportActionCornersProvider';
 import ActiveViewportWindowLevel from './components/ActiveViewportWindowLevel';
 import { registerPanoImageLoader } from '../../../modes/cpr/src/panoImageLoader';
+import { registerCrossSectionImageLoader } from '../../../modes/cpr/src/crossSectionImageLoader';
 
 const { helpers: volumeLoaderHelpers } = csStreamingImageVolumeLoader;
 const { getDynamicVolumeInfo } = volumeLoaderHelpers ?? {};
@@ -116,6 +117,7 @@ const cornerstoneExtension: Types.Extensions.Extension = {
 
     // Idempotent pano scheme registration (safe if preRegistration runs more than once)
     registerPanoImageLoader();
+    registerCrossSectionImageLoader();
 
     return init.call(this, props);
   },

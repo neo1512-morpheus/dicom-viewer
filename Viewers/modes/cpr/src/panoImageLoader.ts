@@ -1,5 +1,10 @@
 import * as cornerstone from '@cornerstonejs/core';
 
+import {
+  SyntheticCprIntensityDomain,
+  getFallbackSyntheticCprVoi,
+} from './cprSyntheticDisplay';
+
 export interface PanoImagePayload {
   pixelData: Float32Array;
   width: number;
@@ -7,6 +12,7 @@ export interface PanoImagePayload {
   minValue: number;
   maxValue: number;
   huDomain?: boolean;
+  intensityDomain?: SyntheticCprIntensityDomain;
   columnPixelSpacing?: number;
   rowPixelSpacing?: number;
   windowWidth?: number;
@@ -21,9 +27,6 @@ let panoImageCounter = 0;
 const PANO_FRAME_OF_REFERENCE_UID = 'CPR_PANO_FRAME_OF_REFERENCE';
 const PANO_SERIES_INSTANCE_UID = 'CPR_PANO_SERIES_INSTANCE';
 const PANO_STUDY_INSTANCE_UID = 'CPR_PANO_STUDY_INSTANCE';
-const DEFAULT_PANO_WINDOW_WIDTH = 3000;
-const DEFAULT_PANO_WINDOW_CENTER = 600;
-
 interface PanoDisplayMetadata {
   minValue: number;
   maxValue: number;
@@ -36,46 +39,28 @@ interface PanoDisplayMetadata {
 function getPanoDisplayMetadata(payload: PanoImagePayload | null): PanoDisplayMetadata {
   const safeMin = Number.isFinite(payload?.minValue) ? Number(payload?.minValue) : -1000;
   const safeMax = Number.isFinite(payload?.maxValue) ? Number(payload?.maxValue) : 3000;
-  const isHuDomain = payload?.huDomain === true;
   const payloadSlope =
     Number.isFinite(payload?.slope) && Math.abs(Number(payload?.slope)) > 1e-8
       ? Number(payload?.slope)
       : 1;
   const payloadIntercept = Number.isFinite(payload?.intercept) ? Number(payload?.intercept) : 0;
-  const hasNonIdentityRescale =
-    Math.abs(payloadSlope - 1) > 1e-6 || Math.abs(payloadIntercept) > 1e-6;
 
   // Worker output for pano:// is expected to already be in HU space.
   // Always expose identity rescale metadata to avoid accidental double-LUT.
-  if (hasNonIdentityRescale) {
-    console.warn(
-      '[panoImageLoader] Ignoring non-identity pano payload rescale and exposing identity modality LUT.',
-      {
-        payloadSlope,
-        payloadIntercept,
-      }
-    );
-  }
+  void payloadSlope;
+  void payloadIntercept;
   const safeSlope = 1;
   const safeIntercept = 0;
-
-  const modalityMin = safeMin;
-  const modalityMax = safeMax;
-  const dynamicRange = Math.max(1, modalityMax - modalityMin);
-  const looksLikeHU = isHuDomain && modalityMin >= -5000 && modalityMax <= 7000 && dynamicRange >= 250;
+  const derivedVoi = getFallbackSyntheticCprVoi();
 
   const windowWidth =
     Number.isFinite(payload?.windowWidth) && Number(payload?.windowWidth) > 1
       ? Number(payload?.windowWidth)
-      : looksLikeHU
-        ? DEFAULT_PANO_WINDOW_WIDTH
-        : dynamicRange;
+      : derivedVoi.windowWidth;
 
   const windowCenter = Number.isFinite(payload?.windowCenter)
     ? Number(payload?.windowCenter)
-    : looksLikeHU
-      ? DEFAULT_PANO_WINDOW_CENTER
-      : modalityMin + dynamicRange / 2;
+    : derivedVoi.windowCenter;
 
   return {
     minValue: safeMin,
@@ -114,23 +99,6 @@ export function createPanoImageId(): string {
 export function setPanoImagePayload(imageId: string, payload: PanoImagePayload): void {
   panoImageCache.set(imageId, payload);
   latestPanoImageId = imageId;
-  console.log('[CPR-LOADER-PAYLOAD-JSON]', JSON.stringify({
-    imageId,
-    width: payload.width,
-    height: payload.height,
-    minValue: payload.minValue,
-    maxValue: payload.maxValue,
-    huDomain: payload.huDomain === true,
-    windowWidth: payload.windowWidth ?? null,
-    windowCenter: payload.windowCenter ?? null,
-    slope: payload.slope ?? null,
-    intercept: payload.intercept ?? null,
-    rowPixelSpacing: payload.rowPixelSpacing ?? null,
-    columnPixelSpacing: payload.columnPixelSpacing ?? null,
-    first8: Array.from(payload.pixelData.subarray(0, Math.min(8, payload.pixelData.length))).map(
-      value => Math.round(Number(value) * 1000) / 1000
-    ),
-  }));
 }
 
 export function clearPanoImageCache(): void {
@@ -142,14 +110,6 @@ function createImageObject(imageId: string, payload: PanoImagePayload): cornerst
   const { pixelData, width, height } = payload;
   const display = getPanoDisplayMetadata(payload);
   const spacing = getPanoPixelSpacing(payload);
-  console.log('[CPR-LOADER-IMAGE-JSON]', JSON.stringify({
-    imageId,
-    width,
-    height,
-    display,
-    spacing,
-    huDomain: payload.huDomain === true,
-  }));
 
   const image: cornerstone.Types.IImage = {
     imageId,
@@ -188,7 +148,6 @@ function panoImageLoader(imageId: string): {
     const payload = panoImageCache.get(imageId);
 
     if (!payload) {
-      console.error('[CPR-LOADER-MISS-JSON]', JSON.stringify({ imageId, latestPanoImageId }));
       reject(
         new Error(
           `[panoImageLoader] No panoramic image cached for imageId: "${imageId}". ` +
@@ -228,7 +187,7 @@ function panoMetadataProvider(type: string, imageId: string) {
   }
 
   const payload = getPanoPayloadForMetadata(imageId);
-  const isHuDomain = payload?.huDomain === true;
+  const isHuDomain = payload?.intensityDomain === 'hu' || payload?.huDomain === true;
   const width = payload?.width ?? 1;
   const height = payload?.height ?? 1;
   const display = getPanoDisplayMetadata(payload);

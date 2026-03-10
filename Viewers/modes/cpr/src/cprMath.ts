@@ -138,8 +138,13 @@ function orthonormalizeFrame(
   N = normalize(cross(S, T), N);
 
   // Keep frame orientation continuous to prevent 180-degree flips.
-  const continuityScore = dot(N, previousN) + dot(S, previousS);
-  if (continuityScore < 0) {
+  // Use S (vertical/binormal) as the stability anchor — on horizontal dental
+  // arches S starts as [0,0,1] and should remain stable throughout.
+  // N_camera legitimately rotates ~180° on U-shaped arches as T follows the
+  // curve, so using N in this check would falsely trigger a flip that corrupts
+  // the vertical direction, causing cross-section mirror-flips and panoramic
+  // sampling distortion.
+  if (dot(S, previousS) < 0) {
     N = negate(N);
     S = negate(S);
   }
@@ -147,22 +152,92 @@ function orthonormalizeFrame(
   return { N, S };
 }
 
-function toSlabNormal(nCamera: Point3, s: Point3): Point3 {
-  const zZeroedN: Point3 = [nCamera[0], nCamera[1], 0];
-  if (norm(zZeroedN) >= EPS) {
-    return normalize(zZeroedN, [1, 0, 0]);
+function toSlabNormal(
+  tangent: Point3,
+  nCamera: Point3,
+  s: Point3,
+  verticalDir: Point3 | null
+): Point3 {
+  const T = normalize(tangent, [1, 0, 0]);
+  const fallback = pickStablePerpendicular(T);
+  const candidates: Point3[] = [];
+
+  if (verticalDir) {
+    const projectedVertical = projectPerpendicular(verticalDir, T);
+    if (norm(projectedVertical) >= EPS) {
+      candidates.push(cross(T, normalize(projectedVertical, s)));
+    }
   }
 
-  const zZeroedS: Point3 = [s[0], s[1], 0];
-  if (norm(zZeroedS) >= EPS) {
-    return normalize(zZeroedS, [1, 0, 0]);
+  const projectedNCamera = projectPerpendicular(nCamera, T);
+  if (norm(projectedNCamera) >= EPS) {
+    candidates.push(projectedNCamera);
   }
 
-  return [1, 0, 0];
+  const projectedS = projectPerpendicular(s, T);
+  if (norm(projectedS) >= EPS) {
+    candidates.push(cross(T, normalize(projectedS, fallback)));
+    candidates.push(projectedS);
+  }
+
+  candidates.push(fallback);
+
+  for (let index = 0; index < candidates.length; index++) {
+    const projectedCandidate = projectPerpendicular(candidates[index], T);
+    if (norm(projectedCandidate) >= EPS) {
+      return normalize(projectedCandidate, fallback);
+    }
+  }
+
+  return fallback;
 }
 
 function coercePoint3(v: Point3): Point3 {
   return [v[0], v[1], v[2]];
+}
+
+function computePointCentroid(points: Point3[]): Point3 {
+  if (points.length === 0) {
+    return [0, 0, 0];
+  }
+
+  let sumX = 0;
+  let sumY = 0;
+  let sumZ = 0;
+
+  for (let i = 0; i < points.length; i++) {
+    sumX += points[i][0];
+    sumY += points[i][1];
+    sumZ += points[i][2];
+  }
+
+  const invCount = 1 / points.length;
+  return [sumX * invCount, sumY * invCount, sumZ * invCount];
+}
+
+function computeOutwardHint(
+  position: Point3,
+  archCentroid: Point3,
+  tangent: Point3,
+  verticalDir: Point3 | null
+): Point3 | null {
+  let outward: Point3 = [
+    position[0] - archCentroid[0],
+    position[1] - archCentroid[1],
+    position[2] - archCentroid[2],
+  ];
+
+  if (verticalDir) {
+    outward = projectPerpendicular(outward, verticalDir);
+  }
+
+  outward = projectPerpendicular(outward, tangent);
+
+  if (norm(outward) < EPS) {
+    return null;
+  }
+
+  return normalize(outward, [1, 0, 0]);
 }
 
 export function buildRMFFrames(
@@ -185,16 +260,27 @@ export function buildRMFFrames(
   const count = positions.length;
   const frames: CPRFrame[] = new Array(count);
   const normalizedVerticalDir = verticalDir ? normalize(coercePoint3(verticalDir), [0, 0, 1]) : null;
+  const normalizedPositions = positions.map(coercePoint3);
+  const archCentroid = computePointCentroid(normalizedPositions);
 
   const T0 = normalize(coercePoint3(tangents[0]), [1, 0, 0]);
-  const initialN = chooseInitialNormal(T0);
-  const initialS = normalize(cross(T0, initialN), pickStablePerpendicular(T0));
+  const initialProjectedVertical = normalizedVerticalDir
+    ? projectPerpendicular(normalizedVerticalDir, T0)
+    : null;
+  const initialS =
+    initialProjectedVertical && norm(initialProjectedVertical) >= EPS
+      ? normalize(initialProjectedVertical, pickStablePerpendicular(T0))
+      : normalize(cross(T0, chooseInitialNormal(T0)), pickStablePerpendicular(T0));
+  const initialN =
+    initialProjectedVertical && norm(initialProjectedVertical) >= EPS
+      ? normalize(cross(T0, initialS), chooseInitialNormal(T0))
+      : chooseInitialNormal(T0);
   const initialBasis = orthonormalizeFrame(T0, initialN, initialS, initialN, initialS);
   let N = initialBasis.N;
   let S = initialBasis.S;
 
   let prevT = T0;
-  let prevNslab = projectPerpendicular(toSlabNormal(N, S), T0);
+  let prevNslab = projectPerpendicular(toSlabNormal(T0, N, S, normalizedVerticalDir), T0);
   if (normalizedVerticalDir) {
     const initialU = projectPerpendicular(normalizedVerticalDir, T0);
     if (norm(initialU) >= EPS) {
@@ -204,11 +290,20 @@ export function buildRMFFrames(
   if (norm(prevNslab) < EPS) {
     prevNslab = pickStablePerpendicular(T0);
   }
-  prevNslab = normalize(prevNslab, toSlabNormal(N, S));
+  prevNslab = normalize(prevNslab, toSlabNormal(T0, N, S, normalizedVerticalDir));
+  const initialOutwardHint = computeOutwardHint(
+    normalizedPositions[0],
+    archCentroid,
+    T0,
+    normalizedVerticalDir
+  );
+  if (initialOutwardHint && dot(prevNslab, initialOutwardHint) < 0) {
+    prevNslab = negate(prevNslab);
+  }
 
   frames[0] = {
     index: 0,
-    position: coercePoint3(positions[0]),
+    position: normalizedPositions[0],
     T: T0,
     N_camera: N,
     N_slab: prevNslab,
@@ -243,7 +338,7 @@ export function buildRMFFrames(
 
     let Nslab = projectPerpendicular(transportedNslab, T);
     if (norm(Nslab) < EPS) {
-      Nslab = projectPerpendicular(toSlabNormal(Ni, Si), T);
+      Nslab = projectPerpendicular(toSlabNormal(T, Ni, Si, normalizedVerticalDir), T);
     }
     if (normalizedVerticalDir) {
       const targetU = projectPerpendicular(normalizedVerticalDir, T);
@@ -251,19 +346,22 @@ export function buildRMFFrames(
         const normalizedTargetU = normalize(targetU, Si);
         const currentU = normalize(cross(Nslab, T), normalizedTargetU);
         const blendedU = normalize(
-          add(scale(currentU, 0.95), scale(normalizedTargetU, 0.05)),
+          add(scale(currentU, 0.75), scale(normalizedTargetU, 0.25)),
           normalizedTargetU
         );
         Nslab = normalize(cross(T, blendedU), Nslab);
       }
     }
-    if (dot(Nslab, prevNslab) < 0) {
+    const outwardHint = computeOutwardHint(normalizedPositions[i], archCentroid, T, normalizedVerticalDir);
+    if (outwardHint && dot(Nslab, outwardHint) < 0) {
+      Nslab = negate(Nslab);
+    } else if (dot(Nslab, prevNslab) < 0) {
       Nslab = negate(Nslab);
     }
 
     frames[i] = {
       index: i,
-      position: coercePoint3(positions[i]),
+      position: normalizedPositions[i],
       T,
       N_camera: Ni,
       N_slab: Nslab,

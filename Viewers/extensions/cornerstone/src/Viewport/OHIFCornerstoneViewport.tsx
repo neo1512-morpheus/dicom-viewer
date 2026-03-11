@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useCallback, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useCallback, useState } from 'react';
 import ReactResizeDetector from 'react-resize-detector';
 import PropTypes from 'prop-types';
 import * as cs3DTools from '@cornerstonejs/tools';
@@ -440,6 +440,22 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
       eventTarget.removeEventListener(Enums.Events.ELEMENT_ENABLED, elementEnabledHandler);
     };
   }, [viewportId, elementEnabledHandler, cornerstoneViewportService]);
+
+  useLayoutEffect(() => {
+    const element = elementRef.current as HTMLDivElement | null;
+    if (!element) {
+      return;
+    }
+
+    if (viewportId === 'cpr-crosssection') {
+      element.style.opacity = '0';
+      element.style.pointerEvents = 'none';
+      return;
+    }
+
+    element.style.opacity = '';
+    element.style.pointerEvents = '';
+  }, [viewportId]);
 
   // =====================================================
   // WebGL CONTEXT LOSS LISTENERS

@@ -409,12 +409,18 @@ const hpCPR = {
           viewportOptions: {
             viewportId: 'cpr-crosssection',
             toolGroupId: 'cprCrossSection',
-            viewportType: 'stack',
+            viewportType: 'volume',
+            orientation: 'axial',
             allowUnmatchedView: true,
           },
           displaySets: [
             {
               id: 'activeDisplaySet',
+              options: {
+                blendMode: 'avg',
+                slabThickness: 1.5,
+                voiInverted: false,
+              },
             },
           ],
         },

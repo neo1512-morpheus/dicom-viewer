@@ -135,6 +135,28 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // (see MEASUREMENT_UPDATED subscriber with renderingEngine.render() call)
   }
 
+  private getLogicalViewportId(viewportId: string): string | null {
+    const { viewportGridService } = this.servicesManager.services || {};
+    const viewportMap = viewportGridService?.getState?.()?.viewports;
+
+    if (!viewportMap) {
+      return null;
+    }
+
+    if (typeof viewportMap.get === 'function') {
+      return viewportMap.get(viewportId)?.viewportOptions?.viewportId ?? null;
+    }
+
+    return viewportMap[viewportId]?.viewportOptions?.viewportId ?? null;
+  }
+
+  private isCPRCrossSectionViewport(viewportId: string): boolean {
+    return (
+      viewportId === 'cpr-crosssection' ||
+      this.getLogicalViewportId(viewportId) === 'cpr-crosssection'
+    );
+  }
+
   private isWebGLUnavailableError(error: unknown): boolean {
     const message =
       (typeof error === 'object' && error && 'message' in error
@@ -301,7 +323,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       }
     }
 
-    if (positionPresentation) {
+    if (positionPresentation && !this.isCPRCrossSectionViewport(viewportId)) {
       const { viewPlaneNormal, viewUp, zoom, pan } = positionPresentation.presentation;
       viewport.setCamera({ viewPlaneNormal, viewUp });
 
@@ -324,6 +346,10 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
   public getPositionPresentation(viewportId: string): PositionPresentation {
     const viewportInfo = this.viewportsById.get(viewportId);
     if (!viewportInfo) {
+      return;
+    }
+
+    if (this.isCPRCrossSectionViewport(viewportId)) {
       return;
     }
 
@@ -460,8 +486,8 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       stateSyncService.getState();
 
     const { lutPresentation, positionPresentation } = presentations;
-    const { id: positionPresentationId } = positionPresentation;
-    const { id: lutPresentationId } = lutPresentation;
+    const positionPresentationId = positionPresentation?.id;
+    const lutPresentationId = lutPresentation?.id;
 
     const updateStore = (store, id, value) => ({ ...store, [id]: value });
 
@@ -808,7 +834,6 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
 
     console.log('[DEBUG] _setStackViewport called, setting stack with', imageIds.length, 'images');
     const isCPRPanoViewport = viewport.id === 'cpr-pano';
-    const isCPRCrossSectionViewport = viewport.id === 'cpr-crosssection';
     if (isCPRPanoViewport) {
       console.log('[CPR-TRACE] CornerstoneViewportService entering _setStackViewport for cpr-pano', {
         initialImageIndexToUse,
@@ -820,7 +845,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     }
 
     // Avoid #2d parallel cache rewriting on synthetic CPR stacks to keep their custom schemes intact.
-    const shouldUseParallel2dCache = !isCPRPanoViewport && !isCPRCrossSectionViewport;
+    const shouldUseParallel2dCache = !isCPRPanoViewport;
     const stackImageIds = shouldUseParallel2dCache
       ? imageIds.map((imageId: string) => {
           if (imageId.endsWith('#2d')) {
@@ -846,16 +871,6 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       if (!firstImageId.startsWith('pano://')) {
         console.log(
           '[CPR] _setStackViewport: blocking non-pano:// stack load into cpr-pano. Orchestrator will set the correct pano:// stack.'
-        );
-        return Promise.resolve();
-      }
-    }
-
-    if (viewport.id === 'cpr-crosssection') {
-      const firstImageId = stackImageIds?.[0] ?? '';
-      if (!firstImageId.startsWith('cross://')) {
-        console.log(
-          '[CPR] _setStackViewport: blocking non-cross:// stack load into cpr-crosssection. Orchestrator will set the correct cross:// stack.'
         );
         return Promise.resolve();
       }
@@ -888,7 +903,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         });
       }
 
-      if (!isCPRPanoViewport && !isCPRCrossSectionViewport) {
+      if (!isCPRPanoViewport) {
         // [GEMINI FIX] Recalculate VOI based on ACTUAL pixel data (Corrected for Slope/Intercept)
         try {
           const imageData = viewport.getImageData();
@@ -1116,6 +1131,10 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
 
     const viewportInfo = this.getViewportInfo(viewport.id);
     const viewportId = viewport.id;
+
+    if (this.isCPRCrossSectionViewport(viewportId)) {
+      return;
+    }
 
     const displaySetOptions = viewportInfo.getDisplaySetOptions();
     const displaySetUIDs = viewportGridService.getDisplaySetsUIDsForViewport(viewport.id);
@@ -1541,10 +1560,18 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         return;
       }
 
+      this.beforeResizePositionPresentations.clear();
+
       // Store the current position presentations for each viewport.
       viewports.forEach(({ id }) => {
+        if (this.isCPRCrossSectionViewport(id)) {
+          return;
+        }
+
         const presentation = this.getPositionPresentation(id);
-        this.beforeResizePositionPresentations.set(id, presentation);
+        if (presentation) {
+          this.beforeResizePositionPresentations.set(id, presentation);
+        }
       });
 
       // Use requestAnimationFrame to move heavy render operations off main thread
@@ -1561,7 +1588,9 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         // Reset the camera for viewports that should reset their camera on resize,
         // which means only those viewports that have a zoom level of 1.
         this.beforeResizePositionPresentations.forEach((positionPresentation, viewportId) => {
-          this.setPresentations(viewportId, { positionPresentation });
+          if (positionPresentation) {
+            this.setPresentations(viewportId, { positionPresentation });
+          }
         });
 
         // Single render after resize and presentation updates

@@ -12,6 +12,10 @@ type PreviousCameraLike = {
   parallelScale?: number | null;
 } | null | undefined;
 
+const CROSSSECTION_CLINICAL_VERTICAL_HEIGHT_MM = 45;
+const CROSSSECTION_FIXED_PARALLEL_SCALE = CROSSSECTION_CLINICAL_VERTICAL_HEIGHT_MM / 2;
+const CROSSSECTION_RIGID_CAMERA_DISTANCE_MULTIPLIER = 8;
+
 function normalizeCameraVector(
   value: CameraVector,
   fallback: CameraVector
@@ -87,43 +91,7 @@ function pickStablePerpendicular(axis: vec3): vec3 {
   return projectPerpendicular(best, unitAxis, [0, 1, 0]);
 }
 
-function toFinitePoint(value: ArrayLike<number> | null | undefined): vec3 | null {
-  if (!value) {
-    return null;
-  }
-
-  const out = vec3.fromValues(
-    Number(value[0] ?? Number.NaN),
-    Number(value[1] ?? Number.NaN),
-    Number(value[2] ?? Number.NaN)
-  );
-
-  if (!Number.isFinite(out[0]) || !Number.isFinite(out[1]) || !Number.isFinite(out[2])) {
-    return null;
-  }
-
-  return out;
-}
-
-function computeCameraDistance(
-  previousCamera: PreviousCameraLike,
-  parallelScale: number
-): number {
-  const previousPosition = toFinitePoint(previousCamera?.position);
-  const previousFocalPoint = toFinitePoint(previousCamera?.focalPoint);
-
-  if (previousPosition && previousFocalPoint) {
-    const previousOffset = vec3.subtract(vec3.create(), previousPosition, previousFocalPoint);
-    const previousDistance = vec3.length(previousOffset);
-    if (Number.isFinite(previousDistance) && previousDistance > 1e-3) {
-      return previousDistance;
-    }
-  }
-
-  return Math.max(120, parallelScale * 8);
-}
-
-function buildCrossSectionBasis(frame: CPRFrame): {
+export function buildCrossSectionBasis(frame: CPRFrame): {
   viewPlaneNormal: CameraVector;
   viewUp: CameraVector;
 } {
@@ -188,7 +156,6 @@ function buildCrossSectionBasis(frame: CPRFrame): {
 export function buildCrossSectionCameraForFrame(
   frame: CPRFrame,
   previousCamera?: PreviousCameraLike,
-  fallbackParallelScale = 20,
   verticalCenterOffsetMm = 0
 ): {
   focalPoint: CameraVector;
@@ -196,18 +163,15 @@ export function buildCrossSectionCameraForFrame(
   viewPlaneNormal: CameraVector;
   viewUp: CameraVector;
   parallelScale: number;
+  clippingRange: [number, number];
   parallelProjection: true;
   flipHorizontal: false;
   flipVertical: false;
 } {
-  const previousParallelScale = Number(previousCamera?.parallelScale);
-  const parallelScale =
-    Number.isFinite(previousParallelScale) && previousParallelScale > 0
-      ? previousParallelScale
-      : fallbackParallelScale;
-
   const { viewPlaneNormal, viewUp } = buildCrossSectionBasis(frame);
-  const cameraDistance = computeCameraDistance(previousCamera, parallelScale);
+  const parallelScale = CROSSSECTION_FIXED_PARALLEL_SCALE;
+  const cameraDistance = parallelScale * CROSSSECTION_RIGID_CAMERA_DISTANCE_MULTIPLIER;
+  const clippingRange: [number, number] = [cameraDistance - 200, cameraDistance + 200];
   const centerOffsetMm = Number.isFinite(verticalCenterOffsetMm) ? verticalCenterOffsetMm : 0;
   const focalPoint: CameraVector = [
     frame.position[0] + viewUp[0] * centerOffsetMm,
@@ -220,12 +184,28 @@ export function buildCrossSectionCameraForFrame(
     focalPoint[2] + viewPlaneNormal[2] * cameraDistance,
   ];
 
+  console.log(
+    `[CPR-DEBUG] buildCrossSectionCameraForFrame ${JSON.stringify({
+      frameIndex: frame.index,
+      previousParallelScale: Number.isFinite(previousCamera?.parallelScale as number)
+        ? Number(previousCamera?.parallelScale)
+        : null,
+      centerOffsetMm,
+      fixedVerticalFieldOfViewMm: CROSSSECTION_CLINICAL_VERTICAL_HEIGHT_MM,
+      outputParallelScale: parallelScale,
+      clippingRange,
+      focalPoint,
+      position,
+    })}`
+  );
+
   return {
     focalPoint,
     position,
     viewPlaneNormal,
     viewUp,
     parallelScale,
+    clippingRange,
     parallelProjection: true,
     flipHorizontal: false,
     flipVertical: false,

@@ -10,13 +10,6 @@ import {
   classifySyntheticCprIntensityDomain,
   isSyntheticCprHuDomain,
 } from './cprSyntheticDisplay';
-import {
-  clearCrossSectionImageCache,
-  createCrossSectionImageIds,
-  createCrossSectionSeriesId,
-  setCrossSectionSeriesPayload,
-  updateCrossSectionSeriesDisplayDefaults,
-} from './crossSectionImageLoader';
 import { buildRMFFrames } from './cprMath';
 import { CPR_CROSSSECTION_SYNC_EVENT, CPRCrossSectionSyncDetail } from './cprEvents';
 import { buildCrossSectionCameraForFrame } from './cprCrossSectionCamera';
@@ -28,6 +21,10 @@ const CPR_PANO_MAX_DIMENSION = 4096;
 const CPR_PANO_DEFAULT_VERTICAL_HALF_MM = 18;
 const CPR_PANO_MAX_VERTICAL_HALF_MM = 28;
 const CPR_PANO_TARGET_ASPECT = 3.2;
+const CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM = 1.5;
+const CPR_CROSSSECTION_DEFAULT_BLEND_MODE =
+  cornerstone.Enums.BlendModes.AVERAGE_INTENSITY_BLEND;
+const CPR_CROSSSECTION_RENDER_WAIT_TIMEOUT_MS = 1500;
 
 interface FloatBufferDebugSummary {
   sampledCount: number;
@@ -1910,6 +1907,21 @@ function isStackViewportLike(
   );
 }
 
+function isVolumeViewportLike(
+  viewport: cornerstone.Types.IViewport | null
+): viewport is cornerstone.Types.IVolumeViewport {
+  if (!viewport) {
+    return false;
+  }
+
+  const candidate = viewport as cornerstone.Types.IVolumeViewport;
+
+  return (
+    typeof candidate.setVolumes === 'function' &&
+    typeof candidate.setBlendMode === 'function'
+  );
+}
+
 async function waitForViewportByLogicalId(
   servicesManager: any,
   logicalViewportId: string,
@@ -1962,11 +1974,37 @@ async function waitForPanoStackViewport(
   return waitForStackViewportByLogicalId(servicesManager, 'cpr-pano', timeoutMs);
 }
 
-async function waitForCrossSectionStackViewport(
+async function waitForVolumeViewportByLogicalId(
+  servicesManager: any,
+  logicalViewportId: string,
+  timeoutMs = 12000
+): Promise<cornerstone.Types.IVolumeViewport> {
+  const startedAt = Date.now();
+  let lastViewportType = 'none';
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const viewport = findViewportByLogicalId(servicesManager, logicalViewportId);
+    if (viewport) {
+      lastViewportType = viewport.constructor?.name || 'unknown';
+
+      if (isVolumeViewportLike(viewport)) {
+        return viewport as cornerstone.Types.IVolumeViewport;
+      }
+    }
+
+    await new Promise(resolve => window.setTimeout(resolve, 50));
+  }
+
+  throw new Error(
+    `[CPR] ${logicalViewportId} volume viewport not ready within timeout. Last resolved type: ${lastViewportType}`
+  );
+}
+
+async function waitForCrossSectionVolumeViewport(
   servicesManager: any,
   timeoutMs = 12000
-): Promise<cornerstone.Types.IStackViewport> {
-  return waitForStackViewportByLogicalId(servicesManager, 'cpr-crosssection', timeoutMs);
+): Promise<cornerstone.Types.IVolumeViewport> {
+  return waitForVolumeViewportByLogicalId(servicesManager, 'cpr-crosssection', timeoutMs);
 }
 
 function getCurrentStackImageId(viewport: cornerstone.Types.IViewport | null): string | null {
@@ -1984,27 +2022,6 @@ function getCurrentStackImageId(viewport: cornerstone.Types.IViewport | null): s
 
   const safeIndex = Math.max(0, Math.min(imageIds.length - 1, Math.floor(index)));
   return imageIds[safeIndex] ?? null;
-}
-
-function getCurrentCrossSectionSeriesId(
-  viewport: cornerstone.Types.IViewport | null
-): string | null {
-  if (!viewport || !isStackViewportLike(viewport)) {
-    return null;
-  }
-
-  const imageId = getCurrentStackImageId(viewport) ?? viewport.getImageIds?.()?.[0] ?? null;
-  if (typeof imageId !== 'string' || !imageId.startsWith('cross://')) {
-    return null;
-  }
-
-  const remainder = imageId.slice('cross://'.length);
-  const separatorIndex = remainder.lastIndexOf('/');
-  if (separatorIndex <= 0) {
-    return null;
-  }
-
-  return remainder.slice(0, separatorIndex) || null;
 }
 
 function toFiniteNumber(value: unknown): number | undefined {
@@ -2178,143 +2195,96 @@ function applyPanoDisplaySettings(
   }));
 }
 
-type PreservedCrossSectionDisplaySettings = {
-  voiRange: {
-    lower: number;
-    upper: number;
-  };
-  VOILUTFunction: string;
-};
+function getViewportElementDimensions(
+  viewport: cornerstone.Types.IViewport | null
+): { width: number; height: number } {
+  const element = viewport?.element as HTMLDivElement | null | undefined;
 
-const pendingCrossSectionVoiReapplyListeners = new WeakMap<
-  EventTarget,
-  EventListenerOrEventListenerObject
->();
-
-function captureCrossSectionDisplaySettings(
-  viewport: cornerstone.Types.IStackViewport | null
-): PreservedCrossSectionDisplaySettings | null {
-  if (!viewport) {
-    return null;
+  if (!element) {
+    return { width: 0, height: 0 };
   }
 
-  const properties = ((viewport as { getProperties?: () => unknown }).getProperties?.() || {}) as {
-    voiRange?: { lower?: number; upper?: number };
-    VOILUTFunction?: unknown;
-  };
-  const lower = toFiniteNumber(properties.voiRange?.lower);
-  const upper = toFiniteNumber(properties.voiRange?.upper);
-  if (lower === undefined || upper === undefined) {
-    return null;
-  }
+  const rect = element.getBoundingClientRect?.();
+  const width = Number(rect?.width ?? element.clientWidth ?? 0);
+  const height = Number(rect?.height ?? element.clientHeight ?? 0);
 
   return {
-    voiRange: { lower, upper },
-    VOILUTFunction:
-      typeof properties.VOILUTFunction === 'string' && properties.VOILUTFunction
-        ? properties.VOILUTFunction
-        : 'LINEAR_EXACT',
+    width: Number.isFinite(width) ? width : 0,
+    height: Number.isFinite(height) ? height : 0,
   };
 }
 
-function applyCrossSectionDisplaySettings(
+async function waitForViewportElementToHaveSize(
   viewport: cornerstone.Types.IViewport | null,
-  settings: PreservedCrossSectionDisplaySettings | null
-): void {
-  if (!settings || !viewport || !isStackViewportLike(viewport)) {
+  timeoutMs = CPR_CROSSSECTION_RENDER_WAIT_TIMEOUT_MS
+): Promise<void> {
+  if (!viewport || typeof window === 'undefined') {
     return;
   }
 
-  viewport.setProperties({
-    isComputedVOI: false,
-    voiRange: {
-      lower: settings.voiRange.lower,
-      upper: settings.voiRange.upper,
-    },
-    VOILUTFunction: settings.VOILUTFunction,
-  } as any);
+  const hasRenderableSize = () => {
+    const { width, height } = getViewportElementDimensions(viewport);
+
+    return width > 0 && height > 0;
+  };
+
+  if (!hasRenderableSize()) {
+    await new Promise<void>((resolve, reject) => {
+      const startedAt = Date.now();
+
+      const tick = () => {
+        if (hasRenderableSize()) {
+          resolve();
+          return;
+        }
+
+        if (Date.now() - startedAt >= timeoutMs) {
+          reject(new Error('[CPR] Timed out waiting for the cross-section viewport to report a size.'));
+          return;
+        }
+
+        window.requestAnimationFrame(tick);
+      };
+
+      window.requestAnimationFrame(tick);
+    });
+  }
+
+  await new Promise<void>(resolve => {
+    window.requestAnimationFrame(() => resolve());
+  });
 }
 
-function applyCrossSectionCameraAlignment(
-  viewport: cornerstone.Types.IViewport | null,
-  frame: CPRFrame,
-  verticalCenterOffsetMm?: number,
-  previousCameraOverride?: ReturnType<typeof cloneCameraState> | null
+function setCrossSectionViewportVisibility(
+  viewport: { element?: HTMLDivElement | null } | null | undefined,
+  isVisible: boolean
 ): void {
-  if (!viewport) {
+  const element = viewport?.element;
+  if (!element) {
     return;
   }
 
-  const previousCamera = previousCameraOverride ?? viewport.getCamera?.();
-  const nextCamera = buildCrossSectionCameraForFrame(
-    frame,
-    previousCamera,
-    20,
-    toFiniteNumber(verticalCenterOffsetMm) ?? 0
-  );
-  viewport.setCamera?.(nextCamera);
+  element.style.opacity = isVisible ? '1' : '0';
+  element.style.pointerEvents = isVisible ? 'auto' : 'none';
+}
 
-  const appliedCamera = viewport.getCamera?.();
-  const requestedRight = normalize3([
-    nextCamera.viewUp[1] * nextCamera.viewPlaneNormal[2] -
-      nextCamera.viewUp[2] * nextCamera.viewPlaneNormal[1],
-    nextCamera.viewUp[2] * nextCamera.viewPlaneNormal[0] -
-      nextCamera.viewUp[0] * nextCamera.viewPlaneNormal[2],
-    nextCamera.viewUp[0] * nextCamera.viewPlaneNormal[1] -
-      nextCamera.viewUp[1] * nextCamera.viewPlaneNormal[0],
-  ]);
-  const cameraAxis = normalize3([frame.N_camera[0], frame.N_camera[1], frame.N_camera[2]]);
-  const appliedRight =
-    appliedCamera?.viewUp && appliedCamera?.viewPlaneNormal
-      ? normalize3([
-        appliedCamera.viewUp[1] * appliedCamera.viewPlaneNormal[2] -
-          appliedCamera.viewUp[2] * appliedCamera.viewPlaneNormal[1],
-        appliedCamera.viewUp[2] * appliedCamera.viewPlaneNormal[0] -
-          appliedCamera.viewUp[0] * appliedCamera.viewPlaneNormal[2],
-        appliedCamera.viewUp[0] * appliedCamera.viewPlaneNormal[1] -
-          appliedCamera.viewUp[1] * appliedCamera.viewPlaneNormal[0],
-      ])
-      : null;
+function resolveCrossSectionVerticalCenterOffsetMm(
+  frameIndex: number,
+  fallbackVerticalCenterOffsetMm?: number,
+  verticalCenterOffsetsMm?: number[] | null
+): number {
+  const safeFallbackVerticalCenterOffsetMm = toFiniteNumber(fallbackVerticalCenterOffsetMm) ?? 0;
+  if (!Array.isArray(verticalCenterOffsetsMm) || verticalCenterOffsetsMm.length === 0) {
+    return safeFallbackVerticalCenterOffsetMm;
+  }
 
-  console.log('[CPR-CROSSSECTION-CAMERA]', {
-    frameIndex: frame.index,
-    viewportId: viewport.id,
-    verticalCenterOffsetMm: toFiniteNumber(verticalCenterOffsetMm) ?? 0,
-    requested: {
-      focalPoint: nextCamera.focalPoint,
-      position: nextCamera.position,
-      viewPlaneNormal: nextCamera.viewPlaneNormal,
-      viewUp: nextCamera.viewUp,
-      viewRight: requestedRight,
-      parallelScale: nextCamera.parallelScale,
-      flipHorizontal: nextCamera.flipHorizontal,
-      flipVertical: nextCamera.flipVertical,
-      dotRightCamera:
-        requestedRight[0] * cameraAxis[0] +
-        requestedRight[1] * cameraAxis[1] +
-        requestedRight[2] * cameraAxis[2],
-    },
-    applied: appliedCamera
-      ? {
-        focalPoint: appliedCamera.focalPoint,
-        position: appliedCamera.position,
-        viewPlaneNormal: appliedCamera.viewPlaneNormal,
-        viewUp: appliedCamera.viewUp,
-        viewRight: appliedRight,
-        parallelScale: appliedCamera.parallelScale,
-        flipHorizontal: appliedCamera.flipHorizontal,
-        flipVertical: appliedCamera.flipVertical,
-        dotRightCamera:
-          appliedRight
-            ? (
-              appliedRight[0] * cameraAxis[0] +
-              appliedRight[1] * cameraAxis[1] +
-              appliedRight[2] * cameraAxis[2]
-            )
-            : null,
-      }
-      : null,
-  });
+  const maxIndex = Math.max(0, verticalCenterOffsetsMm.length - 1);
+  const safeIndex = Math.max(0, Math.min(Math.round(frameIndex), maxIndex));
+  const localVerticalCenterOffsetMm = Number(verticalCenterOffsetsMm[safeIndex]);
+
+  return Number.isFinite(localVerticalCenterOffsetMm)
+    ? localVerticalCenterOffsetMm
+    : safeFallbackVerticalCenterOffsetMm;
 }
 
 function cloneCameraState(
@@ -2452,114 +2422,27 @@ function setCrossSectionForFrame(
   verticalCenterOffsetMm?: number
 ): void {
   const crossViewport = findViewportByLogicalId(servicesManager, 'cpr-crosssection');
-  if (!crossViewport) {
+  if (!crossViewport || !isVolumeViewportLike(crossViewport)) {
     return;
   }
 
-  if (isStackViewportLike(crossViewport)) {
-    if (crossViewport.element) {
-      const pendingListener = pendingCrossSectionVoiReapplyListeners.get(crossViewport.element);
-      if (pendingListener) {
-        crossViewport.element.removeEventListener(
-          cornerstone.Enums.Events.IMAGE_RENDERED,
-          pendingListener
-        );
-        pendingCrossSectionVoiReapplyListeners.delete(crossViewport.element);
-      }
-    }
-
-    const preservedDisplaySettings = captureCrossSectionDisplaySettings(crossViewport);
-    const preservedCamera = cloneCameraState(crossViewport);
-    const currentImageIndex = Number(crossViewport.getCurrentImageIdIndex?.());
-    const safeCurrentIndex = Number.isFinite(currentImageIndex) ? Math.floor(currentImageIndex) : -1;
-
-    if (crossViewport.element && safeCurrentIndex !== frame.index) {
-      const targetImageIndex = frame.index;
-      const onTargetImageRendered: EventListener = () => {
-        const liveViewport = findViewportByLogicalId(servicesManager, 'cpr-crosssection');
-        if (!liveViewport || !isStackViewportLike(liveViewport)) {
-          return;
-        }
-
-        const renderedImageIndex = Number(liveViewport.getCurrentImageIdIndex?.());
-        if (!Number.isFinite(renderedImageIndex) || Math.floor(renderedImageIndex) !== targetImageIndex) {
-          return;
-        }
-
-        crossViewport.element.removeEventListener(
-          cornerstone.Enums.Events.IMAGE_RENDERED,
-          onTargetImageRendered
-        );
-        pendingCrossSectionVoiReapplyListeners.delete(crossViewport.element);
-        applyCrossSectionCameraAlignment(
-          liveViewport,
-          frame,
-          verticalCenterOffsetMm,
-          preservedCamera
-        );
-        applyCrossSectionDisplaySettings(liveViewport, preservedDisplaySettings);
-        liveViewport.render?.();
-      };
-
-      crossViewport.element.addEventListener(
-        cornerstone.Enums.Events.IMAGE_RENDERED,
-        onTargetImageRendered
-      );
-      pendingCrossSectionVoiReapplyListeners.set(crossViewport.element, onTargetImageRendered);
-      applyCrossSectionDisplaySettings(crossViewport, preservedDisplaySettings);
-      const crossSectionSeriesId = getCurrentCrossSectionSeriesId(crossViewport);
-      const savedVoi = preservedDisplaySettings?.voiRange;
-      if (crossSectionSeriesId && savedVoi) {
-        updateCrossSectionSeriesDisplayDefaults(crossSectionSeriesId, savedVoi);
-      }
-
-      cornerstoneTools.utilities.jumpToSlice(crossViewport.element, {
-        imageIndex: frame.index,
-        debounceLoading: true,
-      });
-    } else {
-      applyCrossSectionDisplaySettings(crossViewport, preservedDisplaySettings);
-      applyCrossSectionCameraAlignment(
-        crossViewport,
-        frame,
-        verticalCenterOffsetMm,
-        preservedCamera
-      );
-    }
-    crossViewport.render?.();
-    return;
-  }
-
-  applyCrossSectionCameraAlignment(crossViewport, frame, verticalCenterOffsetMm);
-  crossViewport.render();
-}
-
-function buildCrossSectionStackConfig(
-  _sourceVolumeId: string,
-  _verticalHalfHeightMm?: number
-): {
-  width: number;
-  height: number;
-  rowPixelSpacing: number;
-  columnPixelSpacing: number;
-  horizontalHalfWidthMm: number;
-  verticalHalfHeightMm: number;
-} {
-  const width = 256;
-  const height = 256;
-  const rowPixelSpacing = 0.16;
-  const columnPixelSpacing = 0.16;
-  const horizontalHalfWidthMm = columnPixelSpacing * Math.max(0, width - 1) * 0.5;
-  const verticalHalfHeightMm = rowPixelSpacing * Math.max(0, height - 1) * 0.5;
-
-  return {
-    width,
-    height,
-    rowPixelSpacing,
-    columnPixelSpacing,
-    horizontalHalfWidthMm,
-    verticalHalfHeightMm,
-  };
+  const previousCamera = cloneCameraState(crossViewport);
+  console.log(
+    `[CPR-DEBUG] setCrossSectionForFrame previousCamera ${JSON.stringify({
+      frameIndex: frame.index,
+      viewportId: crossViewport.id,
+      currentParallelScale: previousCamera?.parallelScale ?? null,
+      verticalCenterOffsetMm: toFiniteNumber(verticalCenterOffsetMm) ?? 0,
+    })}`
+  );
+  crossViewport.setCamera(
+    buildCrossSectionCameraForFrame(
+      frame,
+      previousCamera,
+      verticalCenterOffsetMm
+    )
+  );
+  crossViewport.render?.();
 }
 
 type VolumeLoadStatusLike = {
@@ -2577,60 +2460,75 @@ async function initializeCrossSection(
   sourceVolumeId: string,
   verticalHalfHeightMm: number | undefined,
   verticalCenterOffsetMm: number | undefined,
+  verticalCenterOffsetsMm: number[] | undefined,
   samplingOffsetsActive: boolean,
   servicesManager: any
 ): Promise<void> {
   const { syncGroupService } = servicesManager.services;
-  const crossViewport = await waitForCrossSectionStackViewport(servicesManager);
+  const crossViewport = await waitForCrossSectionVolumeViewport(servicesManager);
 
   const initialFrameIndex = Math.max(
     0,
     Math.min(cprStateService.getCurrentFrameIndex(), Math.max(0, frames.length - 1))
   );
-  const stackConfig = buildCrossSectionStackConfig(sourceVolumeId, verticalHalfHeightMm);
-  const crossSeriesId = createCrossSectionSeriesId();
-  const crossImageIds = createCrossSectionImageIds(crossSeriesId, frames.length);
-
-  clearCrossSectionImageCache();
-  setCrossSectionSeriesPayload(crossSeriesId, {
-    sourceVolumeId,
-    frames,
-    width: stackConfig.width,
-    height: stackConfig.height,
-    rowPixelSpacing: stackConfig.rowPixelSpacing,
-    columnPixelSpacing: stackConfig.columnPixelSpacing,
-    horizontalHalfWidthMm: stackConfig.horizontalHalfWidthMm,
-    verticalHalfHeightMm: stackConfig.verticalHalfHeightMm,
-    verticalCenterOffsetMm: toFiniteNumber(verticalCenterOffsetMm) ?? 0,
-  });
+  const initialFrameVerticalCenterOffsetMm = resolveCrossSectionVerticalCenterOffsetMm(
+    initialFrameIndex,
+    verticalCenterOffsetMm,
+    verticalCenterOffsetsMm
+  );
   console.log('[CPR-CROSSSECTION-CONFIG-JSON]', JSON.stringify({
     sourceVolumeId,
     frameCount: frames.length,
     initialFrameIndex,
-    width: stackConfig.width,
-    height: stackConfig.height,
-    rowPixelSpacing: stackConfig.rowPixelSpacing,
-    columnPixelSpacing: stackConfig.columnPixelSpacing,
-    horizontalHalfWidthMm: stackConfig.horizontalHalfWidthMm,
-    verticalHalfHeightMm: stackConfig.verticalHalfHeightMm,
+    verticalHalfHeightMm: toFiniteNumber(verticalHalfHeightMm) ?? null,
     verticalCenterOffsetMm: toFiniteNumber(verticalCenterOffsetMm) ?? 0,
-    geometryMode: 'fixed-grid-rigid-world',
+    initialFrameVerticalCenterOffsetMm,
+    geometryMode: 'hybrid-volume-voi-custom-camera',
     samplingOffsetsActive,
+    blendMode: 'avg',
+    slabThicknessMm: CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM,
+    voiMode: 'native-volume-default',
   }));
 
-  await crossViewport.setStack(crossImageIds, initialFrameIndex);
-  crossViewport.resetProperties?.();
-  crossViewport.setProperties?.({
-    invert: false,
-    VOILUTFunction: 'LINEAR_EXACT',
-  } as any);
-  crossViewport.resetCamera?.();
-  applyCrossSectionCameraAlignment(
-    crossViewport,
+  setCrossSectionViewportVisibility(crossViewport, false);
+  await crossViewport.setVolumes([
+    {
+      volumeId: sourceVolumeId,
+      blendMode: CPR_CROSSSECTION_DEFAULT_BLEND_MODE,
+      slabThickness: CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM,
+    },
+  ]);
+  await waitForViewportElementToHaveSize(crossViewport);
+  const crossViewportElement = crossViewport.element as HTMLDivElement | null | undefined;
+  console.log(
+    `[CPR-DEBUG] initializeCrossSection elementSize ${JSON.stringify({
+      viewportId: crossViewport.id,
+      clientWidth: Number(crossViewportElement?.clientWidth ?? 0),
+      clientHeight: Number(crossViewportElement?.clientHeight ?? 0),
+      rectWidth: Number(crossViewportElement?.getBoundingClientRect?.().width ?? 0),
+      rectHeight: Number(crossViewportElement?.getBoundingClientRect?.().height ?? 0),
+    })}`
+  );
+  const initialCrossSectionCamera = buildCrossSectionCameraForFrame(
     frames[initialFrameIndex],
-    verticalCenterOffsetMm
+    undefined,
+    initialFrameVerticalCenterOffsetMm
+  );
+  crossViewport.setCamera(initialCrossSectionCamera);
+  console.log(
+    `[CPR-DEBUG] initializeCrossSection cameraAfterSet ${JSON.stringify({
+      viewportId: crossViewport.id,
+      requestedParallelScale: initialCrossSectionCamera.parallelScale,
+      appliedParallelScale: crossViewport.getCamera?.()?.parallelScale ?? null,
+    })}`
   );
   crossViewport.render?.();
+  await new Promise<void>(resolve => {
+    window.requestAnimationFrame(() => {
+      setCrossSectionViewportVisibility(crossViewport, true);
+      resolve();
+    });
+  });
 
   const syncId = 'cpr-crosssection-sync';
   const renderingEngineId = crossViewport.getRenderingEngine().id;
@@ -2778,7 +2676,6 @@ export function useCPROrchestrator({
   const lastSetupCleanupRef = useRef<string | null>(null);
   const sliderAnimationFrameRef = useRef<number | null>(null);
   const pendingSliderFrameIndexRef = useRef<number | null>(null);
-  const crossSectionVerticalCenterOffsetMmRef = useRef(0);
 
   const clearProtocolListener = useCallback(() => {
     if (hpSubscriptionRef.current) {
@@ -4353,7 +4250,6 @@ export function useCPROrchestrator({
         (phase2VirtualPano.usedAsDisplayedOutput
           ? phase2BaseAttempt?.verticalCenterOffsetMm
           : bestAttempt.verticalCenterOffsetMm) ?? 0;
-      crossSectionVerticalCenterOffsetMmRef.current = crossSectionVerticalCenterOffsetMm;
       console.log('[CPR-CROSSSECTION-GEOMETRY-JSON]', JSON.stringify({
         runId: debugRunId,
         displayedOutputMode,
@@ -4419,7 +4315,14 @@ export function useCPROrchestrator({
 
       // Keep exactly one arch annotation to avoid stale/ghost spline overlays.
       removeSplineAnnotationsExcept(latestAnnotationUID);
-      cprStateService.setArchData(controlPoints, frames, sourceVolumeId, latestAnnotationUID);
+      cprStateService.setArchData(
+        controlPoints,
+        frames,
+        sourceVolumeId,
+        latestAnnotationUID,
+        crossSectionVerticalCenterOffsetMm,
+        selectedLocalCenterOffsetsMm
+      );
 
       clearProtocolListener();
 
@@ -4599,6 +4502,7 @@ export function useCPROrchestrator({
                 sourceVolumeId,
                 selectedActualVertHalfMm,
                 crossSectionVerticalCenterOffsetMm,
+                selectedLocalCenterOffsetsMm,
                 selectedLocalCenterOffsetsMm.length === frames.length,
                 servicesManager
               )
@@ -4813,11 +4717,9 @@ export function useCPROrchestrator({
       dotSlabS: nSlab[0] * s[0] + nSlab[1] * s[1] + nSlab[2] * s[2],
     });
 
-    setCrossSectionForFrame(
-      frame,
-      servicesManager,
-      crossSectionVerticalCenterOffsetMmRef.current
-    );
+    const verticalCenterOffsetMm =
+      cprStateService.getCrossSectionVerticalCenterOffsetMm(clampedIndex);
+    setCrossSectionForFrame(frame, servicesManager, verticalCenterOffsetMm);
     const panoViewport = findViewportByLogicalId(servicesManager, 'cpr-pano');
     if (panoViewport?.element) {
       cornerstoneTools.utilities.triggerAnnotationRender(panoViewport.element);

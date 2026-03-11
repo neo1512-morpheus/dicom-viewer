@@ -5,6 +5,7 @@ import {
   utilities as csUtils,
   Types as CoreTypes,
   BaseVolumeViewport,
+  Enums as csCoreEnums,
 } from '@cornerstonejs/core';
 import {
   ToolGroupManager,
@@ -25,12 +26,12 @@ import getActiveViewportEnabledElement from './utils/getActiveViewportEnabledEle
 import toggleVOISliceSync from './utils/toggleVOISliceSync';
 import { cprStateService } from '../../../modes/cpr/src/CPRStateService';
 import { buildCrossSectionCameraForFrame } from '../../../modes/cpr/src/cprCrossSectionCamera';
-import { getDefaultCrossSectionVoiRange } from '../../../modes/cpr/src/crossSectionImageLoader';
 
 const toggleSyncFunctions = {
   imageSlice: toggleImageSliceSync,
   voi: toggleVOISliceSync,
 };
+const CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM = 1.5;
 
 function commandsModule({
   servicesManager,
@@ -690,15 +691,57 @@ function commandsModule({
             0,
             Math.min(cprStateService.getCurrentFrameIndex(), frames.length - 1)
           );
+          const frame = frames[frameIndex];
+          const sourceVolumeId = cprStateService.getSourceVolumeId();
+
+          if (viewport instanceof BaseVolumeViewport) {
+            const actorUIDs = sourceVolumeId ? [sourceVolumeId] : [];
+            const verticalCenterOffsetMm =
+              cprStateService.getCrossSectionVerticalCenterOffsetMm(frameIndex);
+
+            if (sourceVolumeId) {
+              viewport.resetProperties?.(sourceVolumeId);
+              viewport.setProperties?.(
+                { slabThickness: CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM, invert: false },
+                sourceVolumeId
+              );
+            } else {
+              viewport.resetProperties?.();
+              viewport.setProperties?.({
+                slabThickness: CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM,
+                invert: false,
+              });
+            }
+            viewport.setBlendMode(
+              csCoreEnums.BlendModes.AVERAGE_INTENSITY_BLEND,
+              actorUIDs
+            );
+            const resetCrossSectionCamera = buildCrossSectionCameraForFrame(
+              frame,
+              undefined,
+              verticalCenterOffsetMm
+            );
+            console.log(
+              `[CPR-DEBUG] resetViewport cpr-crosssection ${JSON.stringify({
+                viewportId: viewport.id,
+                frameIndex,
+                verticalCenterOffsetMm,
+                requestedParallelScale: resetCrossSectionCamera.parallelScale,
+              })}`
+            );
+            viewport.setCamera(resetCrossSectionCamera);
+            console.log(
+              `[CPR-DEBUG] resetViewport cpr-crosssection appliedCamera ${JSON.stringify({
+                viewportId: viewport.id,
+                appliedParallelScale: viewport.getCamera?.()?.parallelScale ?? null,
+              })}`
+            );
+            viewport.render();
+            return;
+          }
+
           if (viewport instanceof StackViewport) {
-            const crossSectionVoiRange = getDefaultCrossSectionVoiRange();
             viewport.resetProperties?.();
-            viewport.setProperties?.({
-              isComputedVOI: false,
-              voiRange: crossSectionVoiRange,
-              invert: false,
-              VOILUTFunction: 'LINEAR_EXACT',
-            } as any);
             if (viewport.element) {
               cstUtils.jumpToSlice(viewport.element, { imageIndex: frameIndex });
             }
@@ -707,10 +750,8 @@ function commandsModule({
             return;
           }
 
-          const frame = frames[frameIndex];
-          const previousCamera = viewport.getCamera?.();
           viewport.resetProperties?.();
-          viewport.setCamera(buildCrossSectionCameraForFrame(frame, previousCamera));
+          viewport.resetCamera?.();
           viewport.render();
           return;
         }

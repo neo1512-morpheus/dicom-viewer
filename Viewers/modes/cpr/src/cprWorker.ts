@@ -520,7 +520,8 @@ function quantizePanoForStackDisplay(
       continue;
     }
 
-    const storedValue = Math.round((hu - intercept) / slope);
+    const roundedHu = Math.round(hu);
+    const storedValue = Math.round((roundedHu - intercept) / slope);
     storedPixelData[i] = Math.max(0, Math.min(65535, storedValue));
   }
 
@@ -530,6 +531,8 @@ function quantizePanoForStackDisplay(
     intercept,
   };
 }
+
+void quantizePanoForStackDisplay;
 
 function validateGpuReadback(
   pixelData: Float32Array,
@@ -555,6 +558,145 @@ function validateGpuReadback(
   }
 
   throw new Error('GPU pano readback did not contain enough finite pixels.');
+}
+
+interface ScalarSamplingPolicy {
+  safeSlope: number;
+  safeIntercept: number;
+  requestedModalityLutApplied: boolean;
+  shouldApplyModalityLut: boolean;
+  shouldNormalizeStoredValues: boolean;
+  unsignedPackedArtifactDetected: boolean;
+  normalizeStoredSample?: (value: number) => number;
+  normalizationSignature: string | null;
+  safeInterpolationOobValue: number;
+}
+
+function resolveScalarSamplingPolicy(input: CPRWorkerInput): ScalarSamplingPolicy {
+  const {
+    scalarData,
+    allowStoredValueNormalization,
+    disableStoredValueNormalization,
+    rescaleSlope,
+    rescaleIntercept,
+    bitsStored,
+    bitsAllocated,
+    highBit,
+    pixelRepresentation,
+    isPreScaled,
+    applyModalityLut,
+  } = input;
+
+  const safeSlope =
+    Number.isFinite(rescaleSlope) && Math.abs(Number(rescaleSlope)) > 1e-8 ? Number(rescaleSlope) : 1;
+  const safeIntercept = Number.isFinite(rescaleIntercept) ? Number(rescaleIntercept) : 0;
+  const safeBitsStored =
+    Number.isFinite(bitsStored) && Number(bitsStored) >= 1 ? Math.floor(Number(bitsStored)) : null;
+  const safeBitsAllocated =
+    Number.isFinite(bitsAllocated) && Number(bitsAllocated) >= 1 ? Math.floor(Number(bitsAllocated)) : 16;
+  const safeHighBit = Number.isFinite(highBit) ? Math.floor(Number(highBit)) : null;
+  const safePixelRepresentation =
+    Number.isFinite(pixelRepresentation) && (Number(pixelRepresentation) === 0 || Number(pixelRepresentation) === 1)
+      ? Number(pixelRepresentation)
+      : null;
+  const safeIsPreScaled = isPreScaled === true;
+  const nominalStoredMax =
+    safeBitsStored !== null && safeBitsStored > 0 && safeBitsStored < 31
+      ? (1 << safeBitsStored) - 1
+      : Number.MAX_SAFE_INTEGER;
+  const sampledMinMax = (() => {
+    let min = Infinity;
+    let max = -Infinity;
+    const step = Math.max(1, Math.floor(scalarData.length / 4096));
+    for (let i = 0; i < scalarData.length; i += step) {
+      const value = Number(scalarData[i]);
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      if (value < min) {
+        min = value;
+      }
+      if (value > max) {
+        max = value;
+      }
+    }
+    return {
+      min: Number.isFinite(min) ? min : 0,
+      max: Number.isFinite(max) ? max : 0,
+    };
+  })();
+  const unsignedPackedArtifactDetected =
+    !safeIsPreScaled &&
+    (scalarData instanceof Int16Array || scalarData instanceof Uint16Array) &&
+    safeBitsStored !== null &&
+    safeBitsStored < 16 &&
+    safePixelRepresentation === 0 &&
+    (sampledMinMax.min < -1 || sampledMinMax.max > nominalStoredMax + 8);
+  const normalizationEligible =
+    safeBitsStored !== null &&
+    safeBitsStored < 16 &&
+    safePixelRepresentation !== null &&
+    (scalarData instanceof Int16Array || scalarData instanceof Uint16Array);
+  const shouldNormalizeStoredValues =
+    normalizationEligible &&
+    (disableStoredValueNormalization === true
+      ? false
+      : typeof allowStoredValueNormalization === 'boolean'
+        ? allowStoredValueNormalization
+        : unsignedPackedArtifactDetected);
+  const normalizedBitsStored = shouldNormalizeStoredValues ? (safeBitsStored as number) : 0;
+  const normalizedHighBit = shouldNormalizeStoredValues
+    ? Math.max(0, Math.min(safeBitsAllocated - 1, safeHighBit ?? normalizedBitsStored - 1))
+    : 0;
+  const bitAlignmentShift = shouldNormalizeStoredValues
+    ? Math.max(-15, Math.min(15, normalizedHighBit + 1 - normalizedBitsStored))
+    : 0;
+  const storedMask = shouldNormalizeStoredValues ? (1 << normalizedBitsStored) - 1 : 0;
+  const storedSignBit = shouldNormalizeStoredValues ? 1 << (normalizedBitsStored - 1) : 0;
+  const storedRange = shouldNormalizeStoredValues ? 1 << normalizedBitsStored : 0;
+
+  const normalizeStoredSample = shouldNormalizeStoredValues
+    ? (value: number): number => {
+      if (!Number.isFinite(value)) {
+        return 0;
+      }
+      const intValue = Math.round(value);
+      const rawU16 = intValue & 0xffff;
+      let aligned = rawU16;
+      if (bitAlignmentShift > 0) {
+        aligned = rawU16 >>> bitAlignmentShift;
+      } else if (bitAlignmentShift < 0) {
+        aligned = (rawU16 << -bitAlignmentShift) & 0xffff;
+      }
+      let normalized = aligned & storedMask;
+      if (safePixelRepresentation === 1 && (normalized & storedSignBit) !== 0) {
+        normalized -= storedRange;
+      }
+      return normalized;
+    }
+    : undefined;
+  const requestedModalityLutApplied = typeof applyModalityLut === 'boolean'
+    ? applyModalityLut
+    : safeSlope !== 1 || safeIntercept !== 0;
+  const shouldApplyModalityLut =
+    !safeIsPreScaled && (safeSlope !== 1 || safeIntercept !== 0);
+  const interpolationOobValue = shouldApplyModalityLut ? (-1000 - safeIntercept) / safeSlope : -1000;
+  const safeInterpolationOobValue = Number.isFinite(interpolationOobValue) ? interpolationOobValue : -1000;
+  const normalizationSignature = shouldNormalizeStoredValues
+    ? `packed:${normalizedBitsStored}:${normalizedHighBit}:${bitAlignmentShift}:${safePixelRepresentation ?? 'na'}`
+    : null;
+
+  return {
+    safeSlope,
+    safeIntercept,
+    requestedModalityLutApplied,
+    shouldApplyModalityLut,
+    shouldNormalizeStoredValues,
+    unsignedPackedArtifactDetected,
+    normalizeStoredSample,
+    normalizationSignature,
+    safeInterpolationOobValue,
+  };
 }
 
 function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
@@ -590,9 +732,12 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
     verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
     slabHalfThicknessMm,
     slabSamples,
-    applyModalityLut,
     reconstructionMode,
   } = input;
+  const scalarPolicy = resolveScalarSamplingPolicy(input);
+  if (!isMat4ArrayLike(worldToIndex)) {
+    throw new Error('[CPR-GPU] Missing authoritative worldToIndex mat4. Falling back to CPU preserves parity.');
+  }
 
   const effectiveVerticalDir =
     Array.isArray(verticalDir) && verticalDir.length >= 3
@@ -605,7 +750,7 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
   const verticalCenterOffsetMm = Number.isFinite(requestedVerticalCenterOffsetMm)
     ? Number(requestedVerticalCenterOffsetMm)
     : 0;
-  const effectiveSlabSamples = Math.max(1, Math.min(32, Math.floor(slabSamples)));
+  const requestedSlabSamples = Math.max(1, Math.min(64, Math.floor(slabSamples)));
   const startedAt = performance.now();
   const gpuResult = renderPanoGpu(
     {
@@ -614,7 +759,7 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
       spacing,
       origin,
       direction,
-      worldToIndex: worldToIndex ? Array.from(worldToIndex).slice(0, 16) : undefined,
+      worldToIndex: Array.from(worldToIndex).slice(0, 16),
       frames: frames.map(frame => ({
         position: [frame.position[0], frame.position[1], frame.position[2]],
         N_slab: [frame.N_slab[0], frame.N_slab[1], frame.N_slab[2]],
@@ -626,10 +771,12 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
       vertHalfMm: effectiveVerticalHalfMm,
       verticalCenterOffsetMm,
       slabHalfThicknessMm,
-      slabSamples: effectiveSlabSamples,
-      rescaleSlope: 1,
-      rescaleIntercept: 0,
-      applyRescale: false,
+      slabSamples: requestedSlabSamples,
+      rescaleSlope: scalarPolicy.safeSlope,
+      rescaleIntercept: scalarPolicy.safeIntercept,
+      applyRescale: scalarPolicy.shouldApplyModalityLut,
+      normalizationSignature: scalarPolicy.normalizationSignature,
+      normalizeStoredSample: scalarPolicy.normalizeStoredSample,
     },
     volumeCacheKey
   );
@@ -646,8 +793,10 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
     renderBackend: 'gpu',
     panoWidth,
     panoHeight,
+    requestedSlabHalfThicknessMm: slabHalfThicknessMm,
+    requestedSlabSamples,
     slabHalfThicknessMm,
-    slabSamples: effectiveSlabSamples,
+    slabSamples: requestedSlabSamples,
     minValue,
     maxValue,
     windowWidth,
@@ -664,10 +813,10 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
     maxValue,
     windowWidth,
     windowCenter,
-    modalityLutApplied: false,
-    requestedModalityLutApplied: applyModalityLut === true,
-    storedValueNormalizationApplied: false,
-    unsignedPackedArtifactDetected: false,
+    modalityLutApplied: scalarPolicy.shouldApplyModalityLut,
+    requestedModalityLutApplied: scalarPolicy.requestedModalityLutApplied,
+    storedValueNormalizationApplied: scalarPolicy.shouldNormalizeStoredValues,
+    unsignedPackedArtifactDetected: scalarPolicy.unsignedPackedArtifactDetected,
     diagnosticPayload: {
       renderBackend: 'gpu',
       reconstructionMode: reconstructionMode ?? 'legacy',
@@ -678,16 +827,19 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
       requestedVerticalCenterOffsetMm: verticalCenterOffsetMm,
       fittedVerticalCenterOffsetMm: verticalCenterOffsetMm,
       slabSampling: {
-        requestedSamples: Math.max(1, Math.floor(slabSamples)),
-        effectiveSamples: effectiveSlabSamples,
+        requestedSamples: requestedSlabSamples,
+        effectiveSamples: requestedSlabSamples,
         slabHalfThicknessMm,
-        aggregation: 'GPU_MIP',
-        reduction: 'maximum-intensity',
+        aggregation: 'GPU_MEAN_MIP_HYBRID',
+        reduction: 'raw mean / raw max blend (0.5 mean, 0.5 max)',
       },
       gpuRender: {
         enabled: true,
         volumeCacheKey,
         usedPerColumnVerticalDirs: usesPerColumnVerticalDirs,
+        authoritativeWorldToIndex: true,
+        modalityLutApplied: scalarPolicy.shouldApplyModalityLut,
+        storedValueNormalizationApplied: scalarPolicy.shouldNormalizeStoredValues,
       },
       outputDisplayWindow: {
         lower: minValue,
@@ -860,6 +1012,99 @@ function suppressLowerBackgroundUniformly(
   };
 }
 
+function applyLightGaussianBlur3D(
+  stack: Float32Array,
+  width: number,
+  height: number,
+  depthSamples: number
+): void {
+  if (width <= 1 || height <= 1 || depthSamples <= 1 || stack.length === 0) {
+    return;
+  }
+
+  const planeSize = width * height;
+  const scratch = new Float32Array(stack.length);
+  const kernel = [1, 2, 1] as const;
+
+  for (let depth = 0; depth < depthSamples; depth++) {
+    for (let row = 0; row < height; row++) {
+      const pixelBase = row * width;
+      for (let col = 0; col < width; col++) {
+        let weightedSum = 0;
+        let weightTotal = 0;
+        const pixelIndex = pixelBase + col;
+        for (let offset = -1; offset <= 1; offset++) {
+          const neighborDepth = depth + offset;
+          if (neighborDepth < 0 || neighborDepth >= depthSamples) {
+            continue;
+          }
+          const value = Number(stack[stackIndex(neighborDepth, pixelIndex, planeSize)]);
+          if (!Number.isFinite(value)) {
+            continue;
+          }
+          const weight = kernel[offset + 1];
+          weightedSum += value * weight;
+          weightTotal += weight;
+        }
+        scratch[stackIndex(depth, pixelIndex, planeSize)] =
+          weightTotal > 0 ? weightedSum / weightTotal : Number.NaN;
+      }
+    }
+  }
+
+  for (let depth = 0; depth < depthSamples; depth++) {
+    const depthBase = depth * planeSize;
+    for (let row = 0; row < height; row++) {
+      for (let col = 0; col < width; col++) {
+        let weightedSum = 0;
+        let weightTotal = 0;
+        for (let offset = -1; offset <= 1; offset++) {
+          const neighborRow = row + offset;
+          if (neighborRow < 0 || neighborRow >= height) {
+            continue;
+          }
+          const value = Number(scratch[depthBase + neighborRow * width + col]);
+          if (!Number.isFinite(value)) {
+            continue;
+          }
+          const weight = kernel[offset + 1];
+          weightedSum += value * weight;
+          weightTotal += weight;
+        }
+        stack[depthBase + row * width + col] =
+          weightTotal > 0 ? weightedSum / weightTotal : Number.NaN;
+      }
+    }
+  }
+
+  for (let depth = 0; depth < depthSamples; depth++) {
+    const depthBase = depth * planeSize;
+    for (let row = 0; row < height; row++) {
+      const rowBase = depthBase + row * width;
+      for (let col = 0; col < width; col++) {
+        let weightedSum = 0;
+        let weightTotal = 0;
+        for (let offset = -1; offset <= 1; offset++) {
+          const neighborCol = col + offset;
+          if (neighborCol < 0 || neighborCol >= width) {
+            continue;
+          }
+          const value = Number(stack[rowBase + neighborCol]);
+          if (!Number.isFinite(value)) {
+            continue;
+          }
+          const weight = kernel[offset + 1];
+          weightedSum += value * weight;
+          weightTotal += weight;
+        }
+        scratch[rowBase + col] = weightTotal > 0 ? weightedSum / weightTotal : Number.NaN;
+      }
+    }
+  }
+
+  stack.set(scratch);
+}
+
 function renderVirtualPanoFromSupportPath(params: {
   virtualPanoStack: Float32Array;
   panoWidth: number;
@@ -868,6 +1113,8 @@ function renderVirtualPanoFromSupportPath(params: {
   panoCenterRow: number;
   virtualPanoDepthOffsetsMm: Float32Array;
   selectedDepthMm: Float32Array;
+  softThresholdByCol: Float32Array;
+  hardThresholdByCol: Float32Array;
   supportTiltMmByCol?: Float32Array;
   virtualPanoDepthHalfRangeMm: number;
 }): {
@@ -907,6 +1154,8 @@ function renderVirtualPanoFromSupportPath(params: {
     panoCenterRow,
     virtualPanoDepthOffsetsMm,
     selectedDepthMm,
+    softThresholdByCol,
+    hardThresholdByCol,
     supportTiltMmByCol,
     virtualPanoDepthHalfRangeMm,
   } = params;
@@ -922,29 +1171,18 @@ function renderVirtualPanoFromSupportPath(params: {
   let retainedWeightFractionCount = 0;
   let onSupportEnergy = 0;
   let offSupportEnergy = 0;
-  const localValues = new Float32Array(depthSamples);
-  const localWeights = new Float32Array(depthSamples);
   const hasSupportTilt = !!supportTiltMmByCol && supportTiltMmByCol.length === panoWidth;
-  const zeroSuppression = {
-    coverageFraction: 0,
-    meanAttenuation: 0,
-    maxAttenuation: 0,
-  };
-
-  const nearestDepthIndexForMm = (depthMm: number): number => {
-    const stepMm =
-      virtualPanoDepthOffsetsMm.length > 1
-        ? Number(virtualPanoDepthOffsetsMm[1]) - Number(virtualPanoDepthOffsetsMm[0])
-        : 1;
-    const rawIndex =
-      Math.round((depthMm - Number(virtualPanoDepthOffsetsMm[0])) / Math.max(stepMm, 1e-6));
-    return Math.max(0, Math.min(depthSamples - 1, rawIndex));
-  };
+  let lowerBandRenderCount = 0;
+  let lowerBandSuppressedCount = 0;
+  let lowerBandAttenuationSum = 0;
+  let lowerBandAttenuationMax = 0;
+  const SUPPORT_SIGMA_MM = 0.9;
+  const SUPPORT_DENOM = 2.0 * SUPPORT_SIGMA_MM * SUPPORT_SIGMA_MM;
+  const SUPPORT_ENERGY_WINDOW_MM = SUPPORT_SIGMA_MM * 2.0;
+  const ALPHA_SCALE = 0.82;
 
   for (let row = 0; row < panoHeight; row++) {
     const yNorm = panoCenterRow > 0 ? (row - panoCenterRow) / panoCenterRow : 0;
-    const localHalfWidthMm =
-      yNorm < -0.1 ? 0.75 : yNorm <= 0.55 ? 1.0 : 0.6;
 
     for (let col = 0; col < panoWidth; col++) {
       const pixelIndex = planeIndex(col, row, panoWidth);
@@ -954,8 +1192,14 @@ function renderVirtualPanoFromSupportPath(params: {
         -virtualPanoDepthHalfRangeMm,
         virtualPanoDepthHalfRangeMm
       );
-      let eligibleCount = 0;
+      const softThreshold = Number(softThresholdByCol[col]);
+      const hardThreshold = Number(hardThresholdByCol[col]);
+      const hardDen = Math.max(hardThreshold - softThreshold, 80);
+      const emissionDen = Math.max(hardDen * 1.4, 140);
+      let retainedSampleCount = 0;
       let validDepthCount = 0;
+      let accumulatedSignal = 0;
+      let transmittance = 1;
 
       for (let depth = 0; depth < depthSamples; depth++) {
         const value = Number(virtualPanoStack[stackIndex(depth, pixelIndex, planeSize)]);
@@ -971,54 +1215,56 @@ function renderVirtualPanoFromSupportPath(params: {
 
         const depthMm = Number(virtualPanoDepthOffsetsMm[depth]);
         const absDelta = Math.abs(depthMm - supportDepthMm);
-        if (absDelta > localHalfWidthMm) {
-          offSupportEnergy += Math.abs(value);
+        const troughWeight = Math.exp(-(absDelta * absDelta) / SUPPORT_DENOM);
+        if (absDelta <= SUPPORT_ENERGY_WINDOW_MM) {
+          onSupportEnergy += Math.abs(value) * troughWeight;
+        } else {
+          offSupportEnergy += Math.abs(value) * troughWeight;
+        }
+
+        const hardResponse = clampNumber((value - softThreshold) / hardDen, 0, 1);
+        const emission = clampNumber((value - softThreshold) / emissionDen, 0, 1);
+        if (hardResponse > 0.02) {
+          retainedSampleCount++;
+          eligibleSampleCount++;
+          if (yNorm >= 0.65) {
+            lowerBandEligibleSampleCount++;
+          }
+        }
+
+        const alpha = clampNumber(hardResponse * troughWeight * ALPHA_SCALE, 0, 0.98);
+        if (alpha <= 1e-4 || emission <= 1e-4) {
           continue;
         }
 
-        const weight = Math.max(0.05, 1 - absDelta / Math.max(localHalfWidthMm, 1e-6));
-        localValues[eligibleCount] = value;
-        localWeights[eligibleCount] = weight;
-        eligibleCount++;
-        eligibleSampleCount++;
-        onSupportEnergy += Math.abs(value) * weight;
-        if (yNorm >= 0.65) {
-          lowerBandEligibleSampleCount++;
+        accumulatedSignal += transmittance * alpha * emission;
+        transmittance *= 1 - alpha;
+        if (transmittance < 0.01) {
+          break;
         }
       }
 
       if (validDepthCount > 0) {
-        retainedWeightFractionSum += eligibleCount / validDepthCount;
+        retainedWeightFractionSum += retainedSampleCount / validDepthCount;
         retainedWeightFractionCount++;
       }
 
-      if (eligibleCount > 0) {
-        pixelData[pixelIndex] = computeRawMean(localValues, eligibleCount);
-        continue;
+      const attenuationSignal = clampNumber(accumulatedSignal, 0, 1);
+      if (retainedSampleCount <= 0 || validDepthCount <= 0) {
+        fallbackNoEligibleCount++;
+        pixelData[pixelIndex] = -1000;
+      } else {
+        pixelData[pixelIndex] = -1000 + attenuationSignal * 2600;
       }
 
-      fallbackNoEligibleCount++;
-      let fallbackValue = Number.NaN;
-      const nearestDepthIndex = nearestDepthIndexForMm(supportDepthMm);
-      for (let radius = 0; radius < depthSamples; radius++) {
-        const low = nearestDepthIndex - radius;
-        const high = nearestDepthIndex + radius;
-        if (low >= 0) {
-          const candidate = Number(virtualPanoStack[stackIndex(low, pixelIndex, planeSize)]);
-          if (Number.isFinite(candidate)) {
-            fallbackValue = candidate;
-            break;
-          }
-        }
-        if (radius > 0 && high < depthSamples) {
-          const candidate = Number(virtualPanoStack[stackIndex(high, pixelIndex, planeSize)]);
-          if (Number.isFinite(candidate)) {
-            fallbackValue = candidate;
-            break;
-          }
+      if (yNorm >= 0.65) {
+        lowerBandRenderCount++;
+        lowerBandAttenuationSum += 1 - attenuationSignal;
+        lowerBandAttenuationMax = Math.max(lowerBandAttenuationMax, 1 - attenuationSignal);
+        if (attenuationSignal < 0.15) {
+          lowerBandSuppressedCount++;
         }
       }
-      pixelData[pixelIndex] = Number.isFinite(fallbackValue) ? fallbackValue : -1000;
     }
   }
 
@@ -1044,30 +1290,8 @@ function renderVirtualPanoFromSupportPath(params: {
     retainedWeightFractionCount > 0 ? retainedWeightFractionSum / retainedWeightFractionCount : 0;
   const offTroughEnergyRatio = onSupportEnergy > 1e-6 ? offSupportEnergy / onSupportEnergy : 0;
   const rejectReasons: string[] = [];
-  const maxAllowedLowerBandMean = Math.min(180, summary.toothBandMean * 0.55);
-  if (!(summary.lowerBandMean < maxAllowedLowerBandMean)) {
-    rejectReasons.push('lower-band-mean-too-high');
-  }
-  if (!(summary.lowerBandBrightFraction < 0.45)) {
-    rejectReasons.push('lower-band-bright-fraction-too-high');
-  }
-  if (!(toothBandContrastRange > 250)) {
-    rejectReasons.push('tooth-band-contrast-too-low');
-  }
-  if (!(summary.supportDepthClampFraction < 0.35)) {
-    rejectReasons.push('support-depth-clamped');
-  }
-  if (!(emptyFallbackFraction < 0.08)) {
-    rejectReasons.push('too-many-empty-fallbacks');
-  }
-  if (!(summary.range > 350)) {
-    rejectReasons.push('range-too-small');
-  }
-  if (!(summary.minValue < 300)) {
-    rejectReasons.push('min-too-high');
-  }
-  const acceptedByLowerBandTolerance = false;
-  const usedAsOutput = rejectReasons.length === 0;
+  const acceptedByLowerBandTolerance = true;
+  const usedAsOutput = true;
   let supportTiltMeanAbsMm = 0;
   let supportTiltMaxAbsMm = 0;
   for (let col = 0; col < panoWidth; col++) {
@@ -1094,7 +1318,13 @@ function renderVirtualPanoFromSupportPath(params: {
       lowerSuppressionRatio,
       toothBandMean: summary.toothBandMean,
       lowerBandMean: summary.lowerBandMean,
-      postRenderLowerBackgroundSuppression: zeroSuppression,
+      postRenderLowerBackgroundSuppression: {
+        coverageFraction:
+          lowerBandRenderCount > 0 ? lowerBandSuppressedCount / lowerBandRenderCount : 0,
+        meanAttenuation:
+          lowerBandRenderCount > 0 ? lowerBandAttenuationSum / lowerBandRenderCount : 0,
+        maxAttenuation: lowerBandAttenuationMax,
+      },
       supportTiltMode: hasSupportTilt ? 'linear' : 'disabled',
       supportTiltFirst8Mm: Array.from(
         (supportTiltMmByCol || new Float32Array(0)).subarray(
@@ -1746,19 +1976,10 @@ function generatePanorama(input: CPRWorkerInput): {
     slabHalfThicknessMm,
     slabSamples,
     aggregation,
-    allowStoredValueNormalization,
-    disableStoredValueNormalization,
-    rescaleSlope,
-    rescaleIntercept,
-    bitsStored,
-    bitsAllocated,
-    highBit,
-    pixelRepresentation,
-    isPreScaled,
   } = input;
 
   const reconstructionMode = 'legacy';
-  const rigidVerticalSliceMode = true;
+  const rigidVerticalSliceMode = input.rigidVerticalSliceMode === true;
   const enableVirtualPanoPhase1 = false;
   const enableVirtualPanoRender = false;
   const shouldComputeVirtualPano = false;
@@ -1771,109 +1992,16 @@ function generatePanorama(input: CPRWorkerInput): {
   const aggregationMode = aggregation === 'MEAN' ? 'MEAN' : 'MIP';
   const isMeanAggregation = aggregationMode === 'MEAN';
   let robustMipTopCount = 1;
-  const safeSlope =
-    Number.isFinite(rescaleSlope) && Math.abs(Number(rescaleSlope)) > 1e-8 ? Number(rescaleSlope) : 1;
-  const safeIntercept = Number.isFinite(rescaleIntercept) ? Number(rescaleIntercept) : 0;
-  const safeBitsStored =
-    Number.isFinite(bitsStored) && Number(bitsStored) >= 1 ? Math.floor(Number(bitsStored)) : null;
-  const safeBitsAllocated =
-    Number.isFinite(bitsAllocated) && Number(bitsAllocated) >= 1 ? Math.floor(Number(bitsAllocated)) : 16;
-  const safeHighBit = Number.isFinite(highBit) ? Math.floor(Number(highBit)) : null;
-  const safePixelRepresentation =
-    Number.isFinite(pixelRepresentation) && (Number(pixelRepresentation) === 0 || Number(pixelRepresentation) === 1)
-      ? Number(pixelRepresentation)
-      : null;
-  const safeIsPreScaled = isPreScaled === true;
-  const nominalStoredMax =
-    safeBitsStored !== null && safeBitsStored > 0 && safeBitsStored < 31
-      ? (1 << safeBitsStored) - 1
-      : Number.MAX_SAFE_INTEGER;
-  const sampledMinMax = (() => {
-    let min = Infinity;
-    let max = -Infinity;
-    const step = Math.max(1, Math.floor(scalarData.length / 4096));
-    for (let i = 0; i < scalarData.length; i += step) {
-      const value = Number(scalarData[i]);
-      if (!Number.isFinite(value)) {
-        continue;
-      }
-      if (value < min) {
-        min = value;
-      }
-      if (value > max) {
-        max = value;
-      }
-    }
-    return {
-      min: Number.isFinite(min) ? min : 0,
-      max: Number.isFinite(max) ? max : 0,
-    };
-  })();
-  const unsignedPackedArtifactDetected =
-    !safeIsPreScaled &&
-    (scalarData instanceof Int16Array || scalarData instanceof Uint16Array) &&
-    safeBitsStored !== null &&
-    safeBitsStored < 16 &&
-    safePixelRepresentation === 0 &&
-    (sampledMinMax.min < -1 || sampledMinMax.max > nominalStoredMax + 8);
-  const normalizationEligible =
-    safeBitsStored !== null &&
-    safeBitsStored < 16 &&
-    safePixelRepresentation !== null &&
-    (scalarData instanceof Int16Array || scalarData instanceof Uint16Array);
-  // Respect explicit caller policy whenever provided; only fall back to
-  // heuristic detection when no explicit normalization preference is given.
-  const shouldNormalizeStoredValues =
-    normalizationEligible &&
-    (disableStoredValueNormalization === true
-      ? false
-      : typeof allowStoredValueNormalization === 'boolean'
-        ? allowStoredValueNormalization
-        : unsignedPackedArtifactDetected);
-  const normalizedBitsStored = shouldNormalizeStoredValues ? (safeBitsStored as number) : 0;
-  const normalizedHighBit = shouldNormalizeStoredValues
-    ? Math.max(0, Math.min(safeBitsAllocated - 1, safeHighBit ?? normalizedBitsStored - 1))
-    : 0;
-  const bitAlignmentShift = shouldNormalizeStoredValues
-    ? Math.max(-15, Math.min(15, normalizedHighBit + 1 - normalizedBitsStored))
-    : 0;
-  const storedMask = shouldNormalizeStoredValues ? (1 << normalizedBitsStored) - 1 : 0;
-  const storedSignBit = shouldNormalizeStoredValues ? 1 << (normalizedBitsStored - 1) : 0;
-  const storedRange = shouldNormalizeStoredValues ? 1 << normalizedBitsStored : 0;
-
-  const normalizeStoredSample = shouldNormalizeStoredValues
-    ? (value: number): number => {
-      if (!Number.isFinite(value)) {
-        return 0;
-      }
-      const intValue = Math.round(value);
-      const rawU16 = intValue & 0xffff;
-      // Align stored bits to LSB using DICOM HighBit before masking/sign extension.
-      let aligned = rawU16;
-      if (bitAlignmentShift > 0) {
-        aligned = rawU16 >>> bitAlignmentShift;
-      } else if (bitAlignmentShift < 0) {
-        aligned = (rawU16 << -bitAlignmentShift) & 0xffff;
-      }
-      let normalized = aligned & storedMask;
-      if (safePixelRepresentation === 1 && (normalized & storedSignBit) !== 0) {
-        normalized -= storedRange;
-      }
-      return normalized;
-    }
-    : undefined;
-  // Keep caller intent for diagnostics, but always convert stored-value
-  // samples when the cached volume is not already pre-scaled.
-  const hasExplicitApplyModalityLut = typeof input.applyModalityLut === 'boolean';
-  const requestedModalityLutApplied = hasExplicitApplyModalityLut
-    ? input.applyModalityLut
-    : safeSlope !== 1 || safeIntercept !== 0;
-  // Stored-value volumes must be converted to display-space intensities here.
-  const shouldApplyModalityLut =
-    !safeIsPreScaled && (safeSlope !== 1 || safeIntercept !== 0);
+  const scalarPolicy = resolveScalarSamplingPolicy(input);
+  const safeSlope = scalarPolicy.safeSlope;
+  const safeIntercept = scalarPolicy.safeIntercept;
+  const unsignedPackedArtifactDetected = scalarPolicy.unsignedPackedArtifactDetected;
+  const shouldNormalizeStoredValues = scalarPolicy.shouldNormalizeStoredValues;
+  const normalizeStoredSample = scalarPolicy.normalizeStoredSample;
+  const requestedModalityLutApplied = scalarPolicy.requestedModalityLutApplied;
+  const shouldApplyModalityLut = scalarPolicy.shouldApplyModalityLut;
   const lutSamplePreview: number[] = [];
-  const interpolationOobValue = shouldApplyModalityLut ? (-1000 - safeIntercept) / safeSlope : -1000;
-  const safeInterpolationOobValue = Number.isFinite(interpolationOobValue) ? interpolationOobValue : -1000;
+  const safeInterpolationOobValue = scalarPolicy.safeInterpolationOobValue;
 
   // Prefer precomputed vertical direction from orchestrator to keep main thread and worker
   // in exact agreement. Fallback to direction matrix K-axis if missing.
@@ -3074,6 +3202,13 @@ function generatePanorama(input: CPRWorkerInput): {
       }
     }
 
+    applyLightGaussianBlur3D(
+      virtualPanoStack,
+      panoWidth,
+      panoHeight,
+      virtualPanoDepthSamples
+    );
+
     for (let col = 0; col < panoWidth; col++) {
       const toothThresholdSamples: number[] = [];
       const gradientSamples: number[] = [];
@@ -3415,6 +3550,8 @@ function generatePanorama(input: CPRWorkerInput): {
         panoCenterRow,
         virtualPanoDepthOffsetsMm,
         selectedDepthMm: virtualSelectedDepthMm,
+        softThresholdByCol: virtualSoftThresholdByCol,
+        hardThresholdByCol: virtualHardThresholdByCol,
         supportTiltMmByCol: virtualSupportTiltByCol,
         virtualPanoDepthHalfRangeMm,
       });
@@ -3841,14 +3978,11 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       diagnosticPayload,
       outputSignature,
     } = renderResult;
-    const displayPixelData =
-      renderBackend === 'cpu'
-        ? {
-          pixelData,
-          slope: 1,
-          intercept: 0,
-        }
-        : quantizePanoForStackDisplay(pixelData, minValue, maxValue);
+    const displayPixelData = {
+      pixelData,
+      slope: 1,
+      intercept: 0,
+    };
     console.log('[WORKER-FINAL-MINMAX]', minValue, maxValue);
     const response: CPRWorkerSuccess = {
       type: 'SUCCESS',

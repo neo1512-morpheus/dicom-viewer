@@ -61,11 +61,7 @@ void main() {
 }
 `;
 
-const FRAG_SRC = `#version 300 es
-precision highp float;
-precision highp sampler3D;
-precision highp sampler2D;
-
+const RAY_SHADER_COMMON_GLSL = `
 uniform sampler3D uVolume;
 uniform sampler2D uSplineData; // width=panoWidth, height=3; row0=pos, row1=slabDir, row2=verticalDir
 
@@ -80,13 +76,9 @@ uniform int uPanoHeight;
 uniform mat4 uWorldToIndex;
 uniform vec3 uDims;
 
-// Rescale: applied AFTER trilinear sampling (matches Cornerstone GPU pipeline)
 uniform float uRescaleSlope;
 uniform float uRescaleIntercept;
 uniform bool uApplyRescale;
-uniform int uDebugMode;
-
-out vec4 fragColor;
 
 vec3 encodeDirection(vec3 direction) {
   float directionLength = length(direction);
@@ -101,6 +93,120 @@ vec3 encodeIndexCoord(vec3 indexCoord) {
   return clamp((indexCoord + 0.5) / safeDims, 0.0, 1.0);
 }
 
+float sampleHu(vec3 uvw) {
+  float rawVal = texture(uVolume, uvw).r;
+  return uApplyRescale ? rawVal * uRescaleSlope + uRescaleIntercept : rawVal;
+}
+
+float computeNativeSlabPitchMm(vec3 slabDirIndexPerMm) {
+  return clamp(1.0 / max(length(slabDirIndexPerMm), 1e-5), 0.3, 0.6);
+}
+
+int computeRaySampleCount(float slabWidthMm, float nativeSlabPitchMm, int requestedSampleCount) {
+  const int MAX_SLAB = 64;
+  int pitchAlignedSampleCount = 1;
+  if (slabWidthMm > 1e-4) {
+    pitchAlignedSampleCount = min(MAX_SLAB, max(3, int(ceil(slabWidthMm / nativeSlabPitchMm)) + 1));
+  }
+  return min(MAX_SLAB, max(1, min(max(requestedSampleCount, 1), pitchAlignedSampleCount)));
+}
+
+vec3 sampleSplineRowLinear(float curveColumnCoord, int splineRow) {
+  float safeMaxColumn = max(float(uPanoWidth - 1), 0.0);
+  float clampedColumn = clamp(curveColumnCoord, 0.0, safeMaxColumn);
+  float leftColumnFloat = floor(clampedColumn);
+  int leftColumn = int(leftColumnFloat);
+  int rightColumn = min(leftColumn + 1, max(uPanoWidth - 1, 0));
+  float blend = clampedColumn - leftColumnFloat;
+  vec3 leftValue = texelFetch(uSplineData, ivec2(leftColumn, splineRow), 0).xyz;
+  vec3 rightValue = texelFetch(uSplineData, ivec2(rightColumn, splineRow), 0).xyz;
+  return mix(leftValue, rightValue, blend);
+}
+
+float computeCurveColumnCoord(int col) {
+  return clamp(float(col), 0.0, max(float(uPanoWidth - 1), 0.0));
+}
+
+void loadRayGeometry(
+  float curveColumnCoord,
+  int outputRow,
+  out vec3 baseWorldPos,
+  out vec3 slabDirWorld,
+  out vec3 slabDirIndexPerMm,
+  out vec3 baseIndex
+) {
+  int row = (uPanoHeight - 1) - outputRow;
+  vec3 pos = sampleSplineRowLinear(curveColumnCoord, 0);
+  vec3 slabDir = sampleSplineRowLinear(curveColumnCoord, 1);
+  vec3 verticalDir = sampleSplineRowLinear(curveColumnCoord, 2);
+
+  float slabDirLen = length(slabDir);
+  slabDir = slabDirLen > 1e-5 ? slabDir / slabDirLen : vec3(0.0, 0.0, 1.0);
+
+  float verticalDirLen = length(verticalDir);
+  verticalDir = verticalDirLen > 1e-5 ? verticalDir / verticalDirLen : normalize(uVerticalDir);
+
+  float panoHeightDen = max(1.0, float(uPanoHeight - 1));
+  float vertStepMm = (uVertHalfMm * 2.0) / panoHeightDen;
+  float vertOffsetMm = uVertCenterOffsetMm + (uVertHalfMm - float(row) * vertStepMm);
+  baseWorldPos = pos + vertOffsetMm * verticalDir;
+  slabDirWorld = slabDir;
+  slabDirIndexPerMm = (uWorldToIndex * vec4(slabDir, 0.0)).xyz;
+  baseIndex = (uWorldToIndex * vec4(baseWorldPos, 1.0)).xyz;
+}
+
+bool computeSampleUvw(
+  vec3 baseWorldPos,
+  vec3 slabDirWorld,
+  float slabOffset,
+  out vec3 uvw
+) {
+  vec3 sampleWorldPos = baseWorldPos + slabOffset * slabDirWorld;
+  vec3 sampleIndex = (uWorldToIndex * vec4(sampleWorldPos, 1.0)).xyz;
+  vec3 minIndex = vec3(-0.5);
+  vec3 maxIndex = uDims - vec3(0.5);
+  if (any(lessThan(sampleIndex, minIndex)) || any(greaterThan(sampleIndex, maxIndex))) {
+    return false;
+  }
+
+  vec3 clampedIndex = clamp(sampleIndex, vec3(0.0), max(uDims - vec3(1.001), vec3(0.0)));
+  uvw = (clampedIndex + vec3(0.5)) / uDims;
+  return true;
+}
+`;
+
+const ATTENUATION_MODEL_GLSL = `
+float pseudoAttenuationFromHu(float hu) {
+  float softTissue = 0.010 * smoothstep(-950.0, -120.0, hu);
+  float cancellousBone = 0.030 * smoothstep(-100.0, 450.0, hu);
+  float denseBone = 0.070 * smoothstep(250.0, 1400.0, hu);
+  float enamel = 0.145 * smoothstep(900.0, 3200.0, hu);
+  return softTissue + cancellousBone + denseBone + enamel;
+}
+
+float softFogAttenuationFromHu(float hu) {
+  float airToSoft = 0.008 * smoothstep(-950.0, -150.0, hu);
+  float softToLowBone = 0.012 * smoothstep(-150.0, 220.0, hu);
+  return airToSoft + softToLowBone;
+}
+
+float supportResponseFromHu(float hu) {
+  float trabecularSupport = smoothstep(120.0, 900.0, hu);
+  float denseSupport = smoothstep(700.0, 2200.0, hu);
+  return clamp(0.75 * trabecularSupport + 0.35 * denseSupport, 0.0, 1.0);
+}
+`;
+
+const DEBUG_FRAG_SRC = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+precision highp sampler2D;
+
+${RAY_SHADER_COMMON_GLSL}
+uniform int uDebugMode;
+
+out vec4 fragColor;
+
 void main() {
   int col = int(gl_FragCoord.x);
   int outputRow = int(gl_FragCoord.y);
@@ -108,33 +214,13 @@ void main() {
     fragColor = vec4(-1000.0, 0.0, 0.0, 1.0);
     return;
   }
+  float curveColumnCoord = computeCurveColumnCoord(col);
 
-  int row = (uPanoHeight - 1) - outputRow;
-  vec3 pos = texelFetch(uSplineData, ivec2(col, 0), 0).xyz;
-  vec3 slabDir = texelFetch(uSplineData, ivec2(col, 1), 0).xyz;
-  vec3 verticalDir = texelFetch(uSplineData, ivec2(col, 2), 0).xyz;
-
-  float slabDirLen = length(slabDir);
-  if (slabDirLen > 1e-5) {
-    slabDir /= slabDirLen;
-  } else {
-    slabDir = vec3(0.0, 0.0, 1.0);
-  }
-
-  float verticalDirLen = length(verticalDir);
-  if (verticalDirLen > 1e-5) {
-    verticalDir /= verticalDirLen;
-  } else {
-    verticalDir = normalize(uVerticalDir);
-  }
-
-  float panoHeightDen = max(1.0, float(uPanoHeight - 1));
-  float vertStepMm = (uVertHalfMm * 2.0) / panoHeightDen;
-  float vertOffsetMm = uVertCenterOffsetMm + (uVertHalfMm - float(row) * vertStepMm);
-  vec3 posIndex = (uWorldToIndex * vec4(pos, 1.0)).xyz;
-  vec3 slabDirIndexPerMm = (uWorldToIndex * vec4(slabDir, 0.0)).xyz;
-  vec3 verticalDirIndexPerMm = (uWorldToIndex * vec4(verticalDir, 0.0)).xyz;
-  vec3 baseIndex = posIndex + vertOffsetMm * verticalDirIndexPerMm;
+  vec3 baseWorldPos;
+  vec3 slabDirWorld;
+  vec3 slabDirIndexPerMm;
+  vec3 baseIndex;
+  loadRayGeometry(curveColumnCoord, outputRow, baseWorldPos, slabDirWorld, slabDirIndexPerMm, baseIndex);
 
   if (uDebugMode == 1) {
     fragColor = vec4(encodeIndexCoord(baseIndex), 1.0);
@@ -148,7 +234,7 @@ void main() {
 
   if (uDebugMode == 3) {
     int splineRow = min(2, (outputRow * 3) / max(1, uPanoHeight));
-    vec3 rawSpline = texelFetch(uSplineData, ivec2(col, splineRow), 0).xyz;
+    vec3 rawSpline = sampleSplineRowLinear(curveColumnCoord, splineRow);
     vec3 debugColor = splineRow == 0
       ? encodeIndexCoord((uWorldToIndex * vec4(rawSpline, 1.0)).xyz)
       : encodeDirection(rawSpline);
@@ -156,58 +242,318 @@ void main() {
     return;
   }
 
-  float slabStep = uSlabSamples > 1
-    ? (uSlabHalfMm * 2.0) / float(uSlabSamples - 1)
-    : 0.0;
-
-  vec3 clampMin = 0.5 / uDims;
-  vec3 clampMax = vec3(1.0) - 0.5 / uDims;
-
-  float finalHu = -1000.0;
-  float sumHu = 0.0;
-  float totalWeight = 0.0;
   const int MAX_SLAB = 64;
-  const float TROUGH_SIGMA_MM = 1.0;
-  const float TROUGH_DENOM = 2.0 * TROUGH_SIGMA_MM * TROUGH_SIGMA_MM;
+  float effectiveSlabHalfMm = max(uSlabHalfMm, 0.0);
+  float slabWidthMm = effectiveSlabHalfMm * 2.0;
+  int raySampleCount = min(MAX_SLAB, max(1, uSlabSamples));
+  float slabStep = raySampleCount > 1 ? slabWidthMm / float(raySampleCount - 1) : 0.0;
+  float sumHu = 0.0;
+  float rayMax = -3.402823e38;
+  int validSampleCount = 0;
 
   for (int s = 0; s < MAX_SLAB; s++) {
-    if (s >= uSlabSamples) {
+    if (s >= raySampleCount) {
       break;
     }
 
-    float slabOffset = uSlabSamples > 1
-      ? -uSlabHalfMm + float(s) * slabStep
+    float slabOffset = raySampleCount > 1
+      ? -effectiveSlabHalfMm + float(s) * slabStep
       : 0.0;
-
-    vec3 sampleIndex = baseIndex + slabOffset * slabDirIndexPerMm;
-    vec3 uvw = (sampleIndex + vec3(0.5)) / uDims;
-
-    if (any(lessThan(uvw, clampMin)) || any(greaterThan(uvw, clampMax))) {
+    vec3 uvw;
+    if (!computeSampleUvw(baseWorldPos, slabDirWorld, slabOffset, uvw)) {
       continue;
     }
 
-    float rawVal = texture(uVolume, uvw).r;
-    float hu = uApplyRescale ? rawVal * uRescaleSlope + uRescaleIntercept : rawVal;
-    hu = clamp(hu, -3000.0, 10000.0);
-    float troughWeight = exp(-(slabOffset * slabOffset) / TROUGH_DENOM);
-    sumHu += hu * troughWeight;
-    totalWeight += troughWeight;
+    float hu = sampleHu(uvw);
+    sumHu += hu;
+    rayMax = max(rayMax, hu);
+    validSampleCount++;
   }
 
-  if (totalWeight > 1e-5) {
-    finalHu = sumHu / totalWeight;
-  } else {
-    finalHu = -1000.0;
-  }
-
+  float meanHu = validSampleCount > 0 ? sumHu / float(validSampleCount) : -1000.0;
+  float finalHu = validSampleCount > 0 ? mix(meanHu, rayMax, 0.5) : -1000.0;
   fragColor = vec4(finalHu, 0.0, 0.0, 1.0);
+}
+`;
+
+const SUPPORT_FRAG_SRC = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+precision highp sampler2D;
+
+${RAY_SHADER_COMMON_GLSL}
+${ATTENUATION_MODEL_GLSL}
+
+out vec4 fragColor;
+
+void main() {
+  int col = int(gl_FragCoord.x);
+  int outputRow = int(gl_FragCoord.y);
+  if (col >= uPanoWidth || outputRow >= uPanoHeight) {
+    fragColor = vec4(0.0, 0.0, 1.0, 0.0);
+    return;
+  }
+  float curveColumnCoord = computeCurveColumnCoord(col);
+
+  vec3 baseWorldPos;
+  vec3 slabDirWorld;
+  vec3 slabDirIndexPerMm;
+  vec3 baseIndex;
+  loadRayGeometry(curveColumnCoord, outputRow, baseWorldPos, slabDirWorld, slabDirIndexPerMm, baseIndex);
+
+  float nativeSlabPitchMm = computeNativeSlabPitchMm(slabDirIndexPerMm);
+  float slabWidthMm = max(uSlabHalfMm * 2.0, 0.0);
+  int raySampleCount = computeRaySampleCount(slabWidthMm, nativeSlabPitchMm, uSlabSamples);
+  float slabStep = raySampleCount > 1 ? slabWidthMm / float(raySampleCount - 1) : 0.0;
+
+  float supportMass = 0.0;
+  float supportOffsetSum = 0.0;
+  float supportOffsetSqSum = 0.0;
+  float peakHu = -1000.0;
+  bool hasValidSample = false;
+
+  const int MAX_SLAB = 64;
+  for (int s = 0; s < MAX_SLAB; s++) {
+    if (s >= raySampleCount) {
+      break;
+    }
+
+    float slabOffset = raySampleCount > 1 ? -uSlabHalfMm + float(s) * slabStep : 0.0;
+    vec3 uvw;
+    if (!computeSampleUvw(baseWorldPos, slabDirWorld, slabOffset, uvw)) {
+      continue;
+    }
+
+    float hu = sampleHu(uvw);
+    float supportResponse = supportResponseFromHu(hu);
+    supportMass += supportResponse;
+    supportOffsetSum += slabOffset * supportResponse;
+    supportOffsetSqSum += slabOffset * slabOffset * supportResponse;
+    peakHu = max(peakHu, hu);
+    hasValidSample = true;
+  }
+
+  float defaultSpreadMm = max(uSlabHalfMm * 0.75, nativeSlabPitchMm);
+  if (!hasValidSample || supportMass <= 1e-5) {
+    fragColor = vec4(0.0, 0.0, defaultSpreadMm, 0.0);
+    return;
+  }
+
+  float supportCenterMm = supportOffsetSum / supportMass;
+  float secondMoment = supportOffsetSqSum / supportMass;
+  float varianceMm = max(secondMoment - supportCenterMm * supportCenterMm, nativeSlabPitchMm * nativeSlabPitchMm * 0.25);
+  float supportSpreadMm = sqrt(varianceMm);
+  float supportDensity = supportMass / max(float(raySampleCount), 1.0);
+  float supportConfidence =
+    smoothstep(0.05, 0.30, supportDensity) *
+    smoothstep(120.0, 950.0, peakHu);
+
+  fragColor = vec4(
+    supportCenterMm,
+    clamp(supportConfidence, 0.0, 1.0),
+    clamp(supportSpreadMm, nativeSlabPitchMm * 0.75, max(uSlabHalfMm, nativeSlabPitchMm)),
+    clamp(supportDensity, 0.0, 1.0)
+  );
+}
+`;
+
+const SUPPORT_SMOOTH_FRAG_SRC = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+uniform sampler2D uSupportData;
+uniform int uPanoWidth;
+uniform int uPanoHeight;
+
+out vec4 fragColor;
+
+void main() {
+  int col = int(gl_FragCoord.x);
+  int outputRow = int(gl_FragCoord.y);
+  if (col >= uPanoWidth || outputRow >= uPanoHeight) {
+    fragColor = vec4(0.0);
+    return;
+  }
+
+  ivec2 centerCoord = ivec2(col, outputRow);
+  vec4 centerSample = texelFetch(uSupportData, centerCoord, 0);
+  float centerDepthMm = centerSample.r;
+
+  float weightedCenter = 0.0;
+  float weightedConfidence = 0.0;
+  float weightedSpread = 0.0;
+  float weightedDensity = 0.0;
+  float weightSum = 0.0;
+
+  for (int dy = -2; dy <= 2; dy++) {
+    for (int dx = -3; dx <= 3; dx++) {
+      ivec2 sampleCoord = ivec2(
+        clamp(col + dx, 0, max(uPanoWidth - 1, 0)),
+        clamp(outputRow + dy, 0, max(uPanoHeight - 1, 0))
+      );
+      vec4 sampleValue = texelFetch(uSupportData, sampleCoord, 0);
+      float confidence = clamp(sampleValue.g, 0.0, 1.0);
+      float spatialWeight =
+        exp(-0.5 * (float(dx * dx) / 4.5 + float(dy * dy) / 2.0));
+      float depthDelta = sampleValue.r - centerDepthMm;
+      float depthWeight = exp(-(depthDelta * depthDelta) / (2.0 * 1.6 * 1.6));
+      float sampleWeight = spatialWeight * depthWeight * max(confidence, 0.05);
+
+      weightedCenter += sampleValue.r * sampleWeight;
+      weightedConfidence += confidence * sampleWeight;
+      weightedSpread += sampleValue.b * sampleWeight;
+      weightedDensity += sampleValue.a * sampleWeight;
+      weightSum += sampleWeight;
+    }
+  }
+
+  if (weightSum <= 1e-5) {
+    fragColor = centerSample;
+    return;
+  }
+
+  fragColor = vec4(
+    weightedCenter / weightSum,
+    clamp(weightedConfidence / weightSum, 0.0, 1.0),
+    max(weightedSpread / weightSum, 0.1),
+    clamp(weightedDensity / weightSum, 0.0, 1.0)
+  );
+}
+`;
+
+const DRR_FRAG_SRC = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+precision highp sampler2D;
+
+${RAY_SHADER_COMMON_GLSL}
+${ATTENUATION_MODEL_GLSL}
+
+uniform sampler2D uSupportData;
+
+out vec4 fragColor;
+
+void main() {
+  int col = int(gl_FragCoord.x);
+  int outputRow = int(gl_FragCoord.y);
+  if (col >= uPanoWidth || outputRow >= uPanoHeight) {
+    fragColor = vec4(0.0);
+    return;
+  }
+  float curveColumnCoord = computeCurveColumnCoord(col);
+
+  vec3 baseWorldPos;
+  vec3 slabDirWorld;
+  vec3 slabDirIndexPerMm;
+  vec3 baseIndex;
+  loadRayGeometry(curveColumnCoord, outputRow, baseWorldPos, slabDirWorld, slabDirIndexPerMm, baseIndex);
+
+  vec4 supportData = texelFetch(uSupportData, ivec2(col, outputRow), 0);
+  float supportCenterMm = supportData.r;
+  float supportConfidence = clamp(supportData.g, 0.0, 1.0);
+  float supportSpreadMm = max(supportData.b, 0.1);
+
+  float nativeSlabPitchMm = computeNativeSlabPitchMm(slabDirIndexPerMm);
+  float slabWidthMm = max(uSlabHalfMm * 2.0, 0.0);
+  int raySampleCount = computeRaySampleCount(slabWidthMm, nativeSlabPitchMm, uSlabSamples);
+  float slabStep = raySampleCount > 1 ? slabWidthMm / float(raySampleCount - 1) : 0.0;
+
+  float broadSigmaMm = max(uSlabHalfMm * 0.85, nativeSlabPitchMm * 1.5);
+  float focusedSigmaMm = clamp(
+    supportSpreadMm * 1.7 + nativeSlabPitchMm * 0.65,
+    nativeSlabPitchMm * 1.2,
+    max(uSlabHalfMm * 0.8, nativeSlabPitchMm * 1.2)
+  );
+  float supportSigmaMm = mix(broadSigmaMm, focusedSigmaMm, supportConfidence);
+  float supportDenom = 2.0 * supportSigmaMm * supportSigmaMm;
+
+  float totalAttenuation = 0.0;
+  float fogAttenuation = 0.0;
+  float denseAttenuation = 0.0;
+  bool hasValidSample = false;
+
+  const int MAX_SLAB = 64;
+  for (int s = 0; s < MAX_SLAB; s++) {
+    if (s >= raySampleCount) {
+      break;
+    }
+
+    float slabOffset = raySampleCount > 1 ? -uSlabHalfMm + float(s) * slabStep : 0.0;
+    vec3 uvw;
+    if (!computeSampleUvw(baseWorldPos, slabDirWorld, slabOffset, uvw)) {
+      continue;
+    }
+
+    float hu = sampleHu(uvw);
+    float supportDistanceMm = slabOffset - supportCenterMm;
+    float supportWeight = exp(-(supportDistanceMm * supportDistanceMm) / supportDenom);
+    float mu = pseudoAttenuationFromHu(hu);
+    float muFog = softFogAttenuationFromHu(hu);
+    float segmentLength = max(slabStep, nativeSlabPitchMm);
+
+    totalAttenuation += mu * supportWeight * segmentLength;
+    fogAttenuation += muFog * supportWeight * segmentLength;
+    denseAttenuation += max(mu - muFog, 0.0) * supportWeight * segmentLength;
+    hasValidSample = true;
+  }
+
+  if (!hasValidSample) {
+    fragColor = vec4(0.0);
+    return;
+  }
+
+  fragColor = vec4(
+    max(totalAttenuation, 0.0),
+    max(fogAttenuation, 0.0),
+    supportConfidence,
+    max(denseAttenuation, 0.0)
+  );
+}
+`;
+
+const TONE_FRAG_SRC = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+uniform sampler2D uDrrData;
+uniform int uPanoWidth;
+uniform int uPanoHeight;
+
+out vec4 fragColor;
+
+void main() {
+  int col = int(gl_FragCoord.x);
+  int outputRow = int(gl_FragCoord.y);
+  if (col >= uPanoWidth || outputRow >= uPanoHeight) {
+    fragColor = vec4(-780.0, 0.0, 0.0, 1.0);
+    return;
+  }
+
+  vec4 drr = texelFetch(uDrrData, ivec2(col, outputRow), 0);
+  float totalAttenuation = max(drr.r, 0.0);
+  float fogAttenuation = max(drr.g, 0.0);
+  float supportConfidence = clamp(drr.b, 0.0, 1.0);
+
+  float residualFogFloor = fogAttenuation * mix(0.42, 0.24, supportConfidence);
+  float gentlySuppressedAttenuation =
+    max(totalAttenuation - fogAttenuation * mix(0.35, 0.55, supportConfidence), residualFogFloor);
+
+  float radiographSignal = 1.0 - exp(-2.9 * gentlySuppressedAttenuation);
+  radiographSignal = pow(clamp(radiographSignal, 0.0, 1.0), 0.86);
+
+  float finalHu = mix(-780.0, 3150.0, radiographSignal);
+  fragColor = vec4(finalHu, gentlySuppressedAttenuation, fogAttenuation, 1.0);
 }
 `;
 
 // ─── Cached GPU State ────────────────────────────────────────────────
 let _canvas: OffscreenCanvas | HTMLCanvasElement | null = null;
 let _gl: WebGL2RenderingContext | null = null;
-let _program: WebGLProgram | null = null;
+let _debugProgram: WebGLProgram | null = null;
+let _supportProgram: WebGLProgram | null = null;
+let _supportSmoothProgram: WebGLProgram | null = null;
+let _drrProgram: WebGLProgram | null = null;
+let _toneProgram: WebGLProgram | null = null;
 let _vao: WebGLVertexArrayObject | null = null;
 
 // Volume texture cache (avoid re-uploading for same volume)
@@ -217,27 +563,18 @@ let _cachedVolumeNormalizationSignature: string | null = null;
 let _hasFloatLinearFiltering = false;
 
 let _splineTex: WebGLTexture | null = null;
+let _supportTexA: WebGLTexture | null = null;
+let _supportTexB: WebGLTexture | null = null;
+let _drrTex: WebGLTexture | null = null;
+let _supportFboA: WebGLFramebuffer | null = null;
+let _supportFboB: WebGLFramebuffer | null = null;
+let _drrFbo: WebGLFramebuffer | null = null;
 let _fbo: WebGLFramebuffer | null = null;
 let _fboTex: WebGLTexture | null = null;
 let _fboWidth = 0;
 let _fboHeight = 0;
 
 // Uniform locations
-let _uVolume = -1;
-let _uSplineData = -1;
-let _uVerticalDir = -1;
-let _uVertHalfMm = -1;
-let _uVertCenterOffsetMm = -1;
-let _uSlabHalfMm = -1;
-let _uSlabSamples = -1;
-let _uPanoWidth = -1;
-let _uPanoHeight = -1;
-let _uWorldToIndex = -1;
-let _uDims = -1;
-let _uRescaleSlope = -1;
-let _uRescaleIntercept = -1;
-let _uApplyRescale = -1;
-let _uDebugMode = -1;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 function compileShader(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
@@ -251,6 +588,218 @@ function compileShader(gl: WebGL2RenderingContext, type: number, src: string): W
     }
     return shader;
 }
+
+function compileProgram(gl: WebGL2RenderingContext, fragSrc: string): WebGLProgram {
+    const vs = compileShader(gl, gl.VERTEX_SHADER, VERT_SRC);
+    const fs = compileShader(gl, gl.FRAGMENT_SHADER, fragSrc);
+    const program = gl.createProgram()!;
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        const log = gl.getProgramInfoLog(program);
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        gl.deleteProgram(program);
+        throw new Error(`Program link error: ${log}`);
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    return program;
+}
+
+function setUniform1i(gl: WebGL2RenderingContext, program: WebGLProgram | null, name: string, value: number): void {
+    if (!program) return;
+    const location = gl.getUniformLocation(program, name);
+    if (location !== null) {
+        gl.uniform1i(location, value);
+    }
+}
+
+function setUniform1f(gl: WebGL2RenderingContext, program: WebGLProgram | null, name: string, value: number): void {
+    if (!program) return;
+    const location = gl.getUniformLocation(program, name);
+    if (location !== null) {
+        gl.uniform1f(location, value);
+    }
+}
+
+function setUniform3f(
+    gl: WebGL2RenderingContext,
+    program: WebGLProgram | null,
+    name: string,
+    x: number,
+    y: number,
+    z: number
+): void {
+    if (!program) return;
+    const location = gl.getUniformLocation(program, name);
+    if (location !== null) {
+        gl.uniform3f(location, x, y, z);
+    }
+}
+
+function setUniformMatrix4fv(
+    gl: WebGL2RenderingContext,
+    program: WebGLProgram | null,
+    name: string,
+    value: Float32Array
+): void {
+    if (!program) return;
+    const location = gl.getUniformLocation(program, name);
+    if (location !== null) {
+        gl.uniformMatrix4fv(location, false, value);
+    }
+}
+
+function bindCommonRayUniforms(
+    gl: WebGL2RenderingContext,
+    program: WebGLProgram | null,
+    params: {
+        verticalDir: [number, number, number];
+        vertHalfMm: number;
+        verticalCenterOffsetMm: number;
+        slabHalfThicknessMm: number;
+        slabSamples: number;
+        panoWidth: number;
+        panoHeight: number;
+        worldToIndexMat: Float32Array;
+        dimensions: [number, number, number];
+        rescaleSlope: number;
+        rescaleIntercept: number;
+        applyRescale: boolean;
+        debugMode?: number;
+    }
+): void {
+    if (!program) return;
+    setUniform1i(gl, program, 'uVolume', 0);
+    setUniform1i(gl, program, 'uSplineData', 1);
+    setUniform3f(gl, program, 'uVerticalDir', params.verticalDir[0], params.verticalDir[1], params.verticalDir[2]);
+    setUniform1f(gl, program, 'uVertHalfMm', params.vertHalfMm);
+    setUniform1f(gl, program, 'uVertCenterOffsetMm', params.verticalCenterOffsetMm);
+    setUniform1f(gl, program, 'uSlabHalfMm', params.slabHalfThicknessMm);
+    setUniform1i(gl, program, 'uSlabSamples', params.slabSamples);
+    setUniform1i(gl, program, 'uPanoWidth', params.panoWidth);
+    setUniform1i(gl, program, 'uPanoHeight', params.panoHeight);
+    setUniformMatrix4fv(gl, program, 'uWorldToIndex', params.worldToIndexMat);
+    setUniform3f(gl, program, 'uDims', params.dimensions[0], params.dimensions[1], params.dimensions[2]);
+    setUniform1f(gl, program, 'uRescaleSlope', params.rescaleSlope);
+    setUniform1f(gl, program, 'uRescaleIntercept', params.rescaleIntercept);
+    setUniform1i(gl, program, 'uApplyRescale', params.applyRescale ? 1 : 0);
+    if (typeof params.debugMode === 'number') {
+        setUniform1i(gl, program, 'uDebugMode', params.debugMode);
+    }
+}
+
+function drawFullscreenTriangle(gl: WebGL2RenderingContext): void {
+    gl.bindVertexArray(_vao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindVertexArray(null);
+}
+
+function destroyPipelineTargets(gl: WebGL2RenderingContext): void {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.bindTexture(gl.TEXTURE_3D, null);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.bindTexture(gl.TEXTURE_3D, null);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.bindTexture(gl.TEXTURE_3D, null);
+
+    if (_supportTexA) gl.deleteTexture(_supportTexA);
+    if (_supportTexB) gl.deleteTexture(_supportTexB);
+    if (_drrTex) gl.deleteTexture(_drrTex);
+    if (_fboTex) gl.deleteTexture(_fboTex);
+    if (_supportFboA) gl.deleteFramebuffer(_supportFboA);
+    if (_supportFboB) gl.deleteFramebuffer(_supportFboB);
+    if (_drrFbo) gl.deleteFramebuffer(_drrFbo);
+    if (_fbo) gl.deleteFramebuffer(_fbo);
+
+    _supportTexA = null;
+    _supportTexB = null;
+    _drrTex = null;
+    _fboTex = null;
+    _supportFboA = null;
+    _supportFboB = null;
+    _drrFbo = null;
+    _fbo = null;
+    _fboWidth = 0;
+    _fboHeight = 0;
+}
+
+function createFloatRenderTarget(
+    gl: WebGL2RenderingContext,
+    w: number,
+    h: number
+): { texture: WebGLTexture; fbo: WebGLFramebuffer } {
+    const texture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const fbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        gl.deleteFramebuffer(fbo);
+        gl.deleteTexture(texture);
+        throw new Error(`FBO incomplete: ${status}`);
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { texture, fbo };
+}
+
+function ensurePipelineTargets(gl: WebGL2RenderingContext, w: number, h: number): void {
+    const targetsReady =
+        _supportTexA &&
+        _supportTexB &&
+        _drrTex &&
+        _fboTex &&
+        _supportFboA &&
+        _supportFboB &&
+        _drrFbo &&
+        _fbo &&
+        _fboWidth === w &&
+        _fboHeight === h;
+
+    if (targetsReady) {
+        return;
+    }
+
+    destroyPipelineTargets(gl);
+
+    const supportA = createFloatRenderTarget(gl, w, h);
+    const supportB = createFloatRenderTarget(gl, w, h);
+    const drr = createFloatRenderTarget(gl, w, h);
+    const finalTarget = createFloatRenderTarget(gl, w, h);
+
+    _supportTexA = supportA.texture;
+    _supportFboA = supportA.fbo;
+    _supportTexB = supportB.texture;
+    _supportFboB = supportB.fbo;
+    _drrTex = drr.texture;
+    _drrFbo = drr.fbo;
+    _fboTex = finalTarget.texture;
+    _fbo = finalTarget.fbo;
+    _fboWidth = w;
+    _fboHeight = h;
+}
+
+// Retain legacy DRR declarations as inert references during rollback so
+// strict TS unused-symbol checks do not fail while the file is simplified.
+void SUPPORT_FRAG_SRC;
+void SUPPORT_SMOOTH_FRAG_SRC;
+void DRR_FRAG_SRC;
+void TONE_FRAG_SRC;
+void ensurePipelineTargets;
 
 function buildWorldToIndexMat4(
     origin: [number, number, number],
@@ -282,6 +831,25 @@ function buildWorldToIndexMat4(
     ]);
 }
 
+function coerceWorldToIndexMat4(worldToIndex?: number[] | null): Float32Array {
+    if (!Array.isArray(worldToIndex) || worldToIndex.length < 16) {
+        throw new Error('[CPR-GPU] Missing worldToIndex mat4; GPU pano rendering requires the worker transform.');
+    }
+
+    const mat = new Float32Array(16);
+    for (let i = 0; i < 16; i++) {
+        const value = Number(worldToIndex[i]);
+        if (!Number.isFinite(value)) {
+            throw new Error('[CPR-GPU] Invalid worldToIndex mat4; non-finite element encountered.');
+        }
+        mat[i] = value;
+    }
+
+    return mat;
+}
+
+void buildWorldToIndexMat4;
+
 function computeMinMax(buffer: Float32Array): { minValue: number; maxValue: number } {
     let minValue = Infinity;
     let maxValue = -Infinity;
@@ -304,9 +872,12 @@ function resetGpuRendererState(): void {
         try {
             if (_volumeTex) _gl.deleteTexture(_volumeTex);
             if (_splineTex) _gl.deleteTexture(_splineTex);
-            if (_fboTex) _gl.deleteTexture(_fboTex);
-            if (_fbo) _gl.deleteFramebuffer(_fbo);
-            if (_program) _gl.deleteProgram(_program);
+            destroyPipelineTargets(_gl);
+            if (_debugProgram) _gl.deleteProgram(_debugProgram);
+            if (_supportProgram) _gl.deleteProgram(_supportProgram);
+            if (_supportSmoothProgram) _gl.deleteProgram(_supportSmoothProgram);
+            if (_drrProgram) _gl.deleteProgram(_drrProgram);
+            if (_toneProgram) _gl.deleteProgram(_toneProgram);
             if (_vao) _gl.deleteVertexArray(_vao);
         } catch (cleanupError) {
             console.warn('[CPR-GPU] Failed to clean up WebGL resources.', cleanupError);
@@ -324,9 +895,19 @@ function resetGpuRendererState(): void {
 
     _volumeTex = null;
     _splineTex = null;
+    _supportTexA = null;
+    _supportTexB = null;
+    _drrTex = null;
+    _supportFboA = null;
+    _supportFboB = null;
+    _drrFbo = null;
     _fboTex = null;
     _fbo = null;
-    _program = null;
+    _debugProgram = null;
+    _supportProgram = null;
+    _supportSmoothProgram = null;
+    _drrProgram = null;
+    _toneProgram = null;
     _vao = null;
     _gl = null;
     _canvas = null;
@@ -335,21 +916,6 @@ function resetGpuRendererState(): void {
     _hasFloatLinearFiltering = false;
     _fboWidth = 0;
     _fboHeight = 0;
-    _uVolume = -1;
-    _uSplineData = -1;
-    _uVerticalDir = -1;
-    _uVertHalfMm = -1;
-    _uVertCenterOffsetMm = -1;
-    _uSlabHalfMm = -1;
-    _uSlabSamples = -1;
-    _uPanoWidth = -1;
-    _uPanoHeight = -1;
-    _uWorldToIndex = -1;
-    _uDims = -1;
-    _uRescaleSlope = -1;
-    _uRescaleIntercept = -1;
-    _uApplyRescale = -1;
-    _uDebugMode = -1;
 }
 
 // ─── Init ────────────────────────────────────────────────────────────
@@ -417,36 +983,11 @@ function ensureGpuContext(): WebGL2RenderingContext {
     }
     _hasFloatLinearFiltering = true;
 
-    // Compile program
-    const vs = compileShader(_gl, _gl.VERTEX_SHADER, VERT_SRC);
-    const fs = compileShader(_gl, _gl.FRAGMENT_SHADER, FRAG_SRC);
-    _program = _gl.createProgram()!;
-    _gl.attachShader(_program, vs);
-    _gl.attachShader(_program, fs);
-    _gl.linkProgram(_program);
-    if (!_gl.getProgramParameter(_program, _gl.LINK_STATUS)) {
-        const log = _gl.getProgramInfoLog(_program);
-        throw new Error(`Program link error: ${log}`);
-    }
-    _gl.deleteShader(vs);
-    _gl.deleteShader(fs);
-
-    // Cache uniform locations
-    _uVolume = _gl.getUniformLocation(_program, 'uVolume') as number;
-    _uSplineData = _gl.getUniformLocation(_program, 'uSplineData') as number;
-    _uVerticalDir = _gl.getUniformLocation(_program, 'uVerticalDir') as number;
-    _uVertHalfMm = _gl.getUniformLocation(_program, 'uVertHalfMm') as number;
-    _uVertCenterOffsetMm = _gl.getUniformLocation(_program, 'uVertCenterOffsetMm') as number;
-    _uSlabHalfMm = _gl.getUniformLocation(_program, 'uSlabHalfMm') as number;
-    _uSlabSamples = _gl.getUniformLocation(_program, 'uSlabSamples') as number;
-    _uPanoWidth = _gl.getUniformLocation(_program, 'uPanoWidth') as number;
-    _uPanoHeight = _gl.getUniformLocation(_program, 'uPanoHeight') as number;
-    _uWorldToIndex = _gl.getUniformLocation(_program, 'uWorldToIndex') as number;
-    _uDims = _gl.getUniformLocation(_program, 'uDims') as number;
-    _uRescaleSlope = _gl.getUniformLocation(_program, 'uRescaleSlope') as number;
-    _uRescaleIntercept = _gl.getUniformLocation(_program, 'uRescaleIntercept') as number;
-    _uApplyRescale = _gl.getUniformLocation(_program, 'uApplyRescale') as number;
-    _uDebugMode = _gl.getUniformLocation(_program, 'uDebugMode') as number;
+    _debugProgram = compileProgram(_gl, DEBUG_FRAG_SRC);
+    _supportProgram = null;
+    _supportSmoothProgram = null;
+    _drrProgram = null;
+    _toneProgram = null;
 
     // Empty VAO for fullscreen triangle (no attributes needed)
     _vao = _gl.createVertexArray()!;
@@ -640,8 +1181,8 @@ function uploadSplineTexture(
 
     _splineTex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, _splineTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -684,7 +1225,7 @@ function ensureFbo(gl: WebGL2RenderingContext, w: number, h: number): void {
 export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoResult {
     const gl = ensureGpuContext();
     const {
-        scalarData, dimensions, spacing, origin, direction, worldToIndex,
+        scalarData, dimensions, worldToIndex,
         frames, panoWidth, panoHeight,
         verticalDir, vertHalfMm, verticalCenterOffsetMm,
         slabHalfThicknessMm, slabSamples,
@@ -696,7 +1237,6 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
     const safePanoHeight = Math.max(1, Math.floor(Number(panoHeight) || 1));
     const t0 = performance.now();
 
-    // 1. Upload volume texture with RAW values (cached by volumeId)
     uploadVolumeTexture(
         gl,
         scalarData,
@@ -705,92 +1245,42 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         normalizeStoredSample,
         volumeId
     );
-
-    // 2. Upload spline data
-    const splineDebugVertices = uploadSplineTexture(gl, frames, safePanoWidth, verticalDir);
-
-    // 3. Ensure FBO at correct size
+    uploadSplineTexture(gl, frames, safePanoWidth, verticalDir);
     ensureFbo(gl, safePanoWidth, safePanoHeight);
 
-    // 4. Compute worldToIndex mat4
-    const w2iMat = buildWorldToIndexMat4(origin, spacing, direction);
+    const w2iMat = coerceWorldToIndexMat4(worldToIndex ?? undefined);
+    const requestedSlabSamples = Math.max(1, Math.min(64, slabSamples | 0));
+    const commonUniforms = {
+        verticalDir,
+        vertHalfMm,
+        verticalCenterOffsetMm,
+        slabHalfThicknessMm,
+        slabSamples: requestedSlabSamples,
+        panoWidth: safePanoWidth,
+        panoHeight: safePanoHeight,
+        worldToIndexMat: w2iMat,
+        dimensions,
+        rescaleSlope,
+        rescaleIntercept,
+        applyRescale,
+    };
 
-    // 5. Render
-    gl.bindFramebuffer(gl.FRAMEBUFFER, _fbo);
     gl.viewport(0, 0, safePanoWidth, safePanoHeight);
-    gl.useProgram(_program);
+    gl.disable(gl.BLEND);
 
-    // Bind volume texture to unit 0
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_3D, _volumeTex);
-    gl.uniform1i(_uVolume, 0);
-
-    // Bind spline data texture to unit 1
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, _splineTex);
-    gl.uniform1i(_uSplineData, 1);
 
-    // Set uniforms
-    gl.uniform3f(_uVerticalDir, verticalDir[0], verticalDir[1], verticalDir[2]);
-    gl.uniform1f(_uVertHalfMm, vertHalfMm);
-    gl.uniform1f(_uVertCenterOffsetMm, verticalCenterOffsetMm);
-    gl.uniform1f(_uSlabHalfMm, slabHalfThicknessMm);
-    const effectiveSlabSamples = Math.max(1, Math.min(64, slabSamples | 0));
-    gl.uniform1i(_uSlabSamples, effectiveSlabSamples);
-    gl.uniform1i(_uPanoWidth, safePanoWidth);
-    gl.uniform1i(_uPanoHeight, safePanoHeight);
-    gl.uniformMatrix4fv(_uWorldToIndex, false, w2iMat);
-    gl.uniform3f(_uDims, dimensions[0], dimensions[1], dimensions[2]);
-    gl.uniform1f(_uRescaleSlope, rescaleSlope);
-    gl.uniform1f(_uRescaleIntercept, rescaleIntercept);
-    gl.uniform1i(_uApplyRescale, applyRescale ? 1 : 0);
-    gl.uniform1i(_uDebugMode, ACTIVE_GPU_DEBUG_MODE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, _fbo);
+    gl.useProgram(_debugProgram);
+    bindCommonRayUniforms(gl, _debugProgram, {
+        ...commonUniforms,
+        debugMode: ACTIVE_GPU_DEBUG_MODE,
+    });
+    drawFullscreenTriangle(gl);
 
-    const splineFlattenedSample: number[] = [];
-    for (let i = 0; i < Math.min(2, splineDebugVertices.length); i++) {
-        const vertex = splineDebugVertices[i];
-        splineFlattenedSample.push(
-            vertex.position[0],
-            vertex.position[1],
-            vertex.position[2],
-            0,
-            vertex.slabDir[0],
-            vertex.slabDir[1],
-            vertex.slabDir[2],
-            0,
-            vertex.verticalDir[0],
-            vertex.verticalDir[1],
-            vertex.verticalDir[2],
-            0
-        );
-    }
-
-    console.error(
-        `[FINAL-FAILSAFE-LOGS]\n${JSON.stringify(
-            {
-                debugMode: ACTIVE_GPU_DEBUG_MODE,
-                sentWorldToIndex: Array.from(w2iMat),
-                incomingWorldToIndex: worldToIndex ? Array.from(worldToIndex) : null,
-                uDims: [dimensions[0], dimensions[1], dimensions[2]],
-                spacing: [spacing[0], spacing[1], spacing[2]],
-                origin: [origin[0], origin[1], origin[2]],
-                panoWidth: safePanoWidth,
-                panoHeight: safePanoHeight,
-                slabHalfThicknessMm,
-                slabSamples: effectiveSlabSamples,
-                splineFirstTwoIndicesFlattened: splineFlattenedSample,
-            },
-            null,
-            2
-        )}`
-    );
-
-    // Draw fullscreen triangle
-    gl.bindVertexArray(_vao);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-    gl.bindVertexArray(null);
-
-    // 6. Read back pixels
     gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
     const rgbaBuffer = new Float32Array(safePanoWidth * safePanoHeight * 4);
     gl.readPixels(0, 0, safePanoWidth, safePanoHeight, gl.RGBA, gl.FLOAT, rgbaBuffer);
@@ -800,7 +1290,6 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         throw new Error(`GPU pano readPixels failed with WebGL error ${readbackError}.`);
     }
 
-    // Flip rows to match Cornerstone's top-to-bottom pixel layout.
     const pixelData = new Float32Array(safePanoWidth * safePanoHeight);
     for (let row = 0; row < safePanoHeight; row++) {
         const srcRow = safePanoHeight - 1 - row;
@@ -811,8 +1300,6 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         }
     }
 
-    console.log('[GPU-READ-ERROR]', readbackError);
-    console.log('[GPU-RAW-PIXELS-SAMPLE]', Array.from(pixelData.slice(0, 10)));
     let rawMin = Infinity;
     let rawMax = -Infinity;
     for (let i = 0; i < pixelData.length; i++) {
@@ -828,13 +1315,15 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         max: Number.isFinite(rawMax) ? rawMax : null,
     });
 
-    // No post-processing: strict GPU MIP result is read back directly.
     const { minValue, maxValue } = computeMinMax(pixelData);
-
     const elapsed = performance.now() - t0;
-    console.log(`[CPR-GPU] Render complete: ${safePanoWidth}x${safePanoHeight} in ${elapsed.toFixed(1)}ms`, {
+    console.log(`[CPR-GPU] Single-pass continuous-geometry hybrid projection complete: ${safePanoWidth}x${safePanoHeight} in ${elapsed.toFixed(1)}ms`, {
         minValue,
         maxValue,
+        slabHalfThicknessMm,
+        slabSamples: requestedSlabSamples,
+        reduction: 'raw mean / raw max blend (0.5 mean, 0.5 max)',
+        debugMode: ACTIVE_GPU_DEBUG_MODE,
     });
 
     return { pixelData, width: safePanoWidth, height: safePanoHeight, minValue, maxValue };

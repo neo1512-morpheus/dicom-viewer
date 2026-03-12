@@ -15,11 +15,12 @@ import { CPR_CROSSSECTION_SYNC_EVENT, CPRCrossSectionSyncDetail } from './cprEve
 import { buildCrossSectionCameraForFrame } from './cprCrossSectionCamera';
 import type { CPRFrame } from './cprMath';
 
-const CPR_PANO_DEFAULT_WINDOW_WIDTH = 2000;
-const CPR_PANO_DEFAULT_WINDOW_CENTER = 400;
+const CPR_PANO_DEFAULT_WINDOW_WIDTH = 4500;
+const CPR_PANO_DEFAULT_WINDOW_CENTER = 1000;
 const CPR_PANO_RENDER_BACKEND_DEFAULT = 'gpu';
-const CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM = 3;
+const CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM = 2;
 const CPR_GPU_PANO_DEFAULT_SLAB_SAMPLES = 15;
+const CPR_PANO_GENERATION_DEBOUNCE_MS = 300;
 const CPR_PANO_MAX_DIMENSION = 4096;
 const CPR_PANO_DEFAULT_VERTICAL_HALF_MM = 18;
 const CPR_PANO_MAX_VERTICAL_HALF_MM = 28;
@@ -56,19 +57,15 @@ interface PanoVoiSettings {
   windowCenter: number;
 }
 
-function buildDirectWorkerPanoVoi(
-  windowWidth: number,
-  windowCenter: number
-): PanoVoiSettings {
-  const safeWindowWidth =
-    Number.isFinite(windowWidth) && Number(windowWidth) > 1 ? Number(windowWidth) : 1;
-  const safeWindowCenter = Number.isFinite(windowCenter) ? Number(windowCenter) : 0;
+function buildDirectWorkerPanoVoi(): PanoVoiSettings {
+  const lower = CPR_PANO_DEFAULT_WINDOW_CENTER - CPR_PANO_DEFAULT_WINDOW_WIDTH / 2;
+  const upper = CPR_PANO_DEFAULT_WINDOW_CENTER + CPR_PANO_DEFAULT_WINDOW_WIDTH / 2;
 
   return {
-    lower: safeWindowCenter - safeWindowWidth / 2,
-    upper: safeWindowCenter + safeWindowWidth / 2,
-    windowWidth: safeWindowWidth,
-    windowCenter: safeWindowCenter,
+    lower,
+    upper,
+    windowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
+    windowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
   };
 }
 
@@ -518,6 +515,27 @@ function summarizeFloatBufferForDebug(
   };
 }
 
+function reconstructPanoFloatBuffer(
+  pixelData: Float32Array | Uint16Array,
+  slope: number,
+  intercept: number
+): Float32Array {
+  const safeSlope =
+    Number.isFinite(slope) && Math.abs(Number(slope)) > 1e-8 ? Number(slope) : 1;
+  const safeIntercept = Number.isFinite(intercept) ? Number(intercept) : 0;
+
+  if (pixelData instanceof Float32Array && Math.abs(safeSlope - 1) <= 1e-6 && Math.abs(safeIntercept) <= 1e-6) {
+    return pixelData;
+  }
+
+  const reconstructed = new Float32Array(pixelData.length);
+  for (let i = 0; i < pixelData.length; i++) {
+    reconstructed[i] = Number(pixelData[i]) * safeSlope + safeIntercept;
+  }
+
+  return reconstructed;
+}
+
 function drawPanoDebugCanvas(
   runId: string,
   pixelData: Float32Array | Uint16Array,
@@ -617,6 +635,7 @@ function drawPanoDebugCanvas(
   overlay.style.top = '0';
   overlay.style.left = '0';
   overlay.style.zIndex = '9999';
+  overlay.style.pointerEvents = 'none';
   overlay.style.background = 'rgba(0,0,0,0.85)';
   overlay.style.color = '#fff';
   overlay.style.padding = '8px';
@@ -3224,6 +3243,8 @@ export function useCPROrchestrator({
   const lastSetupCleanupRef = useRef<string | null>(null);
   const sliderAnimationFrameRef = useRef<number | null>(null);
   const pendingSliderFrameIndexRef = useRef<number | null>(null);
+  const generationInFlightRef = useRef(false);
+  const lastGenerationStartedAtRef = useRef(0);
 
   const clearProtocolListener = useCallback(() => {
     if (hpSubscriptionRef.current) {
@@ -3234,6 +3255,13 @@ export function useCPROrchestrator({
     if (hpTimeoutRef.current != null) {
       window.clearTimeout(hpTimeoutRef.current);
       hpTimeoutRef.current = null;
+    }
+  }, []);
+
+  const markGenerationIdle = useCallback(() => {
+    generationInFlightRef.current = false;
+    if (isMountedRef.current) {
+      setIsGenerating(false);
     }
   }, []);
 
@@ -3253,6 +3281,7 @@ export function useCPROrchestrator({
   useEffect(() => {
     return () => {
       isMountedRef.current = false;
+      generationInFlightRef.current = false;
       if (sliderAnimationFrameRef.current != null) {
         window.cancelAnimationFrame(sliderAnimationFrameRef.current);
         sliderAnimationFrameRef.current = null;
@@ -3284,8 +3313,8 @@ export function useCPROrchestrator({
 
         if (isMountedRef.current) {
           setError(null);
-          setIsGenerating(false);
         }
+        markGenerationIdle();
 
         void ensureSetupViewportInteraction();
         return;
@@ -3312,15 +3341,30 @@ export function useCPROrchestrator({
     return () => {
       subscription.unsubscribe();
     };
-  }, [servicesManager, ensureSetupViewportInteraction]);
+  }, [servicesManager, ensureSetupViewportInteraction, markGenerationIdle]);
 
   const onDone = useCallback(async () => {
+    const startedAt = performance.now();
+    if (generationInFlightRef.current) {
+      console.warn('[CPR] Ignoring duplicate onDone while a generation is already in flight.');
+      return;
+    }
+    if (startedAt - lastGenerationStartedAtRef.current < CPR_PANO_GENERATION_DEBOUNCE_MS) {
+      console.warn('[CPR] Ignoring debounced onDone request.');
+      return;
+    }
+
+    generationInFlightRef.current = true;
+    lastGenerationStartedAtRef.current = startedAt;
     setIsGenerating(true);
     setError(null);
     const debugRunId = `cpr-${Date.now().toString(36)}`;
     console.log(`[CPR][${debugRunId}] onDone started`);
 
     try {
+      clearProtocolListener();
+      await terminateCPRWorkerSession();
+
       const { cornerstoneViewportService, hangingProtocolService, viewportGridService } =
         servicesManager.services;
 
@@ -3579,25 +3623,19 @@ export function useCPROrchestrator({
         const requestedAggregation = (overrides.aggregation ?? workerInput.aggregation) === 'MEAN' ? 'MEAN' : 'MIP';
         const requestedRenderBackend =
           (overrides.renderBackend ?? workerInput.renderBackend) === 'cpu' ? 'cpu' : 'gpu';
-        const requestedSlabHalfThicknessMm =
-          requestedRenderBackend === 'gpu'
-            ? CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM
-            : toPositiveFinite(
-                overrides.slabHalfThicknessMm,
-                toPositiveFinite(workerInput.slabHalfThicknessMm, balancedSlabHalfThicknessMm)
-              );
-        const requestedSlabSamples =
-          requestedRenderBackend === 'gpu'
-            ? CPR_GPU_PANO_DEFAULT_SLAB_SAMPLES
-            : Math.max(
-                1,
-                Math.floor(
-                  toPositiveFinite(
-                    overrides.slabSamples,
-                    toPositiveFinite(workerInput.slabSamples, balancedSlabSamples)
-                  )
-                )
-              );
+        const requestedSlabHalfThicknessMm = toPositiveFinite(
+          overrides.slabHalfThicknessMm,
+          toPositiveFinite(workerInput.slabHalfThicknessMm, balancedSlabHalfThicknessMm)
+        );
+        const requestedSlabSamples = Math.max(
+          1,
+          Math.floor(
+            toPositiveFinite(
+              overrides.slabSamples,
+              toPositiveFinite(workerInput.slabSamples, balancedSlabSamples)
+            )
+          )
+        );
         const requestedVerticalCenterOffsetMm = toFiniteNumber(
           rigidVerticalSliceModeEnabled
             ? rigidSliceVerticalCenterOffsetMm
@@ -3642,18 +3680,6 @@ export function useCPROrchestrator({
           rigidVerticalSliceMode: rigidVerticalSliceModeEnabled,
         });
         const result = rawResult;
-        drawPanoDebugCanvas(
-          `${debugRunId}:${label}`,
-          result.pixelData,
-          result.width,
-          result.height,
-          {
-            windowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
-            windowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
-            slope: result.slope,
-            intercept: result.intercept,
-          }
-        );
         const hasIdentityRescaleMetadata =
           Math.abs(result.rescaleSlope - 1) <= 1e-6 && Math.abs(result.rescaleIntercept) <= 1e-6;
         const intensityDomain = classifySyntheticCprIntensityDomain({
@@ -3665,13 +3691,15 @@ export function useCPROrchestrator({
         const huDomain = isSyntheticCprHuDomain(intensityDomain);
         const convertedToHu = false;
         const rescaleSkippedAsUnsafe = intensityDomain === 'unknown';
-        const summary =
-          requestedRenderBackend === 'gpu'
-            ? null
-            : summarizeFloatBufferForDebug(result.pixelData, finalPanoWidth, finalPanoHeight);
+        const summaryPixelData = reconstructPanoFloatBuffer(
+          result.pixelData,
+          result.slope,
+          result.intercept
+        );
+        const summary = summarizeFloatBufferForDebug(summaryPixelData, finalPanoWidth, finalPanoHeight);
         const voi =
           requestedRenderBackend === 'gpu'
-            ? buildDirectWorkerPanoVoi(result.windowWidth, result.windowCenter)
+            ? buildDirectWorkerPanoVoi()
             : computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
         console.log('[CPR-GPU-VOI-APPLY-JSON]', JSON.stringify({
           runId: debugRunId,
@@ -3685,9 +3713,9 @@ export function useCPROrchestrator({
           adaptiveWindowCenter: voi.windowCenter,
           minValue: result.minValue,
           maxValue: result.maxValue,
-          voiSource: requestedRenderBackend === 'gpu' ? 'worker-native' : 'adaptive',
+          voiSource: requestedRenderBackend === 'gpu' ? 'fixed-dental' : 'adaptive',
         }));
-        const qualityBase = requestedRenderBackend === 'gpu' ? 0 : scorePanoQuality(summary);
+        const qualityBase = summary ? scorePanoQuality(summary) : 0;
         const workerDiagnostic =
           result.workerDebugPayload &&
             typeof result.workerDebugPayload === 'object' &&
@@ -4151,9 +4179,7 @@ export function useCPROrchestrator({
       });
       recordAttempt(bestAttempt);
 
-      if (gpuSinglePassEnabled) {
-        earlyExitReason = 'gpu-single-pass';
-      } else if (isGoodEnoughPanoAttempt(bestAttempt)) {
+      if (isGoodEnoughPanoAttempt(bestAttempt)) {
         earlyExitReason = 'primary-good-enough';
       } else {
         const retryConfigs: Array<{
@@ -4847,6 +4873,18 @@ export function useCPROrchestrator({
         windowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
         windowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
       };
+      drawPanoDebugCanvas(
+        `${debugRunId}:selected`,
+        panoWorkerResult.pixelData,
+        panoWorkerResult.width,
+        panoWorkerResult.height,
+        {
+          windowWidth: adaptiveVoi.windowWidth,
+          windowCenter: adaptiveVoi.windowCenter,
+          slope: panoWorkerResult.slope,
+          intercept: panoWorkerResult.intercept,
+        }
+      );
       const displayedWorkerDebugPayload =
         phase2VirtualPano.usedAsDisplayedOutput
           ? phase2WorkerResult?.workerDebugPayload ?? null
@@ -5136,9 +5174,7 @@ export function useCPROrchestrator({
             setError(msg);
           }
         } finally {
-          if (isMountedRef.current) {
-            setIsGenerating(false);
-          }
+          markGenerationIdle();
         }
       };
 
@@ -5163,8 +5199,8 @@ export function useCPROrchestrator({
             '[CPR] Timed out waiting for hanging protocol change after stage switch.';
           console.error(`[CPR][${debugRunId}] ${timeoutMsg}`);
           setError(timeoutMsg);
-          setIsGenerating(false);
         }
+        markGenerationIdle();
       }, 12000);
 
       console.log(`[CPR][${debugRunId}] switching to CPR stage 1`);
@@ -5177,8 +5213,8 @@ export function useCPROrchestrator({
       console.error(`[CPR][${debugRunId}] onDone failed:`, msg);
       if (isMountedRef.current) {
         setError(msg);
-        setIsGenerating(false);
       }
+      markGenerationIdle();
     }
   }, [
     servicesManager,
@@ -5190,12 +5226,14 @@ export function useCPROrchestrator({
     slabSamples,
     aggregation,
     clearProtocolListener,
+    markGenerationIdle,
   ]);
 
   const onRedraw = useCallback(async () => {
     setError(null);
-    setIsGenerating(false);
+    markGenerationIdle();
     clearProtocolListener();
+    await terminateCPRWorkerSession();
 
     const currentAxialViewport = findViewportByLogicalId(servicesManager, 'cpr-axial');
     if (currentAxialViewport?.element) {
@@ -5270,7 +5308,7 @@ export function useCPROrchestrator({
         setError(msg);
       }
     }
-  }, [servicesManager, commandsManager, clearProtocolListener]);
+  }, [servicesManager, commandsManager, clearProtocolListener, markGenerationIdle]);
 
   const flushSliderFrameChange = useCallback(() => {
     sliderAnimationFrameRef.current = null;

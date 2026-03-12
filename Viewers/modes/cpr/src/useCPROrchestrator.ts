@@ -15,8 +15,11 @@ import { CPR_CROSSSECTION_SYNC_EVENT, CPRCrossSectionSyncDetail } from './cprEve
 import { buildCrossSectionCameraForFrame } from './cprCrossSectionCamera';
 import type { CPRFrame } from './cprMath';
 
-const CPR_PANO_DEFAULT_WINDOW_WIDTH = 3500;
-const CPR_PANO_DEFAULT_WINDOW_CENTER = 850;
+const CPR_PANO_DEFAULT_WINDOW_WIDTH = 2000;
+const CPR_PANO_DEFAULT_WINDOW_CENTER = 400;
+const CPR_PANO_RENDER_BACKEND_DEFAULT = 'gpu';
+const CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM = 3;
+const CPR_GPU_PANO_DEFAULT_SLAB_SAMPLES = 15;
 const CPR_PANO_MAX_DIMENSION = 4096;
 const CPR_PANO_DEFAULT_VERTICAL_HALF_MM = 18;
 const CPR_PANO_MAX_VERTICAL_HALF_MM = 28;
@@ -51,6 +54,22 @@ interface PanoVoiSettings {
   upper: number;
   windowWidth: number;
   windowCenter: number;
+}
+
+function buildDirectWorkerPanoVoi(
+  windowWidth: number,
+  windowCenter: number
+): PanoVoiSettings {
+  const safeWindowWidth =
+    Number.isFinite(windowWidth) && Number(windowWidth) > 1 ? Number(windowWidth) : 1;
+  const safeWindowCenter = Number.isFinite(windowCenter) ? Number(windowCenter) : 0;
+
+  return {
+    lower: safeWindowCenter - safeWindowWidth / 2,
+    upper: safeWindowCenter + safeWindowWidth / 2,
+    windowWidth: safeWindowWidth,
+    windowCenter: safeWindowCenter,
+  };
 }
 
 function isHuLikeRange(minValue: number, maxValue: number): boolean {
@@ -341,7 +360,7 @@ function percentileFromSorted(values: number[], q: number): number {
 }
 
 function summarizeFloatBufferForDebug(
-  buffer: Float32Array,
+  buffer: Float32Array | Uint16Array,
   width?: number,
   height?: number
 ): FloatBufferDebugSummary | null {
@@ -497,6 +516,175 @@ function summarizeFloatBufferForDebug(
     detailBandVerticalEdgeMean:
       detailBandVerticalEdgeCount > 0 ? detailBandVerticalEdgeAccum / detailBandVerticalEdgeCount : 0,
   };
+}
+
+function drawPanoDebugCanvas(
+  runId: string,
+  pixelData: Float32Array | Uint16Array,
+  width: number,
+  height: number,
+  options?: {
+    windowWidth?: number;
+    windowCenter?: number;
+    slope?: number;
+    intercept?: number;
+  }
+): void {
+  if (typeof document === 'undefined' || !document.createElement) {
+    return;
+  }
+
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    console.error('[CPR-CANVAS-BYPASS] Invalid dimensions', { runId, width, height });
+    return;
+  }
+
+  if (!pixelData || pixelData.length !== width * height) {
+    console.error('[CPR-CANVAS-BYPASS] Length mismatch', {
+      runId,
+      width,
+      height,
+      length: pixelData?.length ?? null,
+      expected: width * height,
+      type: pixelData?.constructor?.name ?? null,
+    });
+    return;
+  }
+
+  const existing = document.getElementById('cpr-pano-debug-overlay');
+  if (existing?.parentNode) {
+    existing.parentNode.removeChild(existing);
+  }
+
+  const slope =
+    Number.isFinite(options?.slope) && Math.abs(Number(options?.slope)) > 1e-8
+      ? Number(options?.slope)
+      : 1;
+  const intercept = Number.isFinite(options?.intercept) ? Number(options?.intercept) : 0;
+  const windowWidth =
+    Number.isFinite(options?.windowWidth) && Number(options?.windowWidth) > 1
+      ? Number(options?.windowWidth)
+      : CPR_PANO_DEFAULT_WINDOW_WIDTH;
+  const windowCenter = Number.isFinite(options?.windowCenter)
+    ? Number(options?.windowCenter)
+    : CPR_PANO_DEFAULT_WINDOW_CENTER;
+  const windowLower = windowCenter - windowWidth / 2;
+  const windowUpper = windowCenter + windowWidth / 2;
+  const storedValueSample: number[] = [];
+  const reconstructedValueSample: number[] = [];
+
+  let minValue = Infinity;
+  let maxValue = -Infinity;
+  for (let i = 0; i < pixelData.length; i++) {
+    const storedValue = Number(pixelData[i]);
+    const value = storedValue * slope + intercept;
+    if (storedValueSample.length < 5) {
+      storedValueSample.push(storedValue);
+      reconstructedValueSample.push(value);
+    }
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    if (value < minValue) {
+      minValue = value;
+    }
+    if (value > maxValue) {
+      maxValue = value;
+    }
+  }
+
+  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+    minValue = 0;
+    maxValue = 1;
+  }
+
+  console.log(
+    '[CPR-CANVAS-RUNTIME-JSON]',
+    JSON.stringify({
+      runId,
+      windowWidth,
+      windowCenter,
+      slope,
+      intercept,
+      storedValueSample,
+      reconstructedValueSample,
+    })
+  );
+
+  const overlay = document.createElement('div');
+  overlay.id = 'cpr-pano-debug-overlay';
+  overlay.style.position = 'fixed';
+  overlay.style.top = '0';
+  overlay.style.left = '0';
+  overlay.style.zIndex = '9999';
+  overlay.style.background = 'rgba(0,0,0,0.85)';
+  overlay.style.color = '#fff';
+  overlay.style.padding = '8px';
+  overlay.style.font = '12px monospace';
+  overlay.style.border = '1px solid #444';
+
+  const label = document.createElement('div');
+  label.textContent =
+    `[CPR-CANVAS-BYPASS] ${runId} ` +
+    `${pixelData.constructor.name} ${width}x${height} ` +
+    `min=${minValue.toFixed(3)} max=${maxValue.toFixed(3)} ` +
+    `WC=${windowCenter.toFixed(1)} WW=${windowWidth.toFixed(1)}`;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  canvas.style.display = 'block';
+  canvas.style.marginTop = '6px';
+  canvas.style.imageRendering = 'pixelated';
+  canvas.style.width = `${Math.max(320, Math.min(960, width))}px`;
+  canvas.style.height = 'auto';
+  canvas.style.border = '1px solid #666';
+
+  const ctx = canvas.getContext('2d', { alpha: false });
+  if (!ctx) {
+    console.error('[CPR-CANVAS-BYPASS] Failed to create 2D canvas context');
+    return;
+  }
+
+  const imageData = ctx.createImageData(width, height);
+  const dst = imageData.data;
+
+  for (let i = 0; i < pixelData.length; i++) {
+    const storedValue = Number(pixelData[i]);
+    const value = storedValue * slope + intercept;
+    const normalized = Number.isFinite(value)
+      ? Math.max(
+          0,
+          Math.min(255, Math.round(((value - windowLower) / Math.max(1e-6, windowUpper - windowLower)) * 255))
+        )
+      : 0;
+
+    const j = i * 4;
+    dst[j] = normalized;
+    dst[j + 1] = normalized;
+    dst[j + 2] = normalized;
+    dst[j + 3] = 255;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+
+  overlay.appendChild(label);
+  overlay.appendChild(canvas);
+  document.body.appendChild(overlay);
+
+  console.log('[CPR-CANVAS-BYPASS]', {
+    runId,
+    type: pixelData.constructor.name,
+    length: pixelData.length,
+    width,
+    height,
+    slope,
+    intercept,
+    windowWidth,
+    windowCenter,
+    minValue,
+    maxValue,
+  });
 }
 
 function computeAdaptivePanoVoi(
@@ -1061,13 +1249,15 @@ function buildArcLengthSpline(
 }
 
 interface CPRWorkerLaunchResult {
-  pixelData: Float32Array;
+  pixelData: Float32Array | Uint16Array;
   width: number;
   height: number;
   minValue: number;
   maxValue: number;
   windowWidth: number;
   windowCenter: number;
+  slope: number;
+  intercept: number;
   modalityLutApplied: boolean;
   requestedModalityLutApplied: boolean;
   storedValueNormalizationApplied: boolean;
@@ -1090,18 +1280,22 @@ interface CPRWorkerLaunchResult {
 
 interface CPRWorkerInitSuccessMessage {
   type: 'INIT_SUCCESS';
+  requestId: string;
   sessionKey: string;
 }
 
 interface CPRWorkerSuccessMessage {
   type: 'SUCCESS';
-  pixelData: Float32Array;
+  requestId: string;
+  pixelData: Float32Array | Uint16Array;
   panoWidth: number;
   panoHeight: number;
   minValue: number;
   maxValue: number;
   windowWidth: number;
   windowCenter: number;
+  slope: number;
+  intercept: number;
   modalityLutApplied: boolean;
   requestedModalityLutApplied: boolean;
   storedValueNormalizationApplied: boolean;
@@ -1109,23 +1303,49 @@ interface CPRWorkerSuccessMessage {
   debugPayload?: CPRWorkerLaunchResult['workerDebugPayload'];
 }
 
+interface CPRWorkerDisposeSuccessMessage {
+  type: 'DISPOSE_SUCCESS';
+  requestId: string;
+}
+
 interface CPRWorkerErrorMessage {
   type: 'ERROR';
+  requestId: string;
   message: string;
 }
 
 type CPRWorkerResponseMessage =
   | CPRWorkerInitSuccessMessage
   | CPRWorkerSuccessMessage
+  | CPRWorkerDisposeSuccessMessage
   | CPRWorkerErrorMessage;
+
+type CPRWorkerExpectedResponseType = Exclude<CPRWorkerResponseMessage['type'], 'ERROR'>;
+
+type PendingCPRWorkerRequest = {
+  expectedTypes: Set<CPRWorkerExpectedResponseType>;
+  requestType: string;
+  resolve: (value: CPRWorkerResponseMessage) => void;
+  reject: (error: Error) => void;
+  timeoutId?: number;
+};
 
 interface CPRWorkerSession {
   worker: Worker;
   volumeKey: string;
   sessionKey: string;
+  pendingRequests: Map<string, PendingCPRWorkerRequest>;
+  isTerminating: boolean;
+  terminatePromise?: Promise<void>;
+  cleanupListeners: () => void;
+  rejectPendingRequests: (
+    error: Error,
+    predicate?: (requestId: string, request: PendingCPRWorkerRequest) => boolean
+  ) => void;
 }
 
 let activeCPRWorkerSession: CPRWorkerSession | null = null;
+let cprWorkerRequestCounter = 0;
 
 function buildCPRWorkerVolumeKey(params: {
   volume: cornerstone.Types.IImageVolume;
@@ -1150,47 +1370,212 @@ function buildCPRWorkerVolumeKey(params: {
   ].join('|');
 }
 
-function terminateCPRWorkerSession(): void {
-  if (activeCPRWorkerSession) {
-    activeCPRWorkerSession.worker.terminate();
+function createCPRWorkerRequestId(): string {
+  cprWorkerRequestCounter += 1;
+  return `cpr-worker-${Date.now().toString(36)}-${cprWorkerRequestCounter.toString(36)}`;
+}
+
+function createCPRWorkerSession(
+  worker: Worker,
+  volumeKey: string,
+  sessionKey: string
+): CPRWorkerSession {
+  const session: CPRWorkerSession = {
+    worker,
+    volumeKey,
+    sessionKey,
+    pendingRequests: new Map(),
+    isTerminating: false,
+    cleanupListeners: () => {},
+    rejectPendingRequests: () => {},
+  };
+
+  const rejectPendingRequests = (
+    error: Error,
+    predicate: (requestId: string, request: PendingCPRWorkerRequest) => boolean = () => true
+  ) => {
+    for (const [requestId, request] of Array.from(session.pendingRequests.entries())) {
+      if (!predicate(requestId, request)) {
+        continue;
+      }
+
+      session.pendingRequests.delete(requestId);
+      if (request.timeoutId != null) {
+        window.clearTimeout(request.timeoutId);
+      }
+      request.reject(error);
+    }
+  };
+
+  const handleMessage = (event: MessageEvent<CPRWorkerResponseMessage>) => {
+    const data = event.data;
+    if (!data || typeof data !== 'object') {
+      return;
+    }
+
+    const requestId =
+      typeof (data as { requestId?: unknown }).requestId === 'string'
+        ? ((data as { requestId: string }).requestId)
+        : null;
+    if (!requestId) {
+      console.warn('[cprWorker] Ignoring worker response without requestId.', data);
+      return;
+    }
+
+    const pendingRequest = session.pendingRequests.get(requestId);
+    if (!pendingRequest) {
+      return;
+    }
+
+    session.pendingRequests.delete(requestId);
+    if (pendingRequest.timeoutId != null) {
+      window.clearTimeout(pendingRequest.timeoutId);
+    }
+
+    if (data.type === 'ERROR') {
+      pendingRequest.reject(new Error(`[cprWorker] ${data.message}`));
+      return;
+    }
+
+    if (!pendingRequest.expectedTypes.has(data.type)) {
+      pendingRequest.reject(
+        new Error(
+          `[cprWorker] Unexpected worker response "${data.type}" for ${pendingRequest.requestType}.`
+        )
+      );
+      return;
+    }
+
+    pendingRequest.resolve(data);
+  };
+
+  const handleError = (event: ErrorEvent) => {
+    rejectPendingRequests(new Error(`[cprWorker] Uncaught worker error: ${event.message}`));
+  };
+
+  worker.addEventListener('message', handleMessage as EventListener);
+  worker.addEventListener('error', handleError as EventListener);
+
+  session.cleanupListeners = () => {
+    worker.removeEventListener('message', handleMessage as EventListener);
+    worker.removeEventListener('error', handleError as EventListener);
+  };
+  session.rejectPendingRequests = rejectPendingRequests;
+
+  return session;
+}
+
+async function terminateCPRWorkerSession(sessionArg?: CPRWorkerSession | null): Promise<void> {
+  const session = sessionArg ?? activeCPRWorkerSession;
+  if (!session) {
+    return;
+  }
+
+  if (activeCPRWorkerSession === session) {
     activeCPRWorkerSession = null;
   }
+
+  if (session.isTerminating) {
+    await session.terminatePromise;
+    return;
+  }
+
+  session.isTerminating = true;
+  session.terminatePromise = (async () => {
+    session.rejectPendingRequests(
+      new Error('[cprWorker] Worker session terminated during teardown.')
+    );
+
+    try {
+      await postMessageToCPRWorker<CPRWorkerDisposeSuccessMessage>(
+        session,
+        {
+          type: 'DISPOSE' as const,
+        },
+        {
+          expectedTypes: ['DISPOSE_SUCCESS'],
+          timeoutMs: 500,
+        }
+      );
+    } catch (disposeError) {
+      console.warn('[CPR] Failed to dispose CPR worker before termination.', disposeError);
+    } finally {
+      session.rejectPendingRequests(
+        new Error('[cprWorker] Worker session terminated before pending request completion.')
+      );
+      session.cleanupListeners();
+      session.worker.terminate();
+    }
+  })();
+
+  await session.terminatePromise;
 }
 
 function postMessageToCPRWorker<T extends CPRWorkerResponseMessage>(
-  worker: Worker,
+  session: CPRWorkerSession,
   payload: unknown,
-  transferList?: Transferable[]
+  options: {
+    expectedTypes: T['type'][];
+    transferList?: Transferable[];
+    timeoutMs?: number;
+  }
 ): Promise<T> {
+  const requestType =
+    payload && typeof payload === 'object' && typeof (payload as { type?: unknown }).type === 'string'
+      ? String((payload as { type: string }).type)
+      : 'UNKNOWN';
+
+  if (session.isTerminating && requestType !== 'DISPOSE') {
+    return Promise.reject(new Error('[cprWorker] Worker session is terminating.'));
+  }
+
+  const requestId = createCPRWorkerRequestId();
+  const expectedTypes = new Set(options.expectedTypes as CPRWorkerExpectedResponseType[]);
+  const message = {
+    ...(payload as Record<string, unknown>),
+    requestId,
+  };
+
   return new Promise((resolve, reject) => {
-    const cleanup = () => {
-      worker.removeEventListener('message', handleMessage as EventListener);
-      worker.removeEventListener('error', handleError as EventListener);
-    };
-    const handleMessage = (event: MessageEvent<CPRWorkerResponseMessage>) => {
-      cleanup();
-      const data = event.data;
-      if (!data || typeof data !== 'object') {
-        reject(new Error('[cprWorker] Invalid worker response.'));
-        return;
-      }
-      if (data.type === 'ERROR') {
-        reject(new Error(`[cprWorker] ${data.message}`));
-        return;
-      }
-      resolve(data as T);
-    };
-    const handleError = (event: ErrorEvent) => {
-      cleanup();
-      reject(new Error(`[cprWorker] Uncaught worker error: ${event.message}`));
+    const pendingRequest: PendingCPRWorkerRequest = {
+      expectedTypes,
+      requestType,
+      resolve: response => {
+        resolve(response as T);
+      },
+      reject,
     };
 
-    worker.addEventListener('message', handleMessage as EventListener);
-    worker.addEventListener('error', handleError as EventListener);
-    if (transferList && transferList.length > 0) {
-      worker.postMessage(payload, transferList);
-    } else {
-      worker.postMessage(payload);
+    if (options.timeoutMs && options.timeoutMs > 0) {
+      pendingRequest.timeoutId = window.setTimeout(() => {
+        const liveRequest = session.pendingRequests.get(requestId);
+        if (!liveRequest) {
+          return;
+        }
+
+        session.pendingRequests.delete(requestId);
+        liveRequest.reject(
+          new Error(
+            `[cprWorker] Timed out waiting for ${Array.from(expectedTypes).join('/')} from ${requestType}.`
+          )
+        );
+      }, options.timeoutMs);
+    }
+
+    session.pendingRequests.set(requestId, pendingRequest);
+
+    try {
+      if (options.transferList && options.transferList.length > 0) {
+        session.worker.postMessage(message, options.transferList);
+      } else {
+        session.worker.postMessage(message);
+      }
+    } catch (postError) {
+      session.pendingRequests.delete(requestId);
+      if (pendingRequest.timeoutId != null) {
+        window.clearTimeout(pendingRequest.timeoutId);
+      }
+      reject(postError instanceof Error ? postError : new Error(String(postError)));
     }
   });
 }
@@ -1203,6 +1588,7 @@ function launchCPRWorker(params: {
   slabHalfThicknessMm: number;
   slabSamples: number;
   aggregation: 'MIP' | 'MEAN';
+  renderBackend?: 'gpu' | 'cpu';
   verticalDir?: [number, number, number];
   forceApplyModalityLut?: boolean;
   modalityLutOverride?: boolean;
@@ -1222,6 +1608,7 @@ function launchCPRWorker(params: {
       slabHalfThicknessMm,
       slabSamples,
       aggregation,
+      renderBackend = CPR_PANO_RENDER_BACKEND_DEFAULT,
       verticalDir,
       forceApplyModalityLut,
       modalityLutOverride,
@@ -1412,9 +1799,11 @@ function launchCPRWorker(params: {
       }
 
       if (!activeCPRWorkerSession || activeCPRWorkerSession.volumeKey !== volumeKey) {
-        terminateCPRWorkerSession();
+        await terminateCPRWorkerSession();
         const worker = new Worker(new URL('./cprWorker.ts', import.meta.url), { type: 'module' });
         const sessionKey = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const workerSession = createCPRWorkerSession(worker, volumeKey, sessionKey);
+        activeCPRWorkerSession = workerSession;
         const isSharedArrayBuffer = scalarData.buffer instanceof SharedArrayBuffer;
         const initScalarData = isSharedArrayBuffer
           ? scalarData
@@ -1439,12 +1828,23 @@ function launchCPRWorker(params: {
         };
         const transferList =
           isSharedArrayBuffer || !initScalarData.buffer ? undefined : [initScalarData.buffer];
-        await postMessageToCPRWorker<CPRWorkerInitSuccessMessage>(worker, initPayload, transferList);
-        activeCPRWorkerSession = {
-          worker,
-          volumeKey,
-          sessionKey,
-        };
+        try {
+          await postMessageToCPRWorker<CPRWorkerInitSuccessMessage>(
+            workerSession,
+            initPayload,
+            {
+              expectedTypes: ['INIT_SUCCESS'],
+              transferList,
+            }
+          );
+        } catch (initError) {
+          await terminateCPRWorkerSession(workerSession);
+          throw initError;
+        }
+      }
+
+      if (!activeCPRWorkerSession) {
+        throw new Error('[cprWorker] Worker session was not initialized.');
       }
 
       const serializedFrames = frames.map(f => ({
@@ -1455,7 +1855,7 @@ function launchCPRWorker(params: {
       }));
 
       const data = await postMessageToCPRWorker<CPRWorkerSuccessMessage>(
-        activeCPRWorkerSession.worker,
+        activeCPRWorkerSession,
         {
           type: 'RENDER' as const,
           sessionKey: activeCPRWorkerSession.sessionKey,
@@ -1468,6 +1868,7 @@ function launchCPRWorker(params: {
           slabHalfThicknessMm,
           slabSamples,
           aggregation,
+          renderBackend,
           verticalDir,
           applyModalityLut,
           allowStoredValueNormalization,
@@ -1475,6 +1876,9 @@ function launchCPRWorker(params: {
             forceDisableStoredValueNormalization === true ? true : undefined,
           debugRunId,
           reconstructionMode,
+        },
+        {
+          expectedTypes: ['SUCCESS'],
         }
       );
 
@@ -1500,6 +1904,8 @@ function launchCPRWorker(params: {
         maxValue: data.maxValue,
         windowWidth: data.windowWidth,
         windowCenter: data.windowCenter,
+        slope: data.slope,
+        intercept: data.intercept,
         modalityLutApplied: data.modalityLutApplied === true,
         requestedModalityLutApplied: data.requestedModalityLutApplied === true,
         storedValueNormalizationApplied: data.storedValueNormalizationApplied === true,
@@ -1514,7 +1920,7 @@ function launchCPRWorker(params: {
       });
     } catch (error) {
       if (activeCPRWorkerSession) {
-        terminateCPRWorkerSession();
+        await terminateCPRWorkerSession();
       }
       reject(error instanceof Error ? error : new Error(String(error)));
     }
@@ -2307,6 +2713,109 @@ function cloneCameraState(
   };
 }
 
+type VolumeViewportDisplayState = {
+  volumeId?: string;
+  properties: {
+    isComputedVOI?: boolean;
+    voiRange?: { lower?: number; upper?: number };
+    VOILUTFunction?: unknown;
+    invert?: unknown;
+    colormap?: unknown;
+  };
+};
+
+function cloneVoiRange(
+  voiRange: { lower?: number; upper?: number } | null | undefined
+): { lower?: number; upper?: number } | undefined {
+  if (!voiRange || typeof voiRange !== 'object') {
+    return undefined;
+  }
+
+  return {
+    lower: toFiniteNumber(voiRange.lower),
+    upper: toFiniteNumber(voiRange.upper),
+  };
+}
+
+function getVolumeViewportDisplayVolumeId(
+  viewport: cornerstone.Types.IVolumeViewport
+): string | undefined {
+  void viewport;
+  const sourceVolumeId = cprStateService.getSourceVolumeId();
+  return typeof sourceVolumeId === 'string' && sourceVolumeId.length > 0 ? sourceVolumeId : undefined;
+}
+
+function captureVolumeViewportDisplayState(
+  viewport: cornerstone.Types.IVolumeViewport
+): VolumeViewportDisplayState | null {
+  const properties = ((viewport as { getProperties?: () => unknown }).getProperties?.() || {}) as {
+    isComputedVOI?: boolean;
+    voiRange?: { lower?: number; upper?: number };
+    VOILUTFunction?: unknown;
+    invert?: unknown;
+    colormap?: unknown;
+  };
+
+  return {
+    volumeId: getVolumeViewportDisplayVolumeId(viewport),
+    properties: {
+      isComputedVOI:
+        typeof properties.isComputedVOI === 'boolean' ? properties.isComputedVOI : undefined,
+      voiRange: cloneVoiRange(properties.voiRange),
+      VOILUTFunction: properties.VOILUTFunction,
+      invert: properties.invert,
+      colormap: properties.colormap,
+    },
+  };
+}
+
+function restoreVolumeViewportDisplayState(
+  viewport: cornerstone.Types.IVolumeViewport,
+  displayState: VolumeViewportDisplayState | null
+): void {
+  if (!displayState) {
+    return;
+  }
+
+  const nextProperties: {
+    isComputedVOI?: boolean;
+    voiRange?: { lower?: number; upper?: number };
+    VOILUTFunction?: unknown;
+    invert?: unknown;
+    colormap?: unknown;
+  } = {};
+
+  if (typeof displayState.properties.isComputedVOI === 'boolean') {
+    nextProperties.isComputedVOI = displayState.properties.isComputedVOI;
+  }
+  if (displayState.properties.voiRange) {
+    nextProperties.voiRange = {
+      lower: displayState.properties.voiRange.lower,
+      upper: displayState.properties.voiRange.upper,
+    };
+  }
+  if (displayState.properties.VOILUTFunction !== undefined) {
+    nextProperties.VOILUTFunction = displayState.properties.VOILUTFunction;
+  }
+  if (displayState.properties.invert !== undefined) {
+    nextProperties.invert = displayState.properties.invert;
+  }
+  if (displayState.properties.colormap !== undefined) {
+    nextProperties.colormap = displayState.properties.colormap;
+  }
+
+  if (Object.keys(nextProperties).length === 0) {
+    return;
+  }
+
+  (viewport as {
+    setProperties: (
+      properties: typeof nextProperties,
+      volumeId?: string
+    ) => void;
+  }).setProperties(nextProperties, displayState.volumeId);
+}
+
 type AnnotationLike = {
   annotationUID?: string;
   modifiedTimestamp?: number;
@@ -2427,6 +2936,7 @@ function setCrossSectionForFrame(
   }
 
   const previousCamera = cloneCameraState(crossViewport);
+  const previousDisplayState = captureVolumeViewportDisplayState(crossViewport);
   console.log(
     `[CPR-DEBUG] setCrossSectionForFrame previousCamera ${JSON.stringify({
       frameIndex: frame.index,
@@ -2442,7 +2952,45 @@ function setCrossSectionForFrame(
       verticalCenterOffsetMm
     )
   );
-  crossViewport.render?.();
+  const reapplyDisplayState = () => {
+    restoreVolumeViewportDisplayState(crossViewport, previousDisplayState);
+    crossViewport.render?.();
+  };
+  reapplyDisplayState();
+  const crossViewportElement = crossViewport.element;
+  if (crossViewportElement) {
+    let isVolumeListenerActive = true;
+    const cleanupVolumeListener = () => {
+      if (!isVolumeListenerActive) {
+        return;
+      }
+      isVolumeListenerActive = false;
+      crossViewportElement.removeEventListener(
+        cornerstone.Enums.Events.VOLUME_NEW_IMAGE,
+        onVolumeNewImage as EventListener
+      );
+    };
+    const onVolumeNewImage = () => {
+      if (!isVolumeListenerActive) {
+        return;
+      }
+      cleanupVolumeListener();
+      reapplyDisplayState();
+    };
+
+    crossViewportElement.addEventListener(
+      cornerstone.Enums.Events.VOLUME_NEW_IMAGE,
+      onVolumeNewImage as EventListener
+    );
+
+    window.requestAnimationFrame(() => {
+      reapplyDisplayState();
+      window.setTimeout(() => {
+        cleanupVolumeListener();
+      }, 250);
+    });
+    return;
+  }
 }
 
 type VolumeLoadStatusLike = {
@@ -2664,8 +3212,8 @@ export function useCPROrchestrator({
   sourceViewportId,
   panoWidth: requestedPanoWidth = 800,
   panoHeight: requestedPanoHeight = 400,
-  slabHalfThicknessMm = 2.5,
-  slabSamples = 13,
+  slabHalfThicknessMm = CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM,
+  slabSamples = CPR_GPU_PANO_DEFAULT_SLAB_SAMPLES,
   aggregation = 'MIP',
 }: UseCPROrchestratorProps): UseCPROrchestratorReturn {
   const [isGenerating, setIsGenerating] = useState(false);
@@ -2982,12 +3530,14 @@ export function useCPROrchestrator({
         slabHalfThicknessMm,
         slabSamples,
         aggregation,
+        renderBackend: CPR_PANO_RENDER_BACKEND_DEFAULT as 'gpu' | 'cpu',
         verticalDir,
         verticalHalfMm: baseVerticalHalfMm,
         verticalCenterOffsetMm: rigidSliceVerticalCenterOffsetMm,
         rigidVerticalSliceMode: rigidVerticalSliceModeEnabled,
         debugRunId,
       };
+      const gpuSinglePassEnabled: boolean = workerInput.renderBackend !== 'cpu';
       const runWorkerAttempt = async (
         label: string,
         overrides: Partial<Parameters<typeof launchCPRWorker>[0]>
@@ -3027,16 +3577,27 @@ export function useCPROrchestrator({
         launchedAttemptCount++;
         const attemptStartMs = performance.now();
         const requestedAggregation = (overrides.aggregation ?? workerInput.aggregation) === 'MEAN' ? 'MEAN' : 'MIP';
-        const requestedSlabHalfThicknessMm = toPositiveFinite(
-          overrides.slabHalfThicknessMm,
-          toPositiveFinite(workerInput.slabHalfThicknessMm, balancedSlabHalfThicknessMm)
-        );
-        const requestedSlabSamples = Math.max(
-          1,
-          Math.floor(
-            toPositiveFinite(overrides.slabSamples, toPositiveFinite(workerInput.slabSamples, balancedSlabSamples))
-          )
-        );
+        const requestedRenderBackend =
+          (overrides.renderBackend ?? workerInput.renderBackend) === 'cpu' ? 'cpu' : 'gpu';
+        const requestedSlabHalfThicknessMm =
+          requestedRenderBackend === 'gpu'
+            ? CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM
+            : toPositiveFinite(
+                overrides.slabHalfThicknessMm,
+                toPositiveFinite(workerInput.slabHalfThicknessMm, balancedSlabHalfThicknessMm)
+              );
+        const requestedSlabSamples =
+          requestedRenderBackend === 'gpu'
+            ? CPR_GPU_PANO_DEFAULT_SLAB_SAMPLES
+            : Math.max(
+                1,
+                Math.floor(
+                  toPositiveFinite(
+                    overrides.slabSamples,
+                    toPositiveFinite(workerInput.slabSamples, balancedSlabSamples)
+                  )
+                )
+              );
         const requestedVerticalCenterOffsetMm = toFiniteNumber(
           rigidVerticalSliceModeEnabled
             ? rigidSliceVerticalCenterOffsetMm
@@ -3056,16 +3617,43 @@ export function useCPROrchestrator({
           (actualVertHalfMm * 2) / Math.max(1, finalPanoHeight - 1),
           minSpacing
         );
+        console.log('[CPR-GPU-REQUEST-JSON]', JSON.stringify({
+          runId: debugRunId,
+          label,
+          renderBackend: requestedRenderBackend,
+          aggregation: requestedAggregation,
+          panoWidth: finalPanoWidth,
+          panoHeight: finalPanoHeight,
+          slabHalfThicknessMm: requestedSlabHalfThicknessMm,
+          slabSamples: requestedSlabSamples,
+          verticalHalfMm: actualVertHalfMm,
+          verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
+        }));
         const rawResult = await launchCPRWorker({
           ...workerInput,
           ...overrides,
           panoWidth: finalPanoWidth,
           panoHeight: finalPanoHeight,
+          renderBackend: requestedRenderBackend,
+          slabHalfThicknessMm: requestedSlabHalfThicknessMm,
+          slabSamples: requestedSlabSamples,
           verticalHalfMm: actualVertHalfMm,
           verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
           rigidVerticalSliceMode: rigidVerticalSliceModeEnabled,
         });
         const result = rawResult;
+        drawPanoDebugCanvas(
+          `${debugRunId}:${label}`,
+          result.pixelData,
+          result.width,
+          result.height,
+          {
+            windowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
+            windowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
+            slope: result.slope,
+            intercept: result.intercept,
+          }
+        );
         const hasIdentityRescaleMetadata =
           Math.abs(result.rescaleSlope - 1) <= 1e-6 && Math.abs(result.rescaleIntercept) <= 1e-6;
         const intensityDomain = classifySyntheticCprIntensityDomain({
@@ -3077,9 +3665,29 @@ export function useCPROrchestrator({
         const huDomain = isSyntheticCprHuDomain(intensityDomain);
         const convertedToHu = false;
         const rescaleSkippedAsUnsafe = intensityDomain === 'unknown';
-        const summary = summarizeFloatBufferForDebug(result.pixelData, finalPanoWidth, finalPanoHeight);
-        const voi = computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
-        const qualityBase = scorePanoQuality(summary);
+        const summary =
+          requestedRenderBackend === 'gpu'
+            ? null
+            : summarizeFloatBufferForDebug(result.pixelData, finalPanoWidth, finalPanoHeight);
+        const voi =
+          requestedRenderBackend === 'gpu'
+            ? buildDirectWorkerPanoVoi(result.windowWidth, result.windowCenter)
+            : computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
+        console.log('[CPR-GPU-VOI-APPLY-JSON]', JSON.stringify({
+          runId: debugRunId,
+          label,
+          renderBackend: requestedRenderBackend,
+          slabHalfThicknessMm: requestedSlabHalfThicknessMm,
+          slabSamples: requestedSlabSamples,
+          workerWindowWidth: result.windowWidth,
+          workerWindowCenter: result.windowCenter,
+          adaptiveWindowWidth: voi.windowWidth,
+          adaptiveWindowCenter: voi.windowCenter,
+          minValue: result.minValue,
+          maxValue: result.maxValue,
+          voiSource: requestedRenderBackend === 'gpu' ? 'worker-native' : 'adaptive',
+        }));
+        const qualityBase = requestedRenderBackend === 'gpu' ? 0 : scorePanoQuality(summary);
         const workerDiagnostic =
           result.workerDebugPayload &&
             typeof result.workerDebugPayload === 'object' &&
@@ -3543,7 +4151,9 @@ export function useCPROrchestrator({
       });
       recordAttempt(bestAttempt);
 
-      if (isGoodEnoughPanoAttempt(bestAttempt)) {
+      if (gpuSinglePassEnabled) {
+        earlyExitReason = 'gpu-single-pass';
+      } else if (isGoodEnoughPanoAttempt(bestAttempt)) {
         earlyExitReason = 'primary-good-enough';
       } else {
         const retryConfigs: Array<{
@@ -3810,6 +4420,7 @@ export function useCPROrchestrator({
       }
 
       const shouldRunMipFallbacks =
+        !gpuSinglePassEnabled &&
         !earlyExitReason &&
         (
           !!bestAttempt.hardRejectReason ||
@@ -3864,16 +4475,18 @@ export function useCPROrchestrator({
       }
 
       const totalAttemptDurationMs = performance.now() - panoAttemptSequenceStartMs;
-      const phase2BaseAttempt = attemptResults
-        .filter(attempt => attempt.aggregation === 'MEAN')
-        .sort((a, b) => {
-          const aHardRejected = !!a.hardRejectReason;
-          const bHardRejected = !!b.hardRejectReason;
-          if (aHardRejected !== bHardRejected) {
-            return aHardRejected ? 1 : -1;
-          }
-          return (b.qualityScore - a.qualityScore) || (b.qualityBase - a.qualityBase);
-        })[0] || null;
+      const phase2BaseAttempt = gpuSinglePassEnabled
+        ? null
+        : attemptResults
+          .filter(attempt => attempt.aggregation === 'MEAN')
+          .sort((a, b) => {
+            const aHardRejected = !!a.hardRejectReason;
+            const bHardRejected = !!b.hardRejectReason;
+            if (aHardRejected !== bHardRejected) {
+              return aHardRejected ? 1 : -1;
+            }
+            return (b.qualityScore - a.qualityScore) || (b.qualityBase - a.qualityBase);
+          })[0] || null;
       const phase1VirtualPano: {
         executed: boolean;
         skippedReason: string | null;
@@ -3887,7 +4500,9 @@ export function useCPROrchestrator({
         timingMs: null,
         diagnostics: null,
       };
-      if (!phase2BaseAttempt) {
+      if (gpuSinglePassEnabled) {
+        phase1VirtualPano.skippedReason = 'GPU_SINGLE_PASS';
+      } else if (!phase2BaseAttempt) {
         phase1VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
       } else {
         try {
@@ -3960,7 +4575,9 @@ export function useCPROrchestrator({
         borderlineAcceptedReason: null,
       };
       let phase2WorkerResult: CPRWorkerLaunchResult | null = null;
-      if (!phase2BaseAttempt) {
+      if (gpuSinglePassEnabled) {
+        phase2VirtualPano.skippedReason = 'GPU_SINGLE_PASS';
+      } else if (!phase2BaseAttempt) {
         phase2VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
       } else {
         try {
@@ -4376,8 +4993,8 @@ export function useCPROrchestrator({
             intensityDomain: bestAttempt.intensityDomain,
             windowWidth: adaptiveVoi.windowWidth,
             windowCenter: adaptiveVoi.windowCenter,
-            slope: 1,
-            intercept: 0,
+            slope: panoWorkerResult.slope,
+            intercept: panoWorkerResult.intercept,
             columnPixelSpacing: selectedColumnPixelSpacing,
             rowPixelSpacing: selectedRowPixelSpacing,
           });
@@ -4392,8 +5009,8 @@ export function useCPROrchestrator({
             windowCenter: adaptiveVoi.windowCenter,
             voiLower: adaptiveVoi.lower,
             voiUpper: adaptiveVoi.upper,
-            slope: 1,
-            intercept: 0,
+            slope: panoWorkerResult.slope,
+            intercept: panoWorkerResult.intercept,
             width: panoWorkerResult.width,
             height: panoWorkerResult.height,
             columnPixelSpacing: selectedColumnPixelSpacing,
@@ -4410,6 +5027,8 @@ export function useCPROrchestrator({
             windowCenter: adaptiveVoi.windowCenter,
             voiLower: adaptiveVoi.lower,
             voiUpper: adaptiveVoi.upper,
+            slope: panoWorkerResult.slope,
+            intercept: panoWorkerResult.intercept,
             width: panoWorkerResult.width,
             height: panoWorkerResult.height,
             columnPixelSpacing: selectedColumnPixelSpacing,
@@ -4765,6 +5384,12 @@ export function useCPROrchestrator({
       cornerstone.eventTarget.removeEventListener(CPR_CROSSSECTION_SYNC_EVENT, onCrossSectionSync);
     };
   }, [onSliderChange]);
+
+  useEffect(() => {
+    return () => {
+      void terminateCPRWorkerSession();
+    };
+  }, []);
 
   return { onDone, onRedraw, onSliderChange, isGenerating, error };
 }

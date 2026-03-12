@@ -1,3 +1,5 @@
+import { disposeGpuPanoRenderer, renderPanoGpu } from './cprGpuRenderer';
+
 /**
  * cprWorker.ts
  * Web Worker: Generates the 2D panoramic image from a 3D CBCT volume.
@@ -40,6 +42,7 @@ interface CPRWorkerInput {
   isPreScaled?: boolean;
   debugRunId?: string;
   reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  renderBackend?: 'gpu' | 'cpu';
 }
 
 interface CPRWorkerVolumeState {
@@ -62,10 +65,12 @@ interface CPRWorkerVolumeState {
 
 interface CPRWorkerInitVolumeInput extends CPRWorkerVolumeState {
   type: 'INIT_VOLUME';
+  requestId: string;
 }
 
 interface CPRWorkerRenderInput {
   type: 'RENDER';
+  requestId: string;
   sessionKey: string;
   verticalDir?: [number, number, number];
   frames: WorkerFrame[];
@@ -82,9 +87,15 @@ interface CPRWorkerRenderInput {
   disableStoredValueNormalization?: boolean;
   debugRunId?: string;
   reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  renderBackend?: 'gpu' | 'cpu';
 }
 
-type CPRWorkerMessage = CPRWorkerInitVolumeInput | CPRWorkerRenderInput;
+interface CPRWorkerDisposeInput {
+  type: 'DISPOSE';
+  requestId: string;
+}
+
+type CPRWorkerMessage = CPRWorkerInitVolumeInput | CPRWorkerRenderInput | CPRWorkerDisposeInput;
 
 function isMat4ArrayLike(value: unknown): value is ArrayLike<number> {
   if (!value || typeof value !== 'object') {
@@ -107,13 +118,16 @@ function isMat4ArrayLike(value: unknown): value is ArrayLike<number> {
 
 interface CPRWorkerSuccess {
   type: 'SUCCESS';
-  pixelData: Float32Array;
+  requestId: string;
+  pixelData: Float32Array | Uint16Array;
   panoWidth: number;
   panoHeight: number;
   minValue: number;
   maxValue: number;
   windowWidth: number;
   windowCenter: number;
+  slope: number;
+  intercept: number;
   modalityLutApplied: boolean;
   requestedModalityLutApplied: boolean;
   storedValueNormalizationApplied: boolean;
@@ -131,6 +145,7 @@ interface CPRWorkerSuccess {
 
 interface CPRWorkerError {
   type: 'ERROR';
+  requestId: string;
   message: string;
 }
 
@@ -169,7 +184,13 @@ function decodeStoredScalarValue(
 
 interface CPRWorkerInitSuccess {
   type: 'INIT_SUCCESS';
+  requestId: string;
   sessionKey: string;
+}
+
+interface CPRWorkerDisposeSuccess {
+  type: 'DISPOSE_SUCCESS';
+  requestId: string;
 }
 
 function normalize3(v: [number, number, number]): [number, number, number] {
@@ -431,6 +452,261 @@ function computeArrayMinMax(buffer: Float32Array): { minValue: number; maxValue:
   }
 
   return { minValue, maxValue };
+}
+
+function computeAutoDisplayWindow(pixelData: Float32Array): {
+  minValue: number;
+  maxValue: number;
+  windowWidth: number;
+  windowCenter: number;
+} {
+  const { minValue, maxValue } = computeArrayMinMax(pixelData);
+  const samples: number[] = [];
+  const sampleStep = Math.max(1, Math.floor(pixelData.length / 20000));
+
+  for (let index = 0; index < pixelData.length; index += sampleStep) {
+    const value = Number(pixelData[index]);
+    if (Number.isFinite(value)) {
+      samples.push(value);
+    }
+  }
+
+  if (samples.length >= 32) {
+    const lower = percentile(samples, 0.01);
+    const upper = percentile(samples, 0.99);
+    if (Number.isFinite(lower) && Number.isFinite(upper) && upper > lower) {
+      const windowWidth = Math.max(1, upper - lower);
+      return {
+        minValue,
+        maxValue,
+        windowWidth,
+        windowCenter: lower + windowWidth / 2,
+      };
+    }
+  }
+
+  const safeMin = Number.isFinite(minValue) ? minValue : 0;
+  const safeMax = Number.isFinite(maxValue) ? maxValue : safeMin + 1;
+  const windowWidth = Math.max(1, safeMax - safeMin);
+
+  return {
+    minValue: safeMin,
+    maxValue: safeMax,
+    windowWidth,
+    windowCenter: safeMin + windowWidth / 2,
+  };
+}
+
+function quantizePanoForStackDisplay(
+  pixelData: Float32Array,
+  minValue: number,
+  maxValue: number
+): {
+  pixelData: Uint16Array;
+  slope: number;
+  intercept: number;
+} {
+  const safeMin = Number.isFinite(minValue) ? Number(minValue) : 0;
+  const safeMax = Number.isFinite(maxValue) ? Number(maxValue) : safeMin;
+  const intercept = safeMin;
+  const range = Math.max(0, safeMax - safeMin);
+  const slope = range > 1e-6 ? range / 65535 : 1;
+  const storedPixelData = new Uint16Array(pixelData.length);
+
+  for (let i = 0; i < pixelData.length; i++) {
+    const hu = Number(pixelData[i]);
+    if (!Number.isFinite(hu)) {
+      storedPixelData[i] = 0;
+      continue;
+    }
+
+    const storedValue = Math.round((hu - intercept) / slope);
+    storedPixelData[i] = Math.max(0, Math.min(65535, storedValue));
+  }
+
+  return {
+    pixelData: storedPixelData,
+    slope,
+    intercept,
+  };
+}
+
+function validateGpuReadback(
+  pixelData: Float32Array,
+  panoWidth: number,
+  panoHeight: number
+): void {
+  const expectedLength = Math.max(0, panoWidth * panoHeight);
+  if (!(pixelData instanceof Float32Array) || pixelData.length !== expectedLength) {
+    throw new Error(
+      `GPU pano readback length mismatch: expected ${expectedLength}, got ${pixelData?.length ?? 0}.`
+    );
+  }
+
+  let finiteCount = 0;
+  const sampleStep = Math.max(1, Math.floor(pixelData.length / 4096));
+  for (let index = 0; index < pixelData.length; index += sampleStep) {
+    if (Number.isFinite(Number(pixelData[index]))) {
+      finiteCount++;
+      if (finiteCount >= 8) {
+        return;
+      }
+    }
+  }
+
+  throw new Error('GPU pano readback did not contain enough finite pixels.');
+}
+
+function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
+  pixelData: Float32Array;
+  minValue: number;
+  maxValue: number;
+  windowWidth: number;
+  windowCenter: number;
+  modalityLutApplied: boolean;
+  requestedModalityLutApplied: boolean;
+  storedValueNormalizationApplied: boolean;
+  unsignedPackedArtifactDetected: boolean;
+  diagnosticPayload: Record<string, unknown>;
+  outputSignature: {
+    sampledCount: number;
+    checksum: number;
+    absChecksum: number;
+    first16: number[];
+  };
+} {
+  const {
+    scalarData,
+    dimensions,
+    spacing,
+    origin,
+    direction,
+    worldToIndex,
+    verticalDir,
+    frames,
+    panoWidth,
+    panoHeight,
+    vertHalfMm: requestedVertHalfMm,
+    verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
+    slabHalfThicknessMm,
+    slabSamples,
+    applyModalityLut,
+    reconstructionMode,
+  } = input;
+
+  const effectiveVerticalDir =
+    Array.isArray(verticalDir) && verticalDir.length >= 3
+      ? normalize3([verticalDir[0], verticalDir[1], verticalDir[2]])
+      : normalize3([direction[6] ?? 0, direction[7] ?? 0, direction[8] ?? 1]);
+  const effectiveVerticalHalfMm =
+    Number.isFinite(requestedVertHalfMm) && Number(requestedVertHalfMm) > 0
+      ? Number(requestedVertHalfMm)
+      : 15.0;
+  const verticalCenterOffsetMm = Number.isFinite(requestedVerticalCenterOffsetMm)
+    ? Number(requestedVerticalCenterOffsetMm)
+    : 0;
+  const effectiveSlabSamples = Math.max(1, Math.min(32, Math.floor(slabSamples)));
+  const startedAt = performance.now();
+  const gpuResult = renderPanoGpu(
+    {
+      scalarData,
+      dimensions,
+      spacing,
+      origin,
+      direction,
+      worldToIndex: worldToIndex ? Array.from(worldToIndex).slice(0, 16) : undefined,
+      frames: frames.map(frame => ({
+        position: [frame.position[0], frame.position[1], frame.position[2]],
+        N_slab: [frame.N_slab[0], frame.N_slab[1], frame.N_slab[2]],
+        S: Array.isArray(frame.S) ? [frame.S[0], frame.S[1], frame.S[2]] : undefined,
+      })),
+      panoWidth,
+      panoHeight,
+      verticalDir: effectiveVerticalDir,
+      vertHalfMm: effectiveVerticalHalfMm,
+      verticalCenterOffsetMm,
+      slabHalfThicknessMm,
+      slabSamples: effectiveSlabSamples,
+      rescaleSlope: 1,
+      rescaleIntercept: 0,
+      applyRescale: false,
+    },
+    volumeCacheKey
+  );
+  validateGpuReadback(gpuResult.pixelData, panoWidth, panoHeight);
+  const elapsedMs = performance.now() - startedAt;
+  const {
+    minValue,
+    maxValue,
+    windowWidth,
+    windowCenter,
+  } = computeAutoDisplayWindow(gpuResult.pixelData);
+  console.log('[CPR-GPU-WORKER-RESULT-JSON]', JSON.stringify({
+    debugRunId: input.debugRunId ?? null,
+    renderBackend: 'gpu',
+    panoWidth,
+    panoHeight,
+    slabHalfThicknessMm,
+    slabSamples: effectiveSlabSamples,
+    minValue,
+    maxValue,
+    windowWidth,
+    windowCenter,
+  }));
+  const outputSignature = computeOutputSignature(gpuResult.pixelData);
+  const usesPerColumnVerticalDirs = frames.some(
+    frame => Array.isArray(frame.S) && frame.S.length >= 3
+  );
+
+  return {
+    pixelData: gpuResult.pixelData,
+    minValue,
+    maxValue,
+    windowWidth,
+    windowCenter,
+    modalityLutApplied: false,
+    requestedModalityLutApplied: applyModalityLut === true,
+    storedValueNormalizationApplied: false,
+    unsignedPackedArtifactDetected: false,
+    diagnosticPayload: {
+      renderBackend: 'gpu',
+      reconstructionMode: reconstructionMode ?? 'legacy',
+      verticalHalfMm: effectiveVerticalHalfMm,
+      globalVerticalCenterOffsetMm: 0,
+      baseVerticalCenterOffsetMm: verticalCenterOffsetMm,
+      verticalCenterOffsetMm,
+      requestedVerticalCenterOffsetMm: verticalCenterOffsetMm,
+      fittedVerticalCenterOffsetMm: verticalCenterOffsetMm,
+      slabSampling: {
+        requestedSamples: Math.max(1, Math.floor(slabSamples)),
+        effectiveSamples: effectiveSlabSamples,
+        slabHalfThicknessMm,
+        aggregation: 'GPU_MIP',
+        reduction: 'maximum-intensity',
+      },
+      gpuRender: {
+        enabled: true,
+        volumeCacheKey,
+        usedPerColumnVerticalDirs: usesPerColumnVerticalDirs,
+      },
+      outputDisplayWindow: {
+        lower: minValue,
+        upper: maxValue,
+        windowWidth,
+        windowCenter,
+      },
+      timingMs: {
+        adaptiveCenterSearch: 0,
+        pass1And2TwoPassRender: 0,
+        virtualPanoPhase12: 0,
+        suppressionAndDenoise: 0,
+        diagnosticAssembly: 0,
+        gpuRender: Math.round(elapsedMs),
+        total: Math.round(elapsedMs),
+      },
+    },
+    outputSignature,
+  };
 }
 
 function summarizeVirtualPanoOutput(
@@ -3409,13 +3685,32 @@ function buildRenderInput(
     disableStoredValueNormalization: render.disableStoredValueNormalization,
     debugRunId: render.debugRunId,
     reconstructionMode: render.reconstructionMode,
+    renderBackend: render.renderBackend,
   };
+}
+
+function resolveWorkerRequestId(input: unknown): string {
+  return typeof (input as { requestId?: unknown })?.requestId === 'string'
+    ? String((input as { requestId: string }).requestId)
+    : 'unknown-request';
 }
 
 // eslint-disable-next-line no-restricted-globals
 self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
   try {
     const input = event.data;
+    const requestId = resolveWorkerRequestId(input);
+    if (input.type === 'DISPOSE') {
+      disposeGpuPanoRenderer();
+      cachedVolumeState = null;
+      const disposeResponse: CPRWorkerDisposeSuccess = {
+        type: 'DISPOSE_SUCCESS',
+        requestId,
+      };
+      (self as unknown as Worker).postMessage(disposeResponse);
+      return;
+    }
+
     if (input.type === 'INIT_VOLUME') {
       if (!input.scalarData || input.scalarData.length === 0) {
         throw new Error('Received empty or null scalar data during INIT_VOLUME.');
@@ -3459,6 +3754,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       };
       const initResponse: CPRWorkerInitSuccess = {
         type: 'INIT_SUCCESS',
+        requestId,
         sessionKey: input.sessionKey,
       };
       (self as unknown as Worker).postMessage(initResponse);
@@ -3482,6 +3778,56 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
     if (!renderInput.frames || renderInput.frames.length === 0) {
       throw new Error('Received empty frames array.');
     }
+    const renderBackend = renderInput.renderBackend === 'cpu' ? 'cpu' : 'gpu';
+    let renderResult:
+      | ReturnType<typeof generateGpuPanorama>
+      | Pick<
+          ReturnType<typeof generatePanorama>,
+          | 'pixelData'
+          | 'minValue'
+          | 'maxValue'
+          | 'windowWidth'
+          | 'windowCenter'
+          | 'modalityLutApplied'
+          | 'requestedModalityLutApplied'
+          | 'storedValueNormalizationApplied'
+          | 'unsignedPackedArtifactDetected'
+          | 'diagnosticPayload'
+          | 'outputSignature'
+        >
+      | undefined;
+
+    if (renderBackend === 'gpu') {
+      let lastGpuError: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          renderResult = generateGpuPanorama(renderInput, input.sessionKey);
+          lastGpuError = null;
+          break;
+        } catch (gpuError) {
+          lastGpuError = gpuError;
+          console.warn(
+            attempt === 0
+              ? '[CPR-GPU] GPU panorama render failed. Disposing context and retrying once.'
+              : '[CPR-GPU] GPU panorama render failed again after context reset.',
+            gpuError
+          );
+          try {
+            disposeGpuPanoRenderer();
+          } catch (disposeError) {
+            console.warn('[CPR-GPU] Failed to dispose GPU renderer after render failure.', disposeError);
+          }
+        }
+      }
+
+      if (!renderResult) {
+        console.warn('[CPR-GPU] Falling back to CPU panorama renderer after GPU retry failure.', lastGpuError);
+        renderResult = generatePanorama(renderInput);
+      }
+    } else {
+      renderResult = generatePanorama(renderInput);
+    }
+
     const {
       pixelData,
       minValue,
@@ -3494,16 +3840,28 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       unsignedPackedArtifactDetected,
       diagnosticPayload,
       outputSignature,
-    } = generatePanorama(renderInput);
+    } = renderResult;
+    const displayPixelData =
+      renderBackend === 'cpu'
+        ? {
+          pixelData,
+          slope: 1,
+          intercept: 0,
+        }
+        : quantizePanoForStackDisplay(pixelData, minValue, maxValue);
+    console.log('[WORKER-FINAL-MINMAX]', minValue, maxValue);
     const response: CPRWorkerSuccess = {
       type: 'SUCCESS',
-      pixelData,
+      requestId,
+      pixelData: displayPixelData.pixelData,
       panoWidth: renderInput.panoWidth,
       panoHeight: renderInput.panoHeight,
       minValue,
       maxValue,
       windowWidth,
       windowCenter,
+      slope: displayPixelData.slope,
+      intercept: displayPixelData.intercept,
       modalityLutApplied,
       requestedModalityLutApplied,
       storedValueNormalizationApplied,
@@ -3515,10 +3873,12 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
     };
 
     // eslint-disable-next-line no-restricted-globals
-    (self as unknown as Worker).postMessage(response, [pixelData.buffer]);
+    (self as unknown as Worker).postMessage(response, [displayPixelData.pixelData.buffer]);
   } catch (err) {
+    const requestId = resolveWorkerRequestId(event.data);
     const response: CPRWorkerError = {
       type: 'ERROR',
+      requestId,
       message: err instanceof Error ? err.message : String(err),
     };
     // eslint-disable-next-line no-restricted-globals

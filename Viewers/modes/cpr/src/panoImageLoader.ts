@@ -6,7 +6,7 @@ import {
 } from './cprSyntheticDisplay';
 
 export interface PanoImagePayload {
-  pixelData: Float32Array;
+  pixelData: Float32Array | Uint16Array;
   width: number;
   height: number;
   minValue: number;
@@ -39,18 +39,11 @@ interface PanoDisplayMetadata {
 function getPanoDisplayMetadata(payload: PanoImagePayload | null): PanoDisplayMetadata {
   const safeMin = Number.isFinite(payload?.minValue) ? Number(payload?.minValue) : -1000;
   const safeMax = Number.isFinite(payload?.maxValue) ? Number(payload?.maxValue) : 3000;
-  const payloadSlope =
-    Number.isFinite(payload?.slope) && Math.abs(Number(payload?.slope)) > 1e-8
-      ? Number(payload?.slope)
-      : 1;
+  const payloadSlope = Number.isFinite(payload?.slope) && Math.abs(Number(payload?.slope)) > 1e-8
+    ? Number(payload?.slope)
+    : 1;
   const payloadIntercept = Number.isFinite(payload?.intercept) ? Number(payload?.intercept) : 0;
 
-  // Worker output for pano:// is expected to already be in HU space.
-  // Always expose identity rescale metadata to avoid accidental double-LUT.
-  void payloadSlope;
-  void payloadIntercept;
-  const safeSlope = 1;
-  const safeIntercept = 0;
   const derivedVoi = getFallbackSyntheticCprVoi();
 
   const windowWidth =
@@ -67,9 +60,42 @@ function getPanoDisplayMetadata(payload: PanoImagePayload | null): PanoDisplayMe
     maxValue: safeMax,
     windowWidth,
     windowCenter,
-    slope: safeSlope,
-    intercept: safeIntercept,
+    slope: payloadSlope,
+    intercept: payloadIntercept,
   };
+}
+
+function getPanoStoredPixelRange(
+  pixelData: Float32Array | Uint16Array
+): {
+  minValue: number;
+  maxValue: number;
+} {
+  if (!pixelData.length) {
+    return { minValue: 0, maxValue: 0 };
+  }
+
+  let minValue = Infinity;
+  let maxValue = -Infinity;
+
+  for (let i = 0; i < pixelData.length; i++) {
+    const value = Number(pixelData[i]);
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    if (value < minValue) {
+      minValue = value;
+    }
+    if (value > maxValue) {
+      maxValue = value;
+    }
+  }
+
+  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+    return { minValue: 0, maxValue: 0 };
+  }
+
+  return { minValue, maxValue };
 }
 
 function getPanoPixelSpacing(payload: PanoImagePayload | null): {
@@ -110,11 +136,12 @@ function createImageObject(imageId: string, payload: PanoImagePayload): cornerst
   const { pixelData, width, height } = payload;
   const display = getPanoDisplayMetadata(payload);
   const spacing = getPanoPixelSpacing(payload);
+  const storedRange = getPanoStoredPixelRange(pixelData);
 
   const image: cornerstone.Types.IImage = {
     imageId,
-    minPixelValue: display.minValue,
-    maxPixelValue: display.maxValue,
+    minPixelValue: storedRange.minValue,
+    maxPixelValue: storedRange.maxValue,
     slope: display.slope,
     intercept: display.intercept,
     windowCenter: display.windowCenter,
@@ -135,6 +162,7 @@ function createImageObject(imageId: string, payload: PanoImagePayload): cornerst
     rowPixelSpacing: spacing.rowPixelSpacing,
     sizeInBytes: pixelData.byteLength,
     invert: false,
+    modalityLUT: undefined,
   };
 
   return image;
@@ -157,7 +185,17 @@ function panoImageLoader(imageId: string): {
       return;
     }
 
-    resolve(createImageObject(imageId, payload));
+    const image = createImageObject(imageId, payload);
+    console.log('[PANO-LOADER-METADATA]', {
+      minPixelValue: image.minPixelValue,
+      maxPixelValue: image.maxPixelValue,
+      windowWidth: image.windowWidth,
+      windowCenter: image.windowCenter,
+      slope: image.slope,
+      intercept: image.intercept,
+      invert: image.invert,
+    });
+    resolve(image);
   });
 
   return { promise };
@@ -209,6 +247,17 @@ function panoMetadataProvider(type: string, imageId: string) {
   }
 
   if (type === 'imagePixelModule') {
+    if (payload?.pixelData instanceof Uint16Array) {
+      return {
+        samplesPerPixel: 1,
+        photometricInterpretation: 'MONOCHROME2',
+        bitsAllocated: 16,
+        bitsStored: 16,
+        highBit: 15,
+        pixelRepresentation: 0,
+      };
+    }
+
     return {
       samplesPerPixel: 1,
       photometricInterpretation: 'MONOCHROME2',

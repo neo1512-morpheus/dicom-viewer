@@ -39,10 +39,14 @@ export interface GpuPanoInput {
 
 export interface GpuPanoResult {
     pixelData: Float32Array;
+    meanMap: Float32Array;
+    maxMap: Float32Array;
+    sampleCountMap: Float32Array;
     width: number;
     height: number;
     minValue: number;
     maxValue: number;
+    pipelineMode: 'single-pass' | 'multi-pass';
 }
 
 const GPU_DEBUG_MODE_OFF = 0;
@@ -99,16 +103,24 @@ float sampleHu(vec3 uvw) {
 }
 
 float computeNativeSlabPitchMm(vec3 slabDirIndexPerMm) {
-  return clamp(1.0 / max(length(slabDirIndexPerMm), 1e-5), 0.3, 0.6);
+  float indexUnitsPerMm = length(slabDirIndexPerMm);
+  if (indexUnitsPerMm <= 1e-5) {
+    return 0.2;
+  }
+  return clamp(1.0 / indexUnitsPerMm, 0.05, 2.0);
 }
 
 int computeRaySampleCount(float slabWidthMm, float nativeSlabPitchMm, int requestedSampleCount) {
   const int MAX_SLAB = 64;
   int pitchAlignedSampleCount = 1;
   if (slabWidthMm > 1e-4) {
-    pitchAlignedSampleCount = min(MAX_SLAB, max(3, int(ceil(slabWidthMm / nativeSlabPitchMm)) + 1));
+    float safeNativePitchMm = max(nativeSlabPitchMm, 1e-4);
+    pitchAlignedSampleCount = min(
+      MAX_SLAB,
+      max(3, int(ceil(slabWidthMm / safeNativePitchMm)) + 1)
+    );
   }
-  return min(MAX_SLAB, max(1, min(max(requestedSampleCount, 1), pitchAlignedSampleCount)));
+  return min(MAX_SLAB, max(max(requestedSampleCount, 1), pitchAlignedSampleCount));
 }
 
 vec3 sampleSplineRowLinear(float curveColumnCoord, int splineRow) {
@@ -168,7 +180,6 @@ bool computeSampleUvw(
   if (any(lessThan(sampleIndex, minIndex)) || any(greaterThan(sampleIndex, maxIndex))) {
     return false;
   }
-
   vec3 clampedIndex = clamp(sampleIndex, vec3(0.0), max(uDims - vec3(1.001), vec3(0.0)));
   uvw = (clampedIndex + vec3(0.5)) / uDims;
   return true;
@@ -185,19 +196,25 @@ float pseudoAttenuationFromHu(float hu) {
 }
 
 float softFogAttenuationFromHu(float hu) {
-  float airToSoft = 0.008 * smoothstep(-950.0, -150.0, hu);
-  float softToLowBone = 0.012 * smoothstep(-150.0, 220.0, hu);
+  float airToSoft = 0.0035 * smoothstep(-950.0, -180.0, hu);
+  float softToLowBone = 0.0055 * smoothstep(-180.0, 180.0, hu);
   return airToSoft + softToLowBone;
 }
 
 float supportResponseFromHu(float hu) {
-  float trabecularSupport = smoothstep(120.0, 900.0, hu);
-  float denseSupport = smoothstep(700.0, 2200.0, hu);
-  return clamp(0.75 * trabecularSupport + 0.35 * denseSupport, 0.0, 1.0);
+  float rootSupport = smoothstep(280.0, 1100.0, hu);
+  float dentinSupport = smoothstep(650.0, 2000.0, hu);
+  float enamelSupport = smoothstep(1200.0, 3200.0, hu);
+  float denseBias = smoothstep(900.0, 2600.0, hu);
+  float combined =
+    0.20 * rootSupport +
+    0.95 * dentinSupport +
+    0.90 * enamelSupport;
+  return clamp(combined * mix(0.9, 1.35, denseBias), 0.0, 1.75);
 }
 `;
 
-const DEBUG_FRAG_SRC = `#version 300 es
+const FOCAL_TROUGH_DRR_FRAG_SRC = `#version 300 es
 precision highp float;
 precision highp sampler3D;
 precision highp sampler2D;
@@ -245,9 +262,13 @@ void main() {
   const int MAX_SLAB = 64;
   float effectiveSlabHalfMm = max(uSlabHalfMm, 0.0);
   float slabWidthMm = effectiveSlabHalfMm * 2.0;
-  int raySampleCount = min(MAX_SLAB, max(1, uSlabSamples));
+  float nativeSlabPitchMm = computeNativeSlabPitchMm(slabDirIndexPerMm);
+  int raySampleCount = computeRaySampleCount(slabWidthMm, nativeSlabPitchMm, uSlabSamples);
   float slabStep = raySampleCount > 1 ? slabWidthMm / float(raySampleCount - 1) : 0.0;
-  float sumHu = 0.0;
+  const float sigmaMm = 1.5;
+  const float troughDenom = 2.0 * sigmaMm * sigmaMm;
+  float drrAccum = 0.0;
+  float troughWeightSum = 0.0;
   float rayMax = -3.402823e38;
   int validSampleCount = 0;
 
@@ -265,14 +286,20 @@ void main() {
     }
 
     float hu = sampleHu(uvw);
-    sumHu += hu;
+    float offsetMm = slabOffset;
+    float wTrough = exp(-(offsetMm * offsetMm) / troughDenom);
+    drrAccum += hu * wTrough;
+    troughWeightSum += wTrough;
     rayMax = max(rayMax, hu);
     validSampleCount++;
   }
 
-  float meanHu = validSampleCount > 0 ? sumHu / float(validSampleCount) : -1000.0;
-  float finalHu = validSampleCount > 0 ? mix(meanHu, rayMax, 0.5) : -1000.0;
-  fragColor = vec4(finalHu, 0.0, 0.0, 1.0);
+  float weightedMeanHu =
+    validSampleCount > 0 && troughWeightSum > 1e-5
+      ? drrAccum / troughWeightSum
+      : -1000.0;
+  float finalHu = weightedMeanHu;
+  fragColor = vec4(finalHu, weightedMeanHu, rayMax, float(validSampleCount));
 }
 `;
 
@@ -309,6 +336,9 @@ void main() {
   float supportMass = 0.0;
   float supportOffsetSum = 0.0;
   float supportOffsetSqSum = 0.0;
+  float denseMass = 0.0;
+  float bestSupportScore = 0.0;
+  float bestSupportOffsetMm = 0.0;
   float peakHu = -1000.0;
   bool hasValidSample = false;
 
@@ -326,9 +356,17 @@ void main() {
 
     float hu = sampleHu(uvw);
     float supportResponse = supportResponseFromHu(hu);
-    supportMass += supportResponse;
-    supportOffsetSum += slabOffset * supportResponse;
-    supportOffsetSqSum += slabOffset * slabOffset * supportResponse;
+    float denseBias = smoothstep(850.0, 2600.0, hu);
+    float weightedSupport = supportResponse * supportResponse * mix(0.85, 1.6, denseBias);
+    supportMass += weightedSupport;
+    supportOffsetSum += slabOffset * weightedSupport;
+    supportOffsetSqSum += slabOffset * slabOffset * weightedSupport;
+    denseMass += weightedSupport * mix(0.45, 1.0, denseBias);
+    float candidateScore = weightedSupport * mix(0.8, 1.8, denseBias);
+    if (candidateScore > bestSupportScore) {
+      bestSupportScore = candidateScore;
+      bestSupportOffsetMm = slabOffset;
+    }
     peakHu = max(peakHu, hu);
     hasValidSample = true;
   }
@@ -343,10 +381,23 @@ void main() {
   float secondMoment = supportOffsetSqSum / supportMass;
   float varianceMm = max(secondMoment - supportCenterMm * supportCenterMm, nativeSlabPitchMm * nativeSlabPitchMm * 0.25);
   float supportSpreadMm = sqrt(varianceMm);
-  float supportDensity = supportMass / max(float(raySampleCount), 1.0);
+  float peakDominance = bestSupportScore / max(supportMass, 1e-5);
+  supportCenterMm = mix(
+    supportCenterMm,
+    bestSupportOffsetMm,
+    smoothstep(0.16, 0.58, peakDominance)
+  );
+  float supportDensity = denseMass / max(float(raySampleCount), 1.0);
+  float spreadConfidence =
+    1.0 - smoothstep(
+      nativeSlabPitchMm * 1.5,
+      max(uSlabHalfMm * 0.55, nativeSlabPitchMm * 2.8),
+      supportSpreadMm
+    );
   float supportConfidence =
-    smoothstep(0.05, 0.30, supportDensity) *
-    smoothstep(120.0, 950.0, peakHu);
+    smoothstep(0.03, 0.18, supportDensity) *
+    smoothstep(650.0, 2200.0, peakHu) *
+    clamp(spreadConfidence, 0.0, 1.0);
 
   fragColor = vec4(
     supportCenterMm,
@@ -378,15 +429,20 @@ void main() {
   ivec2 centerCoord = ivec2(col, outputRow);
   vec4 centerSample = texelFetch(uSupportData, centerCoord, 0);
   float centerDepthMm = centerSample.r;
+  float centerConfidence = clamp(centerSample.g, 0.0, 1.0);
 
-  float weightedCenter = 0.0;
-  float weightedConfidence = 0.0;
-  float weightedSpread = 0.0;
-  float weightedDensity = 0.0;
-  float weightSum = 0.0;
+  float centerWeight = 1.8 + centerConfidence * 2.6;
+  float weightedCenter = centerSample.r * centerWeight;
+  float weightedConfidence = centerConfidence * centerWeight;
+  float weightedSpread = centerSample.b * centerWeight;
+  float weightedDensity = centerSample.a * centerWeight;
+  float weightSum = centerWeight;
 
-  for (int dy = -2; dy <= 2; dy++) {
-    for (int dx = -3; dx <= 3; dx++) {
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -2; dx <= 2; dx++) {
+      if (dx == 0 && dy == 0) {
+        continue;
+      }
       ivec2 sampleCoord = ivec2(
         clamp(col + dx, 0, max(uPanoWidth - 1, 0)),
         clamp(outputRow + dy, 0, max(uPanoHeight - 1, 0))
@@ -394,10 +450,10 @@ void main() {
       vec4 sampleValue = texelFetch(uSupportData, sampleCoord, 0);
       float confidence = clamp(sampleValue.g, 0.0, 1.0);
       float spatialWeight =
-        exp(-0.5 * (float(dx * dx) / 4.5 + float(dy * dy) / 2.0));
+        exp(-0.5 * (float(dx * dx) / 1.8 + float(dy * dy) / 1.2));
       float depthDelta = sampleValue.r - centerDepthMm;
-      float depthWeight = exp(-(depthDelta * depthDelta) / (2.0 * 1.6 * 1.6));
-      float sampleWeight = spatialWeight * depthWeight * max(confidence, 0.05);
+      float depthWeight = exp(-(depthDelta * depthDelta) / (2.0 * 0.75 * 0.75));
+      float sampleWeight = spatialWeight * depthWeight * max(confidence * confidence, 0.01);
 
       weightedCenter += sampleValue.r * sampleWeight;
       weightedConfidence += confidence * sampleWeight;
@@ -458,14 +514,18 @@ void main() {
   int raySampleCount = computeRaySampleCount(slabWidthMm, nativeSlabPitchMm, uSlabSamples);
   float slabStep = raySampleCount > 1 ? slabWidthMm / float(raySampleCount - 1) : 0.0;
 
-  float broadSigmaMm = max(uSlabHalfMm * 0.85, nativeSlabPitchMm * 1.5);
+  float broadSigmaMm = max(uSlabHalfMm * 0.45, nativeSlabPitchMm * 1.0);
   float focusedSigmaMm = clamp(
-    supportSpreadMm * 1.7 + nativeSlabPitchMm * 0.65,
-    nativeSlabPitchMm * 1.2,
-    max(uSlabHalfMm * 0.8, nativeSlabPitchMm * 1.2)
+    supportSpreadMm * 0.90 + nativeSlabPitchMm * 0.35,
+    nativeSlabPitchMm * 0.85,
+    max(uSlabHalfMm * 0.45, nativeSlabPitchMm * 1.05)
   );
-  float supportSigmaMm = mix(broadSigmaMm, focusedSigmaMm, supportConfidence);
+  float supportSigmaMm = min(
+    broadSigmaMm,
+    mix(focusedSigmaMm, focusedSigmaMm * 1.35, smoothstep(0.18, 0.72, supportConfidence))
+  );
   float supportDenom = 2.0 * supportSigmaMm * supportSigmaMm;
+  float confidenceGate = smoothstep(0.08, 0.48, supportConfidence);
 
   float totalAttenuation = 0.0;
   float fogAttenuation = 0.0;
@@ -491,8 +551,8 @@ void main() {
     float muFog = softFogAttenuationFromHu(hu);
     float segmentLength = max(slabStep, nativeSlabPitchMm);
 
-    totalAttenuation += mu * supportWeight * segmentLength;
-    fogAttenuation += muFog * supportWeight * segmentLength;
+    totalAttenuation += mu * supportWeight * segmentLength * mix(0.35, 1.0, confidenceGate);
+    fogAttenuation += muFog * supportWeight * segmentLength * mix(0.08, 0.32, supportConfidence);
     denseAttenuation += max(mu - muFog, 0.0) * supportWeight * segmentLength;
     hasValidSample = true;
   }
@@ -534,14 +594,15 @@ void main() {
   float fogAttenuation = max(drr.g, 0.0);
   float supportConfidence = clamp(drr.b, 0.0, 1.0);
 
-  float residualFogFloor = fogAttenuation * mix(0.42, 0.24, supportConfidence);
+  float residualFogFloor = fogAttenuation * mix(0.16, 0.08, supportConfidence);
   float gentlySuppressedAttenuation =
-    max(totalAttenuation - fogAttenuation * mix(0.35, 0.55, supportConfidence), residualFogFloor);
+    max(totalAttenuation - fogAttenuation * mix(0.72, 0.88, supportConfidence), residualFogFloor);
+  gentlySuppressedAttenuation *= mix(0.45, 1.0, smoothstep(0.10, 0.50, supportConfidence));
 
-  float radiographSignal = 1.0 - exp(-2.9 * gentlySuppressedAttenuation);
-  radiographSignal = pow(clamp(radiographSignal, 0.0, 1.0), 0.86);
+  float radiographSignal = 1.0 - exp(-3.5 * gentlySuppressedAttenuation);
+  radiographSignal = pow(clamp(radiographSignal, 0.0, 1.0), 0.92);
 
-  float finalHu = mix(-780.0, 3150.0, radiographSignal);
+  float finalHu = mix(-860.0, 2650.0, radiographSignal);
   fragColor = vec4(finalHu, gentlySuppressedAttenuation, fogAttenuation, 1.0);
 }
 `;
@@ -549,7 +610,7 @@ void main() {
 // ─── Cached GPU State ────────────────────────────────────────────────
 let _canvas: OffscreenCanvas | HTMLCanvasElement | null = null;
 let _gl: WebGL2RenderingContext | null = null;
-let _debugProgram: WebGLProgram | null = null;
+let _panoProgram: WebGLProgram | null = null;
 let _supportProgram: WebGLProgram | null = null;
 let _supportSmoothProgram: WebGLProgram | null = null;
 let _drrProgram: WebGLProgram | null = null;
@@ -873,7 +934,7 @@ function resetGpuRendererState(): void {
             if (_volumeTex) _gl.deleteTexture(_volumeTex);
             if (_splineTex) _gl.deleteTexture(_splineTex);
             destroyPipelineTargets(_gl);
-            if (_debugProgram) _gl.deleteProgram(_debugProgram);
+            if (_panoProgram) _gl.deleteProgram(_panoProgram);
             if (_supportProgram) _gl.deleteProgram(_supportProgram);
             if (_supportSmoothProgram) _gl.deleteProgram(_supportSmoothProgram);
             if (_drrProgram) _gl.deleteProgram(_drrProgram);
@@ -903,7 +964,7 @@ function resetGpuRendererState(): void {
     _drrFbo = null;
     _fboTex = null;
     _fbo = null;
-    _debugProgram = null;
+    _panoProgram = null;
     _supportProgram = null;
     _supportSmoothProgram = null;
     _drrProgram = null;
@@ -983,11 +1044,11 @@ function ensureGpuContext(): WebGL2RenderingContext {
     }
     _hasFloatLinearFiltering = true;
 
-    _debugProgram = compileProgram(_gl, DEBUG_FRAG_SRC);
-    _supportProgram = null;
-    _supportSmoothProgram = null;
-    _drrProgram = null;
-    _toneProgram = null;
+    _panoProgram = compileProgram(_gl, FOCAL_TROUGH_DRR_FRAG_SRC);
+    _supportProgram = compileProgram(_gl, SUPPORT_FRAG_SRC);
+    _supportSmoothProgram = compileProgram(_gl, SUPPORT_SMOOTH_FRAG_SRC);
+    _drrProgram = compileProgram(_gl, DRR_FRAG_SRC);
+    _toneProgram = compileProgram(_gl, TONE_FRAG_SRC);
 
     // Empty VAO for fullscreen triangle (no attributes needed)
     _vao = _gl.createVertexArray()!;
@@ -1221,6 +1282,60 @@ function ensureFbo(gl: WebGL2RenderingContext, w: number, h: number): void {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
+function readFramebufferResult(
+    gl: WebGL2RenderingContext,
+    width: number,
+    height: number
+): {
+    pixelData: Float32Array;
+    meanMap: Float32Array;
+    maxMap: Float32Array;
+    sampleCountMap: Float32Array;
+    rawMin: number;
+    rawMax: number;
+} {
+    gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
+    const rgbaBuffer = new Float32Array(width * height * 4);
+    gl.readPixels(0, 0, width, height, gl.RGBA, gl.FLOAT, rgbaBuffer);
+    const readbackError = gl.getError();
+    if (readbackError !== gl.NO_ERROR) {
+        throw new Error(`GPU pano readPixels failed with WebGL error ${readbackError}.`);
+    }
+
+    const pixelData = new Float32Array(width * height);
+    const meanMap = new Float32Array(width * height);
+    const maxMap = new Float32Array(width * height);
+    const sampleCountMap = new Float32Array(width * height);
+    let rawMin = Infinity;
+    let rawMax = -Infinity;
+
+    for (let row = 0; row < height; row++) {
+        const srcRow = height - 1 - row;
+        for (let col = 0; col < width; col++) {
+            const dstIndex = row * width + col;
+            const srcIndex = (srcRow * width + col) * 4;
+            const finalValue = rgbaBuffer[srcIndex];
+            pixelData[dstIndex] = finalValue;
+            meanMap[dstIndex] = rgbaBuffer[srcIndex + 1];
+            maxMap[dstIndex] = rgbaBuffer[srcIndex + 2];
+            sampleCountMap[dstIndex] = rgbaBuffer[srcIndex + 3];
+            if (Number.isFinite(finalValue)) {
+                if (finalValue < rawMin) rawMin = finalValue;
+                if (finalValue > rawMax) rawMax = finalValue;
+            }
+        }
+    }
+
+    return {
+        pixelData,
+        meanMap,
+        maxMap,
+        sampleCountMap,
+        rawMin,
+        rawMax,
+    };
+}
+
 // ─── Main Render Function ───────────────────────────────────────────
 export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoResult {
     const gl = ensureGpuContext();
@@ -1236,6 +1351,16 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
     const safePanoWidth = Math.max(1, Math.floor(Number(panoWidth) || 1));
     const safePanoHeight = Math.max(1, Math.floor(Number(panoHeight) || 1));
     const t0 = performance.now();
+    const formatReadableGpuValue = (value: number | null | undefined, fractionDigits = 1): string =>
+        Number.isFinite(value) ? Number(value).toFixed(fractionDigits) : 'na';
+    const multiPassPipelineEnabled = !!(_supportProgram && _supportSmoothProgram && _drrProgram && _toneProgram);
+    console.log(
+        `[CPR-GPU-PIPELINE] mode=${multiPassPipelineEnabled ? 'multi-pass' : 'single-pass'} ` +
+        `panoShader=${_panoProgram ? 'on' : 'off'} supportShader=${_supportProgram ? 'on' : 'off'} ` +
+        `supportSmoothShader=${_supportSmoothProgram ? 'on' : 'off'} drrShader=${_drrProgram ? 'on' : 'off'} ` +
+        `toneShader=${_toneProgram ? 'on' : 'off'} pano=${safePanoWidth}x${safePanoHeight} ` +
+        `slabHalfMm=${formatReadableGpuValue(slabHalfThicknessMm)} slabSamples=${Math.max(1, Math.min(64, slabSamples | 0))}`
+    );
 
     uploadVolumeTexture(
         gl,
@@ -1246,7 +1371,11 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         volumeId
     );
     uploadSplineTexture(gl, frames, safePanoWidth, verticalDir);
-    ensureFbo(gl, safePanoWidth, safePanoHeight);
+    if (multiPassPipelineEnabled) {
+        ensurePipelineTargets(gl, safePanoWidth, safePanoHeight);
+    } else {
+        ensureFbo(gl, safePanoWidth, safePanoHeight);
+    }
 
     const w2iMat = coerceWorldToIndexMat4(worldToIndex ?? undefined);
     const requestedSlabSamples = Math.max(1, Math.min(64, slabSamples | 0));
@@ -1272,44 +1401,70 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
     gl.bindTexture(gl.TEXTURE_3D, _volumeTex);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, _splineTex);
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, _fbo);
-    gl.useProgram(_debugProgram);
-    bindCommonRayUniforms(gl, _debugProgram, {
-        ...commonUniforms,
-        debugMode: ACTIVE_GPU_DEBUG_MODE,
-    });
-    drawFullscreenTriangle(gl);
-
-    gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
-    const rgbaBuffer = new Float32Array(safePanoWidth * safePanoHeight * 4);
-    gl.readPixels(0, 0, safePanoWidth, safePanoHeight, gl.RGBA, gl.FLOAT, rgbaBuffer);
-    const readbackError = gl.getError();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    if (readbackError !== gl.NO_ERROR) {
-        throw new Error(`GPU pano readPixels failed with WebGL error ${readbackError}.`);
-    }
-
-    const pixelData = new Float32Array(safePanoWidth * safePanoHeight);
-    for (let row = 0; row < safePanoHeight; row++) {
-        const srcRow = safePanoHeight - 1 - row;
-        for (let col = 0; col < safePanoWidth; col++) {
-            const dstIndex = row * safePanoWidth + col;
-            const srcIndex = (srcRow * safePanoWidth + col) * 4;
-            pixelData[dstIndex] = rgbaBuffer[srcIndex];
-        }
-    }
-
+    let pixelData: Float32Array;
+    let meanMap: Float32Array;
+    let maxMap: Float32Array;
+    let sampleCountMap: Float32Array;
     let rawMin = Infinity;
     let rawMax = -Infinity;
-    for (let i = 0; i < pixelData.length; i++) {
-        const value = pixelData[i];
-        if (!Number.isFinite(value)) {
-            continue;
+
+    if (multiPassPipelineEnabled) {
+        if (!_supportFboA || !_supportFboB || !_drrFbo || !_fbo || !_supportTexA || !_supportTexB || !_drrTex) {
+            throw new Error('[CPR-GPU] Multi-pass render targets were not initialized.');
         }
-        if (value < rawMin) rawMin = value;
-        if (value > rawMax) rawMax = value;
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, _supportFboA);
+        gl.useProgram(_supportProgram);
+        bindCommonRayUniforms(gl, _supportProgram, commonUniforms);
+        drawFullscreenTriangle(gl);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, _supportFboB);
+        gl.useProgram(_supportSmoothProgram);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, _supportTexA);
+        setUniform1i(gl, _supportSmoothProgram, 'uSupportData', 2);
+        setUniform1i(gl, _supportSmoothProgram, 'uPanoWidth', safePanoWidth);
+        setUniform1i(gl, _supportSmoothProgram, 'uPanoHeight', safePanoHeight);
+        drawFullscreenTriangle(gl);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, _drrFbo);
+        gl.useProgram(_drrProgram);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_3D, _volumeTex);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, _splineTex);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, _supportTexB);
+        bindCommonRayUniforms(gl, _drrProgram, commonUniforms);
+        setUniform1i(gl, _drrProgram, 'uSupportData', 2);
+        drawFullscreenTriangle(gl);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, _fbo);
+        gl.useProgram(_toneProgram);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, _drrTex);
+        setUniform1i(gl, _toneProgram, 'uDrrData', 2);
+        setUniform1i(gl, _toneProgram, 'uPanoWidth', safePanoWidth);
+        setUniform1i(gl, _toneProgram, 'uPanoHeight', safePanoHeight);
+        drawFullscreenTriangle(gl);
+    } else {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, _fbo);
+        gl.useProgram(_panoProgram);
+        bindCommonRayUniforms(gl, _panoProgram, {
+            ...commonUniforms,
+            debugMode: ACTIVE_GPU_DEBUG_MODE,
+        });
+        drawFullscreenTriangle(gl);
     }
+
+    const readback = readFramebufferResult(gl, safePanoWidth, safePanoHeight);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    pixelData = readback.pixelData;
+    meanMap = readback.meanMap;
+    maxMap = readback.maxMap;
+    sampleCountMap = readback.sampleCountMap;
+    rawMin = readback.rawMin;
+    rawMax = readback.rawMax;
     console.log('[GPU-RAW-MINMAX]', {
         min: Number.isFinite(rawMin) ? rawMin : null,
         max: Number.isFinite(rawMax) ? rawMax : null,
@@ -1317,16 +1472,35 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
 
     const { minValue, maxValue } = computeMinMax(pixelData);
     const elapsed = performance.now() - t0;
-    console.log(`[CPR-GPU] Single-pass continuous-geometry hybrid projection complete: ${safePanoWidth}x${safePanoHeight} in ${elapsed.toFixed(1)}ms`, {
+    console.log(
+        `[CPR-GPU-RESULT] mode=${multiPassPipelineEnabled ? 'multi-pass' : 'single-pass'} ` +
+        `rawMin=${formatReadableGpuValue(rawMin)} rawMax=${formatReadableGpuValue(rawMax)} ` +
+        `finalMin=${formatReadableGpuValue(minValue)} finalMax=${formatReadableGpuValue(maxValue)} ` +
+        `elapsedMs=${formatReadableGpuValue(elapsed, 0)} ` +
+        `reduction=${multiPassPipelineEnabled ? 'support-surface-drr-tone' : 'gaussian-focal-trough-weighted-mean'}`
+    );
+    console.log(`[CPR-GPU] ${multiPassPipelineEnabled ? 'Multi-pass support-surface panoramic projection' : 'Single-pass continuous-geometry hybrid projection'} complete: ${safePanoWidth}x${safePanoHeight} in ${elapsed.toFixed(1)}ms`, {
         minValue,
         maxValue,
         slabHalfThicknessMm,
         slabSamples: requestedSlabSamples,
-        reduction: 'raw mean / raw max blend (0.5 mean, 0.5 max)',
+        reduction: multiPassPipelineEnabled
+            ? 'support estimation + support smoothing + DRR attenuation + tone mapping'
+            : 'gaussian focal-trough weighted accumulation (sigma 1.5 mm)',
         debugMode: ACTIVE_GPU_DEBUG_MODE,
     });
 
-    return { pixelData, width: safePanoWidth, height: safePanoHeight, minValue, maxValue };
+    return {
+        pixelData,
+        meanMap,
+        maxMap,
+        sampleCountMap,
+        width: safePanoWidth,
+        height: safePanoHeight,
+        minValue,
+        maxValue,
+        pipelineMode: multiPassPipelineEnabled ? 'multi-pass' : 'single-pass',
+    };
 }
 
 // ─── GPU Availability Check ─────────────────────────────────────────

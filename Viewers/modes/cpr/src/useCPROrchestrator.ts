@@ -4,7 +4,13 @@ import * as cornerstone from '@cornerstonejs/core';
 import { vec3 } from 'gl-matrix';
 
 import { cprStateService } from './CPRStateService';
-import { setPanoImagePayload, createPanoImageId, clearPanoImageCache } from './panoImageLoader';
+import {
+  setPanoImagePayload,
+  createPanoImageId,
+  clearPanoImageCache,
+  getPanoImagePayload,
+} from './panoImageLoader';
+import type { PanoImagePayload } from './panoImageLoader';
 import {
   SyntheticCprIntensityDomain,
   classifySyntheticCprIntensityDomain,
@@ -29,6 +35,221 @@ const CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM = 1.5;
 const CPR_CROSSSECTION_DEFAULT_BLEND_MODE =
   cornerstone.Enums.BlendModes.AVERAGE_INTENSITY_BLEND;
 const CPR_CROSSSECTION_RENDER_WAIT_TIMEOUT_MS = 1500;
+let activePanoDebugProbeCleanup: (() => void) | null = null;
+
+type PanoDebugProbeSample = {
+  imageId: string | null;
+  col: number;
+  row: number;
+  index: number;
+  finalHu: number;
+  meanHu: number;
+  rayMax: number;
+  maxLift: number;
+  validSampleCount?: number;
+  mappingMode?: string;
+  canvasX?: number;
+  canvasY?: number;
+};
+
+function clearPanoDebugProbe(): void {
+  if (activePanoDebugProbeCleanup) {
+    activePanoDebugProbeCleanup();
+    activePanoDebugProbeCleanup = null;
+  }
+}
+
+function readPanoDebugProbeSample(
+  payload: PanoImagePayload | null,
+  imageId: string | null,
+  col: number,
+  row: number
+): PanoDebugProbeSample | null {
+  if (!payload?.meanMap || !payload?.maxMap) {
+    console.warn('[CPR] Pano debug probe unavailable: diagnostic sidecars are missing.', {
+      imageId,
+      hasPayload: !!payload,
+      hasMeanMap: !!payload?.meanMap,
+      hasMaxMap: !!payload?.maxMap,
+    });
+    return null;
+  }
+
+  const safeCol = Math.max(0, Math.min(payload.width - 1, Math.round(col)));
+  const safeRow = Math.max(0, Math.min(payload.height - 1, Math.round(row)));
+  const index = safeRow * payload.width + safeCol;
+  const finalHu = Number(payload.pixelData[index]);
+  const meanHu = Number(payload.meanMap[index]);
+  const rayMax = Number(payload.maxMap[index]);
+  const validSampleCount = payload.sampleCountMap ? Number(payload.sampleCountMap[index]) : undefined;
+
+  return {
+    imageId,
+    col: safeCol,
+    row: safeRow,
+    index,
+    finalHu,
+    meanHu,
+    rayMax,
+    maxLift: rayMax - meanHu,
+    validSampleCount: Number.isFinite(validSampleCount) ? validSampleCount : undefined,
+  };
+}
+
+function resolvePanoProbePixelFromMouse(
+  viewport: cornerstone.Types.IStackViewport,
+  payload: PanoImagePayload,
+  event: MouseEvent
+): {
+  col: number;
+  row: number;
+  canvasX: number;
+  canvasY: number;
+  mappingMode: 'canvasToWorld' | 'elementLinear';
+} | null {
+  const element = viewport.element as HTMLDivElement | null | undefined;
+  if (!element) {
+    return null;
+  }
+
+  const rect = element.getBoundingClientRect();
+  const canvasX = event.clientX - rect.left;
+  const canvasY = event.clientY - rect.top;
+  let col = Number.NaN;
+  let row = Number.NaN;
+  let mappingMode: 'canvasToWorld' | 'elementLinear' = 'elementLinear';
+  const columnPixelSpacing =
+    Number.isFinite(payload.columnPixelSpacing) && Number(payload.columnPixelSpacing) > 0
+      ? Number(payload.columnPixelSpacing)
+      : 1;
+  const rowPixelSpacing =
+    Number.isFinite(payload.rowPixelSpacing) && Number(payload.rowPixelSpacing) > 0
+      ? Number(payload.rowPixelSpacing)
+      : 1;
+  const viewportWithCanvasToWorld = viewport as cornerstone.Types.IStackViewport & {
+    canvasToWorld?: (point: [number, number]) => [number, number, number] | number[];
+  };
+
+  if (typeof viewportWithCanvasToWorld.canvasToWorld === 'function') {
+    try {
+      const world = viewportWithCanvasToWorld.canvasToWorld([canvasX, canvasY]);
+      const worldX = Number(world?.[0]);
+      const worldY = Number(world?.[1]);
+      if (Number.isFinite(worldX) && Number.isFinite(worldY)) {
+        col = Math.round(worldX / columnPixelSpacing);
+        row = Math.round(worldY / rowPixelSpacing);
+        mappingMode = 'canvasToWorld';
+      }
+    } catch (error) {
+      console.warn('[CPR] Pano debug probe canvasToWorld mapping failed; falling back to element mapping.', error);
+    }
+  }
+
+  if (!Number.isFinite(col) || !Number.isFinite(row)) {
+    const safeWidth = Math.max(rect.width, 1);
+    const safeHeight = Math.max(rect.height, 1);
+    col = Math.round((canvasX / safeWidth) * Math.max(payload.width - 1, 0));
+    row = Math.round((canvasY / safeHeight) * Math.max(payload.height - 1, 0));
+    mappingMode = 'elementLinear';
+  }
+
+  return {
+    col,
+    row,
+    canvasX,
+    canvasY,
+    mappingMode,
+  };
+}
+
+function installPanoDebugProbe(
+  runId: string,
+  viewport: cornerstone.Types.IStackViewport,
+  panoImageId: string
+): void {
+  clearPanoDebugProbe();
+
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  const element = viewport.element as HTMLDivElement | null | undefined;
+  if (!element) {
+    return;
+  }
+
+  const debugHost = window as Window & {
+    cprDebug?: {
+      latestPanoImageId?: string | null;
+      probePanoAt?: (col: number, row: number, imageId?: string | null) => PanoDebugProbeSample | null;
+      detachPanoClickProbe?: () => void;
+    };
+  };
+
+  const probeAt = (
+    col: number,
+    row: number,
+    imageId: string | null = getCurrentStackImageId(viewport) ?? panoImageId
+  ): PanoDebugProbeSample | null => {
+    const payload = getPanoImagePayload(imageId);
+    const sample = readPanoDebugProbeSample(payload, imageId, col, row);
+    if (!sample) {
+      return null;
+    }
+
+    console.log(`[CPR][${runId}] PANO_DEBUG_PROBE`, sample);
+    return sample;
+  };
+
+  const onClick = (event: MouseEvent) => {
+    const imageId = getCurrentStackImageId(viewport) ?? panoImageId;
+    const payload = getPanoImagePayload(imageId);
+    if (!payload) {
+      console.warn('[CPR] Pano debug probe click ignored: no pano payload found.', { imageId });
+      return;
+    }
+
+    const location = resolvePanoProbePixelFromMouse(viewport, payload, event);
+    if (!location) {
+      console.warn('[CPR] Pano debug probe click ignored: viewport element unavailable.');
+      return;
+    }
+
+    const sample = probeAt(location.col, location.row, imageId);
+    if (!sample) {
+      return;
+    }
+
+    console.log(`[CPR][${runId}] PANO_DEBUG_PROBE_CLICK`, {
+      ...sample,
+      canvasX: Math.round(location.canvasX * 100) / 100,
+      canvasY: Math.round(location.canvasY * 100) / 100,
+      mappingMode: location.mappingMode,
+    });
+  };
+
+  element.addEventListener('click', onClick);
+
+  debugHost.cprDebug = {
+    ...debugHost.cprDebug,
+    latestPanoImageId: panoImageId,
+    probePanoAt: probeAt,
+    detachPanoClickProbe: clearPanoDebugProbe,
+  };
+
+  console.log(`[CPR][${runId}] Installed pano debug probe`, {
+    panoImageId,
+    usage: 'Click the pano viewport or call window.cprDebug?.probePanoAt(col, row).',
+  });
+
+  activePanoDebugProbeCleanup = () => {
+    element.removeEventListener('click', onClick);
+    const currentDebug = debugHost.cprDebug;
+    if (currentDebug?.detachPanoClickProbe === clearPanoDebugProbe) {
+      delete currentDebug.detachPanoClickProbe;
+    }
+  };
+}
 
 interface FloatBufferDebugSummary {
   sampledCount: number;
@@ -57,16 +278,15 @@ interface PanoVoiSettings {
   windowCenter: number;
 }
 
-function buildDirectWorkerPanoVoi(): PanoVoiSettings {
-  const lower = CPR_PANO_DEFAULT_WINDOW_CENTER - CPR_PANO_DEFAULT_WINDOW_WIDTH / 2;
-  const upper = CPR_PANO_DEFAULT_WINDOW_CENTER + CPR_PANO_DEFAULT_WINDOW_WIDTH / 2;
+function formatReadablePanoValue(
+  value: number | null | undefined,
+  fractionDigits = 1
+): string {
+  if (!Number.isFinite(value)) {
+    return 'na';
+  }
 
-  return {
-    lower,
-    upper,
-    windowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
-    windowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
-  };
+  return Number(value).toFixed(fractionDigits);
 }
 
 function isHuLikeRange(minValue: number, maxValue: number): boolean {
@@ -820,47 +1040,69 @@ function computeAdaptivePanoVoi(
   return { lower: adaptiveLower, upper: adaptiveUpper, windowWidth, windowCenter };
 }
 
-function catmullRomPoint(
-  Pm1: [number, number, number],
-  P0: [number, number, number],
-  P1: [number, number, number],
-  P2: [number, number, number],
+const CENTRIPETAL_CATMULL_ROM_ALPHA = 0.5;
+const CENTRIPETAL_CATMULL_ROM_EPS = 1e-4;
+const SPLINE_LUT_FINE_STEPS = 2000;
+
+function lerpPoint3(
+  a: [number, number, number],
+  b: [number, number, number],
   t: number
 ): [number, number, number] {
-  const t2 = t * t;
-  const t3 = t2 * t;
-
-  const b0 = -0.5 * t3 + t2 - 0.5 * t;
-  const b1 = 1.5 * t3 - 2.5 * t2 + 1.0;
-  const b2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
-  const b3 = 0.5 * t3 - 0.5 * t2;
-
+  const clampedT = Math.max(0, Math.min(1, t));
+  const invT = 1 - clampedT;
   return [
-    b0 * Pm1[0] + b1 * P0[0] + b2 * P1[0] + b3 * P2[0],
-    b0 * Pm1[1] + b1 * P0[1] + b2 * P1[1] + b3 * P2[1],
-    b0 * Pm1[2] + b1 * P0[2] + b2 * P1[2] + b3 * P2[2],
+    a[0] * invT + b[0] * clampedT,
+    a[1] * invT + b[1] * clampedT,
+    a[2] * invT + b[2] * clampedT,
   ];
 }
 
-function catmullRomTangent(
+function computeCentripetalKnot(
+  prevT: number,
+  a: [number, number, number],
+  b: [number, number, number]
+): number {
+  const distance = Math.max(dist3(a, b), CENTRIPETAL_CATMULL_ROM_EPS);
+  return prevT + Math.pow(distance, CENTRIPETAL_CATMULL_ROM_ALPHA);
+}
+
+function interpolateByKnot(
+  a: [number, number, number],
+  b: [number, number, number],
+  ta: number,
+  tb: number,
+  t: number
+): [number, number, number] {
+  const knotDelta = tb - ta;
+  if (!Number.isFinite(knotDelta) || Math.abs(knotDelta) < 1e-8) {
+    return lerpPoint3(a, b, 0.5);
+  }
+
+  const blend = (t - ta) / knotDelta;
+  return lerpPoint3(a, b, blend);
+}
+
+function centripetalCatmullRomPoint(
   Pm1: [number, number, number],
   P0: [number, number, number],
   P1: [number, number, number],
   P2: [number, number, number],
   t: number
 ): [number, number, number] {
-  const t2 = t * t;
+  const t0 = 0;
+  const t1 = computeCentripetalKnot(t0, Pm1, P0);
+  const t2 = computeCentripetalKnot(t1, P0, P1);
+  const t3 = computeCentripetalKnot(t2, P1, P2);
+  const clampedT = Math.max(0, Math.min(1, t));
+  const knotT = t1 + (t2 - t1) * clampedT;
 
-  const d0 = -1.5 * t2 + 2.0 * t - 0.5;
-  const d1 = 4.5 * t2 - 5.0 * t;
-  const d2 = -4.5 * t2 + 4.0 * t + 0.5;
-  const d3 = 1.5 * t2 - 1.0 * t;
-
-  return [
-    d0 * Pm1[0] + d1 * P0[0] + d2 * P1[0] + d3 * P2[0],
-    d0 * Pm1[1] + d1 * P0[1] + d2 * P1[1] + d3 * P2[1],
-    d0 * Pm1[2] + d1 * P0[2] + d2 * P1[2] + d3 * P2[2],
-  ];
+  const A1 = interpolateByKnot(Pm1, P0, t0, t1, knotT);
+  const A2 = interpolateByKnot(P0, P1, t1, t2, knotT);
+  const A3 = interpolateByKnot(P1, P2, t2, t3, knotT);
+  const B1 = interpolateByKnot(A1, A2, t0, t2, knotT);
+  const B2 = interpolateByKnot(A2, A3, t1, t3, knotT);
+  return interpolateByKnot(B1, B2, t1, t2, knotT);
 }
 
 function dist3(a: [number, number, number], b: [number, number, number]): number {
@@ -1024,6 +1266,93 @@ function addPhantomEndpoints(pts: [number, number, number][]): [number, number, 
   return [phantomStart, ...pts, phantomEnd];
 }
 
+type SplineArcLengthLut = {
+  extended: [number, number, number][];
+  nSegments: number;
+  lutT: number[];
+  lutArc: number[];
+  totalArcLength: number;
+};
+
+function buildSplineArcLengthLut(rawPoints: [number, number, number][]): SplineArcLengthLut {
+  const extended = addPhantomEndpoints(rawPoints);
+  const nSegments = extended.length - 3;
+  const lutT: number[] = [0];
+  const lutArc: number[] = [0];
+
+  if (nSegments <= 0) {
+    return {
+      extended,
+      nSegments,
+      lutT,
+      lutArc,
+      totalArcLength: 0,
+    };
+  }
+
+  const stepsPerSegment = Math.max(8, Math.ceil(SPLINE_LUT_FINE_STEPS / nSegments));
+  let prevPt = centripetalCatmullRomPoint(extended[0], extended[1], extended[2], extended[3], 0);
+
+  for (let seg = 0; seg < nSegments; seg++) {
+    const Pm1 = extended[seg];
+    const P0 = extended[seg + 1];
+    const P1 = extended[seg + 2];
+    const P2 = extended[seg + 3];
+
+    for (let step = 1; step <= stepsPerSegment; step++) {
+      const localT = step / stepsPerSegment;
+      const globalT = seg + localT;
+      const pt = centripetalCatmullRomPoint(Pm1, P0, P1, P2, localT);
+      const arcLen = lutArc[lutArc.length - 1] + dist3(prevPt, pt);
+      lutT.push(globalT);
+      lutArc.push(arcLen);
+      prevPt = pt;
+    }
+  }
+
+  return {
+    extended,
+    nSegments,
+    lutT,
+    lutArc,
+    totalArcLength: lutArc[lutArc.length - 1],
+  };
+}
+
+function computeTangentsFromPositions(
+  positions: [number, number, number][]
+): [number, number, number][] {
+  if (positions.length === 0) {
+    return [];
+  }
+
+  if (positions.length === 1) {
+    return [[1, 0, 0]];
+  }
+
+  return positions.map((position, index) => {
+    const prev = positions[Math.max(0, index - 1)];
+    const next = positions[Math.min(positions.length - 1, index + 1)];
+    const tangent: [number, number, number] = [
+      next[0] - prev[0],
+      next[1] - prev[1],
+      next[2] - prev[2],
+    ];
+
+    if (index === 0) {
+      tangent[0] = positions[1][0] - position[0];
+      tangent[1] = positions[1][1] - position[1];
+      tangent[2] = positions[1][2] - position[2];
+    } else if (index === positions.length - 1) {
+      tangent[0] = position[0] - positions[index - 1][0];
+      tangent[1] = position[1] - positions[index - 1][1];
+      tangent[2] = position[2] - positions[index - 1][2];
+    }
+
+    return normalize3(tangent);
+  });
+}
+
 function median(values: number[]): number {
   if (!values.length) {
     return 0;
@@ -1159,31 +1488,7 @@ function computeSplineTotalArcLength(rawPoints: [number, number, number][]): num
     return 0;
   }
 
-  const extended = addPhantomEndpoints(rawPoints);
-  const nSegments = extended.length - 3;
-  if (nSegments <= 0) {
-    return 0;
-  }
-
-  const FINE_STEPS = 2000;
-  const stepsPerSegment = Math.max(1, Math.floor(FINE_STEPS / nSegments));
-  let prevPt = catmullRomPoint(extended[0], extended[1], extended[2], extended[3], 0);
-  let totalArcLength = 0;
-
-  for (let seg = 0; seg < nSegments; seg++) {
-    const Pm1 = extended[seg];
-    const P0 = extended[seg + 1];
-    const P1 = extended[seg + 2];
-    const P2 = extended[seg + 3];
-
-    for (let step = 1; step <= stepsPerSegment; step++) {
-      const localT = step / stepsPerSegment;
-      const pt = catmullRomPoint(Pm1, P0, P1, P2, localT);
-      totalArcLength += dist3(prevPt, pt);
-      prevPt = pt;
-    }
-  }
-
+  const { totalArcLength } = buildSplineArcLengthLut(rawPoints);
   return Number.isFinite(totalArcLength) && totalArcLength > 0 ? totalArcLength : 0;
 }
 
@@ -1199,39 +1504,21 @@ function buildArcLengthSpline(
   }
 
   const sampleCount = Math.max(2, Math.floor(nSamples));
-  const extended = addPhantomEndpoints(rawPoints);
-  const nSegments = extended.length - 3;
-
-  const FINE_STEPS = 2000;
-  const lutT: number[] = [0];
-  const lutArc: number[] = [0];
-
-  let prevPt = catmullRomPoint(extended[0], extended[1], extended[2], extended[3], 0);
-
-  const stepsPerSegment = Math.max(1, Math.floor(FINE_STEPS / nSegments));
-  for (let seg = 0; seg < nSegments; seg++) {
-    const Pm1 = extended[seg];
-    const P0 = extended[seg + 1];
-    const P1 = extended[seg + 2];
-    const P2 = extended[seg + 3];
-
-    for (let step = 1; step <= stepsPerSegment; step++) {
-      const localT = step / stepsPerSegment;
-      const globalT = seg + localT;
-      const pt = catmullRomPoint(Pm1, P0, P1, P2, localT);
-
-      const arcLen = lutArc[lutArc.length - 1] + dist3(prevPt, pt);
-      lutT.push(globalT);
-      lutArc.push(arcLen);
-      prevPt = pt;
-    }
+  const { extended, nSegments, lutT, lutArc, totalArcLength } = buildSplineArcLengthLut(rawPoints);
+  const positions: [number, number, number][] = [];
+  if (nSegments <= 0 || totalArcLength <= 0) {
+    const startPoint = rawPoints[0];
+    const endPoint = rawPoints[rawPoints.length - 1];
+    const fallbackPositions = Array.from({ length: sampleCount }, (_, index) => {
+      const blend = sampleCount > 1 ? index / (sampleCount - 1) : 0;
+      return lerpPoint3(startPoint, endPoint, blend);
+    });
+    return {
+      positions: fallbackPositions,
+      tangents: computeTangentsFromPositions(fallbackPositions),
+    };
   }
 
-  const totalArcLength = lutArc[lutArc.length - 1];
-  const positions: [number, number, number][] = [];
-  const tangents: [number, number, number][] = [];
-
-  // Hardening #5: guard against divide-by-zero in nSamples denominator.
   const sampleDen = Math.max(1, sampleCount - 1);
 
   for (let i = 0; i < sampleCount; i++) {
@@ -1260,15 +1547,17 @@ function buildArcLengthSpline(
     const P1 = extended[seg + 2];
     const P2 = extended[seg + 3];
 
-    positions.push(catmullRomPoint(Pm1, P0, P1, P2, localT));
-    tangents.push(normalize3(catmullRomTangent(Pm1, P0, P1, P2, localT)));
+    positions.push(centripetalCatmullRomPoint(Pm1, P0, P1, P2, localT));
   }
 
-  return { positions, tangents };
+  return { positions, tangents: computeTangentsFromPositions(positions) };
 }
 
 interface CPRWorkerLaunchResult {
   pixelData: Float32Array | Uint16Array;
+  meanMap?: Float32Array;
+  maxMap?: Float32Array;
+  sampleCountMap?: Float32Array;
   width: number;
   height: number;
   minValue: number;
@@ -1307,6 +1596,9 @@ interface CPRWorkerSuccessMessage {
   type: 'SUCCESS';
   requestId: string;
   pixelData: Float32Array | Uint16Array;
+  meanMap?: Float32Array;
+  maxMap?: Float32Array;
+  sampleCountMap?: Float32Array;
   panoWidth: number;
   panoHeight: number;
   minValue: number;
@@ -1917,6 +2209,9 @@ function launchCPRWorker(params: {
 
       resolve({
         pixelData: data.pixelData,
+        meanMap: data.meanMap,
+        maxMap: data.maxMap,
+        sampleCountMap: data.sampleCountMap,
         width: data.panoWidth,
         height: data.panoHeight,
         minValue: data.minValue,
@@ -3287,6 +3582,7 @@ export function useCPROrchestrator({
         sliderAnimationFrameRef.current = null;
       }
       clearProtocolListener();
+      clearPanoDebugProbe();
     };
   }, [clearProtocolListener]);
 
@@ -3309,6 +3605,7 @@ export function useCPROrchestrator({
         }
         cprStateService.clear();
         clearPanoImageCache();
+        clearPanoDebugProbe();
         removeAllSplineAnnotations();
 
         if (isMountedRef.current) {
@@ -3581,7 +3878,14 @@ export function useCPROrchestrator({
         rigidVerticalSliceMode: rigidVerticalSliceModeEnabled,
         debugRunId,
       };
-      const gpuSinglePassEnabled: boolean = workerInput.renderBackend !== 'cpu';
+      const gpuBackendEnabled: boolean = workerInput.renderBackend !== 'cpu';
+      console.log(
+        `[CPR-PANO-PATH] run=${debugRunId} defaultBackend=${workerInput.renderBackend} ` +
+        `gpuBackend=${gpuBackendEnabled ? 'yes' : 'no'} ` +
+        `defaultAggregation=${workerInput.aggregation} ` +
+        `phase1VirtualPano=${gpuBackendEnabled ? 'skip-on-gpu-backend' : 'candidate'} ` +
+        `phase2VirtualPano=${gpuBackendEnabled ? 'skip-on-gpu-backend' : 'candidate'}`
+      );
       const runWorkerAttempt = async (
         label: string,
         overrides: Partial<Parameters<typeof launchCPRWorker>[0]>
@@ -3697,10 +4001,7 @@ export function useCPROrchestrator({
           result.intercept
         );
         const summary = summarizeFloatBufferForDebug(summaryPixelData, finalPanoWidth, finalPanoHeight);
-        const voi =
-          requestedRenderBackend === 'gpu'
-            ? buildDirectWorkerPanoVoi()
-            : computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
+        const voi = computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
         console.log('[CPR-GPU-VOI-APPLY-JSON]', JSON.stringify({
           runId: debugRunId,
           label,
@@ -3713,8 +4014,18 @@ export function useCPROrchestrator({
           adaptiveWindowCenter: voi.windowCenter,
           minValue: result.minValue,
           maxValue: result.maxValue,
-          voiSource: requestedRenderBackend === 'gpu' ? 'fixed-dental' : 'adaptive',
+          voiSource: 'adaptive',
         }));
+        console.log(
+          `[CPR-PANO-VOI] run=${debugRunId} label=${label} backend=${requestedRenderBackend} ` +
+          `source=adaptive ` +
+          `workerWW=${formatReadablePanoValue(result.windowWidth)} ` +
+          `workerWC=${formatReadablePanoValue(result.windowCenter)} ` +
+          `appliedWW=${formatReadablePanoValue(voi.windowWidth)} ` +
+          `appliedWC=${formatReadablePanoValue(voi.windowCenter)} ` +
+          `min=${formatReadablePanoValue(result.minValue)} ` +
+          `max=${formatReadablePanoValue(result.maxValue)}`
+        );
         const qualityBase = summary ? scorePanoQuality(summary) : 0;
         const workerDiagnostic =
           result.workerDebugPayload &&
@@ -3910,6 +4221,22 @@ export function useCPROrchestrator({
           rowPixelSpacing,
           overrides,
         });
+        console.log(
+          `[CPR-PANO-ATTEMPT] run=${debugRunId} label=${label} backend=${requestedRenderBackend} ` +
+          `aggregation=${requestedAggregation} score=${formatReadablePanoValue(qualityScore, 2)} ` +
+          `base=${formatReadablePanoValue(qualityBase, 2)} hardReject=${hardRejectReason ?? 'none'} ` +
+          `durationMs=${formatReadablePanoValue(attemptDurationMs, 0)} ` +
+          `p50=${formatReadablePanoValue(summary?.p50)} ` +
+          `meanAbsDelta=${formatReadablePanoValue(summary?.meanAbsDelta)} ` +
+          `lowerBandP50=${formatReadablePanoValue(summary?.lowerBandP50)} ` +
+          `lowerBandBrightPct=${formatReadablePanoValue(
+            summary ? summary.lowerBandBrightFraction * 100 : undefined
+          )} ` +
+          `toothMean=${formatReadablePanoValue(summary?.toothBandMean)} ` +
+          `detailRatio=${formatReadablePanoValue(detailBalanceRatio, 2)} ` +
+          `centerDriftMm=${formatReadablePanoValue(actualCenterDriftMm, 2)} ` +
+          `voi=adaptive`
+        );
         console.log(
           '[CPR-ATTEMPT-JSON]',
           JSON.stringify({
@@ -4446,7 +4773,7 @@ export function useCPROrchestrator({
       }
 
       const shouldRunMipFallbacks =
-        !gpuSinglePassEnabled &&
+        !gpuBackendEnabled &&
         !earlyExitReason &&
         (
           !!bestAttempt.hardRejectReason ||
@@ -4501,7 +4828,7 @@ export function useCPROrchestrator({
       }
 
       const totalAttemptDurationMs = performance.now() - panoAttemptSequenceStartMs;
-      const phase2BaseAttempt = gpuSinglePassEnabled
+      const phase2BaseAttempt = gpuBackendEnabled
         ? null
         : attemptResults
           .filter(attempt => attempt.aggregation === 'MEAN')
@@ -4526,8 +4853,8 @@ export function useCPROrchestrator({
         timingMs: null,
         diagnostics: null,
       };
-      if (gpuSinglePassEnabled) {
-        phase1VirtualPano.skippedReason = 'GPU_SINGLE_PASS';
+      if (gpuBackendEnabled) {
+        phase1VirtualPano.skippedReason = 'GPU_BACKEND_ACTIVE';
       } else if (!phase2BaseAttempt) {
         phase1VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
       } else {
@@ -4579,6 +4906,13 @@ export function useCPROrchestrator({
           phase1VirtualPano,
         })
       );
+      console.log(
+        `[CPR-PHASE1] run=${debugRunId} base=${phase2BaseAttempt?.label ?? 'none'} ` +
+        `aggregation=${phase2BaseAttempt?.aggregation ?? 'none'} ` +
+        `executed=${phase1VirtualPano.executed ? 'yes' : 'no'} ` +
+        `skipped=${phase1VirtualPano.skippedReason ?? 'none'} ` +
+        `error=${phase1VirtualPano.error ?? 'none'}`
+      );
       const phase2VirtualPano: {
         executed: boolean;
         skippedReason: string | null;
@@ -4601,8 +4935,8 @@ export function useCPROrchestrator({
         borderlineAcceptedReason: null,
       };
       let phase2WorkerResult: CPRWorkerLaunchResult | null = null;
-      if (gpuSinglePassEnabled) {
-        phase2VirtualPano.skippedReason = 'GPU_SINGLE_PASS';
+      if (gpuBackendEnabled) {
+        phase2VirtualPano.skippedReason = 'GPU_BACKEND_ACTIVE';
       } else if (!phase2BaseAttempt) {
         phase2VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
       } else {
@@ -4694,6 +5028,15 @@ export function useCPROrchestrator({
           selectedAggregation: phase2BaseAttempt?.aggregation ?? null,
           phase2VirtualPano,
         })
+      );
+      console.log(
+        `[CPR-PHASE2] run=${debugRunId} base=${phase2BaseAttempt?.label ?? 'none'} ` +
+        `aggregation=${phase2BaseAttempt?.aggregation ?? 'none'} ` +
+        `executed=${phase2VirtualPano.executed ? 'yes' : 'no'} ` +
+        `usedAsOutput=${phase2VirtualPano.usedAsDisplayedOutput ? 'yes' : 'no'} ` +
+        `skipped=${phase2VirtualPano.skippedReason ?? 'none'} ` +
+        `borderline=${phase2VirtualPano.borderlineAcceptedReason ?? 'none'} ` +
+        `error=${phase2VirtualPano.error ?? 'none'}`
       );
       const rankedAttempts = attemptAudit
         .slice()
@@ -5023,6 +5366,9 @@ export function useCPROrchestrator({
           clearPanoImageCache();
           setPanoImagePayload(panoImageId, {
             pixelData: panoWorkerResult.pixelData,
+            meanMap: panoWorkerResult.meanMap,
+            maxMap: panoWorkerResult.maxMap,
+            sampleCountMap: panoWorkerResult.sampleCountMap,
             width: panoWorkerResult.width,
             height: panoWorkerResult.height,
             minValue: panoWorkerResult.minValue,
@@ -5084,6 +5430,7 @@ export function useCPROrchestrator({
           const panoViewport = await waitForPanoStackViewport(servicesManager);
           logPanoViewportSnapshot(debugRunId, 'before-setStack', panoViewport);
           await panoViewport.setStack([panoImageId], 0);
+          installPanoDebugProbe(debugRunId, panoViewport, panoImageId);
           if (typeof (panoViewport as { resetCamera?: () => void }).resetCamera === 'function') {
             panoViewport.resetCamera();
           }
@@ -5242,6 +5589,7 @@ export function useCPROrchestrator({
 
     cprStateService.clear();
     clearPanoImageCache();
+    clearPanoDebugProbe();
     removeAllSplineAnnotations();
 
     try {
@@ -5425,6 +5773,7 @@ export function useCPROrchestrator({
 
   useEffect(() => {
     return () => {
+      clearPanoDebugProbe();
       void terminateCPRWorkerSession();
     };
   }, []);

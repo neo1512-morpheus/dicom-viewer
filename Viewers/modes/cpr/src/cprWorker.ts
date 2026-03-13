@@ -120,6 +120,9 @@ interface CPRWorkerSuccess {
   type: 'SUCCESS';
   requestId: string;
   pixelData: Float32Array | Uint16Array;
+  meanMap?: Float32Array;
+  maxMap?: Float32Array;
+  sampleCountMap?: Float32Array;
   panoWidth: number;
   panoHeight: number;
   minValue: number;
@@ -180,6 +183,109 @@ function decodeStoredScalarValue(
   }
 
   return maskedValue;
+}
+
+function sampleScalarRange(data: ArrayLike<number>): { min: number; max: number } {
+  let min = Infinity;
+  let max = -Infinity;
+  const step = Math.max(1, Math.floor(data.length / 4096));
+
+  for (let i = 0; i < data.length; i += step) {
+    const value = Number(data[i]);
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    if (value < min) {
+      min = value;
+    }
+    if (value > max) {
+      max = value;
+    }
+  }
+
+  return {
+    min: Number.isFinite(min) ? min : 0,
+    max: Number.isFinite(max) ? max : 0,
+  };
+}
+
+function isHuLikeScalarRange(min: number, max: number): boolean {
+  return Number.isFinite(min) && Number.isFinite(max) && min >= -5000 && max <= 7000;
+}
+
+function resolveEffectivePreScaledForInit(params: {
+  scalarData: Float32Array | Int16Array | Uint16Array;
+  isPreScaled?: boolean;
+  rescaleSlope?: number;
+  rescaleIntercept?: number;
+  bitsStored?: number;
+  pixelRepresentation?: number;
+}): {
+  effectiveIsPreScaled: boolean;
+  sampledMin: number;
+  sampledMax: number;
+  heuristicOverride: boolean;
+} {
+  const {
+    scalarData,
+    isPreScaled,
+    rescaleSlope,
+    rescaleIntercept,
+    bitsStored,
+    pixelRepresentation,
+  } = params;
+  const safeSlope =
+    Number.isFinite(rescaleSlope) && Math.abs(Number(rescaleSlope)) > 1e-8 ? Number(rescaleSlope) : 1;
+  const safeIntercept = Number.isFinite(rescaleIntercept) ? Number(rescaleIntercept) : 0;
+  const hasNonIdentityRescale = Math.abs(safeSlope - 1) > 1e-6 || Math.abs(safeIntercept) > 1e-6;
+  const sampledRange = sampleScalarRange(scalarData);
+  const sampledMin = sampledRange.min;
+  const sampledMax = sampledRange.max;
+  const looksHuLike = isHuLikeScalarRange(sampledMin, sampledMax);
+
+  if (isPreScaled === true) {
+    return {
+      effectiveIsPreScaled: true,
+      sampledMin,
+      sampledMax,
+      heuristicOverride: false,
+    };
+  }
+
+  if (!hasNonIdentityRescale) {
+    return {
+      effectiveIsPreScaled: false,
+      sampledMin,
+      sampledMax,
+      heuristicOverride: false,
+    };
+  }
+
+  const safeBitsStored = resolveStoredBitCount(bitsStored, 16);
+  const isUnsigned = Number(pixelRepresentation) === 0;
+  const storedMin = isUnsigned ? 0 : -(1 << Math.max(safeBitsStored - 1, 0));
+  const storedMax =
+    safeBitsStored >= 31
+      ? Number.MAX_SAFE_INTEGER
+      : isUnsigned
+        ? (1 << safeBitsStored) - 1
+        : (1 << Math.max(safeBitsStored - 1, 0)) - 1;
+  const storedMargin = Math.max(8, safeBitsStored < 16 ? 16 : 64);
+  const looksLikeStoredRange =
+    Number.isFinite(sampledMin) &&
+    Number.isFinite(sampledMax) &&
+    sampledMin >= storedMin - storedMargin &&
+    sampledMax <= storedMax + storedMargin;
+  const impossibleUnsignedHuRange = isUnsigned && sampledMin < -1;
+  const floatHuPayload = scalarData instanceof Float32Array && looksHuLike;
+  const likelyAlreadyScaled = looksHuLike && (floatHuPayload || impossibleUnsignedHuRange || !looksLikeStoredRange);
+
+  return {
+    effectiveIsPreScaled: likelyAlreadyScaled,
+    sampledMin,
+    sampledMax,
+    heuristicOverride: likelyAlreadyScaled,
+  };
 }
 
 interface CPRWorkerInitSuccess {
@@ -701,6 +807,10 @@ function resolveScalarSamplingPolicy(input: CPRWorkerInput): ScalarSamplingPolic
 
 function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
   pixelData: Float32Array;
+  meanMap: Float32Array;
+  maxMap: Float32Array;
+  sampleCountMap: Float32Array;
+  pipelineMode: 'single-pass' | 'multi-pass';
   minValue: number;
   maxValue: number;
   windowWidth: number;
@@ -732,6 +842,7 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
     verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
     slabHalfThicknessMm,
     slabSamples,
+    aggregation,
     reconstructionMode,
   } = input;
   const scalarPolicy = resolveScalarSamplingPolicy(input);
@@ -752,6 +863,20 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
     : 0;
   const requestedSlabSamples = Math.max(1, Math.min(64, Math.floor(slabSamples)));
   const startedAt = performance.now();
+  const formatGpuReadableValue = (value: number | null | undefined, fractionDigits = 1): string =>
+    Number.isFinite(value) ? Number(value).toFixed(fractionDigits) : 'na';
+  console.log(
+    `[CPR-GPU-WORKER] run=${input.debugRunId ?? 'na'} requestedAggregation=${aggregation} ` +
+    `reconstructionMode=${reconstructionMode ?? 'legacy'} ` +
+    `effectivePipeline=renderer-selected ` +
+    `virtualPano=${reconstructionMode === 'legacy' ? 'off' : 'gpu-internal'} ` +
+    `backgroundSuppression=renderer-internal denoise=renderer-internal ` +
+    `pano=${panoWidth}x${panoHeight} ` +
+    `verticalHalfMm=${formatGpuReadableValue(effectiveVerticalHalfMm)} ` +
+    `centerOffsetMm=${formatGpuReadableValue(verticalCenterOffsetMm)} ` +
+    `slabHalfMm=${formatGpuReadableValue(slabHalfThicknessMm)} ` +
+    `slabSamples=${requestedSlabSamples}`
+  );
   const gpuResult = renderPanoGpu(
     {
       scalarData,
@@ -791,6 +916,7 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
   console.log('[CPR-GPU-WORKER-RESULT-JSON]', JSON.stringify({
     debugRunId: input.debugRunId ?? null,
     renderBackend: 'gpu',
+    pipelineMode: gpuResult.pipelineMode,
     panoWidth,
     panoHeight,
     requestedSlabHalfThicknessMm: slabHalfThicknessMm,
@@ -802,6 +928,14 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
     windowWidth,
     windowCenter,
   }));
+  console.log(
+    `[CPR-GPU-WORKER-RESULT] run=${input.debugRunId ?? 'na'} ` +
+    `pipeline=${gpuResult.pipelineMode} ` +
+    `min=${formatGpuReadableValue(minValue)} max=${formatGpuReadableValue(maxValue)} ` +
+    `windowWidth=${formatGpuReadableValue(windowWidth)} ` +
+    `windowCenter=${formatGpuReadableValue(windowCenter)} ` +
+    `elapsedMs=${formatGpuReadableValue(elapsedMs, 0)}`
+  );
   const outputSignature = computeOutputSignature(gpuResult.pixelData);
   const usesPerColumnVerticalDirs = frames.some(
     frame => Array.isArray(frame.S) && frame.S.length >= 3
@@ -809,6 +943,10 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
 
   return {
     pixelData: gpuResult.pixelData,
+    meanMap: gpuResult.meanMap,
+    maxMap: gpuResult.maxMap,
+    sampleCountMap: gpuResult.sampleCountMap,
+    pipelineMode: gpuResult.pipelineMode,
     minValue,
     maxValue,
     windowWidth,
@@ -830,11 +968,18 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
         requestedSamples: requestedSlabSamples,
         effectiveSamples: requestedSlabSamples,
         slabHalfThicknessMm,
-        aggregation: 'GPU_MEAN_MIP_HYBRID',
-        reduction: 'raw mean / raw max blend (0.5 mean, 0.5 max)',
+        aggregation:
+          gpuResult.pipelineMode === 'multi-pass'
+            ? 'GPU_SUPPORT_SURFACE_DRR'
+            : 'GPU_FOCAL_TROUGH_DRR',
+        reduction:
+          gpuResult.pipelineMode === 'multi-pass'
+            ? 'support estimation + support smoothing + DRR attenuation + tone mapping'
+            : 'gaussian focal-trough weighted accumulation (sigma 1.5 mm)',
       },
       gpuRender: {
         enabled: true,
+        pipelineMode: gpuResult.pipelineMode,
         volumeCacheKey,
         usedPerColumnVerticalDirs: usesPerColumnVerticalDirs,
         authoritativeWorldToIndex: true,
@@ -3860,12 +4005,30 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
         ? Number(input.rescaleIntercept)
         : 0;
       const safeBitsStored = resolveStoredBitCount(input.bitsStored, 16);
-      const sourceIsPreScaled = input.isPreScaled === true;
+      const preScaledResolution = resolveEffectivePreScaledForInit({
+        scalarData: input.scalarData,
+        isPreScaled: input.isPreScaled,
+        rescaleSlope: input.rescaleSlope,
+        rescaleIntercept: input.rescaleIntercept,
+        bitsStored: input.bitsStored,
+        pixelRepresentation: input.pixelRepresentation,
+      });
+      const sourceIsPreScaled = preScaledResolution.effectiveIsPreScaled;
+      if (preScaledResolution.heuristicOverride && input.isPreScaled !== true) {
+        console.warn('[CPR-worker] INIT_VOLUME detected already-scaled HU source data; bypassing secondary rescale.', {
+          sampledMin: preScaledResolution.sampledMin,
+          sampledMax: preScaledResolution.sampledMax,
+          rescaleSlope: safeSlope,
+          rescaleIntercept: safeIntercept,
+          bitsStored: safeBitsStored,
+          pixelRepresentation: input.pixelRepresentation,
+        });
+      }
       const cleanedHuScalarData = new Float32Array(input.scalarData.length);
       for (let i = 0; i < input.scalarData.length; i++) {
         const raw = Number(input.scalarData[i]);
         if (sourceIsPreScaled) {
-          cleanedHuScalarData[i] = Number.isFinite(raw) ? raw : safeIntercept;
+          cleanedHuScalarData[i] = Number.isFinite(raw) ? raw : -1000;
           continue;
         }
         const clean = decodeStoredScalarValue(raw, safeBitsStored, input.pixelRepresentation, 16);
@@ -3916,9 +4079,14 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       throw new Error('Received empty frames array.');
     }
     const renderBackend = renderInput.renderBackend === 'cpu' ? 'cpu' : 'gpu';
+    type OptionalGpuDiagnosticMaps = {
+      meanMap?: Float32Array;
+      maxMap?: Float32Array;
+      sampleCountMap?: Float32Array;
+    };
     let renderResult:
       | ReturnType<typeof generateGpuPanorama>
-      | Pick<
+      | (Pick<
           ReturnType<typeof generatePanorama>,
           | 'pixelData'
           | 'minValue'
@@ -3931,7 +4099,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
           | 'unsignedPackedArtifactDetected'
           | 'diagnosticPayload'
           | 'outputSignature'
-        >
+        > & OptionalGpuDiagnosticMaps)
       | undefined;
 
     if (renderBackend === 'gpu') {
@@ -3967,6 +4135,9 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
 
     const {
       pixelData,
+      meanMap,
+      maxMap,
+      sampleCountMap,
       minValue,
       maxValue,
       windowWidth,
@@ -3988,6 +4159,9 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       type: 'SUCCESS',
       requestId,
       pixelData: displayPixelData.pixelData,
+      meanMap,
+      maxMap,
+      sampleCountMap,
       panoWidth: renderInput.panoWidth,
       panoHeight: renderInput.panoHeight,
       minValue,
@@ -4006,8 +4180,19 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       },
     };
 
+    const transferList: Transferable[] = [displayPixelData.pixelData.buffer];
+    if (meanMap?.buffer) {
+      transferList.push(meanMap.buffer);
+    }
+    if (maxMap?.buffer) {
+      transferList.push(maxMap.buffer);
+    }
+    if (sampleCountMap?.buffer) {
+      transferList.push(sampleCountMap.buffer);
+    }
+
     // eslint-disable-next-line no-restricted-globals
-    (self as unknown as Worker).postMessage(response, [displayPixelData.pixelData.buffer]);
+    (self as unknown as Worker).postMessage(response, transferList);
   } catch (err) {
     const requestId = resolveWorkerRequestId(event.data);
     const response: CPRWorkerError = {

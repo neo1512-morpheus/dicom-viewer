@@ -7,6 +7,9 @@ import {
 
 export interface PanoImagePayload {
   pixelData: Float32Array | Uint16Array;
+  meanMap?: Float32Array;
+  maxMap?: Float32Array;
+  sampleCountMap?: Float32Array;
   width: number;
   height: number;
   minValue: number;
@@ -214,6 +217,18 @@ function getPanoPayloadForMetadata(imageId: string): PanoImagePayload | null {
   // Backward compatibility for any legacy path still using a fixed imageId.
   if (panoImageCache.has(PANO_IMAGE_ID)) {
     return panoImageCache.get(PANO_IMAGE_ID)!;
+  }
+
+  return null;
+}
+
+export function getPanoImagePayload(imageId?: string | null): PanoImagePayload | null {
+  if (typeof imageId === 'string' && imageId.length > 0) {
+    return getPanoPayloadForMetadata(imageId);
+  }
+
+  if (latestPanoImageId) {
+    return getPanoPayloadForMetadata(latestPanoImageId);
   }
 
   return null;

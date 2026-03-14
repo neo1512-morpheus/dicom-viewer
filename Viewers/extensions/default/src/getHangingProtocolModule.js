@@ -394,7 +394,8 @@ const hpCPR = {
           viewportOptions: {
             viewportId: 'cpr-pano',
             toolGroupId: 'cprPano',
-            viewportType: 'stack',
+            viewportType: 'volume',
+            orientation: 'axial',
             allowUnmatchedView: true,
           },
           displaySets: [

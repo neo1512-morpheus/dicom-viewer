@@ -1,4 +1,9 @@
 import { disposeGpuPanoRenderer, renderPanoGpu } from './cprGpuRenderer';
+import {
+  createHuScalarTransform,
+  normalizeScalarDataToHuFloat32,
+  resolveStoredValueNormalizationPolicy,
+} from './cprScalarPolicy';
 
 /**
  * cprWorker.ts
@@ -61,11 +66,17 @@ interface CPRWorkerVolumeState {
   highBit?: number;
   pixelRepresentation?: number;
   isPreScaled?: boolean;
+  storedValueNormalizationApplied?: boolean;
+  unsignedPackedArtifactDetected?: boolean;
+  normalizationSignature?: string | null;
+  preScaledHeuristicOverride?: boolean;
 }
 
 interface CPRWorkerInitVolumeInput extends CPRWorkerVolumeState {
   type: 'INIT_VOLUME';
   requestId: string;
+  allowStoredValueNormalization?: boolean;
+  disableStoredValueNormalization?: boolean;
 }
 
 interface CPRWorkerRenderInput {
@@ -150,142 +161,6 @@ interface CPRWorkerError {
   type: 'ERROR';
   requestId: string;
   message: string;
-}
-
-function resolveStoredBitCount(bitsStored: number | null | undefined, fallback = 16): number {
-  return Number.isFinite(bitsStored) && Number(bitsStored) >= 1 && Number(bitsStored) <= 31
-    ? Math.floor(Number(bitsStored))
-    : fallback;
-}
-
-function resolveStoredBitMask(bitsStored: number | null | undefined, fallback = 16): number {
-  const safeBitsStored = resolveStoredBitCount(bitsStored, fallback);
-  return safeBitsStored >= 31 ? 0x7fffffff : (1 << safeBitsStored) - 1;
-}
-
-function decodeStoredScalarValue(
-  rawValue: number,
-  bitsStored: number | null | undefined,
-  pixelRepresentation: number | null | undefined,
-  fallbackBits = 16
-): number {
-  if (!Number.isFinite(rawValue)) {
-    return Number.NaN;
-  }
-
-  const safeBitsStored = resolveStoredBitCount(bitsStored, fallbackBits);
-  const maskedValue = Math.trunc(rawValue) & resolveStoredBitMask(safeBitsStored, fallbackBits);
-
-  if (pixelRepresentation === 1) {
-    const signBit = safeBitsStored >= 31 ? 0x40000000 : 1 << (safeBitsStored - 1);
-    const signedRange = safeBitsStored >= 31 ? 0x80000000 : 1 << safeBitsStored;
-    return maskedValue >= signBit ? maskedValue - signedRange : maskedValue;
-  }
-
-  return maskedValue;
-}
-
-function sampleScalarRange(data: ArrayLike<number>): { min: number; max: number } {
-  let min = Infinity;
-  let max = -Infinity;
-  const step = Math.max(1, Math.floor(data.length / 4096));
-
-  for (let i = 0; i < data.length; i += step) {
-    const value = Number(data[i]);
-    if (!Number.isFinite(value)) {
-      continue;
-    }
-    if (value < min) {
-      min = value;
-    }
-    if (value > max) {
-      max = value;
-    }
-  }
-
-  return {
-    min: Number.isFinite(min) ? min : 0,
-    max: Number.isFinite(max) ? max : 0,
-  };
-}
-
-function isHuLikeScalarRange(min: number, max: number): boolean {
-  return Number.isFinite(min) && Number.isFinite(max) && min >= -5000 && max <= 7000;
-}
-
-function resolveEffectivePreScaledForInit(params: {
-  scalarData: Float32Array | Int16Array | Uint16Array;
-  isPreScaled?: boolean;
-  rescaleSlope?: number;
-  rescaleIntercept?: number;
-  bitsStored?: number;
-  pixelRepresentation?: number;
-}): {
-  effectiveIsPreScaled: boolean;
-  sampledMin: number;
-  sampledMax: number;
-  heuristicOverride: boolean;
-} {
-  const {
-    scalarData,
-    isPreScaled,
-    rescaleSlope,
-    rescaleIntercept,
-    bitsStored,
-    pixelRepresentation,
-  } = params;
-  const safeSlope =
-    Number.isFinite(rescaleSlope) && Math.abs(Number(rescaleSlope)) > 1e-8 ? Number(rescaleSlope) : 1;
-  const safeIntercept = Number.isFinite(rescaleIntercept) ? Number(rescaleIntercept) : 0;
-  const hasNonIdentityRescale = Math.abs(safeSlope - 1) > 1e-6 || Math.abs(safeIntercept) > 1e-6;
-  const sampledRange = sampleScalarRange(scalarData);
-  const sampledMin = sampledRange.min;
-  const sampledMax = sampledRange.max;
-  const looksHuLike = isHuLikeScalarRange(sampledMin, sampledMax);
-
-  if (isPreScaled === true) {
-    return {
-      effectiveIsPreScaled: true,
-      sampledMin,
-      sampledMax,
-      heuristicOverride: false,
-    };
-  }
-
-  if (!hasNonIdentityRescale) {
-    return {
-      effectiveIsPreScaled: false,
-      sampledMin,
-      sampledMax,
-      heuristicOverride: false,
-    };
-  }
-
-  const safeBitsStored = resolveStoredBitCount(bitsStored, 16);
-  const isUnsigned = Number(pixelRepresentation) === 0;
-  const storedMin = isUnsigned ? 0 : -(1 << Math.max(safeBitsStored - 1, 0));
-  const storedMax =
-    safeBitsStored >= 31
-      ? Number.MAX_SAFE_INTEGER
-      : isUnsigned
-        ? (1 << safeBitsStored) - 1
-        : (1 << Math.max(safeBitsStored - 1, 0)) - 1;
-  const storedMargin = Math.max(8, safeBitsStored < 16 ? 16 : 64);
-  const looksLikeStoredRange =
-    Number.isFinite(sampledMin) &&
-    Number.isFinite(sampledMax) &&
-    sampledMin >= storedMin - storedMargin &&
-    sampledMax <= storedMax + storedMargin;
-  const impossibleUnsignedHuRange = isUnsigned && sampledMin < -1;
-  const floatHuPayload = scalarData instanceof Float32Array && looksHuLike;
-  const likelyAlreadyScaled = looksHuLike && (floatHuPayload || impossibleUnsignedHuRange || !looksLikeStoredRange);
-
-  return {
-    effectiveIsPreScaled: likelyAlreadyScaled,
-    sampledMin,
-    sampledMax,
-    heuristicOverride: likelyAlreadyScaled,
-  };
 }
 
 interface CPRWorkerInitSuccess {
@@ -692,116 +567,33 @@ function resolveScalarSamplingPolicy(input: CPRWorkerInput): ScalarSamplingPolic
     isPreScaled,
     applyModalityLut,
   } = input;
-
-  const safeSlope =
-    Number.isFinite(rescaleSlope) && Math.abs(Number(rescaleSlope)) > 1e-8 ? Number(rescaleSlope) : 1;
-  const safeIntercept = Number.isFinite(rescaleIntercept) ? Number(rescaleIntercept) : 0;
-  const safeBitsStored =
-    Number.isFinite(bitsStored) && Number(bitsStored) >= 1 ? Math.floor(Number(bitsStored)) : null;
-  const safeBitsAllocated =
-    Number.isFinite(bitsAllocated) && Number(bitsAllocated) >= 1 ? Math.floor(Number(bitsAllocated)) : 16;
-  const safeHighBit = Number.isFinite(highBit) ? Math.floor(Number(highBit)) : null;
-  const safePixelRepresentation =
-    Number.isFinite(pixelRepresentation) && (Number(pixelRepresentation) === 0 || Number(pixelRepresentation) === 1)
-      ? Number(pixelRepresentation)
-      : null;
-  const safeIsPreScaled = isPreScaled === true;
-  const nominalStoredMax =
-    safeBitsStored !== null && safeBitsStored > 0 && safeBitsStored < 31
-      ? (1 << safeBitsStored) - 1
-      : Number.MAX_SAFE_INTEGER;
-  const sampledMinMax = (() => {
-    let min = Infinity;
-    let max = -Infinity;
-    const step = Math.max(1, Math.floor(scalarData.length / 4096));
-    for (let i = 0; i < scalarData.length; i += step) {
-      const value = Number(scalarData[i]);
-      if (!Number.isFinite(value)) {
-        continue;
-      }
-      if (value < min) {
-        min = value;
-      }
-      if (value > max) {
-        max = value;
-      }
-    }
-    return {
-      min: Number.isFinite(min) ? min : 0,
-      max: Number.isFinite(max) ? max : 0,
-    };
-  })();
-  const unsignedPackedArtifactDetected =
-    !safeIsPreScaled &&
-    (scalarData instanceof Int16Array || scalarData instanceof Uint16Array) &&
-    safeBitsStored !== null &&
-    safeBitsStored < 16 &&
-    safePixelRepresentation === 0 &&
-    (sampledMinMax.min < -1 || sampledMinMax.max > nominalStoredMax + 8);
-  const normalizationEligible =
-    safeBitsStored !== null &&
-    safeBitsStored < 16 &&
-    safePixelRepresentation !== null &&
-    (scalarData instanceof Int16Array || scalarData instanceof Uint16Array);
-  const shouldNormalizeStoredValues =
-    normalizationEligible &&
-    (disableStoredValueNormalization === true
-      ? false
-      : typeof allowStoredValueNormalization === 'boolean'
-        ? allowStoredValueNormalization
-        : unsignedPackedArtifactDetected);
-  const normalizedBitsStored = shouldNormalizeStoredValues ? (safeBitsStored as number) : 0;
-  const normalizedHighBit = shouldNormalizeStoredValues
-    ? Math.max(0, Math.min(safeBitsAllocated - 1, safeHighBit ?? normalizedBitsStored - 1))
-    : 0;
-  const bitAlignmentShift = shouldNormalizeStoredValues
-    ? Math.max(-15, Math.min(15, normalizedHighBit + 1 - normalizedBitsStored))
-    : 0;
-  const storedMask = shouldNormalizeStoredValues ? (1 << normalizedBitsStored) - 1 : 0;
-  const storedSignBit = shouldNormalizeStoredValues ? 1 << (normalizedBitsStored - 1) : 0;
-  const storedRange = shouldNormalizeStoredValues ? 1 << normalizedBitsStored : 0;
-
-  const normalizeStoredSample = shouldNormalizeStoredValues
-    ? (value: number): number => {
-      if (!Number.isFinite(value)) {
-        return 0;
-      }
-      const intValue = Math.round(value);
-      const rawU16 = intValue & 0xffff;
-      let aligned = rawU16;
-      if (bitAlignmentShift > 0) {
-        aligned = rawU16 >>> bitAlignmentShift;
-      } else if (bitAlignmentShift < 0) {
-        aligned = (rawU16 << -bitAlignmentShift) & 0xffff;
-      }
-      let normalized = aligned & storedMask;
-      if (safePixelRepresentation === 1 && (normalized & storedSignBit) !== 0) {
-        normalized -= storedRange;
-      }
-      return normalized;
-    }
-    : undefined;
-  const requestedModalityLutApplied = typeof applyModalityLut === 'boolean'
-    ? applyModalityLut
-    : safeSlope !== 1 || safeIntercept !== 0;
-  const shouldApplyModalityLut =
-    !safeIsPreScaled && (safeSlope !== 1 || safeIntercept !== 0);
-  const interpolationOobValue = shouldApplyModalityLut ? (-1000 - safeIntercept) / safeSlope : -1000;
-  const safeInterpolationOobValue = Number.isFinite(interpolationOobValue) ? interpolationOobValue : -1000;
-  const normalizationSignature = shouldNormalizeStoredValues
-    ? `packed:${normalizedBitsStored}:${normalizedHighBit}:${bitAlignmentShift}:${safePixelRepresentation ?? 'na'}`
-    : null;
+  const transform = createHuScalarTransform({
+    scalarData,
+    allowStoredValueNormalization,
+    disableStoredValueNormalization,
+    rescaleSlope,
+    rescaleIntercept,
+    bitsStored,
+    bitsAllocated,
+    highBit,
+    pixelRepresentation,
+    isPreScaled,
+  });
+  const requestedModalityLutApplied =
+    typeof applyModalityLut === 'boolean'
+      ? applyModalityLut
+      : Math.abs(transform.safeSlope - 1) > 1e-6 || Math.abs(transform.safeIntercept) > 1e-6;
 
   return {
-    safeSlope,
-    safeIntercept,
+    safeSlope: transform.safeSlope,
+    safeIntercept: transform.safeIntercept,
     requestedModalityLutApplied,
-    shouldApplyModalityLut,
-    shouldNormalizeStoredValues,
-    unsignedPackedArtifactDetected,
-    normalizeStoredSample,
-    normalizationSignature,
-    safeInterpolationOobValue,
+    shouldApplyModalityLut: transform.shouldApplyModalityLut,
+    shouldNormalizeStoredValues: transform.shouldNormalizeStoredValues,
+    unsignedPackedArtifactDetected: transform.unsignedPackedArtifactDetected,
+    normalizeStoredSample: transform.normalizeStoredSample,
+    normalizationSignature: transform.normalizationSignature,
+    safeInterpolationOobValue: transform.safeInterpolationOobValue,
   };
 }
 
@@ -3997,44 +3789,41 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       if (!input.scalarData || input.scalarData.length === 0) {
         throw new Error('Received empty or null scalar data during INIT_VOLUME.');
       }
-      const safeSlope =
-        Number.isFinite(input.rescaleSlope) && Math.abs(Number(input.rescaleSlope)) > 1e-8
-          ? Number(input.rescaleSlope)
-          : 1;
-      const safeIntercept = Number.isFinite(input.rescaleIntercept)
-        ? Number(input.rescaleIntercept)
-        : 0;
-      const safeBitsStored = resolveStoredBitCount(input.bitsStored, 16);
-      const preScaledResolution = resolveEffectivePreScaledForInit({
+      const policy = resolveStoredValueNormalizationPolicy({
         scalarData: input.scalarData,
         isPreScaled: input.isPreScaled,
         rescaleSlope: input.rescaleSlope,
         rescaleIntercept: input.rescaleIntercept,
         bitsStored: input.bitsStored,
+        bitsAllocated: input.bitsAllocated,
+        highBit: input.highBit,
         pixelRepresentation: input.pixelRepresentation,
+        allowStoredValueNormalization: input.allowStoredValueNormalization,
+        disableStoredValueNormalization: input.disableStoredValueNormalization,
       });
-      const sourceIsPreScaled = preScaledResolution.effectiveIsPreScaled;
-      if (preScaledResolution.heuristicOverride && input.isPreScaled !== true) {
+      if (policy.heuristicOverride && input.isPreScaled !== true) {
         console.warn('[CPR-worker] INIT_VOLUME detected already-scaled HU source data; bypassing secondary rescale.', {
-          sampledMin: preScaledResolution.sampledMin,
-          sampledMax: preScaledResolution.sampledMax,
-          rescaleSlope: safeSlope,
-          rescaleIntercept: safeIntercept,
-          bitsStored: safeBitsStored,
+          sampledMin: policy.sampledMin,
+          sampledMax: policy.sampledMax,
+          rescaleSlope: policy.safeSlope,
+          rescaleIntercept: policy.safeIntercept,
+          bitsStored: policy.safeBitsStored,
           pixelRepresentation: input.pixelRepresentation,
         });
       }
-      const cleanedHuScalarData = new Float32Array(input.scalarData.length);
-      for (let i = 0; i < input.scalarData.length; i++) {
-        const raw = Number(input.scalarData[i]);
-        if (sourceIsPreScaled) {
-          cleanedHuScalarData[i] = Number.isFinite(raw) ? raw : -1000;
-          continue;
-        }
-        const clean = decodeStoredScalarValue(raw, safeBitsStored, input.pixelRepresentation, 16);
-        const hu = clean * safeSlope + safeIntercept;
-        cleanedHuScalarData[i] = Number.isFinite(hu) ? hu : safeIntercept;
-      }
+      const normalized = normalizeScalarDataToHuFloat32({
+        scalarData: input.scalarData,
+        isPreScaled: input.isPreScaled,
+        rescaleSlope: input.rescaleSlope,
+        rescaleIntercept: input.rescaleIntercept,
+        bitsStored: input.bitsStored,
+        bitsAllocated: input.bitsAllocated,
+        highBit: input.highBit,
+        pixelRepresentation: input.pixelRepresentation,
+        allowStoredValueNormalization: input.allowStoredValueNormalization,
+        disableStoredValueNormalization: input.disableStoredValueNormalization,
+      });
+      const cleanedHuScalarData = normalized.pixelData;
       cachedVolumeState = {
         sessionKey: input.sessionKey,
         scalarData: cleanedHuScalarData,
@@ -4046,11 +3835,15 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
         worldToIndex: input.worldToIndex,
         rescaleSlope: 1,
         rescaleIntercept: 0,
-        bitsStored: safeBitsStored,
+        bitsStored: policy.safeBitsStored,
         bitsAllocated: input.bitsAllocated,
         highBit: input.highBit,
         pixelRepresentation: input.pixelRepresentation,
         isPreScaled: true,
+        storedValueNormalizationApplied: policy.shouldNormalizeStoredValues,
+        unsignedPackedArtifactDetected: policy.unsignedPackedArtifactDetected,
+        normalizationSignature: policy.normalizationSignature,
+        preScaledHeuristicOverride: policy.heuristicOverride,
       };
       const initResponse: CPRWorkerInitSuccess = {
         type: 'INIT_SUCCESS',
@@ -4149,6 +3942,10 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       diagnosticPayload,
       outputSignature,
     } = renderResult;
+    const storedValueNormalizationAppliedForOutput =
+      !!cachedVolumeState?.storedValueNormalizationApplied || storedValueNormalizationApplied;
+    const unsignedPackedArtifactDetectedForOutput =
+      !!cachedVolumeState?.unsignedPackedArtifactDetected || unsignedPackedArtifactDetected;
     const displayPixelData = {
       pixelData,
       slope: 1,
@@ -4172,8 +3969,8 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       intercept: displayPixelData.intercept,
       modalityLutApplied,
       requestedModalityLutApplied,
-      storedValueNormalizationApplied,
-      unsignedPackedArtifactDetected,
+      storedValueNormalizationApplied: storedValueNormalizationAppliedForOutput,
+      unsignedPackedArtifactDetected: unsignedPackedArtifactDetectedForOutput,
       debugPayload: {
         diagnostic: diagnosticPayload,
         outputSignature,

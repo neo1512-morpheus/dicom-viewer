@@ -407,15 +407,22 @@ class CPRCursorTool extends AnnotationTool {
     frameCount: number
   ): number | null {
     const imagePoint = this._canvasToImagePoint(viewport, canvasPoint);
-    if (!imagePoint) {
-      return null;
-    }
-
     if (frameCount <= 1) {
       return 0;
     }
 
-    const normalized = imagePoint.imageX / Math.max(1, imagePoint.imageWidth - 1);
+    let normalized: number | null = null;
+
+    if (imagePoint) {
+      normalized = imagePoint.imageX / Math.max(1, imagePoint.imageWidth - 1);
+    } else {
+      const viewportSize = this._getViewportCanvasSize(viewport);
+      if (!viewportSize || viewportSize.width <= 1) {
+        return null;
+      }
+
+      normalized = canvasPoint[0] / Math.max(1, viewportSize.width - 1);
+    }
 
     return Math.max(0, Math.min(Math.round(normalized * (frameCount - 1)), frameCount - 1));
   }
@@ -475,11 +482,42 @@ class CPRCursorTool extends AnnotationTool {
           };
         }
       } catch {
-        return null;
+        // Fall back to element-relative coordinates when the hosted VTK pano
+        // does not expose usable Cornerstone image/world transforms.
       }
     }
 
-    return null;
+    const viewportSize = this._getViewportCanvasSize(viewport);
+    if (!viewportSize) {
+      return null;
+    }
+
+    const canvasX = normalized * Math.max(1, viewportSize.width - 1);
+
+    return {
+      start: [canvasX, 0],
+      end: [canvasX, viewportSize.height],
+      canvasX,
+      centerWorld: [0, 0, 0],
+    };
+  }
+
+  private _getViewportCanvasSize(
+    viewport
+  ): {
+    width: number;
+    height: number;
+  } | null {
+    const element = viewport?.element as HTMLDivElement | undefined;
+    const rect = element?.getBoundingClientRect?.();
+    const width = Number(rect?.width ?? element?.clientWidth);
+    const height = Number(rect?.height ?? element?.clientHeight);
+
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 1 || height <= 1) {
+      return null;
+    }
+
+    return { width, height };
   }
 
   private _distanceToSegment(point: CanvasPoint, start: CanvasPoint, end: CanvasPoint): number {

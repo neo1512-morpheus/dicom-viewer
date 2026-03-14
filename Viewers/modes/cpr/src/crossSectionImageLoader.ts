@@ -1,6 +1,7 @@
 import * as cornerstone from '@cornerstonejs/core';
 
 import type { CPRFrame, Point3 } from './cprMath';
+import { normalizeScalarDataToHuFloat32 } from './cprScalarPolicy';
 import {
   SyntheticCprIntensityDomain,
   classifySyntheticCprIntensityDomain,
@@ -214,15 +215,6 @@ export function getCrossSectionCanonicalGridConfig(): {
   };
 }
 
-function isHuLikeRange(minValue: number, maxValue: number): boolean {
-  return (
-    Number.isFinite(minValue) &&
-    Number.isFinite(maxValue) &&
-    minValue >= -5000 &&
-    maxValue <= 7000
-  );
-}
-
 function estimateScalarRange(data: NumericArray): { minValue: number; maxValue: number } {
   if (!data?.length) {
     return { minValue: 0, maxValue: 0 };
@@ -234,43 +226,6 @@ function estimateScalarRange(data: NumericArray): { minValue: number; maxValue: 
 
   for (let i = 0; i < data.length; i += step) {
     const value = Number(data[i]);
-    if (!Number.isFinite(value)) {
-      continue;
-    }
-
-    if (value < minValue) {
-      minValue = value;
-    }
-    if (value > maxValue) {
-      maxValue = value;
-    }
-  }
-
-  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
-    return { minValue: 0, maxValue: 0 };
-  }
-
-  return { minValue, maxValue };
-}
-
-function estimateTransformedScalarRange(
-  data: NumericArray,
-  transform?: (value: number) => number
-): { minValue: number; maxValue: number } {
-  if (!transform) {
-    return estimateScalarRange(data);
-  }
-
-  if (!data?.length) {
-    return { minValue: 0, maxValue: 0 };
-  }
-
-  let minValue = Infinity;
-  let maxValue = -Infinity;
-  const step = Math.max(1, Math.floor(data.length / 20000));
-
-  for (let i = 0; i < data.length; i += step) {
-    const value = transform(Number(data[i]));
     if (!Number.isFinite(value)) {
       continue;
     }
@@ -305,39 +260,6 @@ function getDefaultCrossSectionVoi(): {
     windowWidth,
     windowCenter,
   };
-}
-
-function resolveStoredBitCount(bitsStored: number | null | undefined, fallback = 16): number {
-  return Number.isFinite(bitsStored) && Number(bitsStored) >= 1 && Number(bitsStored) <= 31
-    ? Math.floor(Number(bitsStored))
-    : fallback;
-}
-
-function resolveStoredValueBitMask(bitsStored: number | null | undefined, fallback = 16): number {
-  const safeBitsStored = resolveStoredBitCount(bitsStored, fallback);
-  return safeBitsStored >= 31 ? 0x7fffffff : (1 << safeBitsStored) - 1;
-}
-
-function decodeStoredScalarValue(
-  rawValue: number,
-  bitsStored: number | null | undefined,
-  pixelRepresentation: number | null | undefined,
-  fallbackBits = 16
-): number {
-  if (!Number.isFinite(rawValue)) {
-    return Number.NaN;
-  }
-
-  const safeBitsStored = resolveStoredBitCount(bitsStored, fallbackBits);
-  const maskedValue = Math.trunc(rawValue) & resolveStoredValueBitMask(safeBitsStored, fallbackBits);
-
-  if (pixelRepresentation === 1) {
-    const signBit = safeBitsStored >= 31 ? 0x40000000 : 1 << (safeBitsStored - 1);
-    const signedRange = safeBitsStored >= 31 ? 0x80000000 : 1 << safeBitsStored;
-    return maskedValue >= signBit ? maskedValue - signedRange : maskedValue;
-  }
-
-  return maskedValue;
 }
 
 function computeExactScalarRange(data: ArrayLike<number>): { minValue: number; maxValue: number } {
@@ -456,100 +378,6 @@ function getVolumePixelStorage(
   };
 }
 
-function resolveEffectivePreScaledFlag(params: {
-  isPreScaled: boolean;
-  scalarMin: number;
-  scalarMax: number;
-  slope: number;
-  intercept: number;
-  bitsStored: number;
-  pixelRepresentation: number;
-}): boolean {
-  const { isPreScaled, scalarMin, scalarMax, slope, intercept, bitsStored, pixelRepresentation } =
-    params;
-
-  if (!isPreScaled) {
-    return false;
-  }
-
-  const hasNonIdentityRescale = Math.abs(slope - 1) > 1e-6 || Math.abs(intercept) > 1e-6;
-  if (!hasNonIdentityRescale) {
-    return true;
-  }
-
-  const looksImplausiblyWideRange =
-    Number.isFinite(scalarMin) &&
-    Number.isFinite(scalarMax) &&
-    (scalarMin < -9000 || scalarMax > 14000);
-  if (looksImplausiblyWideRange) {
-    return false;
-  }
-
-  const safeBitsStored =
-    Number.isFinite(bitsStored) && bitsStored >= 1 && bitsStored <= 31 ? Math.floor(bitsStored) : 16;
-  const isUnsigned = pixelRepresentation === 0;
-  const unsignedStoredMax =
-    safeBitsStored > 0 && safeBitsStored < 31 ? (1 << safeBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
-  const looksLikeUnsignedStoredRange =
-    isUnsigned &&
-    Number.isFinite(scalarMin) &&
-    Number.isFinite(scalarMax) &&
-    scalarMin >= -1 &&
-    scalarMax <= unsignedStoredMax + 8;
-
-  if (looksLikeUnsignedStoredRange) {
-    return false;
-  }
-
-  return true;
-}
-
-function shouldApplyModalityLut(params: {
-  slope: number;
-  intercept: number;
-  scalarMin: number;
-  scalarMax: number;
-  bitsStored: number;
-  pixelRepresentation: number;
-  isPreScaled: boolean;
-}): boolean {
-  const { slope, intercept, scalarMin, scalarMax, bitsStored, pixelRepresentation, isPreScaled } =
-    params;
-  const hasNonIdentityRescale = Math.abs(slope - 1) > 1e-6 || Math.abs(intercept) > 1e-6;
-
-  if (!hasNonIdentityRescale || isPreScaled) {
-    return false;
-  }
-
-  const isUnsigned = pixelRepresentation === 0;
-  const looksLikeHU = isHuLikeRange(scalarMin, scalarMax);
-  if (isUnsigned && scalarMin < -1 && looksLikeHU) {
-    return false;
-  }
-
-  const safeBitsStored =
-    Number.isFinite(bitsStored) && bitsStored >= 1 && bitsStored <= 31 ? Math.floor(bitsStored) : 16;
-
-  if (safeBitsStored < 16) {
-    const storedMin = isUnsigned ? 0 : -(1 << (safeBitsStored - 1));
-    const storedMax = isUnsigned ? (1 << safeBitsStored) - 1 : (1 << (safeBitsStored - 1)) - 1;
-    const margin = Math.max(8, Math.round((storedMax - storedMin) * 0.02));
-    const looksStored =
-      Number.isFinite(scalarMin) &&
-      Number.isFinite(scalarMax) &&
-      scalarMin >= storedMin - margin &&
-      scalarMax <= storedMax + margin;
-
-    if (!looksLikeHU) {
-      return true;
-    }
-
-    return looksStored;
-  }
-
-  return true;
-}
-
 function getSourceSeriesMetadata(
   volume: cornerstone.Types.IImageVolume
 ): {
@@ -603,28 +431,17 @@ function resolveSeriesPayload(
   const sourceScalarData = sourceVolume.imageData.getPointData().getScalars().getData() as NumericArray;
   const { slope, intercept } = getVolumeRescale(sourceVolume);
   const pixelStorage = getVolumePixelStorage(sourceVolume);
-  const sourceScalarRange = estimateScalarRange(sourceScalarData);
-  const effectiveIsPreScaled = resolveEffectivePreScaledFlag({
+  const normalized = normalizeScalarDataToHuFloat32({
+    scalarData: sourceScalarData,
     isPreScaled: pixelStorage.isPreScaled,
-    scalarMin: sourceScalarRange.minValue,
-    scalarMax: sourceScalarRange.maxValue,
-    slope,
-    intercept,
+    rescaleSlope: slope,
+    rescaleIntercept: intercept,
     bitsStored: pixelStorage.bitsStored,
+    bitsAllocated: pixelStorage.bitsAllocated,
+    highBit: pixelStorage.highBit,
     pixelRepresentation: pixelStorage.pixelRepresentation,
   });
-  const safeBitsStored = resolveStoredBitCount(pixelStorage.bitsStored, 16);
-  const cleanedHuScalarData = new Float32Array(sourceScalarData.length);
-  for (let i = 0; i < sourceScalarData.length; i++) {
-    const raw = Number(sourceScalarData[i]);
-    if (effectiveIsPreScaled) {
-      cleanedHuScalarData[i] = Number.isFinite(raw) ? raw : 0;
-      continue;
-    }
-    const clean = decodeStoredScalarValue(raw, safeBitsStored, pixelStorage.pixelRepresentation, 16);
-    const hu = clean * slope + intercept;
-    cleanedHuScalarData[i] = Number.isFinite(hu) ? hu : intercept;
-  }
+  const cleanedHuScalarData = normalized.pixelData;
   const { minValue: displayMin, maxValue: displayMax } = estimateScalarRange(cleanedHuScalarData);
   const requestedIntensityDomain =
     payload.intensityDomain === 'hu' ||
@@ -684,7 +501,7 @@ function resolveSeriesPayload(
     intensityDomain,
     windowWidth,
     windowCenter,
-    storedValueNormalizationApplied: false,
+    storedValueNormalizationApplied: normalized.transform.shouldNormalizeStoredValues,
     applyModalityLut: false,
     interpolationOobValue: -1000,
     slope: 1,

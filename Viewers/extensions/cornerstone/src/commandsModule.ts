@@ -27,6 +27,13 @@ import toggleVOISliceSync from './utils/toggleVOISliceSync';
 import { cprStateService } from '../../../modes/cpr/src/CPRStateService';
 import { buildCrossSectionCameraForFrame } from '../../../modes/cpr/src/cprCrossSectionCamera';
 
+type CPRHostedPanoElement = HTMLElement & {
+  __cprVtkPanoHost?: {
+    resetCamera(): void;
+    render(): void;
+  };
+};
+
 const toggleSyncFunctions = {
   imageSlice: toggleImageSliceSync,
   voi: toggleVOISliceSync,
@@ -757,9 +764,12 @@ function commandsModule({
         }
       }
 
-      if (logicalViewportId === 'cpr-pano' && viewport instanceof StackViewport) {
-        cstUtils.jumpToSlice(viewport.element, { imageIndex: 0 });
+      if (logicalViewportId === 'cpr-pano') {
+        viewport.resetCamera?.();
         viewport.render();
+        const hostedPano = (viewport.element as CPRHostedPanoElement | undefined)?.__cprVtkPanoHost;
+        hostedPano?.resetCamera?.();
+        hostedPano?.render?.();
         return;
       }
 

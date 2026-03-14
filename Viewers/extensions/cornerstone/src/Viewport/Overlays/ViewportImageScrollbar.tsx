@@ -57,6 +57,11 @@ function CornerstoneImageScrollbar({
   };
 
   useEffect(() => {
+    if (isCPRPanoViewport()) {
+      setImageSliceData({ imageIndex: 0, numberOfSlices: 1 });
+      return;
+    }
+
     if (!viewportData) {
       return;
     }
@@ -68,11 +73,6 @@ function CornerstoneImageScrollbar({
     }
 
     if (viewportData.viewportType === Enums.ViewportType.STACK) {
-      if (isCPRPanoViewport()) {
-        setImageSliceData({ imageIndex: 0, numberOfSlices: 1 });
-        return;
-      }
-
       if (isCPRCrossSectionViewport() && cprStateService.hasData()) {
         const viewportImageIds = viewport.getImageIds?.() || [];
         const frameCount = Math.max(
@@ -120,11 +120,12 @@ function CornerstoneImageScrollbar({
   }, [viewportId, viewportData]);
 
   useEffect(() => {
-    if (viewportData?.viewportType !== Enums.ViewportType.STACK) {
+    if (isCPRPanoViewport()) {
+      setImageSliceData({ imageIndex: 0, numberOfSlices: 1 });
       return;
     }
 
-    if (isCPRPanoViewport()) {
+    if (viewportData?.viewportType !== Enums.ViewportType.STACK) {
       return;
     }
 
@@ -157,6 +158,11 @@ function CornerstoneImageScrollbar({
   }, [viewportData, element]);
 
   useEffect(() => {
+    if (isCPRPanoViewport()) {
+      setImageSliceData({ imageIndex: 0, numberOfSlices: 1 });
+      return;
+    }
+
     if (viewportData?.viewportType !== Enums.ViewportType.ORTHOGRAPHIC) {
       return;
     }

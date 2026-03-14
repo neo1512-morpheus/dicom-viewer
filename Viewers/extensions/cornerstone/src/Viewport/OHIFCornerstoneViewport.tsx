@@ -24,6 +24,8 @@ import { Types } from '@ohif/core';
 import OHIFViewportActionCorners from '../components/OHIFViewportActionCorners';
 import { getWindowLevelActionMenu } from '../components/WindowLevelActionMenu/getWindowLevelActionMenu';
 import { useAppConfig } from '@state';
+import { cprStateService } from '../../../../modes/cpr/src/CPRStateService';
+import { emitCPRCrossSectionSync } from '../../../../modes/cpr/src/cprEvents';
 import { useCPROrchestrator } from '../../../../modes/cpr/src/useCPROrchestrator';
 
 import { LutPresentation, PositionPresentation } from '../types/Presentation';
@@ -308,9 +310,9 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     throw new Error('Viewport ID is required');
   }
 
-  // Preserve explicit stack viewports (e.g. CPR pano) and only auto-promote when not pinned.
+  // Preserve explicit stack viewports and only auto-promote when not pinned.
   const hasDynamicReconstructable = displaySets.some(ds => ds.isDynamicVolume && ds.isReconstructable);
-  const isExplicitStackViewport = viewportOptions.viewportType === 'stack' || viewportId === 'cpr-pano';
+  const isExplicitStackViewport = viewportOptions.viewportType === 'stack';
   viewportOptions.viewportType =
     hasDynamicReconstructable && !isExplicitStackViewport
       ? 'volume'
@@ -333,6 +335,8 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     stateSyncService,
     viewportActionCornersService,
   } = servicesManager.services;
+  const logicalViewportId =
+    cornerstoneViewportService.getViewportInfo(viewportId)?.viewportOptions?.viewportId || viewportId;
 
   const [loadingProgress, setLoadingProgress] = useState(null);
   const [viewportDialogState] = useViewportDialog();
@@ -447,15 +451,46 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
       return;
     }
 
-    if (viewportId === 'cpr-crosssection') {
-      element.style.opacity = '0';
-      element.style.pointerEvents = 'none';
-      return;
-    }
-
     element.style.opacity = '';
     element.style.pointerEvents = '';
-  }, [viewportId]);
+  }, [logicalViewportId]);
+
+  const onCrossSectionWheel = useCallback(
+    (evt: React.WheelEvent<HTMLDivElement>) => {
+      if (logicalViewportId !== 'cpr-crosssection') {
+        return;
+      }
+
+      const frames = cprStateService.getFrames();
+      if (!frames.length) {
+        return;
+      }
+
+      const delta = evt.deltaY !== 0 ? evt.deltaY : evt.deltaX;
+      if (!Number.isFinite(delta) || delta === 0) {
+        return;
+      }
+
+      evt.preventDefault();
+      evt.stopPropagation();
+      evt.nativeEvent.stopImmediatePropagation?.();
+
+      const direction = delta > 0 ? 1 : -1;
+      const currentFrameIndex = cprStateService.getCurrentFrameIndex();
+      const nextFrameIndex = Math.max(0, Math.min(currentFrameIndex + direction, frames.length - 1));
+
+      if (nextFrameIndex === currentFrameIndex) {
+        return;
+      }
+
+      cprStateService.setCurrentFrameIndex(nextFrameIndex);
+      emitCPRCrossSectionSync({
+        frameIndex: nextFrameIndex,
+        viewportId: 'cpr-crosssection',
+      });
+    },
+    [logicalViewportId]
+  );
 
   // =====================================================
   // WebGL CONTEXT LOSS LISTENERS
@@ -755,14 +790,7 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
           style={{ height: '100%', width: '100%' }}
           onContextMenu={e => e.preventDefault()}
           onMouseDown={e => e.preventDefault()}
-          onWheel={
-            viewportId === 'cpr-crosssection'
-              ? e => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                }
-              : undefined
-          }
+          onWheel={logicalViewportId === 'cpr-crosssection' ? onCrossSectionWheel : undefined}
           ref={elementRef}
         ></div>
         <CornerstoneOverlays

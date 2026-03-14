@@ -157,6 +157,10 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     );
   }
 
+  private isCPRPanoViewport(viewportId: string): boolean {
+    return viewportId === 'cpr-pano' || this.getLogicalViewportId(viewportId) === 'cpr-pano';
+  }
+
   private isWebGLUnavailableError(error: unknown): boolean {
     const message =
       (typeof error === 'object' && error && 'message' in error
@@ -833,7 +837,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     this._handleOverlays(viewport);
 
     console.log('[DEBUG] _setStackViewport called, setting stack with', imageIds.length, 'images');
-    const isCPRPanoViewport = viewport.id === 'cpr-pano';
+    const isCPRPanoViewport = this.isCPRPanoViewport(viewport.id);
     if (isCPRPanoViewport) {
       console.log('[CPR-TRACE] CornerstoneViewportService entering _setStackViewport for cpr-pano', {
         initialImageIndexToUse,
@@ -866,7 +870,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       });
     }
 
-    if (viewport.id === 'cpr-pano') {
+    if (isCPRPanoViewport) {
       const firstImageId = stackImageIds?.[0] ?? '';
       if (!firstImageId.startsWith('pano://')) {
         console.log(
@@ -1044,6 +1048,26 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     viewportInfo: ViewportInfo,
     presentations: Presentations = {}
   ): Promise<void> {
+    if (this.isCPRPanoViewport(viewport.id)) {
+      const displaySetInstanceUIDs = viewportData.data.map(data => data.displaySetInstanceUID);
+      this.viewportsDisplaySets.set(viewport.id, displaySetInstanceUIDs);
+
+      requestAnimationFrame(() => {
+        try {
+          viewport.render();
+        } catch (renderError) {
+          if (!this.isWebGLUnavailableError(renderError)) {
+            console.warn(
+              `[CornerstoneViewportService] Failed empty render for custom CPR pano viewport ${viewport.id}`,
+              renderError
+            );
+          }
+        }
+      });
+
+      return Promise.resolve();
+    }
+
     // TODO: We need to overhaul the way data sources work so requests can be made
     // async. I think we should follow the image loader pattern which is async and
     // has a cache behind it.

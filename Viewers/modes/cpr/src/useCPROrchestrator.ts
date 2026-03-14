@@ -20,12 +20,17 @@ import { buildRMFFrames } from './cprMath';
 import { CPR_CROSSSECTION_SYNC_EVENT, CPRCrossSectionSyncDetail } from './cprEvents';
 import { buildCrossSectionCameraForFrame } from './cprCrossSectionCamera';
 import type { CPRFrame } from './cprMath';
+import { attachVtkPanoCpr } from './vtkPanoCprRenderer';
+import type { AttachedVtkPanoCpr } from './vtkPanoCprRenderer';
 
 const CPR_PANO_DEFAULT_WINDOW_WIDTH = 4500;
 const CPR_PANO_DEFAULT_WINDOW_CENTER = 1000;
+const CPR_PANO_RENDERER_MODE: 'vtk-cpr' | 'legacy-worker' = 'vtk-cpr';
 const CPR_PANO_RENDER_BACKEND_DEFAULT = 'gpu';
 const CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM = 2;
 const CPR_GPU_PANO_DEFAULT_SLAB_SAMPLES = 15;
+const CPR_VTK_PANO_PRESET_WINDOW_WIDTH = 3200;
+const CPR_VTK_PANO_PRESET_WINDOW_CENTER = 600;
 const CPR_PANO_GENERATION_DEBOUNCE_MS = 300;
 const CPR_PANO_MAX_DIMENSION = 4096;
 const CPR_PANO_DEFAULT_VERTICAL_HALF_MM = 18;
@@ -277,6 +282,15 @@ interface PanoVoiSettings {
   windowWidth: number;
   windowCenter: number;
 }
+
+interface HostedPanoVoiAuthority {
+  runId: string | null;
+  sourceVolumeId: string | null;
+  authoritativeVoi: PanoVoiSettings | null;
+  suppressPanoViewportEventsUntil: number;
+}
+
+const CPR_VTK_PANO_STARTUP_VOI_GUARD_MS = 2000;
 
 function formatReadablePanoValue(
   value: number | null | undefined,
@@ -756,176 +770,6 @@ function reconstructPanoFloatBuffer(
   return reconstructed;
 }
 
-function drawPanoDebugCanvas(
-  runId: string,
-  pixelData: Float32Array | Uint16Array,
-  width: number,
-  height: number,
-  options?: {
-    windowWidth?: number;
-    windowCenter?: number;
-    slope?: number;
-    intercept?: number;
-  }
-): void {
-  if (typeof document === 'undefined' || !document.createElement) {
-    return;
-  }
-
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
-    console.error('[CPR-CANVAS-BYPASS] Invalid dimensions', { runId, width, height });
-    return;
-  }
-
-  if (!pixelData || pixelData.length !== width * height) {
-    console.error('[CPR-CANVAS-BYPASS] Length mismatch', {
-      runId,
-      width,
-      height,
-      length: pixelData?.length ?? null,
-      expected: width * height,
-      type: pixelData?.constructor?.name ?? null,
-    });
-    return;
-  }
-
-  const existing = document.getElementById('cpr-pano-debug-overlay');
-  if (existing?.parentNode) {
-    existing.parentNode.removeChild(existing);
-  }
-
-  const slope =
-    Number.isFinite(options?.slope) && Math.abs(Number(options?.slope)) > 1e-8
-      ? Number(options?.slope)
-      : 1;
-  const intercept = Number.isFinite(options?.intercept) ? Number(options?.intercept) : 0;
-  const windowWidth =
-    Number.isFinite(options?.windowWidth) && Number(options?.windowWidth) > 1
-      ? Number(options?.windowWidth)
-      : CPR_PANO_DEFAULT_WINDOW_WIDTH;
-  const windowCenter = Number.isFinite(options?.windowCenter)
-    ? Number(options?.windowCenter)
-    : CPR_PANO_DEFAULT_WINDOW_CENTER;
-  const windowLower = windowCenter - windowWidth / 2;
-  const windowUpper = windowCenter + windowWidth / 2;
-  const storedValueSample: number[] = [];
-  const reconstructedValueSample: number[] = [];
-
-  let minValue = Infinity;
-  let maxValue = -Infinity;
-  for (let i = 0; i < pixelData.length; i++) {
-    const storedValue = Number(pixelData[i]);
-    const value = storedValue * slope + intercept;
-    if (storedValueSample.length < 5) {
-      storedValueSample.push(storedValue);
-      reconstructedValueSample.push(value);
-    }
-    if (!Number.isFinite(value)) {
-      continue;
-    }
-    if (value < minValue) {
-      minValue = value;
-    }
-    if (value > maxValue) {
-      maxValue = value;
-    }
-  }
-
-  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
-    minValue = 0;
-    maxValue = 1;
-  }
-
-  console.log(
-    '[CPR-CANVAS-RUNTIME-JSON]',
-    JSON.stringify({
-      runId,
-      windowWidth,
-      windowCenter,
-      slope,
-      intercept,
-      storedValueSample,
-      reconstructedValueSample,
-    })
-  );
-
-  const overlay = document.createElement('div');
-  overlay.id = 'cpr-pano-debug-overlay';
-  overlay.style.position = 'fixed';
-  overlay.style.top = '0';
-  overlay.style.left = '0';
-  overlay.style.zIndex = '9999';
-  overlay.style.pointerEvents = 'none';
-  overlay.style.background = 'rgba(0,0,0,0.85)';
-  overlay.style.color = '#fff';
-  overlay.style.padding = '8px';
-  overlay.style.font = '12px monospace';
-  overlay.style.border = '1px solid #444';
-
-  const label = document.createElement('div');
-  label.textContent =
-    `[CPR-CANVAS-BYPASS] ${runId} ` +
-    `${pixelData.constructor.name} ${width}x${height} ` +
-    `min=${minValue.toFixed(3)} max=${maxValue.toFixed(3)} ` +
-    `WC=${windowCenter.toFixed(1)} WW=${windowWidth.toFixed(1)}`;
-
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  canvas.style.display = 'block';
-  canvas.style.marginTop = '6px';
-  canvas.style.imageRendering = 'pixelated';
-  canvas.style.width = `${Math.max(320, Math.min(960, width))}px`;
-  canvas.style.height = 'auto';
-  canvas.style.border = '1px solid #666';
-
-  const ctx = canvas.getContext('2d', { alpha: false });
-  if (!ctx) {
-    console.error('[CPR-CANVAS-BYPASS] Failed to create 2D canvas context');
-    return;
-  }
-
-  const imageData = ctx.createImageData(width, height);
-  const dst = imageData.data;
-
-  for (let i = 0; i < pixelData.length; i++) {
-    const storedValue = Number(pixelData[i]);
-    const value = storedValue * slope + intercept;
-    const normalized = Number.isFinite(value)
-      ? Math.max(
-          0,
-          Math.min(255, Math.round(((value - windowLower) / Math.max(1e-6, windowUpper - windowLower)) * 255))
-        )
-      : 0;
-
-    const j = i * 4;
-    dst[j] = normalized;
-    dst[j + 1] = normalized;
-    dst[j + 2] = normalized;
-    dst[j + 3] = 255;
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-
-  overlay.appendChild(label);
-  overlay.appendChild(canvas);
-  document.body.appendChild(overlay);
-
-  console.log('[CPR-CANVAS-BYPASS]', {
-    runId,
-    type: pixelData.constructor.name,
-    length: pixelData.length,
-    width,
-    height,
-    slope,
-    intercept,
-    windowWidth,
-    windowCenter,
-    minValue,
-    maxValue,
-  });
-}
-
 function computeAdaptivePanoVoi(
   summary: FloatBufferDebugSummary | null,
   minValue: number,
@@ -1142,6 +986,55 @@ function normalize3(v: [number, number, number]): [number, number, number] {
 
 function dot3(a: [number, number, number], b: [number, number, number]): number {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function toFiniteVector3Tuple(
+  value: ArrayLike<number> | null | undefined
+): [number, number, number] | null {
+  if (!value || value.length < 3) {
+    return null;
+  }
+
+  const x = Number(value[0]);
+  const y = Number(value[1]);
+  const z = Number(value[2]);
+
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+    return null;
+  }
+
+  return [x, y, z];
+}
+
+function toFiniteVector2Tuple(
+  value: ArrayLike<number> | null | undefined
+): [number, number] | null {
+  if (!value || value.length < 2) {
+    return null;
+  }
+
+  const x = Number(value[0]);
+  const y = Number(value[1]);
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+
+  return [x, y];
+}
+
+function areAlignedDirectionVectors(
+  a: [number, number, number] | null,
+  b: [number, number, number] | null,
+  epsilon = 1e-4
+): boolean {
+  if (!a || !b) {
+    return false;
+  }
+
+  const normalizedA = normalize3(a);
+  const normalizedB = normalize3(b);
+  return dot3(normalizedA, normalizedB) >= 1 - epsilon;
 }
 
 function projectPointOntoPlane(
@@ -2136,6 +2029,9 @@ function launchCPRWorker(params: {
           highBit,
           pixelRepresentation,
           isPreScaled: effectiveIsPreScaled,
+          allowStoredValueNormalization,
+          disableStoredValueNormalization:
+            forceDisableStoredValueNormalization === true ? true : undefined,
         };
         const transferList =
           isSharedArrayBuffer || !initScalarData.buffer ? undefined : [initScalarData.buffer];
@@ -2627,6 +2523,141 @@ function isStackViewportLike(
   );
 }
 
+function clonePanoVoiSettings(
+  voi: Partial<PanoVoiSettings> | null | undefined
+): PanoVoiSettings | null {
+  const lower = toFiniteNumber(voi?.lower);
+  const upper = toFiniteNumber(voi?.upper);
+  const windowWidth = toFiniteNumber(voi?.windowWidth);
+  const windowCenter = toFiniteNumber(voi?.windowCenter);
+
+  if (
+    lower == null ||
+    upper == null ||
+    windowWidth == null ||
+    windowCenter == null ||
+    upper <= lower ||
+    windowWidth <= 0
+  ) {
+    return null;
+  }
+
+  return {
+    lower: Number(lower),
+    upper: Number(upper),
+    windowWidth: Number(windowWidth),
+    windowCenter: Number(windowCenter),
+  };
+}
+
+function createPanoVoiFromWindowLevel(windowWidth: number, windowCenter: number): PanoVoiSettings | null {
+  const safeWindowWidth = toFiniteNumber(windowWidth);
+  const safeWindowCenter = toFiniteNumber(windowCenter);
+
+  if (safeWindowWidth == null || safeWindowCenter == null || safeWindowWidth <= 0) {
+    return null;
+  }
+
+  const lower = safeWindowCenter - safeWindowWidth / 2;
+  const upper = safeWindowCenter + safeWindowWidth / 2;
+  return clonePanoVoiSettings({
+    lower,
+    upper,
+    windowWidth: safeWindowWidth,
+    windowCenter: safeWindowCenter,
+  });
+}
+
+function createPanoVoiFromRange(range: {
+  lower?: number | null;
+  upper?: number | null;
+} | null | undefined): PanoVoiSettings | null {
+  const lower = toFiniteNumber(range?.lower);
+  const upper = toFiniteNumber(range?.upper);
+
+  if (lower == null || upper == null || upper <= lower) {
+    return null;
+  }
+
+  const windowWidth = upper - lower;
+  return clonePanoVoiSettings({
+    lower,
+    upper,
+    windowWidth,
+    windowCenter: lower + windowWidth / 2,
+  });
+}
+
+function arePanoVoiSettingsClose(
+  left: PanoVoiSettings | null,
+  right: PanoVoiSettings | null,
+  tolerance = 2
+): boolean {
+  if (!left || !right) {
+    return false;
+  }
+
+  return (
+    Math.abs(left.lower - right.lower) <= tolerance &&
+    Math.abs(left.upper - right.upper) <= tolerance &&
+    Math.abs(left.windowWidth - right.windowWidth) <= tolerance &&
+    Math.abs(left.windowCenter - right.windowCenter) <= tolerance
+  );
+}
+
+function evaluateHostedPanoViewportVoiUpdate(params: {
+  nextVoi: PanoVoiSettings;
+  authoritativeVoi: PanoVoiSettings | null;
+  suppressPanoViewportEventsUntil: number;
+  now: number;
+}): { accept: boolean; shouldRepair: boolean; reason: string } {
+  const { nextVoi, authoritativeVoi, suppressPanoViewportEventsUntil, now } = params;
+
+  if (!authoritativeVoi) {
+    return { accept: true, shouldRepair: false, reason: 'no-authority' };
+  }
+
+  if (now < suppressPanoViewportEventsUntil) {
+    if (arePanoVoiSettingsClose(nextVoi, authoritativeVoi)) {
+      return { accept: false, shouldRepair: false, reason: 'startup-match' };
+    }
+
+    return { accept: false, shouldRepair: true, reason: 'startup-divergence' };
+  }
+
+  const authorityWidth = Math.max(authoritativeVoi.windowWidth, 1);
+  const authorityIsHuLike = isHuLikeRange(authoritativeVoi.lower, authoritativeVoi.upper);
+  const centerDelta = Math.abs(nextVoi.windowCenter - authoritativeVoi.windowCenter);
+  const lowerDelta = Math.abs(nextVoi.lower - authoritativeVoi.lower);
+  const upperDelta = Math.abs(nextVoi.upper - authoritativeVoi.upper);
+  const widthRatio = nextVoi.windowWidth / authorityWidth;
+  const implausiblyNarrow =
+    widthRatio < 0.01 && centerDelta > Math.max(150, authorityWidth * 0.15);
+  const implausiblyWide =
+    widthRatio > 12 && centerDelta > Math.max(1500, authorityWidth * 0.75);
+  const implausiblyDisplaced =
+    centerDelta > Math.max(2500, authorityWidth * 1.5) &&
+    lowerDelta > Math.max(1250, authorityWidth * 0.75) &&
+    upperDelta > Math.max(1250, authorityWidth * 0.75);
+  const brokeHuDomain =
+    authorityIsHuLike && !isHuLikeRange(nextVoi.lower, nextVoi.upper);
+
+  if (brokeHuDomain) {
+    return { accept: false, shouldRepair: true, reason: 'left-hu-domain' };
+  }
+  if (implausiblyNarrow) {
+    return { accept: false, shouldRepair: true, reason: 'implausibly-narrow' };
+  }
+  if (implausiblyWide) {
+    return { accept: false, shouldRepair: true, reason: 'implausibly-wide' };
+  }
+  if (implausiblyDisplaced) {
+    return { accept: false, shouldRepair: true, reason: 'implausibly-displaced' };
+  }
+
+  return { accept: true, shouldRepair: false, reason: 'accepted' };
+}
+
 function isVolumeViewportLike(
   viewport: cornerstone.Types.IViewport | null
 ): viewport is cornerstone.Types.IVolumeViewport {
@@ -2692,6 +2723,13 @@ async function waitForPanoStackViewport(
   timeoutMs = 12000
 ): Promise<cornerstone.Types.IStackViewport> {
   return waitForStackViewportByLogicalId(servicesManager, 'cpr-pano', timeoutMs);
+}
+
+async function waitForPanoVolumeViewport(
+  servicesManager: any,
+  timeoutMs = 12000
+): Promise<cornerstone.Types.IVolumeViewport> {
+  return waitForVolumeViewportByLogicalId(servicesManager, 'cpr-pano', timeoutMs);
 }
 
 async function waitForVolumeViewportByLogicalId(
@@ -2913,6 +2951,247 @@ function applyPanoDisplaySettings(
     appliedVoiRange: appliedProperties.voiRange ?? null,
     appliedVoiLutFunction: appliedProperties.VOILUTFunction ?? null,
   }));
+}
+
+function getInitialPanoWindowLevelFromSourceViewport(
+  servicesManager: any
+): { windowWidth: number; windowCenter: number; source: string } {
+  const panoPreset = {
+    windowWidth: CPR_VTK_PANO_PRESET_WINDOW_WIDTH,
+    windowCenter: CPR_VTK_PANO_PRESET_WINDOW_CENTER,
+  };
+  const axialViewport = findViewportByLogicalId(servicesManager, 'cpr-axial');
+  if (axialViewport && isVolumeViewportLike(axialViewport)) {
+    const axialVolumeViewport = axialViewport as cornerstone.Types.IVolumeViewport;
+    const actorUID = axialVolumeViewport.getActors?.()?.[0]?.uid;
+    const properties = ((
+      actorUID
+        ? axialVolumeViewport.getProperties?.(actorUID) || axialVolumeViewport.getProperties?.()
+        : axialVolumeViewport.getProperties?.()
+    ) || {}) as {
+      voiRange?: { lower?: number; upper?: number };
+    };
+    const lower = toFiniteNumber(properties.voiRange?.lower);
+    const upper = toFiniteNumber(properties.voiRange?.upper);
+    if (
+      Number.isFinite(lower) &&
+      Number.isFinite(upper) &&
+      Number(upper) > Number(lower)
+    ) {
+      const windowWidth = Number(upper) - Number(lower);
+      const axialCenter = Number(lower) + windowWidth / 2;
+      const blendedWindowWidth = Math.max(
+        1800,
+        Math.min(4200, windowWidth * 0.35 + panoPreset.windowWidth * 0.65)
+      );
+      const blendedWindowCenter = Math.max(
+        -200,
+        Math.min(1400, axialCenter * 0.35 + panoPreset.windowCenter * 0.65)
+      );
+      return {
+        windowWidth: blendedWindowWidth,
+        windowCenter: blendedWindowCenter,
+        source: 'pano-hu-preset+axial-fallback',
+      };
+    }
+  }
+
+  return {
+    windowWidth: panoPreset.windowWidth,
+    windowCenter: panoPreset.windowCenter,
+    source: 'pano-hu-preset',
+  };
+}
+
+type VtkPanoPresetCandidate = {
+  label: string;
+  verticalHalfMm: number;
+  slabHalfThicknessMm: number;
+  slabSamples: number;
+  score: number;
+};
+
+type VtkPanoProjectionMode = 'AVERAGE' | 'MAX' | 'MIN';
+
+function roundToStep(value: number, step: number): number {
+  if (!Number.isFinite(value) || !Number.isFinite(step) || step <= 0) {
+    return value;
+  }
+
+  return Math.round(value / step) * step;
+}
+
+function toOddSampleCount(value: number, minValue: number, maxValue: number): number {
+  const clamped = Math.max(minValue, Math.min(maxValue, Math.round(value)));
+  return clamped % 2 === 0 ? Math.max(minValue, Math.min(maxValue, clamped + 1)) : clamped;
+}
+
+function selectReadableVtkPanoPreset(params: {
+  baseVerticalHalfMm: number;
+  requestedSlabHalfThicknessMm: number;
+  requestedSlabSamples: number;
+  minSpacing: number;
+  aggregation: 'MIP' | 'MEAN';
+}): {
+  selected: VtkPanoPresetCandidate;
+  candidates: VtkPanoPresetCandidate[];
+} {
+  const desiredVerticalHalfMm = Math.max(15, Math.min(22, params.baseVerticalHalfMm));
+  const averageProjection = params.aggregation === 'MEAN';
+  const baseDesiredSlabHalfMm =
+    params.minSpacing <= 0.2
+      ? 0.7
+      : params.minSpacing <= 0.3
+        ? 0.9
+        : params.minSpacing <= 0.45
+          ? 1.1
+          : 1.3;
+  const desiredSlabHalfMm = averageProjection
+    ? Math.max(0.45, Math.min(0.85, roundToStep(baseDesiredSlabHalfMm * 0.65, 0.05)))
+    : baseDesiredSlabHalfMm;
+  const desiredSamples = toOddSampleCount(
+    (desiredSlabHalfMm * 2) / Math.max(params.minSpacing, 0.12),
+    averageProjection ? 3 : 3,
+    averageProjection ? 11 : 17
+  );
+  const baseSlabHalfMm = Math.max(0.3, params.requestedSlabHalfThicknessMm);
+  const baseSamples = Math.max(3, params.requestedSlabSamples);
+  const rawCandidates = [
+    {
+      label: 'focused',
+      verticalHalfMm: Math.max(14, Math.min(20, roundToStep(desiredVerticalHalfMm - 1.5, 0.5))),
+      slabHalfThicknessMm: Math.max(
+        0.35,
+        Math.min(
+          averageProjection ? 0.65 : 0.9,
+          roundToStep(Math.min(baseSlabHalfMm, desiredSlabHalfMm), 0.05)
+        )
+      ),
+      slabSamples: toOddSampleCount(Math.min(baseSamples, desiredSamples), 3, averageProjection ? 7 : 11),
+    },
+    {
+      label: 'balanced',
+      verticalHalfMm: Math.max(15, Math.min(22, roundToStep(desiredVerticalHalfMm, 0.5))),
+      slabHalfThicknessMm: Math.max(
+        averageProjection ? 0.45 : 0.5,
+        Math.min(
+          averageProjection ? 0.95 : 1.4,
+          roundToStep(
+            Math.max(desiredSlabHalfMm, Math.min(baseSlabHalfMm, averageProjection ? 0.95 : 1.4)),
+            0.05
+          )
+        )
+      ),
+      slabSamples: toOddSampleCount(Math.max(baseSamples, desiredSamples), 5, averageProjection ? 9 : 15),
+    },
+    {
+      label: 'broad',
+      verticalHalfMm: Math.max(16, Math.min(24, roundToStep(desiredVerticalHalfMm + 2, 0.5))),
+      slabHalfThicknessMm: Math.max(
+        averageProjection ? 0.7 : 0.9,
+        Math.min(
+          averageProjection ? 1.25 : 2.2,
+          roundToStep(Math.max(baseSlabHalfMm, desiredSlabHalfMm + (averageProjection ? 0.2 : 0.35)), 0.05)
+        )
+      ),
+      slabSamples: toOddSampleCount(
+        Math.max(baseSamples, desiredSamples + (averageProjection ? 0 : 2)),
+        averageProjection ? 5 : 7,
+        averageProjection ? 11 : 19
+      ),
+    },
+  ];
+  const candidates = rawCandidates.map(candidate => {
+    const slabPenalty = Math.abs(candidate.slabHalfThicknessMm - desiredSlabHalfMm) * 4.2;
+    const verticalPenalty = Math.abs(candidate.verticalHalfMm - desiredVerticalHalfMm) * 0.8;
+    const samplePenalty = Math.abs(candidate.slabSamples - desiredSamples) * 0.35;
+    const broadPenalty = candidate.slabHalfThicknessMm > (averageProjection ? 1.0 : 1.8)
+      ? averageProjection
+        ? 2.2
+        : 1.5
+      : 0;
+    const tallPenalty = candidate.verticalHalfMm > 23 ? 0.8 : 0;
+    const labelBias =
+      candidate.label === 'balanced' ? 1.3 : candidate.label === 'focused' ? 0.9 : 0.3;
+    return {
+      ...candidate,
+      score: 10 + labelBias - slabPenalty - verticalPenalty - samplePenalty - broadPenalty - tallPenalty,
+    };
+  });
+  const selected = candidates
+    .slice()
+    .sort((a, b) => b.score - a.score || a.slabHalfThicknessMm - b.slabHalfThicknessMm)[0] || candidates[0];
+
+  return {
+    selected,
+    candidates,
+  };
+}
+
+function selectVtkPanoProjectionMode(
+  aggregation: 'MIP' | 'MEAN' | null | undefined
+): VtkPanoProjectionMode {
+  return aggregation === 'MEAN' ? 'AVERAGE' : 'MAX';
+}
+
+async function hydratePanoViewportForCornerstoneUi(
+  viewport: cornerstone.Types.IVolumeViewport,
+  sourceVolumeId: string,
+  windowWidth: number,
+  windowCenter: number,
+  displayState: VolumeViewportDisplayState | null,
+  runId: string
+): Promise<void> {
+  await viewport.setVolumes([
+    {
+      volumeId: sourceVolumeId,
+      blendMode: CPR_CROSSSECTION_DEFAULT_BLEND_MODE,
+      slabThickness: CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM,
+    },
+  ]);
+
+  if (displayState) {
+    restoreVolumeViewportDisplayState(viewport, displayState);
+  }
+
+  const { lower, upper } = cornerstone.utilities.windowLevel.toLowHighRange(
+    windowWidth,
+    windowCenter
+  );
+
+  viewport.setProperties(
+    {
+      isComputedVOI: false,
+      voiRange: { lower, upper },
+      VOILUTFunction: 'LINEAR_EXACT',
+    } as any,
+    sourceVolumeId
+  );
+  viewport.render();
+
+  console.log(
+    `CPR-VTK-PANO-UI-HYDRATE run=${runId} viewportId=${viewport.id} volumeId=${sourceVolumeId} windowWidth=${windowWidth.toFixed(
+      2
+    )} windowCenter=${windowCenter.toFixed(2)} hasDisplayState=${displayState ? 'yes' : 'no'}`
+  );
+}
+
+function logVtkPanoViewportSnapshot(
+  runId: string,
+  stage: string,
+  viewport: cornerstone.Types.IViewport | null
+): void {
+  if (!viewport) {
+    console.log(`CPR-VTK-PANO-SNAPSHOT run=${runId} stage=${stage} missingViewport=true`);
+    return;
+  }
+
+  const actorUIDs = viewport.getActors?.().map(actorEntry => actorEntry.uid) || [];
+  console.log(
+    `CPR-VTK-PANO-SNAPSHOT run=${runId} stage=${stage} viewportId=${viewport.id} viewportType=${
+      viewport.constructor?.name || 'unknown'
+    } actorCount=${actorUIDs.length} actorUIDs=${actorUIDs.join('|') || 'none'}`
+  );
 }
 
 function getViewportElementDimensions(
@@ -3203,6 +3482,107 @@ function getLatestSplineAnnotation(axialElement?: HTMLDivElement | null): Annota
   return getLatestAnnotation(localAnnotations as AnnotationLike[]);
 }
 
+function cloneAnnotationLike<T>(annotation: T | null | undefined): T | null {
+  if (!annotation) {
+    return null;
+  }
+
+  try {
+    const structuredCloneImpl = (globalThis as { structuredClone?: <V>(value: V) => V })
+      .structuredClone;
+    if (typeof structuredCloneImpl === 'function') {
+      return structuredCloneImpl(annotation);
+    }
+  } catch (error) {
+    console.warn('[CPR] structuredClone failed for spline annotation snapshot; falling back to JSON clone.', error);
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(annotation)) as T;
+  } catch (error) {
+    console.warn('[CPR] JSON clone failed for spline annotation snapshot.', error);
+    return null;
+  }
+}
+
+function ensureSplineAnnotationVisible(
+  axialViewport: cornerstone.Types.IViewport,
+  annotationUID: string | null,
+  annotationSnapshot: AnnotationLike | null,
+  runId: string,
+  stage: string
+): void {
+  const axialElement = axialViewport.element as HTMLDivElement | null | undefined;
+  if (!axialElement) {
+    return;
+  }
+
+  const repaintSplineAnnotation = () => {
+    cornerstoneTools.utilities.triggerAnnotationRender(axialElement);
+    const renderingEngine = axialViewport.getRenderingEngine?.();
+    const enabledViewport = renderingEngine?.getViewport?.(axialViewport.id);
+    if (enabledViewport?.element) {
+      cornerstoneTools.utilities.triggerAnnotationRender(enabledViewport.element);
+    }
+    axialViewport.render?.();
+    console.log('DIAG-TRIPWIRE: spline-redraw-triggered for cpr-axial');
+  };
+
+  const localAnnotations =
+    (cornerstoneTools.annotation.state.getAnnotations('SplineROI', axialElement) as AnnotationLike[]) || [];
+  const localCount = localAnnotations.length;
+  const hasTargetLocally = annotationUID
+    ? localAnnotations.some(annotation => annotation?.annotationUID === annotationUID)
+    : localCount > 0;
+
+  console.log(
+    `[CPR-SPLINE-STATE] run=${runId} stage=${stage} localCount=${localCount} globalCount=${
+      getAllSplineAnnotations().length
+    } targetUID=${annotationUID || 'none'} hasTargetLocally=${hasTargetLocally}`
+  );
+
+  if (hasTargetLocally) {
+    repaintSplineAnnotation();
+    return;
+  }
+
+  const snapshotToRestore = cloneAnnotationLike(annotationSnapshot);
+  if (!snapshotToRestore) {
+    console.warn(
+      `[CPR][${runId}] Missing spline snapshot during ${stage}; axial viewport will not be able to re-render the arch.`
+    );
+    return;
+  }
+
+  if (annotationUID) {
+    const existingGlobal = cornerstoneTools.annotation.state.getAnnotation?.(annotationUID);
+    if (existingGlobal) {
+      cornerstoneTools.annotation.state.removeAnnotation(annotationUID);
+    }
+    snapshotToRestore.annotationUID = annotationUID;
+  }
+
+  if (snapshotToRestore?.data?.handles) {
+    snapshotToRestore.data.handles.activeHandleIndex = null;
+  }
+  snapshotToRestore.highlighted = false;
+  snapshotToRestore.invalidated = true;
+
+  cornerstoneTools.annotation.state.addAnnotation(
+    snapshotToRestore as Parameters<typeof cornerstoneTools.annotation.state.addAnnotation>[0],
+    axialElement
+  );
+  repaintSplineAnnotation();
+
+  const restoredLocalCount =
+    (cornerstoneTools.annotation.state.getAnnotations('SplineROI', axialElement) as AnnotationLike[])?.length || 0;
+  console.log(
+    `[CPR-SPLINE-RESTORE] run=${runId} stage=${stage} restoredUID=${
+      snapshotToRestore.annotationUID || 'generated'
+    } localCount=${restoredLocalCount}`
+  );
+}
+
 function clearActiveManipulationPreservingSpline(
   axialElement: HTMLDivElement,
   annotation: AnnotationLike
@@ -3420,6 +3800,15 @@ interface UseCPROrchestratorReturn {
 type PointObject = { x: number; y: number; z: number };
 type PointLike = [number, number, number] | PointObject;
 
+type PanoCameraBridgeState = {
+  actorUID: string;
+  viewportId: string;
+  basePan: [number, number];
+  baseZoom: number;
+  baseViewUp: [number, number, number];
+  baseViewPlaneNormal: [number, number, number];
+};
+
 function summarizeFrameGeometry(
   frames: CPRFrame[],
   verticalDir: [number, number, number]
@@ -3540,6 +3929,18 @@ export function useCPROrchestrator({
   const pendingSliderFrameIndexRef = useRef<number | null>(null);
   const generationInFlightRef = useRef(false);
   const lastGenerationStartedAtRef = useRef(0);
+  const attachedVtkPanoRef = useRef<AttachedVtkPanoCpr | null>(null);
+  const persistedSplineAnnotationRef = useRef<AnnotationLike | null>(null);
+  const panoCameraBridgeRef = useRef<PanoCameraBridgeState | null>(null);
+  const hostedPanoVoiAuthorityRef = useRef<HostedPanoVoiAuthority>({
+    runId: null,
+    sourceVolumeId: null,
+    authoritativeVoi: null,
+    suppressPanoViewportEventsUntil: 0,
+  });
+  const hostedPanoVoiRepairTimeoutRef = useRef<number | null>(null);
+  const pendingAxialRestoreCleanupRef = useRef<(() => void) | null>(null);
+  const axialRestoreTokenRef = useRef(0);
 
   const clearProtocolListener = useCallback(() => {
     if (hpSubscriptionRef.current) {
@@ -3559,6 +3960,314 @@ export function useCPROrchestrator({
       setIsGenerating(false);
     }
   }, []);
+
+  const clearPendingAxialViewportRestore = useCallback((reason: string) => {
+    axialRestoreTokenRef.current += 1;
+    const cleanup = pendingAxialRestoreCleanupRef.current;
+    pendingAxialRestoreCleanupRef.current = null;
+    if (cleanup) {
+      console.log(`[CPR-AXIAL-RESTORE] clearing pending restore reason=${reason}`);
+      cleanup();
+    }
+  }, []);
+
+  const clearHostedPanoVoiRepair = useCallback(() => {
+    if (hostedPanoVoiRepairTimeoutRef.current != null) {
+      window.clearTimeout(hostedPanoVoiRepairTimeoutRef.current);
+      hostedPanoVoiRepairTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearHostedPanoVoiAuthority = useCallback(
+    (reason: string) => {
+      clearHostedPanoVoiRepair();
+      const previousAuthority = hostedPanoVoiAuthorityRef.current;
+      if (previousAuthority.authoritativeVoi || previousAuthority.sourceVolumeId) {
+        console.log(
+          `[CPR-VTK-PANO-VOI-AUTHORITY] clear reason=${reason} run=${
+            previousAuthority.runId || 'na'
+          } sourceVolumeId=${previousAuthority.sourceVolumeId || 'none'}`
+        );
+      }
+      hostedPanoVoiAuthorityRef.current = {
+        runId: null,
+        sourceVolumeId: null,
+        authoritativeVoi: null,
+        suppressPanoViewportEventsUntil: 0,
+      };
+    },
+    [clearHostedPanoVoiRepair]
+  );
+
+  const setHostedPanoVoiAuthority = useCallback(
+    (params: {
+      runId: string;
+      sourceVolumeId: string | null;
+      voi: PanoVoiSettings | null;
+      source: string;
+      suppressPanoViewportEventsForMs?: number;
+    }) => {
+      const nextAuthority = clonePanoVoiSettings(params.voi);
+      if (!nextAuthority) {
+        return;
+      }
+
+      hostedPanoVoiAuthorityRef.current = {
+        runId: params.runId,
+        sourceVolumeId: params.sourceVolumeId,
+        authoritativeVoi: nextAuthority,
+        suppressPanoViewportEventsUntil:
+          Date.now() + Math.max(0, params.suppressPanoViewportEventsForMs ?? 0),
+      };
+      console.log(
+        `[CPR-VTK-PANO-VOI-AUTHORITY] run=${params.runId} source=${params.source} sourceVolumeId=${
+          params.sourceVolumeId || 'none'
+        } windowWidth=${nextAuthority.windowWidth.toFixed(2)} windowCenter=${nextAuthority.windowCenter.toFixed(
+          2
+        )} lower=${nextAuthority.lower.toFixed(2)} upper=${nextAuthority.upper.toFixed(2)} suppressMs=${Math.max(
+          0,
+          params.suppressPanoViewportEventsForMs ?? 0
+        )}`
+      );
+    },
+    []
+  );
+
+  const scheduleHostedPanoVoiRepair = useCallback(
+    (reason: string) => {
+      clearHostedPanoVoiRepair();
+      const authority = hostedPanoVoiAuthorityRef.current;
+      const authoritativeVoi = clonePanoVoiSettings(authority.authoritativeVoi);
+      if (!authoritativeVoi) {
+        return;
+      }
+
+      hostedPanoVoiRepairTimeoutRef.current = window.setTimeout(() => {
+        hostedPanoVoiRepairTimeoutRef.current = null;
+        if (!isMountedRef.current) {
+          return;
+        }
+
+        const livePanoViewport = findViewportByLogicalId(servicesManager, 'cpr-pano');
+        if (!livePanoViewport) {
+          return;
+        }
+
+        console.warn(
+          `[CPR-VTK-PANO-VOI-GUARD] run=${authority.runId || 'na'} repairingHiddenViewport reason=${reason} ` +
+            `windowWidth=${authoritativeVoi.windowWidth.toFixed(2)} windowCenter=${authoritativeVoi.windowCenter.toFixed(
+              2
+            )}`
+        );
+        applyPanoDisplaySettings(
+          authority.runId || 'na',
+          `vtk-guard-repair:${reason}`,
+          livePanoViewport,
+          authoritativeVoi
+        );
+        livePanoViewport.render?.();
+      }, 0);
+    },
+    [clearHostedPanoVoiRepair, servicesManager]
+  );
+
+  const clearPanoCameraBridge = useCallback((reason: string) => {
+    const bridge = panoCameraBridgeRef.current;
+    if (bridge) {
+      console.log(
+        `CPR-VTK-PANO-CAMERA-BRIDGE clear reason=${reason} actorUID=${bridge.actorUID} viewportId=${bridge.viewportId}`
+      );
+    }
+    panoCameraBridgeRef.current = null;
+    attachedVtkPanoRef.current?.clearCameraSyncBaseline?.();
+  }, []);
+
+  const disposeAttachedVtkPano = useCallback((reason: string) => {
+    clearPanoCameraBridge(`${reason}-dispose`);
+    const attached = attachedVtkPanoRef.current;
+    if (!attached) {
+      clearHostedPanoVoiAuthority(`${reason}-no-attached`);
+      return;
+    }
+
+    console.log(`CPR-VTK-PANO-DETACH reason=${reason} actorUID=${attached.actorUID}`);
+    try {
+      attached.dispose();
+    } finally {
+      attachedVtkPanoRef.current = null;
+      clearHostedPanoVoiAuthority(reason);
+    }
+  }, [clearHostedPanoVoiAuthority, clearPanoCameraBridge]);
+
+  const initializePanoCameraBridge = useCallback(
+    (
+      viewport: cornerstone.Types.IVolumeViewport,
+      attached: AttachedVtkPanoCpr,
+      runId: string
+    ): boolean => {
+      const viewportWithPanZoom = viewport as cornerstone.Types.IVolumeViewport & {
+        getPan?: () => ArrayLike<number> | null | undefined;
+        getZoom?: () => number;
+      };
+      const camera = viewport.getCamera?.();
+      const basePan = toFiniteVector2Tuple(viewportWithPanZoom.getPan?.());
+      const baseZoom = Number(viewportWithPanZoom.getZoom?.());
+      const baseViewUp = toFiniteVector3Tuple(camera?.viewUp);
+      const baseViewPlaneNormal = toFiniteVector3Tuple(camera?.viewPlaneNormal);
+
+      if (
+        !basePan ||
+        !Number.isFinite(baseZoom) ||
+        baseZoom <= 0 ||
+        !baseViewUp ||
+        !baseViewPlaneNormal
+      ) {
+        clearPanoCameraBridge(`${runId}-initialize-invalid`);
+        return false;
+      }
+
+      attached.captureCameraSyncBaseline();
+      panoCameraBridgeRef.current = {
+        actorUID: attached.actorUID,
+        viewportId: viewport.id,
+        basePan,
+        baseZoom,
+        baseViewUp,
+        baseViewPlaneNormal,
+      };
+
+      console.log(
+        `CPR-VTK-PANO-CAMERA-BRIDGE init run=${runId} actorUID=${attached.actorUID} viewportId=${viewport.id} basePan=${basePan[0].toFixed(
+          2
+        )},${basePan[1].toFixed(2)} baseZoom=${baseZoom.toFixed(4)}`
+      );
+      console.log(
+        `DIAG-TRIPWIRE: camera-bridge-armed run=${runId} actorUID=${attached.actorUID} viewportId=${viewport.id}`
+      );
+
+      return true;
+    },
+    [clearPanoCameraBridge]
+  );
+
+  const scheduleAxialViewportRestore = useCallback(
+    (
+      runId: string,
+      annotationUID: string | null,
+      annotationSnapshot: AnnotationLike | null,
+      preservedAxialCamera: Record<
+        string,
+        cornerstone.Types.Point3 | number | boolean | undefined
+      > | null,
+      stage: string
+    ) => {
+      clearPendingAxialViewportRestore(`${stage}-reschedule`);
+      const restoreToken = axialRestoreTokenRef.current;
+
+      void (async () => {
+        try {
+          const axialViewportAfterSwitch = await waitForViewportByLogicalId(
+            servicesManager,
+            'cpr-axial',
+            4000
+          );
+          if (!axialViewportAfterSwitch || !isMountedRef.current || restoreToken !== axialRestoreTokenRef.current) {
+            return;
+          }
+
+          const axialElement = axialViewportAfterSwitch.element as HTMLDivElement | null | undefined;
+          if (!axialElement) {
+            return;
+          }
+
+          const onImageRendered = (event: Event) => {
+            if (restoreToken !== axialRestoreTokenRef.current || !isMountedRef.current) {
+              cleanup();
+              return;
+            }
+
+            const detail = (
+              event as CustomEvent<{
+                viewportId?: string;
+                viewportStatus?: unknown;
+              }>
+            ).detail;
+
+            console.log(
+              `DIAG-TRIPWIRE: axial-image-rendered run=${runId} stage=${stage} phase=${phase} targetViewportId=${
+                axialViewportAfterSwitch.id
+              } eventViewportId=${detail?.viewportId || 'unknown'} viewportStatus=${String(
+                detail?.viewportStatus ?? 'unknown'
+              )}`
+            );
+
+            if (detail?.viewportId !== axialViewportAfterSwitch.id) {
+              return;
+            }
+
+            if (detail?.viewportStatus !== cornerstone.Enums.ViewportStatus.RENDERED) {
+              return;
+            }
+
+            if (phase === 'await-initial-render' && preservedAxialCamera) {
+              phase = 'await-restored-render';
+              axialViewportAfterSwitch.setCamera(
+                preservedAxialCamera as Partial<ReturnType<typeof axialViewportAfterSwitch.getCamera>>
+              );
+              axialViewportAfterSwitch.render();
+              return;
+            }
+
+            cleanup();
+            const rehydratePointCount = Array.isArray(annotationSnapshot?.data?.handles?.points)
+              ? annotationSnapshot.data.handles.points.length
+              : 0;
+            console.log(
+              `DIAG-TRIPWIRE: spline-rehydrate run=${runId} stage=${stage} annotationUID=${
+                annotationUID || 'none'
+              } pointCount=${rehydratePointCount}`
+            );
+            ensureSplineAnnotationVisible(
+              axialViewportAfterSwitch,
+              annotationUID,
+              annotationSnapshot,
+              runId,
+              stage
+            );
+          };
+
+          const cleanup = () => {
+            axialElement.removeEventListener(
+              cornerstone.Enums.Events.IMAGE_RENDERED,
+              onImageRendered as EventListener
+            );
+            if (pendingAxialRestoreCleanupRef.current === cleanup) {
+              pendingAxialRestoreCleanupRef.current = null;
+            }
+          };
+
+          let phase: 'await-initial-render' | 'await-restored-render' =
+            preservedAxialCamera ? 'await-initial-render' : 'await-restored-render';
+
+          pendingAxialRestoreCleanupRef.current = cleanup;
+          axialElement.addEventListener(
+            cornerstone.Enums.Events.IMAGE_RENDERED,
+            onImageRendered as EventListener
+          );
+          axialViewportAfterSwitch.render();
+        } catch (axialRestoreError) {
+          if (restoreToken !== axialRestoreTokenRef.current) {
+            return;
+          }
+          console.warn(
+            `[CPR][${runId}] Failed to restore axial camera after stage switch`,
+            axialRestoreError
+          );
+        }
+      })();
+    },
+    [clearPendingAxialViewportRestore, servicesManager]
+  );
 
   const ensureSetupViewportInteraction = useCallback(async () => {
     const axialViewport = await waitForViewportByLogicalId(servicesManager, 'cpr-axial', 4000);
@@ -3581,10 +4290,18 @@ export function useCPROrchestrator({
         window.cancelAnimationFrame(sliderAnimationFrameRef.current);
         sliderAnimationFrameRef.current = null;
       }
+      clearPendingAxialViewportRestore('hook-cleanup');
+      clearPanoCameraBridge('hook-cleanup');
       clearProtocolListener();
+      disposeAttachedVtkPano('hook-cleanup');
       clearPanoDebugProbe();
     };
-  }, [clearProtocolListener]);
+  }, [
+    clearPendingAxialViewportRestore,
+    clearPanoCameraBridge,
+    clearProtocolListener,
+    disposeAttachedVtkPano,
+  ]);
 
   useEffect(() => {
     const { hangingProtocolService } = servicesManager.services;
@@ -3603,7 +4320,10 @@ export function useCPROrchestrator({
         if (setupAxialViewport?.element) {
           cornerstoneTools.cancelActiveManipulations?.(setupAxialViewport.element);
         }
+        clearPendingAxialViewportRestore('setup-stage');
+        disposeAttachedVtkPano('setup-stage');
         cprStateService.clear();
+        persistedSplineAnnotationRef.current = null;
         clearPanoImageCache();
         clearPanoDebugProbe();
         removeAllSplineAnnotations();
@@ -3638,7 +4358,13 @@ export function useCPROrchestrator({
     return () => {
       subscription.unsubscribe();
     };
-  }, [servicesManager, ensureSetupViewportInteraction, markGenerationIdle]);
+  }, [
+    servicesManager,
+    ensureSetupViewportInteraction,
+    markGenerationIdle,
+    disposeAttachedVtkPano,
+    clearPendingAxialViewportRestore,
+  ]);
 
   const onDone = useCallback(async () => {
     const startedAt = performance.now();
@@ -3659,7 +4385,11 @@ export function useCPROrchestrator({
     console.log(`[CPR][${debugRunId}] onDone started`);
 
     try {
+      clearPendingAxialViewportRestore('onDone-start');
+      clearPanoCameraBridge('onDone-start');
       clearProtocolListener();
+      disposeAttachedVtkPano('regenerate');
+      clearPanoDebugProbe();
       await terminateCPRWorkerSession();
 
       const { cornerstoneViewportService, hangingProtocolService, viewportGridService } =
@@ -3681,6 +4411,9 @@ export function useCPROrchestrator({
       }
 
       const preservedAxialCamera = cloneCameraState(axialViewport);
+      const preservedAxialDisplayState = isVolumeViewportLike(axialViewport)
+        ? captureVolumeViewportDisplayState(axialViewport as cornerstone.Types.IVolumeViewport)
+        : null;
       const axialElement = axialViewport.element;
       if (!axialElement) {
         throw new Error('Source viewport element is not ready.');
@@ -3701,6 +4434,14 @@ export function useCPROrchestrator({
         getLatestSplineAnnotation(axialElement) ||
         latestAnnotation;
       const latestAnnotationUID = latestAnnotation?.annotationUID ?? null;
+      const latestAnnotationSnapshot = cloneAnnotationLike(latestAnnotation);
+      persistedSplineAnnotationRef.current = latestAnnotationSnapshot;
+
+      console.log(
+        `[CPR-SPLINE-PERSIST] run=${debugRunId} annotationUID=${latestAnnotationUID || 'none'} globalCount=${
+          getAllSplineAnnotations().length
+        }`
+      );
 
       // Hardening #4: tolerate both [x,y,z] arrays and {x,y,z} point objects.
       const rawPoints = (latestAnnotation?.data?.handles?.points ?? []) as PointLike[];
@@ -3856,6 +4597,218 @@ export function useCPROrchestrator({
         verticalDir,
         ...summarizeFrameGeometry(frames, verticalDir),
       });
+
+      const vtkPresetSelection = selectReadableVtkPanoPreset({
+        baseVerticalHalfMm,
+        requestedSlabHalfThicknessMm: toPositiveFinite(
+          slabHalfThicknessMm,
+          CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM
+        ),
+        requestedSlabSamples: Math.max(1, Math.round(slabSamples)),
+        minSpacing,
+        aggregation,
+      });
+      const vtkVerticalHalfMm = vtkPresetSelection.selected.verticalHalfMm;
+      const vtkSlabHalfThicknessMm = vtkPresetSelection.selected.slabHalfThicknessMm;
+      const vtkSlabSamples = vtkPresetSelection.selected.slabSamples;
+      const vtkProjectionMode = selectVtkPanoProjectionMode(aggregation);
+      const vtkActualVerticalHalfMm = vtkVerticalHalfMm;
+      const vtkCrossSectionVerticalCenterOffsetMm = 0;
+      const vtkLocalCenterOffsetsMm: number[] = [];
+
+      if (CPR_PANO_RENDERER_MODE === 'vtk-cpr') {
+        console.log(
+          `[CPR-VTK-PANO-PRESET] run=${debugRunId} selected=${vtkPresetSelection.selected.label} ` +
+          `score=${formatReadablePanoValue(vtkPresetSelection.selected.score, 2)} ` +
+          `verticalHalfMm=${formatReadablePanoValue(vtkVerticalHalfMm, 2)} ` +
+          `slabHalfMm=${formatReadablePanoValue(vtkSlabHalfThicknessMm, 2)} ` +
+          `slabSamples=${vtkSlabSamples}`
+        );
+        console.log(
+          '[CPR-VTK-PANO-PRESET-JSON]',
+          JSON.stringify({
+            runId: debugRunId,
+            minSpacing,
+            requested: {
+              baseVerticalHalfMm,
+              slabHalfThicknessMm: toPositiveFinite(
+                slabHalfThicknessMm,
+                CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM
+              ),
+              slabSamples: Math.max(1, Math.round(slabSamples)),
+            },
+            candidates: vtkPresetSelection.candidates,
+            selected: vtkPresetSelection.selected,
+          })
+        );
+        console.log(
+          `CPR-VTK-PANO-PATH run=${debugRunId} mode=${CPR_PANO_RENDERER_MODE} targetViewportType=volume sourceVolumeId=${sourceVolumeId} frameCount=${frames.length} projectionMode=${vtkProjectionMode} aggregation=${aggregation} slabThicknessMm=${(
+            vtkSlabHalfThicknessMm * 2
+          ).toFixed(2)} slabSamples=${vtkSlabSamples} widthMm=${(
+            vtkVerticalHalfMm * 2
+          ).toFixed(2)}`
+        );
+
+        console.log(
+          `[CPR-SPLINE-PRESERVE] run=${debugRunId} mode=vtk-cpr annotationUID=${
+            latestAnnotationUID || 'none'
+          } skipping pre-transition spline cleanup`
+        );
+        cprStateService.setArchData(
+          controlPoints,
+          frames,
+          sourceVolumeId,
+          latestAnnotationUID,
+          vtkCrossSectionVerticalCenterOffsetMm,
+          vtkLocalCenterOffsetsMm
+        );
+        clearPanoImageCache();
+        clearProtocolListener();
+
+        let protocolAppliedHandled = false;
+        const onProtocolApplied = async () => {
+          if (protocolAppliedHandled) {
+            return;
+          }
+          protocolAppliedHandled = true;
+
+          clearProtocolListener();
+
+          try {
+            scheduleAxialViewportRestore(
+              debugRunId,
+              latestAnnotationUID,
+              latestAnnotationSnapshot,
+              preservedAxialCamera,
+              'vtk-after-stage-switch'
+            );
+
+            const panoViewport = await waitForPanoVolumeViewport(servicesManager);
+            logVtkPanoViewportSnapshot(debugRunId, 'before-attach', panoViewport);
+
+            const wl = getInitialPanoWindowLevelFromSourceViewport(servicesManager);
+            const initialPanoVoi = createPanoVoiFromWindowLevel(
+              wl.windowWidth,
+              wl.windowCenter
+            );
+            setHostedPanoVoiAuthority({
+              runId: debugRunId,
+              sourceVolumeId,
+              voi: initialPanoVoi,
+              source: `vtk-initial:${wl.source}`,
+              suppressPanoViewportEventsForMs: CPR_VTK_PANO_STARTUP_VOI_GUARD_MS,
+            });
+            console.log(
+              `CPR-VTK-PANO-WL run=${debugRunId} source=${wl.source} windowWidth=${wl.windowWidth.toFixed(
+                2
+              )} windowCenter=${wl.windowCenter.toFixed(2)}`
+            );
+            console.log('Centerline frames count:', frames.length);
+            await hydratePanoViewportForCornerstoneUi(
+              panoViewport,
+              sourceVolumeId,
+              wl.windowWidth,
+              wl.windowCenter,
+              preservedAxialDisplayState,
+              debugRunId
+            );
+            console.log(
+              `DIAG-TRIPWIRE: pano-ui-wakeup completed. Viewport has volume: ${panoViewport.hasVolumeId(
+                sourceVolumeId
+              )}`
+            );
+            logVtkPanoViewportSnapshot(debugRunId, 'after-ui-hydrate', panoViewport);
+
+            const attached = await attachVtkPanoCpr({
+              viewport: panoViewport,
+              sourceVolumeId,
+              frames,
+              verticalHalfMm: vtkVerticalHalfMm,
+              slabHalfThicknessMm: vtkSlabHalfThicknessMm,
+              slabSamples: vtkSlabSamples,
+              projectionMode: vtkProjectionMode,
+              initialWindowWidth: wl.windowWidth,
+              initialWindowCenter: wl.windowCenter,
+              runId: debugRunId,
+            });
+            attachedVtkPanoRef.current = attached;
+            setHostedPanoVoiAuthority({
+              runId: debugRunId,
+              sourceVolumeId,
+              voi: initialPanoVoi,
+              source: 'vtk-attached',
+              suppressPanoViewportEventsForMs: CPR_VTK_PANO_STARTUP_VOI_GUARD_MS,
+            });
+            initializePanoCameraBridge(panoViewport, attached, debugRunId);
+
+            logVtkPanoViewportSnapshot(debugRunId, 'after-attach', panoViewport);
+            if (panoViewport.element) {
+              cornerstoneTools.utilities.triggerAnnotationRender(panoViewport.element);
+            }
+
+            await new Promise<void>((resolve, reject) => {
+              window.setTimeout(() => {
+                if (!isMountedRef.current) {
+                  resolve();
+                  return;
+                }
+
+                void initializeCrossSection(
+                  frames,
+                  sourceVolumeId,
+                  vtkActualVerticalHalfMm,
+                  vtkCrossSectionVerticalCenterOffsetMm,
+                  vtkLocalCenterOffsetsMm,
+                  false,
+                  servicesManager
+                )
+                  .then(resolve)
+                  .catch(reject);
+              }, 50);
+            });
+          } catch (innerErr) {
+            const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+            console.error(`[CPR][${debugRunId}] VTK pano pipeline failed after HP switch:`, msg);
+            if (isMountedRef.current) {
+              setError(msg);
+            }
+          } finally {
+            markGenerationIdle();
+          }
+        };
+
+        const protocolAppliedEvent =
+          hangingProtocolService.EVENTS.PROTOCOL_APPLIED ||
+          hangingProtocolService.EVENTS.PROTOCOL_CHANGED;
+
+        if (!protocolAppliedEvent) {
+          throw new Error('[CPR] No supported hanging protocol event found.');
+        }
+
+        hpSubscriptionRef.current = hangingProtocolService.subscribe(
+          protocolAppliedEvent,
+          onProtocolApplied
+        );
+
+        hpTimeoutRef.current = window.setTimeout(() => {
+          clearProtocolListener();
+          if (isMountedRef.current) {
+            const timeoutMsg =
+              '[CPR] Timed out waiting for hanging protocol change after stage switch.';
+            console.error(`[CPR][${debugRunId}] ${timeoutMsg}`);
+            setError(timeoutMsg);
+          }
+          markGenerationIdle();
+        }, 12000);
+
+        console.log(`[CPR][${debugRunId}] switching to CPR stage 1`);
+        commandsManager.runCommand('setHangingProtocol', {
+          protocolId: 'cpr',
+          stageIndex: 1,
+        });
+        return;
+      }
+
       const panoImageId = createPanoImageId();
       console.log(`[CPR][${debugRunId}] generated panoImageId`, { panoImageId });
 
@@ -5210,24 +6163,6 @@ export function useCPROrchestrator({
         selectedColumnPixelSpacing = phase2BaseAttempt.columnPixelSpacing;
         selectedRowPixelSpacing = phase2BaseAttempt.rowPixelSpacing;
       }
-      adaptiveVoi = {
-        lower: CPR_PANO_DEFAULT_WINDOW_CENTER - CPR_PANO_DEFAULT_WINDOW_WIDTH / 2,
-        upper: CPR_PANO_DEFAULT_WINDOW_CENTER + CPR_PANO_DEFAULT_WINDOW_WIDTH / 2,
-        windowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
-        windowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
-      };
-      drawPanoDebugCanvas(
-        `${debugRunId}:selected`,
-        panoWorkerResult.pixelData,
-        panoWorkerResult.width,
-        panoWorkerResult.height,
-        {
-          windowWidth: adaptiveVoi.windowWidth,
-          windowCenter: adaptiveVoi.windowCenter,
-          slope: panoWorkerResult.slope,
-          intercept: panoWorkerResult.intercept,
-        }
-      );
       const displayedWorkerDebugPayload =
         phase2VirtualPano.usedAsDisplayedOutput
           ? phase2WorkerResult?.workerDebugPayload ?? null
@@ -5311,8 +6246,11 @@ export function useCPROrchestrator({
         }
       }
 
-      // Keep exactly one arch annotation to avoid stale/ghost spline overlays.
-      removeSplineAnnotationsExcept(latestAnnotationUID);
+      console.log(
+        `[CPR-SPLINE-PRESERVE] run=${debugRunId} mode=legacy-worker annotationUID=${
+          latestAnnotationUID || 'none'
+        } skipping pre-transition spline cleanup`
+      );
       cprStateService.setArchData(
         controlPoints,
         frames,
@@ -5334,30 +6272,13 @@ export function useCPROrchestrator({
         clearProtocolListener();
 
         try {
-          // Restore axial camera asynchronously so pano swap is not delayed.
-          void (async () => {
-            try {
-              const axialViewportAfterSwitch = await waitForViewportByLogicalId(
-                servicesManager,
-                'cpr-axial',
-                4000
-              );
-              if (axialViewportAfterSwitch && preservedAxialCamera) {
-                const { parallelScale: _ignoredParallelScale, ...cameraWithoutParallelScale } =
-                  preservedAxialCamera;
-                axialViewportAfterSwitch.setCamera(
-                  cameraWithoutParallelScale as Partial<ReturnType<typeof axialViewportAfterSwitch.getCamera>>
-                );
-                axialViewportAfterSwitch.render();
-                cornerstoneTools.utilities.triggerAnnotationRender(axialViewportAfterSwitch.element);
-              }
-            } catch (axialRestoreError) {
-              console.warn(
-                `[CPR][${debugRunId}] Failed to restore axial camera after stage switch`,
-                axialRestoreError
-              );
-            }
-          })();
+          scheduleAxialViewportRestore(
+            debugRunId,
+            latestAnnotationUID,
+            latestAnnotationSnapshot,
+            preservedAxialCamera,
+            'legacy-after-stage-switch'
+          );
 
           if (panoWorkerResult.pixelData.length !== panoWorkerResult.width * panoWorkerResult.height) {
             throw new Error('Dimension mismatch');
@@ -5572,14 +6493,22 @@ export function useCPROrchestrator({
     slabHalfThicknessMm,
     slabSamples,
     aggregation,
+    clearPendingAxialViewportRestore,
+    clearPanoCameraBridge,
     clearProtocolListener,
+    initializePanoCameraBridge,
     markGenerationIdle,
+    disposeAttachedVtkPano,
+    scheduleAxialViewportRestore,
   ]);
 
   const onRedraw = useCallback(async () => {
     setError(null);
     markGenerationIdle();
+    clearPendingAxialViewportRestore('redraw');
+    clearPanoCameraBridge('redraw');
     clearProtocolListener();
+    disposeAttachedVtkPano('redraw');
     await terminateCPRWorkerSession();
 
     const currentAxialViewport = findViewportByLogicalId(servicesManager, 'cpr-axial');
@@ -5588,6 +6517,7 @@ export function useCPROrchestrator({
     }
 
     cprStateService.clear();
+    persistedSplineAnnotationRef.current = null;
     clearPanoImageCache();
     clearPanoDebugProbe();
     removeAllSplineAnnotations();
@@ -5656,7 +6586,15 @@ export function useCPROrchestrator({
         setError(msg);
       }
     }
-  }, [servicesManager, commandsManager, clearProtocolListener, markGenerationIdle]);
+  }, [
+    servicesManager,
+    commandsManager,
+    clearPendingAxialViewportRestore,
+    clearPanoCameraBridge,
+    clearProtocolListener,
+    markGenerationIdle,
+    disposeAttachedVtkPano,
+  ]);
 
   const flushSliderFrameChange = useCallback(() => {
     sliderAnimationFrameRef.current = null;
@@ -5772,11 +6710,199 @@ export function useCPROrchestrator({
   }, [onSliderChange]);
 
   useEffect(() => {
+    if (CPR_PANO_RENDERER_MODE !== 'vtk-cpr' || typeof document === 'undefined') {
+      return;
+    }
+
+    const { cornerstoneViewportService } = servicesManager.services;
+
+    const onVoiModified = (evt: Event) => {
+      const detail = (
+        evt as CustomEvent<{
+          viewportId?: string;
+          volumeId?: string;
+          range?: { lower?: number; upper?: number };
+        }>
+      ).detail;
+      const viewportId = detail?.viewportId;
+      if (!viewportId) {
+        return;
+      }
+
+      const logicalViewportId =
+        cornerstoneViewportService.getViewportInfo(viewportId)?.viewportOptions?.viewportId || viewportId;
+      if (logicalViewportId !== 'cpr-pano' && logicalViewportId !== 'cpr-crosssection') {
+        return;
+      }
+
+      const attachedPano = attachedVtkPanoRef.current;
+      if (logicalViewportId === 'cpr-pano') {
+        console.log(
+          `DIAG-TRIPWIRE: voi-modified logicalViewportId=${logicalViewportId} viewportId=${viewportId} attachedPano=${
+            attachedPano ? 'yes' : 'no'
+          } range=${JSON.stringify(detail?.range ?? null)}`
+        );
+      }
+      if (!attachedPano) {
+        return;
+      }
+
+      const nextVoi = createPanoVoiFromRange(detail?.range);
+      if (!nextVoi) {
+        return;
+      }
+
+      const authority = hostedPanoVoiAuthorityRef.current;
+      const authoritativeVoi = clonePanoVoiSettings(authority.authoritativeVoi);
+      if (
+        logicalViewportId === 'cpr-pano' &&
+        authority.sourceVolumeId &&
+        detail?.volumeId &&
+        detail.volumeId !== authority.sourceVolumeId
+      ) {
+        console.warn(
+          `[CPR-VTK-PANO-VOI-GUARD] run=${authority.runId || 'na'} rejectingPanoEvent reason=volume-mismatch ` +
+            `eventVolumeId=${detail.volumeId} sourceVolumeId=${authority.sourceVolumeId}`
+        );
+        return;
+      }
+
+      if (logicalViewportId === 'cpr-pano') {
+        const evaluation = evaluateHostedPanoViewportVoiUpdate({
+          nextVoi,
+          authoritativeVoi,
+          suppressPanoViewportEventsUntil: authority.suppressPanoViewportEventsUntil,
+          now: Date.now(),
+        });
+        if (!evaluation.accept) {
+          const authoritySummary = authoritativeVoi
+            ? ` authorityWW=${authoritativeVoi.windowWidth.toFixed(2)} authorityWC=${authoritativeVoi.windowCenter.toFixed(
+                2
+              )}`
+            : '';
+          console.warn(
+            `[CPR-VTK-PANO-VOI-GUARD] run=${authority.runId || 'na'} rejectingPanoEvent reason=${evaluation.reason} ` +
+              `eventWW=${nextVoi.windowWidth.toFixed(2)} eventWC=${nextVoi.windowCenter.toFixed(2)}${authoritySummary}`
+          );
+          if (evaluation.shouldRepair) {
+            scheduleHostedPanoVoiRepair(evaluation.reason);
+          }
+          return;
+        }
+      }
+
+      attachedPano.updateWindowLevel(nextVoi.windowWidth, nextVoi.windowCenter);
+      setHostedPanoVoiAuthority({
+        runId: authority.runId || 'na',
+        sourceVolumeId: authority.sourceVolumeId || detail?.volumeId || null,
+        voi: nextVoi,
+        source: logicalViewportId,
+      });
+    };
+
+    document.addEventListener(cornerstone.Enums.Events.VOI_MODIFIED, onVoiModified, true);
+
     return () => {
+      document.removeEventListener(cornerstone.Enums.Events.VOI_MODIFIED, onVoiModified, true);
+    };
+  }, [scheduleHostedPanoVoiRepair, servicesManager, setHostedPanoVoiAuthority]);
+
+  useEffect(() => {
+    if (CPR_PANO_RENDERER_MODE !== 'vtk-cpr' || typeof document === 'undefined') {
+      return;
+    }
+
+    const { cornerstoneViewportService } = servicesManager.services;
+
+    const onCameraModified = (evt: Event) => {
+      const attachedPano = attachedVtkPanoRef.current;
+      const bridgeState = panoCameraBridgeRef.current;
+      if (!attachedPano || !bridgeState || bridgeState.actorUID !== attachedPano.actorUID) {
+        return;
+      }
+
+      const detail = (
+        evt as CustomEvent<{
+          viewportId?: string;
+          camera?: cornerstone.Types.ICamera;
+        }>
+      ).detail;
+      const viewportId = detail?.viewportId;
+      if (!viewportId) {
+        return;
+      }
+
+      const logicalViewportId =
+        cornerstoneViewportService.getViewportInfo(viewportId)?.viewportOptions?.viewportId || viewportId;
+      if (logicalViewportId !== 'cpr-pano') {
+        return;
+      }
+
+      const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
+      if (viewport?.id !== bridgeState.viewportId && viewportId !== bridgeState.viewportId) {
+        return;
+      }
+      const camera = viewport?.getCamera?.() || detail?.camera;
+      const viewportWithPanZoom = viewport as
+        | (cornerstone.Types.IViewport & {
+          getPan?: () => ArrayLike<number> | null | undefined;
+          getZoom?: () => number;
+        })
+        | null;
+      const currentPan = toFiniteVector2Tuple(viewportWithPanZoom?.getPan?.());
+      const currentZoom = Number(viewportWithPanZoom?.getZoom?.());
+      const currentViewUp = toFiniteVector3Tuple(camera?.viewUp);
+      const currentViewPlaneNormal = toFiniteVector3Tuple(camera?.viewPlaneNormal);
+      const viewportHeightPx = Number(viewport?.element?.clientHeight || 0);
+
+      if (
+        !camera ||
+        !currentPan ||
+        !Number.isFinite(currentZoom) ||
+        currentZoom <= 0 ||
+        !Number.isFinite(viewportHeightPx) ||
+        viewportHeightPx <= 0
+      ) {
+        return;
+      }
+
+      if (
+        !areAlignedDirectionVectors(currentViewUp, bridgeState.baseViewUp) ||
+        !areAlignedDirectionVectors(currentViewPlaneNormal, bridgeState.baseViewPlaneNormal)
+      ) {
+        console.log(
+          `CPR-VTK-PANO-CAMERA-BRIDGE ignore-orientation-change viewportId=${viewportId} actorUID=${bridgeState.actorUID}`
+        );
+        return;
+      }
+
+      attachedPano.syncCamera({
+        panDeltaPx: [
+          currentPan[0] - bridgeState.basePan[0],
+          currentPan[1] - bridgeState.basePan[1],
+        ],
+        zoomRatio: currentZoom / bridgeState.baseZoom,
+        viewportHeightPx,
+      });
+    };
+
+    document.addEventListener(cornerstone.Enums.Events.CAMERA_MODIFIED, onCameraModified, true);
+
+    return () => {
+      document.removeEventListener(cornerstone.Enums.Events.CAMERA_MODIFIED, onCameraModified, true);
+    };
+  }, [servicesManager]);
+
+  useEffect(() => {
+    return () => {
+      clearPendingAxialViewportRestore('unmount');
+      clearPanoCameraBridge('unmount');
+      persistedSplineAnnotationRef.current = null;
+      disposeAttachedVtkPano('unmount');
       clearPanoDebugProbe();
       void terminateCPRWorkerSession();
     };
-  }, []);
+  }, [clearPendingAxialViewportRestore, clearPanoCameraBridge, disposeAttachedVtkPano]);
 
   return { onDone, onRedraw, onSliderChange, isGenerating, error };
 }

@@ -32,6 +32,18 @@ class CornerstoneCacheService {
     return cs3DCache.getBytesAvailable();
   }
 
+  public destroy(): void {
+    console.log(
+      `[CS-CACHE-CLEANUP] trackedStacks=${this.stackImageIds.size} ` +
+        `trackedVolumes=${this.volumeImageIds.size} inFlight=${this.volumePromises.size} ` +
+        `cacheSizeBytes=${this.getCacheSize()} cacheFreeBytes=${this.getCacheFreeSpace()}`
+    );
+
+    this.stackImageIds.clear();
+    this.volumeImageIds.clear();
+    this.volumePromises.clear();
+  }
+
   public async createViewportData(
     displaySets: unknown[],
     viewportOptions: Record<string, unknown>,

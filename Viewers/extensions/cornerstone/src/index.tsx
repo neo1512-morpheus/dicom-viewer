@@ -82,7 +82,14 @@ const cornerstoneExtension: Types.Extensions.Extension = {
   },
 
   onModeExit: ({ servicesManager }: withAppTypes): void => {
-    const { cineService } = servicesManager.services;
+    const {
+      cineService,
+      toolGroupService,
+      syncGroupService,
+      segmentationService,
+      cornerstoneViewportService,
+      cornerstoneCacheService,
+    } = servicesManager.services;
     // Empty out the image load and retrieval pools to prevent memory leaks
     // on the mode exits
     Object.values(cs3DEnums.RequestType).forEach(type => {
@@ -91,6 +98,36 @@ const cornerstoneExtension: Types.Extensions.Extension = {
     });
 
     cineService.setIsCineEnabled(false);
+
+    try {
+      toolGroupService?.destroy?.();
+    } catch (error) {
+      console.warn('[Cornerstone] Failed to destroy tool groups on mode exit', error);
+    }
+
+    try {
+      syncGroupService?.destroy?.();
+    } catch (error) {
+      console.warn('[Cornerstone] Failed to destroy sync groups on mode exit', error);
+    }
+
+    try {
+      segmentationService?.destroy?.();
+    } catch (error) {
+      console.warn('[Cornerstone] Failed to destroy segmentation service on mode exit', error);
+    }
+
+    try {
+      cornerstoneViewportService?.destroy?.();
+    } catch (error) {
+      console.warn('[Cornerstone] Failed to destroy viewport service on mode exit', error);
+    }
+
+    try {
+      cornerstoneCacheService?.destroy?.();
+    } catch (error) {
+      console.warn('[Cornerstone] Failed to clear cache tracking on mode exit', error);
+    }
 
     enabledElementReset();
   },

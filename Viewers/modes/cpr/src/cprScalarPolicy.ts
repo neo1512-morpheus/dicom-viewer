@@ -407,9 +407,15 @@ export function normalizeScalarDataToHuFloat32(params: {
   pixelRepresentation?: number;
   allowStoredValueNormalization?: boolean;
   disableStoredValueNormalization?: boolean;
+  targetBuffer?: Float32Array | null;
 }): NormalizeScalarDataToHuResult {
   const transform = createHuScalarTransform(params);
-  const pixelData = new Float32Array(params.scalarData.length);
+  const requestedTargetBuffer = params.targetBuffer;
+  const pixelData =
+    requestedTargetBuffer instanceof Float32Array &&
+    requestedTargetBuffer.length === params.scalarData.length
+      ? requestedTargetBuffer
+      : new Float32Array(params.scalarData.length);
 
   for (let i = 0; i < params.scalarData.length; i++) {
     pixelData[i] = transform.normalizeSample(Number(params.scalarData[i]));

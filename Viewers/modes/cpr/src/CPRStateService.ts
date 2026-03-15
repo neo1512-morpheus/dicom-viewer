@@ -12,6 +12,25 @@ interface CPRArchData {
 
 class CPRStateService {
   private archData: CPRArchData | null = null;
+  private axialTransitioning = false;
+  private listeners = new Set<() => void>();
+
+  private notify(): void {
+    this.listeners.forEach(listener => {
+      try {
+        listener();
+      } catch (error) {
+        console.warn('[CPR] Failed to notify CPR state listener.', error);
+      }
+    });
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
 
   setArchData(
     controlPoints: Point3[],
@@ -53,6 +72,21 @@ class CPRStateService {
 
   clear(): void {
     this.archData = null;
+    this.setAxialTransitioning(false);
+  }
+
+  isAxialTransitioning(): boolean {
+    return this.axialTransitioning;
+  }
+
+  setAxialTransitioning(nextValue: boolean): void {
+    const safeNextValue = Boolean(nextValue);
+    if (this.axialTransitioning === safeNextValue) {
+      return;
+    }
+
+    this.axialTransitioning = safeNextValue;
+    this.notify();
   }
 
   getControlPoints(): Point3[] {

@@ -518,7 +518,7 @@ function buildCrossSectionBasis(frame: CPRFrame): {
   up: Point3;
 } {
   const normal = normalize([frame.T[0], frame.T[1], frame.T[2]], [1, 0, 0]);
-  const frameRight: Point3 = [frame.N_camera[0], frame.N_camera[1], frame.N_camera[2]];
+  const frameRight: Point3 = [frame.N_slab[0], frame.N_slab[1], frame.N_slab[2]];
   const frameUp: Point3 = [frame.S[0], frame.S[1], frame.S[2]];
 
   let right = projectPerpendicular(frameRight, normal);
@@ -825,9 +825,6 @@ function computeCrossSectionImage(
   const height = seriesPayload.height;
   const columnPixelSpacing = seriesPayload.columnPixelSpacing;
   const rowPixelSpacing = seriesPayload.rowPixelSpacing;
-  console.log(
-    `CPR Grid: ${JSON.stringify({ width, height, rowPixelSpacing, columnPixelSpacing })}`
-  );
   const columnCenterIndex = (width - 1) * 0.5;
   const rowCenterIndex = (height - 1) * 0.5;
   const frameCenter =
@@ -945,10 +942,6 @@ function computeCrossSectionImage(
     maxValue = seriesPayload.maxValue;
   }
 
-  console.log(
-    `CPR MinMax BEFORE Denoise: ${JSON.stringify(computeExactScalarRange(pixelData))}`
-  );
-
   if (CROSSSECTION_ENABLE_DENOISE) {
     const firstPassDenoised = applyLightBilateralDenoise(pixelData, width, height, 0.65);
     const secondPassDenoised = applyLightBilateralDenoise(pixelData, width, height, 0.65);
@@ -960,10 +953,6 @@ function computeCrossSectionImage(
       maxValue = denoisedRange.maxValue;
     }
   }
-
-  console.log(
-    `CPR MinMax AFTER Denoise: ${JSON.stringify(computeExactScalarRange(pixelData))}`
-  );
 
   const exactRange = computeExactScalarRange(pixelData);
   minValue = exactRange.minValue;

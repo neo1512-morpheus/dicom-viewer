@@ -26,7 +26,7 @@ import { getWindowLevelActionMenu } from '../components/WindowLevelActionMenu/ge
 import { useAppConfig } from '@state';
 import { cprStateService } from '../../../../modes/cpr/src/CPRStateService';
 import { emitCPRCrossSectionSync } from '../../../../modes/cpr/src/cprEvents';
-import { useCPROrchestrator } from '../../../../modes/cpr/src/useCPROrchestrator';
+import { useCPROrchestratorContext } from '../../../../modes/cpr/src/CPROrchestratorContext';
 
 import { LutPresentation, PositionPresentation } from '../types/Presentation';
 
@@ -54,16 +54,11 @@ const isKnownWebGLUnavailableError = (error: unknown) => {
 };
 
 function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
-  const { onDone, onRedraw, isGenerating, error } = useCPROrchestrator({
-    servicesManager,
-    commandsManager,
-    sourceViewportId: viewportId,
-    panoWidth: 800,
-    panoHeight: 400,
-    slabHalfThicknessMm: 2,
-    slabSamples: 7,
-    aggregation: 'MEAN',
-  });
+  const orchestrator = useCPROrchestratorContext();
+  const onDone = orchestrator?.onDone;
+  const onRedraw = orchestrator?.onRedraw;
+  const isGenerating = orchestrator?.isGenerating ?? false;
+  const error = orchestrator?.error ?? null;
   const [hasSpline, setHasSpline] = useState(false);
 
   const setActiveAxialViewport = useCallback(() => {
@@ -119,7 +114,7 @@ function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
   }, [commandsManager, setActiveAxialViewport]);
 
   const onRedrawClick = useCallback(() => {
-    void onRedraw();
+    void onRedraw?.();
   }, [onRedraw]);
 
   const onDoneMouseDown = useCallback(
@@ -167,9 +162,9 @@ function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
           className="rounded border border-white/40 px-2 py-1 text-xs disabled:opacity-50"
           onMouseDown={onDoneMouseDown}
           onClick={() => {
-            void onDone();
+            void onDone?.();
           }}
-          disabled={isGenerating || !hasSpline}
+          disabled={isGenerating || !hasSpline || !onDone}
         >
           {isGenerating ? 'Generating...' : 'Done'}
         </button>
@@ -337,6 +332,10 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
   } = servicesManager.services;
   const logicalViewportId =
     cornerstoneViewportService.getViewportInfo(viewportId)?.viewportOptions?.viewportId || viewportId;
+  const isAxialCprViewport = logicalViewportId === 'cpr-axial' || viewportId === 'cpr-axial';
+  const [isAxialTransitioning, setIsAxialTransitioning] = useState(() =>
+    isAxialCprViewport ? cprStateService.isAxialTransitioning() : false
+  );
 
   const [loadingProgress, setLoadingProgress] = useState(null);
   const [viewportDialogState] = useViewportDialog();
@@ -454,6 +453,19 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     element.style.opacity = '';
     element.style.pointerEvents = '';
   }, [logicalViewportId]);
+
+  useEffect(() => {
+    if (!isAxialCprViewport) {
+      setIsAxialTransitioning(false);
+      return;
+    }
+
+    setIsAxialTransitioning(cprStateService.isAxialTransitioning());
+
+    return cprStateService.subscribe(() => {
+      setIsAxialTransitioning(cprStateService.isAxialTransitioning());
+    });
+  }, [isAxialCprViewport]);
 
   const onCrossSectionWheel = useCallback(
     (evt: React.WheelEvent<HTMLDivElement>) => {
@@ -780,7 +792,14 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
 
   return (
     <React.Fragment>
-      <div className="viewport-wrapper">
+      <div
+        className="viewport-wrapper"
+        style={
+          isAxialCprViewport && isAxialTransitioning
+            ? { visibility: 'hidden', pointerEvents: 'none' }
+            : undefined
+        }
+      >
         <ReactResizeDetector
           onResize={onResize}
           targetRef={elementRef.current}

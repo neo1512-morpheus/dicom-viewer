@@ -270,17 +270,27 @@ class CPRCursorTool extends AnnotationTool {
 
     const { viewport } = enabledElement;
     const toolClass = this.constructor as typeof AnnotationTool;
-    const annotation = toolClass.createAnnotationForViewport(viewport, {
-      metadata: {
-        viewportId: viewport.id,
-      },
-      data: {
-        viewportId: viewport.id,
-        handles: {
-          points: [[0, 0, 0]],
+    let annotation: CursorAnnotation | null = null;
+
+    try {
+      annotation = toolClass.createAnnotationForViewport(viewport, {
+        metadata: {
+          viewportId: viewport.id,
         },
-      },
-    });
+        data: {
+          viewportId: viewport.id,
+          handles: {
+            points: [[0, 0, 0]],
+          },
+        },
+      });
+    } catch (error) {
+      console.warn(
+        `[CPR] Skipping cursor annotation creation for viewport ${viewport.id} until the viewport is fully initialized.`,
+        error
+      );
+      return null;
+    }
 
     cstAnnotation.state.addAnnotation(annotation, element);
     return annotation;

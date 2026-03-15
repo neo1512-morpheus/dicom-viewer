@@ -6,9 +6,10 @@ import { ViewportGrid, ViewportPane, useViewportGrid } from '@ohif/ui';
 import EmptyViewport from './EmptyViewport';
 import classNames from 'classnames';
 import { useAppConfig } from '@state';
+import { CPROrchestratorProvider } from '../../../../modes/cpr/src/CPROrchestratorContext';
 
 function ViewerViewportGrid(props: withAppTypes) {
-  const { servicesManager, viewportComponents, dataSource } = props;
+  const { servicesManager, viewportComponents, dataSource, commandsManager } = props;
   const [viewportGrid, viewportGridService] = useViewportGrid();
   const [appConfig] = useAppConfig();
 
@@ -362,30 +363,36 @@ function ViewerViewportGrid(props: withAppTypes) {
   }
 
   return (
-    <div
-      ref={elementRef}
-      className="h-full w-full"
+    <CPROrchestratorProvider
+      servicesManager={servicesManager}
+      commandsManager={commandsManager}
     >
-      <ViewportGrid
-        numRows={numRows}
-        numCols={numCols}
+      <div
+        ref={elementRef}
+        className="h-full w-full"
       >
-        <ReactResizeDetector
-          refreshMode="debounce"
-          refreshRate={7} // ms seems to be fine for 10 viewports
-          onResize={() => {
-            viewportGridService.setViewportGridSizeChanged();
-          }}
-          targetRef={elementRef.current}
-        />
-        {getViewportPanes()}
-      </ViewportGrid>
-    </div>
+        <ViewportGrid
+          numRows={numRows}
+          numCols={numCols}
+        >
+          <ReactResizeDetector
+            refreshMode="debounce"
+            refreshRate={7} // ms seems to be fine for 10 viewports
+            onResize={() => {
+              viewportGridService.setViewportGridSizeChanged();
+            }}
+            targetRef={elementRef.current}
+          />
+          {getViewportPanes()}
+        </ViewportGrid>
+      </div>
+    </CPROrchestratorProvider>
   );
 }
 
 ViewerViewportGrid.propTypes = {
   viewportComponents: PropTypes.array.isRequired,
+  commandsManager: PropTypes.instanceOf(Object).isRequired,
   servicesManager: PropTypes.instanceOf(Object).isRequired,
 };
 

@@ -12,7 +12,7 @@ type PreviousCameraLike = {
   parallelScale?: number | null;
 } | null | undefined;
 
-const CROSSSECTION_CLINICAL_VERTICAL_HEIGHT_MM = 45;
+const CROSSSECTION_CLINICAL_VERTICAL_HEIGHT_MM = 60;
 const CROSSSECTION_FIXED_PARALLEL_SCALE = CROSSSECTION_CLINICAL_VERTICAL_HEIGHT_MM / 2;
 const CROSSSECTION_RIGID_CAMERA_DISTANCE_MULTIPLIER = 8;
 
@@ -100,7 +100,7 @@ export function buildCrossSectionBasis(frame: CPRFrame): {
     [1, 0, 0]
   );
   const frameRight = normalizeCameraVector(
-    [frame.N_camera[0], frame.N_camera[1], frame.N_camera[2]],
+    [frame.N_slab[0], frame.N_slab[1], frame.N_slab[2]],
     [0, 1, 0]
   );
   const frameUp = normalizeCameraVector(
@@ -110,7 +110,7 @@ export function buildCrossSectionBasis(frame: CPRFrame): {
 
   // Match the synthetic image basis exactly:
   // - plane normal follows the arch tangent T
-  // - horizontal axis follows the stable RMF N_camera vector
+  // - horizontal axis follows the outward/support-facing slab direction
   // - vertical axis follows the stable RMF S vector
   let right = projectPerpendicular(frameRight, normal, [0, 1, 0]);
   if (vec3.length(right) < 1e-6) {
@@ -155,7 +155,7 @@ export function buildCrossSectionBasis(frame: CPRFrame): {
 
 export function buildCrossSectionCameraForFrame(
   frame: CPRFrame,
-  previousCamera?: PreviousCameraLike,
+  _previousCamera?: PreviousCameraLike,
   verticalCenterOffsetMm = 0
 ): {
   focalPoint: CameraVector;
@@ -183,21 +183,6 @@ export function buildCrossSectionCameraForFrame(
     focalPoint[1] + viewPlaneNormal[1] * cameraDistance,
     focalPoint[2] + viewPlaneNormal[2] * cameraDistance,
   ];
-
-  console.log(
-    `[CPR-DEBUG] buildCrossSectionCameraForFrame ${JSON.stringify({
-      frameIndex: frame.index,
-      previousParallelScale: Number.isFinite(previousCamera?.parallelScale as number)
-        ? Number(previousCamera?.parallelScale)
-        : null,
-      centerOffsetMm,
-      fixedVerticalFieldOfViewMm: CROSSSECTION_CLINICAL_VERTICAL_HEIGHT_MM,
-      outputParallelScale: parallelScale,
-      clippingRange,
-      focalPoint,
-      position,
-    })}`
-  );
 
   return {
     focalPoint,

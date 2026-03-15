@@ -165,7 +165,12 @@ const commandsModule = ({
           useStageIdx || 0
         }`;
 
-        const restoreProtocol = !reset && viewportGridStore[storedHanging];
+        let restoreProtocol = !reset && viewportGridStore[storedHanging];
+
+        if (protocolId === 'cpr' && useStageIdx === 1) {
+          delete viewportGridStore[storedHanging];
+          restoreProtocol = false;
+        }
 
         if (
           protocolId === hpInfo.protocolId &&

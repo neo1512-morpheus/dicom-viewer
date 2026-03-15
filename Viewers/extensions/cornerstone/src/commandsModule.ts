@@ -26,11 +26,16 @@ import getActiveViewportEnabledElement from './utils/getActiveViewportEnabledEle
 import toggleVOISliceSync from './utils/toggleVOISliceSync';
 import { cprStateService } from '../../../modes/cpr/src/CPRStateService';
 import { buildCrossSectionCameraForFrame } from '../../../modes/cpr/src/cprCrossSectionCamera';
+import { emitCPRPanoHostAttached } from '../../../modes/cpr/src/cprEvents';
+import type { HostedVtkPanoReattachState } from '../../../modes/cpr/src/vtkPanoCprRenderer';
 
 type CPRHostedPanoElement = HTMLElement & {
   __cprVtkPanoHost?: {
+    updateWindowLevel(windowWidth: number, windowCenter: number): void;
     resetCamera(): void;
     render(): void;
+    getReattachState(): HostedVtkPanoReattachState | null;
+    dispose(): void;
   };
 };
 
@@ -39,6 +44,13 @@ const toggleSyncFunctions = {
   voi: toggleVOISliceSync,
 };
 const CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM = 1.5;
+const CPR_PANO_RESET_WINDOW_WIDTH = 2000;
+const CPR_PANO_RESET_WINDOW_CENTER = 1000;
+const CPR_LOGICAL_VIEWPORT_IDS = new Set(['cpr-axial', 'cpr-pano', 'cpr-crosssection']);
+const CPR_PRIMARY_TOOL_SUPPORT: Record<string, ReadonlySet<string>> = {
+  cprPano: new Set(['WindowLevel', 'Pan', 'Zoom']),
+  cprCrossSection: new Set(['WindowLevel']),
+};
 
 function commandsModule({
   servicesManager,
@@ -56,6 +68,7 @@ function commandsModule({
     colorbarService,
     hangingProtocolService,
     syncGroupService,
+    stateSyncService,
   } = servicesManager.services;
 
   const { measurementServiceSource } = this;
@@ -110,6 +123,155 @@ function commandsModule({
     if (mappedId) {
       viewportGridService.setActiveViewportId(mappedId);
     }
+  }
+
+  function _getLogicalViewportIdForGridViewportId(
+    viewportId: string | null | undefined
+  ): string | null {
+    if (!viewportId) {
+      return null;
+    }
+
+    const { viewports } = viewportGridService.getState();
+    return viewports.get(viewportId)?.viewportOptions?.viewportId || viewportId;
+  }
+
+  function _findCornerstoneViewportByLogicalId(logicalViewportId: string) {
+    const directViewport = cornerstoneViewportService.getCornerstoneViewport(logicalViewportId);
+    if (directViewport) {
+      return directViewport;
+    }
+
+    const mappedId = _getGridViewportIdByLogicalId(logicalViewportId);
+    return mappedId ? cornerstoneViewportService.getCornerstoneViewport(mappedId) : null;
+  }
+
+  function _disposeHostedPanoIfPresent(reason: string): HostedVtkPanoReattachState | null {
+    const panoViewport = _findCornerstoneViewportByLogicalId('cpr-pano');
+    const hostedPano = (panoViewport?.element as CPRHostedPanoElement | undefined)
+      ?.__cprVtkPanoHost;
+    if (!hostedPano) {
+      return null;
+    }
+
+    const snapshot = hostedPano.getReattachState?.() || null;
+
+    try {
+      hostedPano.dispose?.();
+    } catch (error) {
+      console.warn(`[CPR-ONE-UP] Failed to dispose hosted pano during ${reason}`, error);
+    }
+
+    return snapshot;
+  }
+
+  async function _waitForViewportByLogicalId(logicalViewportId: string, timeoutMs = 6000) {
+    const startedAt = performance.now();
+
+    return await new Promise<ReturnType<typeof cornerstoneViewportService.getCornerstoneViewport>>(
+      (resolve, reject) => {
+        const poll = () => {
+          const viewport = _findCornerstoneViewportByLogicalId(logicalViewportId);
+          if (viewport?.element) {
+            resolve(viewport);
+            return;
+          }
+
+          if (performance.now() - startedAt >= timeoutMs) {
+            const timeoutMessage = `[CPR-ONE-UP] ${logicalViewportId} viewport was not ready within timeout.`;
+            reject(new Error(timeoutMessage));
+            return;
+          }
+
+          window.requestAnimationFrame(poll);
+        };
+
+        poll();
+      }
+    );
+  }
+
+  async function _reattachHostedPanoIfNeeded(
+    panoState: HostedVtkPanoReattachState | null | undefined,
+    reason: string
+  ): Promise<void> {
+    if (!panoState) {
+      return;
+    }
+
+    try {
+      const viewport = await _waitForViewportByLogicalId('cpr-pano');
+      if (!viewport) {
+        return;
+      }
+
+      const element = viewport.element as CPRHostedPanoElement | undefined;
+      if (element) {
+        element.style.visibility = 'hidden';
+      }
+
+      try {
+        element?.__cprVtkPanoHost?.dispose?.();
+        const { attachVtkPanoCpr } = await import('../../../modes/cpr/src/vtkPanoCprRenderer');
+        const attached = await attachVtkPanoCpr({
+          viewport: viewport as VolumeViewport,
+          sourceVolumeId: panoState.sourceVolumeId,
+          frames: panoState.frames,
+          verticalHalfMm: panoState.verticalHalfMm,
+          slabHalfThicknessMm: panoState.slabHalfThicknessMm,
+          slabSamples: panoState.slabSamples,
+          projectionMode: panoState.projectionMode,
+          initialWindowWidth: panoState.windowWidth,
+          initialWindowCenter: panoState.windowCenter,
+          runId: panoState.runId,
+        });
+        emitCPRPanoHostAttached({
+          actorUID: attached.actorUID,
+          runId: panoState.runId,
+          viewportId: viewport.id,
+        });
+      } finally {
+        if (element) {
+          element.style.visibility = '';
+        }
+      }
+    } catch (error) {
+      console.warn(`[CPR-ONE-UP] Failed to reattach hosted pano after ${reason}`, error);
+    }
+  }
+
+  function _clearCprOneUpStore(): void {
+    stateSyncService.store({
+      toggleCprOneUpViewportGridStore: {},
+      cprOneUpPanoStore: null,
+    });
+  }
+
+  function _clearCachedCprStageOneLayout(reason: string): void {
+    const syncState = stateSyncService.getState?.() || {};
+    const viewportGridStore = { ...(syncState.viewportGridStore || {}) };
+    const activeStudyUID = hangingProtocolService.getState?.()?.activeStudyUID;
+    const cacheKey = activeStudyUID ? `${activeStudyUID}:cpr:1` : null;
+    if (cacheKey && viewportGridStore[cacheKey]) {
+      delete viewportGridStore[cacheKey];
+      console.log(`[CPR-ONE-UP] Cleared cached stage-1 CPR layout after ${reason}`);
+      stateSyncService.store({ viewportGridStore });
+    }
+  }
+
+  function _buildFindOrCreateViewportByPosition(
+    viewports:
+      | Map<string, { positionId?: string }>
+      | Record<string, { positionId?: string }>
+      | undefined
+  ) {
+    const viewportEntries: Array<[string, { positionId?: string }]> =
+      viewports && typeof (viewports as Map<string, { positionId?: string }>).entries === 'function'
+        ? Array.from((viewports as Map<string, { positionId?: string }>).entries())
+        : Object.entries((viewports || {}) as Record<string, { positionId?: string }>);
+
+    return (_position: number, positionId: string) =>
+      viewportEntries.find(([, viewport]) => viewport?.positionId === positionId)?.[1];
   }
 
   function _clearCPRAxialAnnotations(element: HTMLDivElement): void {
@@ -368,6 +530,108 @@ function commandsModule({
 
       viewportGridService.setActiveViewportId(viewportId);
     },
+    toggleViewportOneUpAware: async () => {
+      const hpState = hangingProtocolService.getState?.() || {};
+      const viewportGridState = viewportGridService.getState();
+      const { activeViewportId, viewports, layout } = viewportGridState;
+      const activeViewportState = activeViewportId ? viewports.get(activeViewportId) : null;
+      const logicalViewportId =
+        activeViewportState?.viewportOptions?.viewportId ||
+        _getLogicalViewportIdForGridViewportId(activeViewportId);
+
+      if (
+        hpState.protocolId !== 'cpr' ||
+        !logicalViewportId ||
+        !CPR_LOGICAL_VIEWPORT_IDS.has(logicalViewportId)
+      ) {
+        commandsManager.runCommand('toggleOneUp');
+        return;
+      }
+
+      const state = stateSyncService.getState?.() || {};
+      const cprOneUpStore = state.toggleCprOneUpViewportGridStore;
+      const currentStageIndex = hpState.stageIndex;
+      const isRestoringCprOneUp =
+        layout.numCols === 1 &&
+        layout.numRows === 1 &&
+        cprOneUpStore?.layout &&
+        cprOneUpStore?.protocolId === 'cpr' &&
+        cprOneUpStore?.stageIndex === currentStageIndex &&
+        cprOneUpStore?.oneUpLogicalViewportId === logicalViewportId;
+
+      if (isRestoringCprOneUp) {
+        const panoState =
+          _disposeHostedPanoIfPresent('cpr-one-up-exit') ||
+          (state.cprOneUpPanoStore as HostedVtkPanoReattachState | null | undefined) ||
+          null;
+        _clearCachedCprStageOneLayout('cpr-one-up-exit');
+        const findOrCreateViewport = _buildFindOrCreateViewportByPosition(cprOneUpStore.viewports);
+        const layoutOptions = viewportGridService.getLayoutOptionsFromState(cprOneUpStore);
+
+        viewportGridService.setLayout({
+          numRows: cprOneUpStore.layout.numRows,
+          numCols: cprOneUpStore.layout.numCols,
+          activeViewportId: cprOneUpStore.activeViewportId,
+          layoutOptions,
+          findOrCreateViewport,
+          isHangingProtocolLayout: true,
+        });
+
+        _clearCprOneUpStore();
+
+        if (panoState) {
+          window.setTimeout(() => {
+            void _reattachHostedPanoIfNeeded(panoState, 'cpr-one-up-exit');
+          }, 0);
+        }
+
+        return;
+      }
+
+      if (!activeViewportState || !activeViewportId) {
+        return;
+      }
+
+      const panoState = _disposeHostedPanoIfPresent('cpr-one-up-enter');
+      _clearCachedCprStageOneLayout('cpr-one-up-enter');
+      stateSyncService.store({
+        toggleCprOneUpViewportGridStore: {
+          ...viewportGridState,
+          protocolId: 'cpr',
+          stageIndex: currentStageIndex,
+          oneUpLogicalViewportId: logicalViewportId,
+        },
+        cprOneUpPanoStore: panoState,
+      });
+
+      const oneUpViewportState = {
+        ...activeViewportState,
+        displaySetInstanceUIDs: Array.isArray(activeViewportState.displaySetInstanceUIDs)
+          ? [...activeViewportState.displaySetInstanceUIDs]
+          : activeViewportState.displaySetInstanceUIDs,
+        displaySetOptions: activeViewportState.displaySetOptions
+          ? { ...activeViewportState.displaySetOptions }
+          : activeViewportState.displaySetOptions,
+        viewportOptions: activeViewportState.viewportOptions
+          ? { ...activeViewportState.viewportOptions }
+          : activeViewportState.viewportOptions,
+        positionId: '0-0',
+      };
+
+      viewportGridService.setLayout({
+        numRows: 1,
+        numCols: 1,
+        activeViewportId,
+        findOrCreateViewport: () => oneUpViewportState,
+        isHangingProtocolLayout: true,
+      });
+
+      if (logicalViewportId === 'cpr-pano' && panoState) {
+        window.setTimeout(() => {
+          void _reattachHostedPanoIfNeeded(panoState, 'cpr-one-up-enter');
+        }, 0);
+      }
+    },
     arrowTextCallback: ({ callback, data, uid }) => {
       const labelConfig = customizationService.get('measurementLabels');
       callLabelAutocompleteDialog(uiDialogService, callback, {}, labelConfig);
@@ -522,6 +786,14 @@ function commandsModule({
       }
 
       const { protocolId } = hangingProtocolService.getState?.() || {};
+      const supportedCprPrimaryTools = CPR_PRIMARY_TOOL_SUPPORT[toolGroup.id];
+      if (
+        protocolId === 'cpr' &&
+        supportedCprPrimaryTools &&
+        !supportedCprPrimaryTools.has(toolName)
+      ) {
+        return;
+      }
       const toolInstance = toolGroup.getToolInstance?.(toolName);
       const isAnnotationTool = !!toolInstance?.constructor?.isAnnotation;
       if (protocolId === 'cpr' && toolGroup?.id === 'mpr' && isAnnotationTool) {
@@ -719,30 +991,13 @@ function commandsModule({
                 invert: false,
               });
             }
-            viewport.setBlendMode(
-              csCoreEnums.BlendModes.AVERAGE_INTENSITY_BLEND,
-              actorUIDs
-            );
+            viewport.setBlendMode(csCoreEnums.BlendModes.AVERAGE_INTENSITY_BLEND, actorUIDs);
             const resetCrossSectionCamera = buildCrossSectionCameraForFrame(
               frame,
               undefined,
               verticalCenterOffsetMm
             );
-            console.log(
-              `[CPR-DEBUG] resetViewport cpr-crosssection ${JSON.stringify({
-                viewportId: viewport.id,
-                frameIndex,
-                verticalCenterOffsetMm,
-                requestedParallelScale: resetCrossSectionCamera.parallelScale,
-              })}`
-            );
             viewport.setCamera(resetCrossSectionCamera);
-            console.log(
-              `[CPR-DEBUG] resetViewport cpr-crosssection appliedCamera ${JSON.stringify({
-                viewportId: viewport.id,
-                appliedParallelScale: viewport.getCamera?.()?.parallelScale ?? null,
-              })}`
-            );
             viewport.render();
             return;
           }
@@ -765,9 +1020,39 @@ function commandsModule({
       }
 
       if (logicalViewportId === 'cpr-pano') {
-        viewport.resetCamera?.();
-        viewport.render();
         const hostedPano = (viewport.element as CPRHostedPanoElement | undefined)?.__cprVtkPanoHost;
+        const sourceVolumeId = cprStateService.getSourceVolumeId();
+        const { lower, upper } = csUtils.windowLevel.toLowHighRange(
+          CPR_PANO_RESET_WINDOW_WIDTH,
+          CPR_PANO_RESET_WINDOW_CENTER
+        );
+        if (viewport instanceof BaseVolumeViewport) {
+          if (sourceVolumeId) {
+            viewport.resetProperties?.(sourceVolumeId);
+            viewport.setProperties?.(
+              {
+                invert: false,
+                isComputedVOI: false,
+                voiRange: { lower, upper },
+                VOILUTFunction: 'LINEAR_EXACT',
+              },
+              sourceVolumeId
+            );
+          } else {
+            viewport.resetProperties?.();
+            viewport.setProperties?.({
+              invert: false,
+              isComputedVOI: false,
+              voiRange: { lower, upper },
+              VOILUTFunction: 'LINEAR_EXACT',
+            });
+          }
+        } else {
+          viewport.resetProperties?.();
+        }
+        viewport.resetCamera?.();
+        viewport.render?.();
+        hostedPano?.updateWindowLevel?.(CPR_PANO_RESET_WINDOW_WIDTH, CPR_PANO_RESET_WINDOW_CENTER);
         hostedPano?.resetCamera?.();
         hostedPano?.render?.();
         return;
@@ -1113,13 +1398,10 @@ function commandsModule({
 
       const mprToolGroup = toolGroupService.getToolGroup('mpr');
       const mprVolumeViewportCount =
-        mprToolGroup
-          ?.getViewportIds()
-          ?.filter(id => {
-            const mprViewport = cornerstoneViewportService.getCornerstoneViewport(id);
-            return mprViewport instanceof VolumeViewport;
-          })
-          ?.length ?? 0;
+        mprToolGroup?.getViewportIds()?.filter(id => {
+          const mprViewport = cornerstoneViewportService.getCornerstoneViewport(id);
+          return mprViewport instanceof VolumeViewport;
+        })?.length ?? 0;
 
       // Crosshairs require at least two MPR volume viewports.
       if (mprVolumeViewportCount < 2) {
@@ -1293,6 +1575,9 @@ function commandsModule({
     },
     setViewportActive: {
       commandFn: actions.setViewportActive,
+    },
+    toggleViewportOneUpAware: {
+      commandFn: actions.toggleViewportOneUpAware,
     },
     setViewportColormap: {
       commandFn: actions.setViewportColormap,

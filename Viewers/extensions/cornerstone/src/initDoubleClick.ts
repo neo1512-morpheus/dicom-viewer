@@ -1,4 +1,4 @@
-import { eventTarget, EVENTS } from '@cornerstonejs/core';
+import { eventTarget, EVENTS, getEnabledElement } from '@cornerstonejs/core';
 import { Enums } from '@cornerstonejs/tools';
 import { CommandsManager, CustomizationService, Types } from '@ohif/core';
 import { findNearbyToolData } from './utils/findNearbyToolData';
@@ -37,9 +37,36 @@ function getDoubleClickEventName(evt: CustomEvent) {
 export type initDoubleClickArgs = {
   customizationService: CustomizationService;
   commandsManager: CommandsManager;
+  viewportGridService: {
+    getState: () => {
+      viewports:
+        | Map<
+            string,
+            {
+              viewportOptions?: {
+                viewportId?: string;
+              };
+            }
+          >
+        | Record<
+            string,
+            {
+              viewportOptions?: {
+                viewportId?: string;
+              };
+            }
+          >;
+    };
+  };
 };
 
-function initDoubleClick({ customizationService, commandsManager }: initDoubleClickArgs): void {
+const CPR_LOGICAL_VIEWPORT_IDS = new Set(['cpr-axial', 'cpr-pano', 'cpr-crosssection']);
+
+function initDoubleClick({
+  customizationService,
+  commandsManager,
+  viewportGridService,
+}: initDoubleClickArgs): void {
   const cornerstoneViewportHandleDoubleClick = (evt: CustomEvent) => {
     // Do not allow double click on a tool.
     const nearbyToolData = findNearbyToolData(commandsManager, evt);
@@ -59,7 +86,36 @@ function initDoubleClick({ customizationService, commandsManager }: initDoubleCl
       return;
     }
 
-    commandsManager.run(toRun);
+    const clickedElement = evt.detail?.element as HTMLDivElement | undefined;
+    const clickedViewportId = clickedElement
+      ? getEnabledElement(clickedElement)?.viewport?.id
+      : undefined;
+    const viewports = viewportGridService.getState().viewports;
+    const logicalViewportId =
+      clickedViewportId &&
+      (typeof (viewports as Map<string, { viewportOptions?: { viewportId?: string } }>).get ===
+      'function'
+        ? (viewports as Map<string, { viewportOptions?: { viewportId?: string } }>).get(
+            clickedViewportId
+          )?.viewportOptions?.viewportId
+        : (
+            viewports as Record<string, { viewportOptions?: { viewportId?: string } }>
+          )?.[clickedViewportId]?.viewportOptions?.viewportId);
+    const commandToRun =
+      toRun.commandName === 'toggleOneUp' &&
+      logicalViewportId &&
+      CPR_LOGICAL_VIEWPORT_IDS.has(logicalViewportId)
+        ? {
+            ...toRun,
+            commandName: 'toggleViewportOneUpAware',
+          }
+        : toRun;
+
+    if (clickedViewportId) {
+      commandsManager.runCommand('setViewportActive', { viewportId: clickedViewportId });
+    }
+
+    commandsManager.run(commandToRun);
   };
 
   function elementEnabledHandler(evt: CustomEvent) {

@@ -200,16 +200,16 @@ export function buildVtkPanoCenterline(frames: CPRFrame[]): vtkPolyData {
         `DIAG-TRIPWIRE: vtk-orientation-tuple-0: [${orientationTuple.join(', ')}]`
       );
       console.log(
-        `DIAG-TRIPWIRE: vtk-basis-check-0 det=${handedness.toFixed(6)} dotWidthS=${dot(
-          vertical,
-          sourceVertical
-        ).toFixed(6)} dotProjSlab=${dot(slabNormal, sourceSlabNormal).toFixed(
-          6
-        )} dotTravelT=${dot(tangent, sourceTangent).toFixed(6)} widthAxis=[${vertical.join(
-          ', '
-        )}] projAxis=[${slabNormal.join(', ')}] travelAxis=[${tangent.join(', ')}]`
-      );
-    }
+          `DIAG-TRIPWIRE: vtk-basis-check-0 det=${handedness.toFixed(6)} dotWidthS=${dot(
+            vertical,
+            sourceVertical
+          ).toFixed(6)} dotProjSlab=${dot(slabNormal, sourceSlabNormal).toFixed(
+            6
+          )} dotTravelT=${dot(tangent, sourceTangent).toFixed(6)} widthAxis=[${vertical.join(
+            ', '
+          )}] projAxis=[${slabNormal.join(', ')}] travelAxis=[${tangent.join(', ')}]`
+        );
+      }
     orientationArray.setTuple(index, orientationTuple);
   }
 

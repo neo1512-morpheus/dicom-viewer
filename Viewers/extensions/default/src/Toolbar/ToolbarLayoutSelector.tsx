@@ -107,6 +107,16 @@ function ToolbarLayoutSelectorWithServices({
 }: withAppTypes) {
   const [isDisabled, setIsDisabled] = useState(false);
 
+  const releaseViewportResourcesBeforeHeavyLayout = useCallback(() => {
+    const { cornerstoneViewportService } = servicesManager.services;
+    const releasedViewportCount = cornerstoneViewportService?.disableAllElements?.() ?? 0;
+
+    console.log(
+      `[Layout] Pre-switch cleanup releasedViewportCount=${releasedViewportCount} ` +
+        'reason=large-volume-layout'
+    );
+  }, [servicesManager]);
+
   const handleMouseEnter = () => {
     setIsDisabled(false);
   };
@@ -171,6 +181,7 @@ function ToolbarLayoutSelectorWithServices({
           onProceed: () => {
             console.log('[Layout] User clicked PROCEED');
             uiModalService.hide();
+            releaseViewportResourcesBeforeHeavyLayout();
             commandsManager.run({
               commandName: 'setHangingProtocol',
               commandOptions: { ...presetProps },
@@ -202,7 +213,7 @@ function ToolbarLayoutSelectorWithServices({
       commandOptions: { ...presetProps },
     });
     setIsDisabled(true);
-  }, [servicesManager, commandsManager]);
+  }, [servicesManager, commandsManager, releaseViewportResourcesBeforeHeavyLayout]);
 
   return (
     <div onMouseEnter={handleMouseEnter}>

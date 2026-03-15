@@ -291,6 +291,16 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     this.viewportsDisplaySets.delete(viewportId);
   }
 
+  public disableAllElements(): number {
+    const viewportIds = this.getViewportIds();
+
+    viewportIds.forEach(viewportId => {
+      this.disableElement(viewportId);
+    });
+
+    return viewportIds.length;
+  }
+
   /**
    * Sets the presentations for a given viewport. Presentations is an object
    * that can define the lut or position for a viewport.

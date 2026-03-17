@@ -50,10 +50,10 @@ type HostedPanoViewportElement = HTMLElement & {
     syncCamera(
       syncState:
         | {
-            panDeltaPx?: ArrayLike<number> | null;
-            zoomRatio?: number | null;
-            viewportHeightPx?: number | null;
-          }
+          panDeltaPx?: ArrayLike<number> | null;
+          zoomRatio?: number | null;
+          viewportHeightPx?: number | null;
+        }
         | null
         | undefined
     ): void;
@@ -82,10 +82,10 @@ export interface AttachedVtkPanoCpr {
   syncCamera(
     syncState:
       | {
-          panDeltaPx?: ArrayLike<number> | null;
-          zoomRatio?: number | null;
-          viewportHeightPx?: number | null;
-        }
+        panDeltaPx?: ArrayLike<number> | null;
+        zoomRatio?: number | null;
+        viewportHeightPx?: number | null;
+      }
       | null
       | undefined
   ): void;
@@ -275,9 +275,9 @@ function getSourceVolumeModalityRescale(sourceVolume: CprSourceVolume): {
 
   const modalityLut = metaData.get('modalityLutModule', firstImageId) as
     | {
-        rescaleSlope?: number;
-        rescaleIntercept?: number;
-      }
+      rescaleSlope?: number;
+      rescaleIntercept?: number;
+    }
     | undefined;
   const slope = Number(modalityLut?.rescaleSlope);
   const intercept = Number(modalityLut?.rescaleIntercept);
@@ -308,11 +308,11 @@ function getSourceVolumePixelStorage(sourceVolume: CprSourceVolume): {
 
   const imagePixelModule = metaData.get('imagePixelModule', firstImageId) as
     | {
-        bitsStored?: number;
-        bitsAllocated?: number;
-        highBit?: number;
-        pixelRepresentation?: number;
-      }
+      bitsStored?: number;
+      bitsAllocated?: number;
+      highBit?: number;
+      pixelRepresentation?: number;
+    }
     | undefined;
 
   const bitsStored = Number(imagePixelModule?.bitsStored);
@@ -334,7 +334,7 @@ function getSourceVolumePixelStorage(sourceVolume: CprSourceVolume): {
     highBit: Math.max(0, Math.min(safeBitsAllocated - 1, safeHighBit)),
     pixelRepresentation:
       Number.isFinite(pixelRepresentation) &&
-      (pixelRepresentation === 0 || pixelRepresentation === 1)
+        (pixelRepresentation === 0 || pixelRepresentation === 1)
         ? pixelRepresentation
         : 1,
   };
@@ -444,21 +444,15 @@ function createNormalizedHuPanoSource(
   console.log(
     `DIAG-TRIPWIRE: vtk-normalized-source run=${runLabel} sourceRange=${JSON.stringify(
       sourceScalarRange
-    )} normalizedRange=${JSON.stringify(normalizedScalarRange)} sourceDataType=${sourceDataType} normalizedDataType=${normalizedDataType} sourceIsPreScaled=${rawSourceIsPreScaled} effectiveIsPreScaled=${
-      normalized.transform.effectiveIsPreScaled
-    } heuristicOverride=${normalized.transform.heuristicOverride} slope=${slope} intercept=${intercept} bitsStored=${
-      pixelStorage.bitsStored
-    } bitsAllocated=${pixelStorage.bitsAllocated} highBit=${pixelStorage.highBit} pixelRepresentation=${
-      pixelStorage.pixelRepresentation
-    } storedValueNormalizationApplied=${normalized.transform.shouldNormalizeStoredValues} normalizationSignature=${
-      normalized.transform.normalizationSignature ?? 'none'
-    } unsignedPackedArtifactDetected=${normalized.transform.unsignedPackedArtifactDetected} averageProjectionFilter=${
-      averageProjectionFilter ?? 'none'
+    )} normalizedRange=${JSON.stringify(normalizedScalarRange)} sourceDataType=${sourceDataType} normalizedDataType=${normalizedDataType} sourceIsPreScaled=${rawSourceIsPreScaled} effectiveIsPreScaled=${normalized.transform.effectiveIsPreScaled
+    } heuristicOverride=${normalized.transform.heuristicOverride} slope=${slope} intercept=${intercept} bitsStored=${pixelStorage.bitsStored
+    } bitsAllocated=${pixelStorage.bitsAllocated} highBit=${pixelStorage.highBit} pixelRepresentation=${pixelStorage.pixelRepresentation
+    } storedValueNormalizationApplied=${normalized.transform.shouldNormalizeStoredValues} normalizationSignature=${normalized.transform.normalizationSignature ?? 'none'
+    } unsignedPackedArtifactDetected=${normalized.transform.unsignedPackedArtifactDetected} averageProjectionFilter=${averageProjectionFilter ?? 'none'
     }`
   );
   console.log(
-    `CPR-VTK-PANO-REUSE run=${runLabel} normalizedHuBuffer=${
-      bufferLease.reused ? 'reused' : 'allocated'
+    `CPR-VTK-PANO-REUSE run=${runLabel} normalizedHuBuffer=${bufferLease.reused ? 'reused' : 'allocated'
     } requestedBytes=${formatBytesForLog(normalizedScalarBytes)} sourceScalarBytes=${formatBytesForLog(
       sourceScalarBytes
     )} pooledCapacityBefore=${formatBytesForLog(bufferLease.pooledCapacityBytesBeforeAcquire)}`
@@ -646,8 +640,7 @@ export function detachVtkPanoCpr(viewport: Types.IVolumeViewport, actorUID?: str
   viewport.removeActors(actorUIDs);
   viewport.render();
   console.log(
-    `CPR-VTK-PANO-DETACH run=na actorUIDs=${actorUIDs.join('|')} viewportClass=${
-      viewport.constructor?.name || 'unknown'
+    `CPR-VTK-PANO-DETACH run=na actorUIDs=${actorUIDs.join('|')} viewportClass=${viewport.constructor?.name || 'unknown'
     }`
   );
 }
@@ -755,8 +748,7 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
   const centerlineLengthMm = computePanoCenterlineLengthMm(args.frames);
 
   console.log(
-    `CPR-VTK-CENTERLINE run=${runLabel} frameCount=${args.frames.length} pointCount=${
-      centerline.getNumberOfPoints?.() ?? args.frames.length
+    `CPR-VTK-CENTERLINE run=${runLabel} frameCount=${args.frames.length} pointCount=${centerline.getNumberOfPoints?.() ?? args.frames.length
     } lengthMm=${centerlineLengthMm.toFixed(2)}`
   );
 
@@ -961,9 +953,8 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
         return 'vtk-host';
       }
 
-      return `${child.tagName.toLowerCase()}${
-        getElementClassName(child) ? `.${getElementClassName(child).replace(/\s+/g, '.')}` : ''
-      }`;
+      return `${child.tagName.toLowerCase()}${getElementClassName(child) ? `.${getElementClassName(child).replace(/\s+/g, '.')}` : ''
+        }`;
     });
 
     console.log(
@@ -1086,10 +1077,10 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
   const syncHostedCamera = (
     syncState:
       | {
-          panDeltaPx?: ArrayLike<number> | null;
-          zoomRatio?: number | null;
-          viewportHeightPx?: number | null;
-        }
+        panDeltaPx?: ArrayLike<number> | null;
+        zoomRatio?: number | null;
+        viewportHeightPx?: number | null;
+      }
       | null
       | undefined
   ) => {
@@ -1259,8 +1250,7 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
 
     internalViewportElement.insertBefore(hostContainer, insertionReference);
     console.log(
-      `DIAG-TRIPWIRE: vtk-dom-inserted. vtkContainer is firstChild: ${
-        internalViewportElement.firstChild === hostContainer
+      `DIAG-TRIPWIRE: vtk-dom-inserted. vtkContainer is firstChild: ${internalViewportElement.firstChild === hostContainer
       } hostAfterCanvas=${hostContainer.previousSibling === nativeCanvas} childOrder=${Array.from(
         internalViewportElement.childNodes
       )
@@ -1271,9 +1261,8 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
 
           if (node instanceof Element) {
             const className = getElementClassName(node);
-            return `${node.tagName.toLowerCase()}${
-              className ? `.${String(className).replace(/\s+/g, '.')}` : ''
-            }`;
+            return `${node.tagName.toLowerCase()}${className ? `.${String(className).replace(/\s+/g, '.')}` : ''
+              }`;
           }
 
           return node.nodeName;
@@ -1313,8 +1302,7 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
         renderTargetBytes
       )} estimatedPeakBytes=${formatBytesForLog(
         estimatedPeakBytes
-      )} normalizedHuBuffer=${
-        normalizedPanoSource.normalizedBufferReused ? 'reused' : 'allocated'
+      )} normalizedHuBuffer=${normalizedPanoSource.normalizedBufferReused ? 'reused' : 'allocated'
       } pooledCapacityBefore=${formatBytesForLog(
         normalizedPanoSource.pooledCapacityBytesBeforeAcquire
       )}`
@@ -1322,33 +1310,25 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
     console.log(
       `DIAG-TRIPWIRE: vtk-scalar-range run=${runLabel} sourceRange=${JSON.stringify(
         sourceScalarRange
-      )} normalizedRange=${JSON.stringify(normalizedPanoSource.scalarRange)} sourceDataType=${sourceDataType} normalizedDataType=${
-        normalizedPanoSource.dataType
-      } isPreScaled=${sourceIsPreScaled} effectiveIsPreScaled=${normalizedPanoSource.effectiveIsPreScaled} heuristicOverride=${
-        normalizedPanoSource.heuristicOverride
-      } storedValueNormalizationApplied=${normalizedPanoSource.storedValueNormalizationApplied} normalizationSignature=${
-        normalizedPanoSource.normalizationSignature ?? 'none'
+      )} normalizedRange=${JSON.stringify(normalizedPanoSource.scalarRange)} sourceDataType=${sourceDataType} normalizedDataType=${normalizedPanoSource.dataType
+      } isPreScaled=${sourceIsPreScaled} effectiveIsPreScaled=${normalizedPanoSource.effectiveIsPreScaled} heuristicOverride=${normalizedPanoSource.heuristicOverride
+      } storedValueNormalizationApplied=${normalizedPanoSource.storedValueNormalizationApplied} normalizationSignature=${normalizedPanoSource.normalizationSignature ?? 'none'
       } unsignedPackedArtifactDetected=${normalizedPanoSource.unsignedPackedArtifactDetected}`
     );
     console.log(
       `CPR-VTK-PANO-RANGE run=${runLabel} sourceVolumeId=${args.sourceVolumeId} sourceRange=${JSON.stringify(
         normalizedPanoSource.sourceScalarRange
-      )} normalizedRange=${JSON.stringify(normalizedPanoSource.scalarRange)} sourceDataType=${sourceDataType} normalizedDataType=${
-        normalizedPanoSource.dataType
-      } sourceIsPreScaled=${sourceIsPreScaled} effectiveIsPreScaled=${
-        normalizedPanoSource.effectiveIsPreScaled
-      } heuristicOverride=${normalizedPanoSource.heuristicOverride} storedValueNormalizationApplied=${
-        normalizedPanoSource.storedValueNormalizationApplied
-      } normalizationSignature=${normalizedPanoSource.normalizationSignature ?? 'none'} unsignedPackedArtifactDetected=${
-        normalizedPanoSource.unsignedPackedArtifactDetected
+      )} normalizedRange=${JSON.stringify(normalizedPanoSource.scalarRange)} sourceDataType=${sourceDataType} normalizedDataType=${normalizedPanoSource.dataType
+      } sourceIsPreScaled=${sourceIsPreScaled} effectiveIsPreScaled=${normalizedPanoSource.effectiveIsPreScaled
+      } heuristicOverride=${normalizedPanoSource.heuristicOverride} storedValueNormalizationApplied=${normalizedPanoSource.storedValueNormalizationApplied
+      } normalizationSignature=${normalizedPanoSource.normalizationSignature ?? 'none'} unsignedPackedArtifactDetected=${normalizedPanoSource.unsignedPackedArtifactDetected
       } sourceRescaleSlope=${sourceRescaleSlope} sourceRescaleIntercept=${sourceRescaleIntercept} projectionMode=${getProjectionModeLabel(
         args.projectionMode
       )} requestedWindowWidth=${initialWindowWidth.toFixed(2)} requestedWindowCenter=${initialWindowCenter.toFixed(
         2
       )} appliedWindowWidth=${appliedWindowWidth.toFixed(2)} appliedWindowCenter=${appliedWindowCenter.toFixed(
         2
-      )} translatedToStoredWindowLevel=false normalizedHuSource=true averageProjectionFilter=${
-        normalizedPanoSource.averageProjectionFilter
+      )} translatedToStoredWindowLevel=false normalizedHuSource=true averageProjectionFilter=${normalizedPanoSource.averageProjectionFilter
       }`
     );
 
@@ -1403,8 +1383,7 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
         }
 
         console.log(
-          `CPR-VTK-PANO-DETACH run=${runLabel} actorUID=${actorUID} viewportClass=${
-            args.viewport.constructor?.name || 'unknown'
+          `CPR-VTK-PANO-DETACH run=${runLabel} actorUID=${actorUID} viewportClass=${args.viewport.constructor?.name || 'unknown'
           } mode=hosted-child-render-window`
         );
         disposeConstructed();
@@ -1423,8 +1402,7 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
     });
 
     console.log(
-      `CPR-VTK-PANO-ACTOR run=${runLabel} actorUID=${actorUID} actorClass=${
-        imageSlice.getClassName?.() || 'unknown'
+      `CPR-VTK-PANO-ACTOR run=${runLabel} actorUID=${actorUID} actorClass=${imageSlice.getClassName?.() || 'unknown'
       } mapperClass=${mapper.getClassName?.() || 'unknown'} projectionMode=${getProjectionModeLabel(
         args.projectionMode
       )} slabThicknessMm=${totalSlabThicknessMm.toFixed(2)} slabSamples=${slabSamples} widthMm=${totalWidthMm.toFixed(

@@ -468,7 +468,7 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
   }, [isAxialCprViewport]);
 
   const onCrossSectionWheel = useCallback(
-    (evt: React.WheelEvent<HTMLDivElement>) => {
+    (evt: WheelEvent) => {
       if (logicalViewportId !== 'cpr-crosssection') {
         return;
       }
@@ -503,6 +503,23 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     },
     [logicalViewportId]
   );
+
+  useEffect(() => {
+    if (logicalViewportId !== 'cpr-crosssection') {
+      return;
+    }
+
+    const element = elementRef.current;
+    if (!element) {
+      return;
+    }
+
+    element.addEventListener('wheel', onCrossSectionWheel, { passive: false });
+
+    return () => {
+      element.removeEventListener('wheel', onCrossSectionWheel);
+    };
+  }, [logicalViewportId, onCrossSectionWheel]);
 
   // =====================================================
   // WebGL CONTEXT LOSS LISTENERS
@@ -809,7 +826,6 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
           style={{ height: '100%', width: '100%' }}
           onContextMenu={e => e.preventDefault()}
           onMouseDown={e => e.preventDefault()}
-          onWheel={logicalViewportId === 'cpr-crosssection' ? onCrossSectionWheel : undefined}
           ref={elementRef}
         ></div>
         <CornerstoneOverlays

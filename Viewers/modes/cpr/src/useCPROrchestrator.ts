@@ -27,10 +27,16 @@ import type { CPRFrame } from './cprMath';
 import { attachVtkPanoCpr } from './vtkPanoCprRenderer';
 import type { AttachedVtkPanoCpr, HostedVtkPanoReattachState } from './vtkPanoCprRenderer';
 
+type CprPanoDisplayPath = 'vtk-reference' | 'worker-recon';
+type CprPanoReconBackend = 'gpu' | 'cpu';
+type CprPanoDisplayBackend = CprPanoReconBackend | 'vtk';
+type CprPanoDisplaySource = 'panoImageLoader' | 'vtk-hosted-pano-actor';
+
 const CPR_PANO_DEFAULT_WINDOW_WIDTH = 2000;
 const CPR_PANO_DEFAULT_WINDOW_CENTER = 1000;
-const CPR_PANO_RENDERER_MODE: 'vtk-cpr' | 'legacy-worker' = 'vtk-cpr';
-const CPR_PANO_RENDER_BACKEND_DEFAULT = 'gpu';
+const CPR_PANO_DISPLAY_PATH_DEFAULT: CprPanoDisplayPath = 'worker-recon';
+const CPR_PANO_RECON_BACKEND_DEFAULT: CprPanoReconBackend = 'gpu';
+const CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK = false;
 const CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM = 2;
 const CPR_GPU_PANO_DEFAULT_SLAB_SAMPLES = 15;
 const CPR_VTK_PANO_PRESET_WINDOW_WIDTH = 3200;
@@ -41,8 +47,7 @@ const CPR_PANO_DEFAULT_VERTICAL_HALF_MM = 18;
 const CPR_PANO_MAX_VERTICAL_HALF_MM = 28;
 const CPR_PANO_TARGET_ASPECT = 3.2;
 const CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM = 1.5;
-const CPR_CROSSSECTION_DEFAULT_BLEND_MODE =
-  cornerstone.Enums.BlendModes.AVERAGE_INTENSITY_BLEND;
+const CPR_CROSSSECTION_DEFAULT_BLEND_MODE = cornerstone.Enums.BlendModes.AVERAGE_INTENSITY_BLEND;
 const CPR_CROSSSECTION_RENDER_WAIT_TIMEOUT_MS = 1500;
 let activePanoDebugProbeCleanup: (() => void) | null = null;
 
@@ -52,10 +57,23 @@ type PanoDebugProbeSample = {
   row: number;
   index: number;
   finalHu: number;
-  meanHu: number;
-  rayMax: number;
-  maxLift: number;
+  meanHu?: number;
+  rayMax?: number;
+  maxLift?: number;
   validSampleCount?: number;
+  supportDepthMm?: number;
+  supportConfidence?: number;
+  supportSpreadMm?: number;
+  troughLowerMm?: number;
+  troughUpperMm?: number;
+  lowerPenalty?: number;
+  localTransmittance?: number;
+  toneMappedValue?: number;
+  participatingSampleCount?: number;
+  displayedPath?: string | null;
+  backend?: string | null;
+  pipelineMode?: string | null;
+  reconstructionMode?: string | null;
   mappingMode?: string;
   canvasX?: number;
   canvasY?: number;
@@ -68,18 +86,32 @@ function clearPanoDebugProbe(): void {
   }
 }
 
+function readOptionalProbeMapValue(
+  map: Float32Array | undefined,
+  index: number
+): number | undefined {
+  if (!map || index < 0 || index >= map.length) {
+    return undefined;
+  }
+
+  const value = Number(map[index]);
+  return Number.isFinite(value) ? value : undefined;
+}
+
 function readPanoDebugProbeSample(
   payload: PanoImagePayload | null,
   imageId: string | null,
   col: number,
   row: number
 ): PanoDebugProbeSample | null {
-  if (!payload?.meanMap || !payload?.maxMap) {
+  const hasLegacyMaps = !!payload?.meanMap && !!payload?.maxMap;
+  const hasDebugMaps = !!payload?.debugMaps;
+  if (!hasLegacyMaps && !hasDebugMaps) {
     console.warn('[CPR] Pano debug probe unavailable: diagnostic sidecars are missing.', {
       imageId,
       hasPayload: !!payload,
-      hasMeanMap: !!payload?.meanMap,
-      hasMaxMap: !!payload?.maxMap,
+      hasLegacyMaps,
+      hasDebugMaps,
     });
     return null;
   }
@@ -87,10 +119,32 @@ function readPanoDebugProbeSample(
   const safeCol = Math.max(0, Math.min(payload.width - 1, Math.round(col)));
   const safeRow = Math.max(0, Math.min(payload.height - 1, Math.round(row)));
   const index = safeRow * payload.width + safeCol;
+  const hasPhase2ProbeMaps =
+    !!payload.debugMaps?.supportDepthMap || !!payload.debugMaps?.toneResponseMap;
   const finalHu = Number(payload.pixelData[index]);
-  const meanHu = Number(payload.meanMap[index]);
-  const rayMax = Number(payload.maxMap[index]);
-  const validSampleCount = payload.sampleCountMap ? Number(payload.sampleCountMap[index]) : undefined;
+  const meanHu =
+    !hasPhase2ProbeMaps && payload.meanMap ? Number(payload.meanMap[index]) : undefined;
+  const rayMax = !hasPhase2ProbeMaps && payload.maxMap ? Number(payload.maxMap[index]) : undefined;
+  const validSampleCount =
+    payload.sampleCountMap && !payload.debugMaps?.toneResponseMap
+      ? Number(payload.sampleCountMap[index])
+      : undefined;
+  const supportDepthMm = readOptionalProbeMapValue(payload.debugMaps?.supportDepthMap, index);
+  const supportConfidence = readOptionalProbeMapValue(
+    payload.debugMaps?.supportConfidenceMap,
+    index
+  );
+  const supportSpreadMm = readOptionalProbeMapValue(payload.debugMaps?.supportSpreadMap, index);
+  const troughHalfWidthMm = readOptionalProbeMapValue(payload.debugMaps?.troughHalfWidthMap, index);
+  const lowerPenalty = readOptionalProbeMapValue(payload.debugMaps?.lowerPenaltyMap, index);
+  const totalAttenuation = readOptionalProbeMapValue(payload.debugMaps?.totalAttenuationMap, index);
+  const toneMappedValue = readOptionalProbeMapValue(payload.debugMaps?.toneResponseMap, index);
+  const participatingSampleCount = readOptionalProbeMapValue(
+    payload.debugMaps?.participatingSampleCountMap,
+    index
+  );
+  const localTransmittance =
+    typeof totalAttenuation === 'number' ? Math.exp(-Math.max(totalAttenuation, 0)) : undefined;
 
   return {
     imageId,
@@ -98,10 +152,32 @@ function readPanoDebugProbeSample(
     row: safeRow,
     index,
     finalHu,
-    meanHu,
-    rayMax,
-    maxLift: rayMax - meanHu,
+    meanHu: Number.isFinite(meanHu) ? meanHu : undefined,
+    rayMax: Number.isFinite(rayMax) ? rayMax : undefined,
+    maxLift:
+      Number.isFinite(meanHu) && Number.isFinite(rayMax)
+        ? Number(rayMax) - Number(meanHu)
+        : undefined,
     validSampleCount: Number.isFinite(validSampleCount) ? validSampleCount : undefined,
+    supportDepthMm,
+    supportConfidence,
+    supportSpreadMm,
+    troughLowerMm:
+      typeof supportDepthMm === 'number' && typeof troughHalfWidthMm === 'number'
+        ? supportDepthMm - troughHalfWidthMm
+        : undefined,
+    troughUpperMm:
+      typeof supportDepthMm === 'number' && typeof troughHalfWidthMm === 'number'
+        ? supportDepthMm + troughHalfWidthMm
+        : undefined,
+    lowerPenalty,
+    localTransmittance,
+    toneMappedValue,
+    participatingSampleCount,
+    displayedPath: payload.probeContext?.displayedPath ?? null,
+    backend: payload.probeContext?.backend ?? null,
+    pipelineMode: payload.probeContext?.pipelineMode ?? null,
+    reconstructionMode: payload.probeContext?.reconstructionMode ?? null,
   };
 }
 
@@ -150,7 +226,10 @@ function resolvePanoProbePixelFromMouse(
         mappingMode = 'canvasToWorld';
       }
     } catch (error) {
-      console.warn('[CPR] Pano debug probe canvasToWorld mapping failed; falling back to element mapping.', error);
+      console.warn(
+        '[CPR] Pano debug probe canvasToWorld mapping failed; falling back to element mapping.',
+        error
+      );
     }
   }
 
@@ -190,7 +269,11 @@ function installPanoDebugProbe(
   const debugHost = window as Window & {
     cprDebug?: {
       latestPanoImageId?: string | null;
-      probePanoAt?: (col: number, row: number, imageId?: string | null) => PanoDebugProbeSample | null;
+      probePanoAt?: (
+        col: number,
+        row: number,
+        imageId?: string | null
+      ) => PanoDebugProbeSample | null;
       detachPanoClickProbe?: () => void;
     };
   };
@@ -207,6 +290,33 @@ function installPanoDebugProbe(
     }
 
     console.log(`[CPR][${runId}] PANO_DEBUG_PROBE`, sample);
+    if (
+      typeof sample.supportDepthMm === 'number' ||
+      typeof sample.localTransmittance === 'number' ||
+      typeof sample.toneMappedValue === 'number'
+    ) {
+      console.log(
+        '[CPR-PROBE-EXT-JSON]',
+        JSON.stringify({
+          runId,
+          imageId: sample.imageId,
+          col: sample.col,
+          row: sample.row,
+          displayedPath: sample.displayedPath ?? null,
+          backend: sample.backend ?? null,
+          pipelineMode: sample.pipelineMode ?? null,
+          reconstructionMode: sample.reconstructionMode ?? null,
+          supportDepthMm: sample.supportDepthMm ?? null,
+          supportConfidence: sample.supportConfidence ?? null,
+          troughLowerMm: sample.troughLowerMm ?? null,
+          troughUpperMm: sample.troughUpperMm ?? null,
+          localTransmittance: sample.localTransmittance ?? null,
+          toneMappedValue: sample.toneMappedValue ?? null,
+          lowerPenalty: sample.lowerPenalty ?? null,
+          participatingSampleCount: sample.participatingSampleCount ?? null,
+        })
+      );
+    }
     return sample;
   };
 
@@ -296,10 +406,7 @@ interface HostedPanoVoiAuthority {
 
 const CPR_VTK_PANO_STARTUP_VOI_GUARD_MS = 2000;
 
-function formatReadablePanoValue(
-  value: number | null | undefined,
-  fractionDigits = 1
-): string {
+function formatReadablePanoValue(value: number | null | undefined, fractionDigits = 1): string {
   if (!Number.isFinite(value)) {
     return 'na';
   }
@@ -307,12 +414,149 @@ function formatReadablePanoValue(
   return Number(value).toFixed(fractionDigits);
 }
 
+function toNonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+}
+
+function parsePanoReconBackend(value: unknown): CprPanoReconBackend | null {
+  return value === 'gpu' || value === 'cpu' ? value : null;
+}
+
+function resolveWorkerDisplayRouteDiagnostic(
+  workerDebugPayload: CPRWorkerLaunchResult['workerDebugPayload'] | null | undefined
+): {
+  backend: CprPanoReconBackend;
+  requestedBackend: CprPanoReconBackend;
+  pipelineMode: string;
+  fallbackReason: string | null;
+  phase2GatePassed: boolean | null;
+} {
+  const diagnostic =
+    workerDebugPayload &&
+    typeof workerDebugPayload === 'object' &&
+    workerDebugPayload.diagnostic &&
+    typeof workerDebugPayload.diagnostic === 'object'
+      ? (workerDebugPayload.diagnostic as Record<string, unknown>)
+      : null;
+  const gpuRender =
+    diagnostic?.gpuRender && typeof diagnostic.gpuRender === 'object'
+      ? (diagnostic.gpuRender as Record<string, unknown>)
+      : null;
+  const requestedBackend =
+    parsePanoReconBackend(diagnostic?.requestedRenderBackend) ?? CPR_PANO_RECON_BACKEND_DEFAULT;
+  const backend = parsePanoReconBackend(diagnostic?.renderBackend) ?? requestedBackend;
+  const phase2GatePassed =
+    typeof gpuRender?.phase2GatePassed === 'boolean'
+      ? Boolean(gpuRender?.phase2GatePassed)
+      : typeof diagnostic?.phase2GatePassed === 'boolean'
+        ? Boolean(diagnostic?.phase2GatePassed)
+        : null;
+  const pipelineMode =
+    toNonEmptyString(diagnostic?.pipelineMode) ||
+    toNonEmptyString(gpuRender?.pipelineMode) ||
+    toNonEmptyString(diagnostic?.reconstructionMode) ||
+    'unknown';
+  const fallbackReason =
+    toNonEmptyString(diagnostic?.fallbackReason) ||
+    (requestedBackend === 'gpu' && backend === 'gpu' && phase2GatePassed === false
+      ? 'gpu-phase2-gate-failed'
+      : null) ||
+    (requestedBackend === 'gpu' && backend === 'cpu' ? 'gpu-request-resolved-on-cpu' : null);
+
+  return {
+    backend,
+    requestedBackend,
+    pipelineMode,
+    fallbackReason,
+    phase2GatePassed,
+  };
+}
+
+function resolveDisplayedOutputModeFromWorkerResult(params: {
+  routeDiagnostic: ReturnType<typeof resolveWorkerDisplayRouteDiagnostic>;
+  workerDebugPayload: CPRWorkerLaunchResult['workerDebugPayload'] | null | undefined;
+}): 'legacy' | 'workerGpuPhase2' | 'virtualPanoPhase2' {
+  const diagnostic =
+    params.workerDebugPayload &&
+    typeof params.workerDebugPayload === 'object' &&
+    params.workerDebugPayload.diagnostic &&
+    typeof params.workerDebugPayload.diagnostic === 'object'
+      ? (params.workerDebugPayload.diagnostic as Record<string, unknown>)
+      : null;
+  const resolvedReconstructionMode =
+    toNonEmptyString(diagnostic?.reconstructionMode) ||
+    toNonEmptyString(diagnostic?.pipelineMode) ||
+    'legacy';
+
+  if (params.routeDiagnostic.backend === 'cpu' && resolvedReconstructionMode === 'virtualPano') {
+    return 'virtualPanoPhase2';
+  }
+
+  if (
+    params.routeDiagnostic.backend === 'gpu' &&
+    params.routeDiagnostic.phase2GatePassed !== false
+  ) {
+    return 'workerGpuPhase2';
+  }
+
+  return 'legacy';
+}
+
+function logPanoDisplayRoute(params: {
+  runId: string;
+  displayedPath: CprPanoDisplayPath;
+  backend: CprPanoDisplayBackend;
+  pipelineMode: string;
+  fallbackReason?: string | null;
+  requestedBackend?: CprPanoReconBackend | null;
+}): void {
+  const requestedBackendSuffix =
+    params.requestedBackend && params.requestedBackend !== params.backend
+      ? ` requestedBackend=${params.requestedBackend}`
+      : '';
+  console.log(
+    `[CPR-PANO-DISPLAY] run=${params.runId} displayedPath=${params.displayedPath} ` +
+      `backend=${params.backend} pipelineMode=${params.pipelineMode} ` +
+      `fallbackReason=${params.fallbackReason ?? 'none'}${requestedBackendSuffix}`
+  );
+}
+
+function logReconModeJson(params: {
+  runId: string;
+  displayedPath: CprPanoDisplayPath;
+  backend: CprPanoDisplayBackend;
+  pipelineMode: string;
+  reconstructionMode: string;
+  displaySource: CprPanoDisplaySource;
+  referencePathAvailable: boolean;
+  sourceVolumeId?: string | null;
+  fallbackReason?: string | null;
+  requestedBackend?: CprPanoReconBackend | null;
+  phase2GatePassed?: boolean | null;
+}): void {
+  console.log(
+    '[CPR-RECON-MODE-JSON]',
+    JSON.stringify({
+      runId: params.runId,
+      displayedPath: params.displayedPath,
+      backend: params.backend,
+      requestedBackend: params.requestedBackend ?? null,
+      pipelineMode: params.pipelineMode,
+      reconstructionMode: params.reconstructionMode,
+      displaySource: params.displaySource,
+      referencePathAvailable: params.referencePathAvailable,
+      referenceOrLegacyFallbackAllowed: CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK,
+      sourceVolumeId: params.sourceVolumeId ?? null,
+      fallbackReason: params.fallbackReason ?? null,
+      phase2GatePassed:
+        typeof params.phase2GatePassed === 'boolean' ? params.phase2GatePassed : null,
+    })
+  );
+}
+
 function isHuLikeRange(minValue: number, maxValue: number): boolean {
   return (
-    Number.isFinite(minValue) &&
-    Number.isFinite(maxValue) &&
-    minValue >= -5000 &&
-    maxValue <= 7000
+    Number.isFinite(minValue) && Number.isFinite(maxValue) && minValue >= -5000 && maxValue <= 7000
   );
 }
 
@@ -347,8 +591,7 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
   const hasMedianOutOfTypicalRange = summary.p50 < -1800 || summary.p50 > 2600;
   const hasStrongSpeckleNoise = summary.meanAbsDelta > 780;
   const hasModerateSpeckleNoise = summary.meanAbsDelta > 640;
-  const hasLowerBandFill =
-    summary.lowerBandP50 > 140 || summary.lowerBandBrightFraction > 0.7;
+  const hasLowerBandFill = summary.lowerBandP50 > 140 || summary.lowerBandBrightFraction > 0.7;
   const detailAnisotropyRatio =
     summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean);
   const balancedDetailEdgeMean = Math.min(
@@ -363,8 +606,7 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
     summary.toothBandP90 > 1450;
   const hasWeakToothBandContrast = toothBandContrastRange < 260;
   const hasWeakDentalSeparation = balancedDetailEdgeMean < 38;
-  const hasShearWarping =
-    summary.detailBandHorizontalEdgeMean > 220 && detailAnisotropyRatio > 3;
+  const hasShearWarping = summary.detailBandHorizontalEdgeMean > 220 && detailAnisotropyRatio > 3;
 
   return (
     hasExtremeOutliers ||
@@ -576,6 +818,318 @@ function scoreHardRejectedPanoFallback(summary: FloatBufferDebugSummary | null):
   return score;
 }
 
+type Phase4QualityGateCandidateSource =
+  | 'worker-gpu-support-surface'
+  | 'worker-cpu-virtual-pano'
+  | 'worker-legacy';
+
+interface Phase4QualityGateMetrics {
+  sampledCount: number | null;
+  lowerBandBrightFraction: number | null;
+  lowerBandP50: number | null;
+  toothBandMean: number | null;
+  toothBandP10: number | null;
+  toothBandP90: number | null;
+  toothBandContrastRange: number | null;
+  detailBandHorizontalEdgeMean: number | null;
+  detailBandVerticalEdgeMean: number | null;
+  supportDepthClampFraction: number | null;
+  supportDepthStdMm: number | null;
+  pathJumpP95Mm: number | null;
+  supportConfidenceP10: number | null;
+  supportConfidenceP50: number | null;
+  supportConfidenceP90: number | null;
+  fractionBelowMinus950: number | null;
+  fractionAbove3000: number | null;
+}
+
+interface Phase4QualityGateCandidate {
+  candidateSource: Phase4QualityGateCandidateSource;
+  displayedPath: CprPanoDisplayPath;
+  backend: CprPanoDisplayBackend;
+  requestedBackend: CprPanoReconBackend | null;
+  attemptLabel: string | null;
+  requestedReconstructionMode: string | null;
+  reconstructionMode: string;
+  pipelineMode: string;
+  sourceVolumeId: string | null;
+  fallbackReason: string | null;
+  phase2GatePassed: boolean | null;
+  qualityBase: number | null;
+  qualityScore: number | null;
+  hardRejectReason: string | null;
+  workerRejectReasons: string[];
+  workerUsedAsOutput: boolean | null;
+  borderlineAcceptedReason: string | null;
+  pass: boolean;
+  rejectReasons: string[];
+  metrics: Phase4QualityGateMetrics;
+}
+
+function compareRankedPanoOutputs(
+  a: {
+    qualityBase: number;
+    qualityScore: number;
+    hardRejectReason: string | null;
+    summary: FloatBufferDebugSummary | null;
+  },
+  b: {
+    qualityBase: number;
+    qualityScore: number;
+    hardRejectReason: string | null;
+    summary: FloatBufferDebugSummary | null;
+  }
+): number {
+  const aHardRejected = !!a.hardRejectReason;
+  const bHardRejected = !!b.hardRejectReason;
+  if (aHardRejected !== bHardRejected) {
+    return aHardRejected ? 1 : -1;
+  }
+  if (aHardRejected && bHardRejected) {
+    const fallbackDelta = scoreHardRejectedPanoFallback(a.summary) - scoreHardRejectedPanoFallback(b.summary);
+    if (Math.abs(fallbackDelta) > 1e-6) {
+      return fallbackDelta > 0 ? -1 : 1;
+    }
+  }
+  return b.qualityScore - a.qualityScore || b.qualityBase - a.qualityBase;
+}
+
+function readPhase4DiagnosticRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+}
+
+function readPhase4DiagnosticNumber(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function readPhase4DiagnosticBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function readPhase4DiagnosticStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function isPhase4LowerBandRejectReason(reason: string): boolean {
+  return (
+    reason === 'lower-band-bright-fraction-too-high' ||
+    reason === 'lower-band-p50-too-high' ||
+    reason === 'lower-band-mean-too-high' ||
+    reason === 'lower-suppression-ratio-too-high'
+  );
+}
+
+function extractPhase4QualityGateMetrics(
+  summary: FloatBufferDebugSummary | null,
+  workerDebugPayload: CPRWorkerLaunchResult['workerDebugPayload'] | null | undefined
+): Phase4QualityGateMetrics {
+  const diagnostic = readPhase4DiagnosticRecord(workerDebugPayload?.diagnostic);
+  const gpuRender = readPhase4DiagnosticRecord(diagnostic?.gpuRender);
+  const gpuSupportSurface = readPhase4DiagnosticRecord(gpuRender?.supportSurface);
+  const virtualPanoPhase12 = readPhase4DiagnosticRecord(diagnostic?.virtualPanoPhase12);
+  const cpuSupportSurface = readPhase4DiagnosticRecord(virtualPanoPhase12?.supportSurface);
+  const virtualPanoRender = readPhase4DiagnosticRecord(diagnostic?.virtualPanoRender);
+  const supportSurface = gpuSupportSurface ?? cpuSupportSurface;
+
+  return {
+    sampledCount: summary?.sampledCount ?? null,
+    lowerBandBrightFraction: summary?.lowerBandBrightFraction ?? null,
+    lowerBandP50: summary?.lowerBandP50 ?? null,
+    toothBandMean: summary?.toothBandMean ?? null,
+    toothBandP10: summary?.toothBandP10 ?? null,
+    toothBandP90: summary?.toothBandP90 ?? null,
+    toothBandContrastRange:
+      summary ? summary.toothBandP90 - summary.toothBandP10 : readPhase4DiagnosticNumber(virtualPanoRender?.toothBandContrastRange),
+    detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean ?? null,
+    detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean ?? null,
+    supportDepthClampFraction:
+      readPhase4DiagnosticNumber(supportSurface?.clampFraction) ??
+      readPhase4DiagnosticNumber(supportSurface?.supportDepthClampFraction) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.supportDepthClampFraction),
+    supportDepthStdMm: readPhase4DiagnosticNumber(supportSurface?.depthStdMm),
+    pathJumpP95Mm: readPhase4DiagnosticNumber(supportSurface?.pathJumpP95Mm),
+    supportConfidenceP10: readPhase4DiagnosticNumber(supportSurface?.confidenceP10),
+    supportConfidenceP50: readPhase4DiagnosticNumber(supportSurface?.confidenceP50),
+    supportConfidenceP90: readPhase4DiagnosticNumber(supportSurface?.confidenceP90),
+    fractionBelowMinus950: summary?.fractionBelowMinus950 ?? null,
+    fractionAbove3000: summary?.fractionAbove3000 ?? null,
+  };
+}
+
+function buildPhase4QualityGateCandidate(params: {
+  attemptLabel?: string | null;
+  displayedPath: CprPanoDisplayPath;
+  sourceVolumeId?: string | null;
+  summary: FloatBufferDebugSummary | null;
+  qualityBase?: number | null;
+  qualityScore?: number | null;
+  hardRejectReason?: string | null;
+  workerDebugPayload: CPRWorkerLaunchResult['workerDebugPayload'] | null | undefined;
+  backendOverride?: CprPanoDisplayBackend | null;
+  requestedBackendOverride?: CprPanoReconBackend | null;
+  fallbackReasonOverride?: string | null;
+  pipelineModeOverride?: string | null;
+  reconstructionModeOverride?: string | null;
+}): Phase4QualityGateCandidate {
+  const diagnostic = readPhase4DiagnosticRecord(params.workerDebugPayload?.diagnostic);
+  const routeDiagnostic = resolveWorkerDisplayRouteDiagnostic(params.workerDebugPayload);
+  const outputSelection = readPhase4DiagnosticRecord(diagnostic?.outputSelection);
+  const virtualPanoRender = readPhase4DiagnosticRecord(diagnostic?.virtualPanoRender);
+  const requestedReconstructionMode =
+    toNonEmptyString(diagnostic?.requestedReconstructionMode) ??
+    toNonEmptyString(outputSelection?.requestedReconstructionMode) ??
+    null;
+  const reconstructionMode =
+    params.reconstructionModeOverride ??
+    toNonEmptyString(diagnostic?.reconstructionMode) ??
+    toNonEmptyString(outputSelection?.selectedReconstructionMode) ??
+    routeDiagnostic.pipelineMode;
+  const backend = params.backendOverride ?? routeDiagnostic.backend;
+  const requestedBackend = params.requestedBackendOverride ?? routeDiagnostic.requestedBackend;
+  const fallbackReason = params.fallbackReasonOverride ?? routeDiagnostic.fallbackReason;
+  const pipelineMode = params.pipelineModeOverride ?? routeDiagnostic.pipelineMode;
+  const outputSelectionRejectReasons = readPhase4DiagnosticStringArray(outputSelection?.rejectReasons);
+  const virtualPanoRenderRejectReasons = readPhase4DiagnosticStringArray(
+    virtualPanoRender?.rejectReasons
+  );
+  const workerRejectReasons =
+    outputSelectionRejectReasons.length > 0
+      ? outputSelectionRejectReasons
+      : virtualPanoRenderRejectReasons;
+  const workerUsedAsOutput =
+    readPhase4DiagnosticBoolean(outputSelection?.virtualPanoAccepted) ??
+    readPhase4DiagnosticBoolean(virtualPanoRender?.usedAsOutput);
+  const workerAcceptedByLowerBandTolerance =
+    readPhase4DiagnosticBoolean(outputSelection?.acceptedByLowerBandTolerance) === true ||
+    readPhase4DiagnosticBoolean(virtualPanoRender?.acceptedByLowerBandTolerance) === true;
+  const metrics = extractPhase4QualityGateMetrics(params.summary, params.workerDebugPayload);
+  const candidateSource: Phase4QualityGateCandidateSource =
+    backend === 'gpu'
+      ? 'worker-gpu-support-surface'
+      : reconstructionMode === 'virtualPano'
+        ? 'worker-cpu-virtual-pano'
+        : 'worker-legacy';
+
+  const rejectReasons: string[] = [];
+  if (!params.summary || params.summary.sampledCount < 100) {
+    rejectReasons.push('summary-unavailable');
+  }
+  if (candidateSource === 'worker-gpu-support-surface' && routeDiagnostic.phase2GatePassed === false) {
+    rejectReasons.push('gpu-phase2-gate-failed');
+  }
+  if (params.hardRejectReason) {
+    rejectReasons.push(`hard-reject:${params.hardRejectReason}`);
+  }
+  if (
+    candidateSource === 'worker-legacy' &&
+    requestedReconstructionMode !== 'legacy' &&
+    !CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK
+  ) {
+    rejectReasons.push('legacy-fallback-not-allowed');
+  }
+  if (
+    metrics.lowerBandBrightFraction !== null &&
+    metrics.lowerBandBrightFraction > 0.25
+  ) {
+    rejectReasons.push('lower-band-bright-fraction-too-high');
+  }
+  if (metrics.lowerBandP50 !== null && metrics.lowerBandP50 > -100) {
+    rejectReasons.push('lower-band-p50-too-high');
+  }
+  if (
+    metrics.toothBandContrastRange !== null &&
+    metrics.toothBandContrastRange < 350
+  ) {
+    rejectReasons.push('tooth-band-contrast-too-low');
+  }
+  if (
+    metrics.supportDepthClampFraction !== null &&
+    metrics.supportDepthClampFraction > 0.15
+  ) {
+    rejectReasons.push('support-depth-clamp-fraction-too-high');
+  }
+  if (metrics.pathJumpP95Mm !== null && metrics.pathJumpP95Mm > 1.2) {
+    rejectReasons.push('path-jump-p95-too-high');
+  }
+  if (!workerAcceptedByLowerBandTolerance && workerUsedAsOutput === false) {
+    rejectReasons.push(...workerRejectReasons);
+  }
+
+  const uniqueRejectReasons = Array.from(new Set(rejectReasons));
+  const lowerBandOnlyRejects =
+    uniqueRejectReasons.length > 0 &&
+    uniqueRejectReasons.every(reason => isPhase4LowerBandRejectReason(reason));
+  const borderlineAcceptedReason =
+    workerAcceptedByLowerBandTolerance
+      ? 'lower-band-tolerated-in-worker'
+      : lowerBandOnlyRejects &&
+          (params.qualityScore ?? Number.NEGATIVE_INFINITY) >= 12 &&
+          (metrics.toothBandContrastRange ?? 0) >= 350
+        ? 'lower-band-only-borderline'
+        : null;
+
+  return {
+    candidateSource,
+    displayedPath: params.displayedPath,
+    backend,
+    requestedBackend,
+    attemptLabel: params.attemptLabel ?? null,
+    requestedReconstructionMode,
+    reconstructionMode,
+    pipelineMode,
+    sourceVolumeId: params.sourceVolumeId ?? null,
+    fallbackReason,
+    phase2GatePassed: routeDiagnostic.phase2GatePassed,
+    qualityBase:
+      typeof params.qualityBase === 'number' && Number.isFinite(params.qualityBase)
+        ? params.qualityBase
+        : null,
+    qualityScore:
+      typeof params.qualityScore === 'number' && Number.isFinite(params.qualityScore)
+        ? params.qualityScore
+        : null,
+    hardRejectReason: params.hardRejectReason ?? null,
+    workerRejectReasons,
+    workerUsedAsOutput,
+    borderlineAcceptedReason,
+    pass:
+      uniqueRejectReasons.length === 0 ||
+      (borderlineAcceptedReason !== null && lowerBandOnlyRejects),
+    rejectReasons: uniqueRejectReasons,
+    metrics,
+  };
+}
+
+function summarizePhase4QualityGateCandidate(candidate: Phase4QualityGateCandidate | null) {
+  if (!candidate) {
+    return null;
+  }
+
+  return {
+    candidateSource: candidate.candidateSource,
+    attemptLabel: candidate.attemptLabel,
+    displayedPath: candidate.displayedPath,
+    backend: candidate.backend,
+    requestedBackend: candidate.requestedBackend,
+    requestedReconstructionMode: candidate.requestedReconstructionMode,
+    reconstructionMode: candidate.reconstructionMode,
+    pipelineMode: candidate.pipelineMode,
+    sourceVolumeId: candidate.sourceVolumeId,
+    fallbackReason: candidate.fallbackReason,
+    phase2GatePassed: candidate.phase2GatePassed,
+    qualityBase: candidate.qualityBase,
+    qualityScore: candidate.qualityScore,
+    hardRejectReason: candidate.hardRejectReason,
+    workerRejectReasons: candidate.workerRejectReasons,
+    workerUsedAsOutput: candidate.workerUsedAsOutput,
+    borderlineAcceptedReason: candidate.borderlineAcceptedReason,
+    pass: candidate.pass,
+    rejectReasons: candidate.rejectReasons,
+    metrics: candidate.metrics,
+  };
+}
+
 function percentileFromSorted(values: number[], q: number): number {
   if (!values.length) {
     return NaN;
@@ -663,9 +1217,15 @@ function summarizeFloatBufferForDebug(
       const row = Math.round(panoCenterRow + yNorm * panoCenterRow);
       return Math.max(0, Math.min(safeHeight - 1, row));
     };
-    const toothBandStartRow = Math.min(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
+    const toothBandStartRow = Math.min(
+      rowFromNormalizedOffset(-0.35),
+      rowFromNormalizedOffset(0.55)
+    );
     const toothBandEndRow = Math.max(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
-    const lowerBandStartRow = Math.min(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
+    const lowerBandStartRow = Math.min(
+      rowFromNormalizedOffset(0.65),
+      rowFromNormalizedOffset(1.15)
+    );
     const lowerBandEndRow = Math.max(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
     const detailBandStartRow = Math.max(0, Math.floor(safeHeight * 0.12));
     const detailBandEndRow = Math.min(safeHeight - 1, Math.ceil(safeHeight * 0.72));
@@ -747,9 +1307,13 @@ function summarizeFloatBufferForDebug(
     lowerBandP50: lowerBandSamples.length ? percentileFromSorted(lowerBandSamples, 0.5) : 0,
     lowerBandBrightFraction: lowerBandCount > 0 ? lowerBandBrightCount / lowerBandCount : 0,
     detailBandHorizontalEdgeMean:
-      detailBandHorizontalEdgeCount > 0 ? detailBandHorizontalEdgeAccum / detailBandHorizontalEdgeCount : 0,
+      detailBandHorizontalEdgeCount > 0
+        ? detailBandHorizontalEdgeAccum / detailBandHorizontalEdgeCount
+        : 0,
     detailBandVerticalEdgeMean:
-      detailBandVerticalEdgeCount > 0 ? detailBandVerticalEdgeAccum / detailBandVerticalEdgeCount : 0,
+      detailBandVerticalEdgeCount > 0
+        ? detailBandVerticalEdgeAccum / detailBandVerticalEdgeCount
+        : 0,
   };
 }
 
@@ -758,11 +1322,14 @@ function reconstructPanoFloatBuffer(
   slope: number,
   intercept: number
 ): Float32Array {
-  const safeSlope =
-    Number.isFinite(slope) && Math.abs(Number(slope)) > 1e-8 ? Number(slope) : 1;
+  const safeSlope = Number.isFinite(slope) && Math.abs(Number(slope)) > 1e-8 ? Number(slope) : 1;
   const safeIntercept = Number.isFinite(intercept) ? Number(intercept) : 0;
 
-  if (pixelData instanceof Float32Array && Math.abs(safeSlope - 1) <= 1e-6 && Math.abs(safeIntercept) <= 1e-6) {
+  if (
+    pixelData instanceof Float32Array &&
+    Math.abs(safeSlope - 1) <= 1e-6 &&
+    Math.abs(safeIntercept) <= 1e-6
+  ) {
     return pixelData;
   }
 
@@ -792,7 +1359,11 @@ function computeAdaptivePanoVoi(
   let adaptiveLower = Number.isFinite(p01) ? Number(p01) : lower;
   let adaptiveUpper = Number.isFinite(p99) ? Number(p99) : upper;
 
-  if (!Number.isFinite(adaptiveLower) || !Number.isFinite(adaptiveUpper) || adaptiveUpper <= adaptiveLower) {
+  if (
+    !Number.isFinite(adaptiveLower) ||
+    !Number.isFinite(adaptiveUpper) ||
+    adaptiveUpper <= adaptiveLower
+  ) {
     adaptiveLower = lower;
     adaptiveUpper = upper;
   }
@@ -802,7 +1373,11 @@ function computeAdaptivePanoVoi(
   adaptiveLower -= padding;
   adaptiveUpper += padding;
 
-  if (!Number.isFinite(adaptiveLower) || !Number.isFinite(adaptiveUpper) || adaptiveUpper <= adaptiveLower) {
+  if (
+    !Number.isFinite(adaptiveLower) ||
+    !Number.isFinite(adaptiveUpper) ||
+    adaptiveUpper <= adaptiveLower
+  ) {
     adaptiveLower = fallbackLower;
     adaptiveUpper = fallbackUpper;
   }
@@ -811,9 +1386,7 @@ function computeAdaptivePanoVoi(
   const windowCenter = adaptiveLower + windowWidth / 2;
 
   const hasSplitOutliers =
-    !!summary &&
-    summary.fractionBelowMinus950 > 0.4 &&
-    summary.fractionAbove3000 > 0.15;
+    !!summary && summary.fractionBelowMinus950 > 0.4 && summary.fractionAbove3000 > 0.15;
   const isExtremeWindow = adaptiveLower < -5000 || adaptiveUpper > 7000;
   if (hasSplitOutliers && isExtremeWindow) {
     const robustCenter = Number.isFinite(summary?.p50) ? Number(summary?.p50) : windowCenter;
@@ -847,11 +1420,13 @@ function computeAdaptivePanoVoi(
     }
 
     if (summary && summary.lowerBandBrightFraction > 0.62) {
-      const targetWidth =
-        summary.detailBandHorizontalEdgeMean > 210 ? 1300 : 1450;
+      const targetWidth = summary.detailBandHorizontalEdgeMean > 210 ? 1300 : 1450;
       const targetCenter = Math.max(
         120,
-        Math.min(260, 170 + (summary.lowerBandBrightFraction - 0.62) * 260 + Math.max(0, summary.p50) * 0.15)
+        Math.min(
+          260,
+          170 + (summary.lowerBandBrightFraction - 0.62) * 260 + Math.max(0, summary.p50) * 0.15
+        )
       );
       return {
         lower: targetCenter - targetWidth / 2,
@@ -861,10 +1436,8 @@ function computeAdaptivePanoVoi(
       };
     }
 
-    const minHuWindowWidth =
-      summary && summary.detailBandHorizontalEdgeMean >= 85 ? 1600 : 1750;
-    const maxDentalWindowWidth =
-      summary && summary.lowerBandBrightFraction > 0.45 ? 2200 : 2500;
+    const minHuWindowWidth = summary && summary.detailBandHorizontalEdgeMean >= 85 ? 1600 : 1750;
+    const maxDentalWindowWidth = summary && summary.lowerBandBrightFraction > 0.45 ? 2200 : 2500;
     const widthWithMin = Math.max(windowWidth, minHuWindowWidth);
     const cappedWidth = Math.min(widthWithMin, maxDentalWindowWidth);
     const dentalCenterMin = -120;
@@ -1295,15 +1868,23 @@ function sanitizeSplineControlPoints(
   };
 } {
   const safeMinSpacingMm = Math.max(0.2, toPositiveFinite(minSpacingMm, 0.3));
-  const rawEdgeLengths = computeSplineEdgeLengths(rawPoints).filter(length => Number.isFinite(length) && length > 0);
+  const rawEdgeLengths = computeSplineEdgeLengths(rawPoints).filter(
+    length => Number.isFinite(length) && length > 0
+  );
   const medianRawEdgeLengthMm = median(rawEdgeLengths);
   const dedupeThresholdMm = Math.max(
     safeMinSpacingMm * 1.25,
-    Math.min(1.25, medianRawEdgeLengthMm > 0 ? medianRawEdgeLengthMm * 0.22 : safeMinSpacingMm * 1.6)
+    Math.min(
+      1.25,
+      medianRawEdgeLengthMm > 0 ? medianRawEdgeLengthMm * 0.22 : safeMinSpacingMm * 1.6
+    )
   );
   const closureThresholdMm = Math.max(
     dedupeThresholdMm * 1.5,
-    Math.min(2.4, medianRawEdgeLengthMm > 0 ? medianRawEdgeLengthMm * 0.55 : dedupeThresholdMm * 2.2)
+    Math.min(
+      2.4,
+      medianRawEdgeLengthMm > 0 ? medianRawEdgeLengthMm * 0.55 : dedupeThresholdMm * 2.2
+    )
   );
   const suspiciousJumpThresholdMm = Math.max(
     12,
@@ -1455,6 +2036,7 @@ interface CPRWorkerLaunchResult {
   meanMap?: Float32Array;
   maxMap?: Float32Array;
   sampleCountMap?: Float32Array;
+  debugMaps?: PanoImagePayload['debugMaps'];
   width: number;
   height: number;
   minValue: number;
@@ -1496,6 +2078,7 @@ interface CPRWorkerSuccessMessage {
   meanMap?: Float32Array;
   maxMap?: Float32Array;
   sampleCountMap?: Float32Array;
+  debugMaps?: PanoImagePayload['debugMaps'];
   panoWidth: number;
   panoHeight: number;
   minValue: number;
@@ -1623,7 +2206,7 @@ function createCPRWorkerSession(
 
     const requestId =
       typeof (data as { requestId?: unknown }).requestId === 'string'
-        ? ((data as { requestId: string }).requestId)
+        ? (data as { requestId: string }).requestId
         : null;
     if (!requestId) {
       console.warn('[cprWorker] Ignoring worker response without requestId.', data);
@@ -1729,7 +2312,9 @@ function postMessageToCPRWorker<T extends CPRWorkerResponseMessage>(
   }
 ): Promise<T> {
   const requestType =
-    payload && typeof payload === 'object' && typeof (payload as { type?: unknown }).type === 'string'
+    payload &&
+    typeof payload === 'object' &&
+    typeof (payload as { type?: unknown }).type === 'string'
       ? String((payload as { type: string }).type)
       : 'UNKNOWN';
 
@@ -1805,7 +2390,9 @@ function launchCPRWorker(params: {
   verticalCenterOffsetMm?: number;
   rigidVerticalSliceMode?: boolean;
   debugRunId?: string;
+  attemptLabel?: string;
   reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  allowLegacyFallback?: boolean;
 }): Promise<CPRWorkerLaunchResult> {
   return new Promise(async (resolve, reject) => {
     const {
@@ -1816,7 +2403,7 @@ function launchCPRWorker(params: {
       slabHalfThicknessMm,
       slabSamples,
       aggregation,
-      renderBackend = CPR_PANO_RENDER_BACKEND_DEFAULT,
+      renderBackend = CPR_PANO_RECON_BACKEND_DEFAULT,
       verticalDir,
       forceApplyModalityLut,
       modalityLutOverride,
@@ -1825,7 +2412,9 @@ function launchCPRWorker(params: {
       verticalCenterOffsetMm,
       rigidVerticalSliceMode = false,
       debugRunId,
+      attemptLabel,
       reconstructionMode = 'legacy',
+      allowLegacyFallback = CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK,
     } = params;
     const logPrefix = debugRunId ? `[CPR][${debugRunId}]` : '[CPR]';
 
@@ -1838,8 +2427,9 @@ function launchCPRWorker(params: {
       const origin = volume.imageData.getOrigin() as [number, number, number];
       const direction = Array.from(volume.imageData.getDirection());
       const worldToIndexMatrix =
-        (volume.imageData as { getWorldToIndex?: () => ArrayLike<number> | null | undefined })
-          .getWorldToIndex?.() ?? null;
+        (
+          volume.imageData as { getWorldToIndex?: () => ArrayLike<number> | null | undefined }
+        ).getWorldToIndex?.() ?? null;
       const worldToIndexCandidate = worldToIndexMatrix
         ? Array.from(worldToIndexMatrix).slice(0, 16)
         : null;
@@ -1861,8 +2451,13 @@ function launchCPRWorker(params: {
       });
       const { minValue: scalarMin, maxValue: scalarMax } = estimateScalarRange(scalarData);
       const { slope: rescaleSlope, intercept: rescaleIntercept } = getVolumeRescale(volume);
-      const { bitsStored, bitsAllocated, highBit, pixelRepresentation, isPreScaled: rawIsPreScaled } =
-        getVolumePixelStorage(volume);
+      const {
+        bitsStored,
+        bitsAllocated,
+        highBit,
+        pixelRepresentation,
+        isPreScaled: rawIsPreScaled,
+      } = getVolumePixelStorage(volume);
       const effectiveIsPreScaled = resolveEffectivePreScaledFlag({
         isPreScaled: rawIsPreScaled,
         scalarMin,
@@ -1874,7 +2469,9 @@ function launchCPRWorker(params: {
       });
 
       const scalarType =
-        (scalarData as { constructor?: { name?: string } })?.constructor?.name || 'UnknownTypedArray';
+        (scalarData as { constructor?: { name?: string } })?.constructor?.name ||
+        'UnknownTypedArray';
+      const sourceVolumeId = volume.volumeId || undefined;
       const volumeKey = buildCPRWorkerVolumeKey({
         volume,
         dimensions,
@@ -1889,7 +2486,7 @@ function launchCPRWorker(params: {
       if (rawIsPreScaled && !effectiveIsPreScaled) {
         console.warn(
           `${logPrefix} volume.isPreScaled=true but scalar range is not HU-like with non-identity rescale; ` +
-          'overriding preScaled flag for CPR worker.'
+            'overriding preScaled flag for CPR worker.'
         );
       }
 
@@ -1912,9 +2509,13 @@ function launchCPRWorker(params: {
       const nominalBitsStored =
         Number.isFinite(bitsStored) && Number(bitsStored) > 0 ? Math.floor(Number(bitsStored)) : 16;
       const nominalStoredMax =
-        nominalBitsStored > 0 && nominalBitsStored < 31 ? (1 << nominalBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
+        nominalBitsStored > 0 && nominalBitsStored < 31
+          ? (1 << nominalBitsStored) - 1
+          : Number.MAX_SAFE_INTEGER;
       const nominalSignedMin =
-        nominalBitsStored > 0 && nominalBitsStored < 31 ? -(1 << (nominalBitsStored - 1)) : Number.MIN_SAFE_INTEGER;
+        nominalBitsStored > 0 && nominalBitsStored < 31
+          ? -(1 << (nominalBitsStored - 1))
+          : Number.MIN_SAFE_INTEGER;
       const hasUnsignedPackedArtifact =
         !effectiveIsPreScaled &&
         scalarData instanceof Int16Array &&
@@ -1988,7 +2589,7 @@ function launchCPRWorker(params: {
       ) {
         console.warn(
           `${logPrefix} applyModalityLut=false while source metadata has non-identity rescale. ` +
-          'If source pixels are stored values (not HU), fixed WW/WL may cause washed-out pano.'
+            'If source pixels are stored values (not HU), fixed WW/WL may cause washed-out pano.'
         );
       }
       if (
@@ -2040,14 +2641,10 @@ function launchCPRWorker(params: {
         const transferList =
           isSharedArrayBuffer || !initScalarData.buffer ? undefined : [initScalarData.buffer];
         try {
-          await postMessageToCPRWorker<CPRWorkerInitSuccessMessage>(
-            workerSession,
-            initPayload,
-            {
-              expectedTypes: ['INIT_SUCCESS'],
-              transferList,
-            }
-          );
+          await postMessageToCPRWorker<CPRWorkerInitSuccessMessage>(workerSession, initPayload, {
+            expectedTypes: ['INIT_SUCCESS'],
+            transferList,
+          });
         } catch (initError) {
           await terminateCPRWorkerSession(workerSession);
           throw initError;
@@ -2070,6 +2667,7 @@ function launchCPRWorker(params: {
         {
           type: 'RENDER' as const,
           sessionKey: activeCPRWorkerSession.sessionKey,
+          sourceVolumeId,
           frames: serializedFrames,
           panoWidth,
           panoHeight,
@@ -2086,32 +2684,38 @@ function launchCPRWorker(params: {
           disableStoredValueNormalization:
             forceDisableStoredValueNormalization === true ? true : undefined,
           debugRunId,
+          attemptLabel,
           reconstructionMode,
+          allowLegacyFallback,
         },
         {
           expectedTypes: ['SUCCESS'],
         }
       );
 
-      console.log(`${logPrefix} [CPR-WORKER-MESSAGE-JSON]`, JSON.stringify({
-        width: data.panoWidth,
-        height: data.panoHeight,
-        minValue: data.minValue,
-        maxValue: data.maxValue,
-        windowWidth: data.windowWidth,
-        windowCenter: data.windowCenter,
-        modalityLutApplied: data.modalityLutApplied === true,
-        requestedModalityLutApplied: data.requestedModalityLutApplied === true,
-        storedValueNormalizationApplied: data.storedValueNormalizationApplied === true,
-        unsignedPackedArtifactDetected: data.unsignedPackedArtifactDetected === true,
-        workerDebugPayload: data.debugPayload ?? null,
-      }));
+      console.log(
+        `${logPrefix} [CPR-WORKER-MESSAGE-JSON]`,
+        JSON.stringify({
+          width: data.panoWidth,
+          height: data.panoHeight,
+          minValue: data.minValue,
+          maxValue: data.maxValue,
+          windowWidth: data.windowWidth,
+          windowCenter: data.windowCenter,
+          modalityLutApplied: data.modalityLutApplied === true,
+          requestedModalityLutApplied: data.requestedModalityLutApplied === true,
+          storedValueNormalizationApplied: data.storedValueNormalizationApplied === true,
+          unsignedPackedArtifactDetected: data.unsignedPackedArtifactDetected === true,
+          workerDebugPayload: data.debugPayload ?? null,
+        })
+      );
 
       resolve({
         pixelData: data.pixelData,
         meanMap: data.meanMap,
         maxMap: data.maxMap,
         sampleCountMap: data.sampleCountMap,
+        debugMaps: data.debugMaps,
         width: data.panoWidth,
         height: data.panoHeight,
         minValue: data.minValue,
@@ -2130,7 +2734,9 @@ function launchCPRWorker(params: {
         bitsStored,
         pixelRepresentation,
         workerDebugPayload:
-          data.debugPayload && typeof data.debugPayload === 'object' ? data.debugPayload : undefined,
+          data.debugPayload && typeof data.debugPayload === 'object'
+            ? data.debugPayload
+            : undefined,
       });
     } catch (error) {
       if (activeCPRWorkerSession) {
@@ -2141,9 +2747,10 @@ function launchCPRWorker(params: {
   });
 }
 
-function estimateScalarRange(
-  scalarData: Float32Array | Int16Array
-): { minValue: number; maxValue: number } {
+function estimateScalarRange(scalarData: Float32Array | Int16Array): {
+  minValue: number;
+  maxValue: number;
+} {
   if (!scalarData || scalarData.length === 0) {
     return { minValue: 0, maxValue: 0 };
   }
@@ -2173,9 +2780,10 @@ function estimateScalarRange(
   return { minValue, maxValue };
 }
 
-function getVolumeRescale(
-  volume: cornerstone.Types.IImageVolume
-): { slope: number; intercept: number } {
+function getVolumeRescale(volume: cornerstone.Types.IImageVolume): {
+  slope: number;
+  intercept: number;
+} {
   const imageIds = (volume as cornerstone.Types.IImageVolume & { imageIds?: string[] }).imageIds;
   const firstImageId = Array.isArray(imageIds) && imageIds.length > 0 ? imageIds[0] : undefined;
 
@@ -2185,9 +2793,9 @@ function getVolumeRescale(
 
   const modalityLut = cornerstone.metaData.get('modalityLutModule', firstImageId) as
     | {
-      rescaleSlope?: number;
-      rescaleIntercept?: number;
-    }
+        rescaleSlope?: number;
+        rescaleIntercept?: number;
+      }
     | undefined;
 
   const slope = Number(modalityLut?.rescaleSlope);
@@ -2199,9 +2807,7 @@ function getVolumeRescale(
   };
 }
 
-function getVolumePixelStorage(
-  volume: cornerstone.Types.IImageVolume
-): {
+function getVolumePixelStorage(volume: cornerstone.Types.IImageVolume): {
   bitsStored: number;
   bitsAllocated: number;
   highBit: number;
@@ -2225,30 +2831,33 @@ function getVolumePixelStorage(
 
   const imagePixelModule = cornerstone.metaData.get('imagePixelModule', firstImageId) as
     | {
-      bitsStored?: number;
-      bitsAllocated?: number;
-      highBit?: number;
-      pixelRepresentation?: number;
-    }
+        bitsStored?: number;
+        bitsAllocated?: number;
+        highBit?: number;
+        pixelRepresentation?: number;
+      }
     | undefined;
 
   const bitsStored = Number(imagePixelModule?.bitsStored);
   const bitsAllocated = Number(imagePixelModule?.bitsAllocated);
   const highBit = Number(imagePixelModule?.highBit);
   const pixelRepresentation = Number(imagePixelModule?.pixelRepresentation);
-  const safeBitsStored = Number.isFinite(bitsStored) && bitsStored >= 1 ? Math.floor(bitsStored) : 16;
+  const safeBitsStored =
+    Number.isFinite(bitsStored) && bitsStored >= 1 ? Math.floor(bitsStored) : 16;
   const safeBitsAllocated =
     Number.isFinite(bitsAllocated) && bitsAllocated >= safeBitsStored
       ? Math.floor(bitsAllocated)
       : 16;
-  const safeHighBit = Number.isFinite(highBit) && highBit >= 0 ? Math.floor(highBit) : safeBitsStored - 1;
+  const safeHighBit =
+    Number.isFinite(highBit) && highBit >= 0 ? Math.floor(highBit) : safeBitsStored - 1;
 
   return {
     bitsStored: safeBitsStored,
     bitsAllocated: safeBitsAllocated,
     highBit: Math.max(0, Math.min(safeBitsAllocated - 1, safeHighBit)),
     pixelRepresentation:
-      Number.isFinite(pixelRepresentation) && (pixelRepresentation === 0 || pixelRepresentation === 1)
+      Number.isFinite(pixelRepresentation) &&
+      (pixelRepresentation === 0 || pixelRepresentation === 1)
         ? pixelRepresentation
         : 1,
     isPreScaled,
@@ -2340,7 +2949,8 @@ function resolveEffectivePreScaledFlag(params: {
   bitsStored: number;
   pixelRepresentation: number;
 }): boolean {
-  const { isPreScaled, scalarMin, scalarMax, slope, intercept, bitsStored, pixelRepresentation } = params;
+  const { isPreScaled, scalarMin, scalarMax, slope, intercept, bitsStored, pixelRepresentation } =
+    params;
 
   if (!isPreScaled) {
     return false;
@@ -2362,7 +2972,9 @@ function resolveEffectivePreScaledFlag(params: {
   }
 
   const safeBitsStored =
-    Number.isFinite(bitsStored) && bitsStored >= 1 && bitsStored <= 31 ? Math.floor(bitsStored) : 16;
+    Number.isFinite(bitsStored) && bitsStored >= 1 && bitsStored <= 31
+      ? Math.floor(bitsStored)
+      : 16;
   const isUnsigned = pixelRepresentation === 0;
   const unsignedStoredMax =
     safeBitsStored > 0 && safeBitsStored < 31 ? (1 << safeBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
@@ -2382,10 +2994,7 @@ function resolveEffectivePreScaledFlag(params: {
   return isHuLikeRange(scalarMin, scalarMax);
 }
 
-function findViewportByLogicalId(
-  servicesManager: any,
-  logicalViewportId: string
-) {
+function findViewportByLogicalId(servicesManager: any, logicalViewportId: string) {
   const { cornerstoneViewportService, viewportGridService } = servicesManager.services;
 
   type GridViewportLike = {
@@ -2422,6 +3031,124 @@ function findViewportByLogicalId(
   return null;
 }
 
+type GridViewportStateLike = {
+  viewportId?: string;
+  displaySetInstanceUIDs?: string[];
+  displaySetOptions?: Array<Record<string, unknown>>;
+  viewportOptions?: Record<string, unknown> & {
+    viewportId?: string;
+    viewportType?: string;
+  };
+};
+
+function findViewportGridStateByLogicalId(
+  servicesManager: any,
+  logicalViewportId: string
+): { stateViewportId: string; gridViewport: GridViewportStateLike } | null {
+  const { viewportGridService } = servicesManager.services;
+  const gridViewports = viewportGridService.getState().viewports as
+    | Map<string, GridViewportStateLike>
+    | Record<string, GridViewportStateLike>
+    | undefined;
+  const gridEntries: Array<[string, GridViewportStateLike]> =
+    gridViewports &&
+    typeof (gridViewports as Map<string, GridViewportStateLike>).entries === 'function'
+      ? Array.from((gridViewports as Map<string, GridViewportStateLike>).entries())
+      : Object.entries((gridViewports || {}) as Record<string, GridViewportStateLike>);
+
+  for (const [gridViewportId, gridViewport] of gridEntries) {
+    if (gridViewport?.viewportOptions?.viewportId !== logicalViewportId) {
+      continue;
+    }
+
+    const stateViewportId =
+      typeof gridViewport?.viewportId === 'string' && gridViewport.viewportId.length > 0
+        ? gridViewport.viewportId
+        : gridViewportId;
+
+    return {
+      stateViewportId,
+      gridViewport,
+    };
+  }
+
+  return null;
+}
+
+async function ensureViewportTypeByLogicalId(
+  servicesManager: any,
+  logicalViewportId: string,
+  targetViewportType: 'stack' | 'volume',
+  runId: string
+): Promise<void> {
+  const { viewportGridService } = servicesManager.services;
+  const gridState = findViewportGridStateByLogicalId(servicesManager, logicalViewportId);
+  if (!gridState) {
+    console.warn(
+      `[CPR][${runId}] Unable to enforce viewport type; logical viewport "${logicalViewportId}" was not found in the grid state.`
+    );
+    return;
+  }
+
+  const currentViewport = findViewportByLogicalId(servicesManager, logicalViewportId);
+  const actualTypeMatches =
+    targetViewportType === 'stack'
+      ? isStackViewportLike(currentViewport)
+      : isVolumeViewportLike(currentViewport);
+  const currentViewportType = toNonEmptyString(
+    gridState.gridViewport.viewportOptions?.viewportType
+  );
+
+  if (actualTypeMatches && currentViewportType === targetViewportType) {
+    return;
+  }
+
+  const displaySetInstanceUIDs = Array.isArray(gridState.gridViewport.displaySetInstanceUIDs)
+    ? gridState.gridViewport.displaySetInstanceUIDs.filter(
+        (displaySetInstanceUID): displaySetInstanceUID is string =>
+          typeof displaySetInstanceUID === 'string' && displaySetInstanceUID.length > 0
+      )
+    : [];
+  if (!displaySetInstanceUIDs.length) {
+    console.warn(
+      `[CPR][${runId}] Unable to enforce viewport type "${targetViewportType}" for "${logicalViewportId}" because the viewport has no bound display set.`
+    );
+    return;
+  }
+
+  const nextViewportOptions = {
+    ...(gridState.gridViewport.viewportOptions || {}),
+    viewportId: logicalViewportId,
+    viewportType: targetViewportType,
+  };
+  const nextDisplaySetOptions = Array.isArray(gridState.gridViewport.displaySetOptions)
+    ? gridState.gridViewport.displaySetOptions.map(displaySetOptions =>
+        displaySetOptions && typeof displaySetOptions === 'object'
+          ? { ...displaySetOptions }
+          : displaySetOptions
+      )
+    : [];
+
+  console.log(
+    `[CPR-VIEWPORT-TYPE-SWITCH] run=${runId} logicalViewportId=${logicalViewportId} ` +
+      `from=${currentViewportType ?? 'unknown'} to=${targetViewportType}`
+  );
+
+  viewportGridService.setDisplaySetsForViewport({
+    viewportId: gridState.stateViewportId,
+    displaySetInstanceUIDs,
+    viewportOptions: nextViewportOptions,
+    displaySetOptions: nextDisplaySetOptions,
+  });
+
+  if (targetViewportType === 'stack') {
+    await waitForStackViewportByLogicalId(servicesManager, logicalViewportId, 4000);
+    return;
+  }
+
+  await waitForVolumeViewportByLogicalId(servicesManager, logicalViewportId, 4000);
+}
+
 async function waitForVolumeToFullyLoad(
   volume: LoadableImageVolume,
   debugRunId: string,
@@ -2436,13 +3163,20 @@ async function waitForVolumeToFullyLoad(
   };
 
   console.log(`[CPR][${debugRunId}] source volume readiness check`, initialStatus);
-  console.log('[CPR-SOURCE-VOLUME-LOAD-JSON]', JSON.stringify({
-    runId: debugRunId,
-    status: initialStatus.loaded ? 'already-loaded' : 'waiting',
-    ...initialStatus,
-  }));
+  console.log(
+    '[CPR-SOURCE-VOLUME-LOAD-JSON]',
+    JSON.stringify({
+      runId: debugRunId,
+      status: initialStatus.loaded ? 'already-loaded' : 'waiting',
+      ...initialStatus,
+    })
+  );
 
-  if (!volume.loadStatus || volume.loadStatus.loaded === true || typeof volume.load !== 'function') {
+  if (
+    !volume.loadStatus ||
+    volume.loadStatus.loaded === true ||
+    typeof volume.load !== 'function'
+  ) {
     return;
   }
 
@@ -2464,13 +3198,16 @@ async function waitForVolumeToFullyLoad(
       }
       settled = true;
       cleanup();
-      console.log('[CPR-SOURCE-VOLUME-LOAD-JSON]', JSON.stringify({
-        runId: debugRunId,
-        status,
-        volumeId,
-        loaded: volume.loadStatus?.loaded === true,
-        loading: volume.loadStatus?.loading === true,
-      }));
+      console.log(
+        '[CPR-SOURCE-VOLUME-LOAD-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          status,
+          volumeId,
+          loaded: volume.loadStatus?.loaded === true,
+          loading: volume.loadStatus?.loading === true,
+        })
+      );
       resolve();
     };
 
@@ -2503,11 +3240,14 @@ async function waitForVolumeToFullyLoad(
 
     if (!volume.loadStatus?.loading) {
       volume.load();
-      console.log('[CPR-SOURCE-VOLUME-LOAD-JSON]', JSON.stringify({
-        runId: debugRunId,
-        status: 'triggered-load',
-        volumeId,
-      }));
+      console.log(
+        '[CPR-SOURCE-VOLUME-LOAD-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          status: 'triggered-load',
+          volumeId,
+        })
+      );
     }
   });
 }
@@ -2554,7 +3294,10 @@ function clonePanoVoiSettings(
   };
 }
 
-function createPanoVoiFromWindowLevel(windowWidth: number, windowCenter: number): PanoVoiSettings | null {
+function createPanoVoiFromWindowLevel(
+  windowWidth: number,
+  windowCenter: number
+): PanoVoiSettings | null {
   const safeWindowWidth = toFiniteNumber(windowWidth);
   const safeWindowCenter = toFiniteNumber(windowCenter);
 
@@ -2572,10 +3315,15 @@ function createPanoVoiFromWindowLevel(windowWidth: number, windowCenter: number)
   });
 }
 
-function createPanoVoiFromRange(range: {
-  lower?: number | null;
-  upper?: number | null;
-} | null | undefined): PanoVoiSettings | null {
+function createPanoVoiFromRange(
+  range:
+    | {
+        lower?: number | null;
+        upper?: number | null;
+      }
+    | null
+    | undefined
+): PanoVoiSettings | null {
   const lower = toFiniteNumber(range?.lower);
   const upper = toFiniteNumber(range?.upper);
 
@@ -2635,16 +3383,13 @@ function evaluateHostedPanoViewportVoiUpdate(params: {
   const lowerDelta = Math.abs(nextVoi.lower - authoritativeVoi.lower);
   const upperDelta = Math.abs(nextVoi.upper - authoritativeVoi.upper);
   const widthRatio = nextVoi.windowWidth / authorityWidth;
-  const implausiblyNarrow =
-    widthRatio < 0.01 && centerDelta > Math.max(150, authorityWidth * 0.15);
-  const implausiblyWide =
-    widthRatio > 12 && centerDelta > Math.max(1500, authorityWidth * 0.75);
+  const implausiblyNarrow = widthRatio < 0.01 && centerDelta > Math.max(150, authorityWidth * 0.15);
+  const implausiblyWide = widthRatio > 12 && centerDelta > Math.max(1500, authorityWidth * 0.75);
   const implausiblyDisplaced =
     centerDelta > Math.max(2500, authorityWidth * 1.5) &&
     lowerDelta > Math.max(1250, authorityWidth * 0.75) &&
     upperDelta > Math.max(1250, authorityWidth * 0.75);
-  const brokeHuDomain =
-    authorityIsHuLike && !isHuLikeRange(nextVoi.lower, nextVoi.upper);
+  const brokeHuDomain = authorityIsHuLike && !isHuLikeRange(nextVoi.lower, nextVoi.upper);
 
   if (brokeHuDomain) {
     return { accept: false, shouldRepair: true, reason: 'left-hu-domain' };
@@ -2671,10 +3416,7 @@ function isVolumeViewportLike(
 
   const candidate = viewport as cornerstone.Types.IVolumeViewport;
 
-  return (
-    typeof candidate.setVolumes === 'function' &&
-    typeof candidate.setBlendMode === 'function'
-  );
+  return typeof candidate.setVolumes === 'function' && typeof candidate.setBlendMode === 'function';
 }
 
 async function waitForViewportByLogicalId(
@@ -2898,11 +3640,14 @@ function logPanoViewportSnapshot(
     console.log(`[CPR][${runId}] PANO_SNAPSHOT ${stage}`, {
       missingViewport: true,
     });
-    console.log('[CPR-PANO-SNAPSHOT-JSON]', JSON.stringify({
-      runId,
-      stage,
-      missingViewport: true,
-    }));
+    console.log(
+      '[CPR-PANO-SNAPSHOT-JSON]',
+      JSON.stringify({
+        runId,
+        stage,
+        missingViewport: true,
+      })
+    );
     return;
   }
 
@@ -2927,20 +3672,20 @@ function logPanoViewportSnapshot(
   const cornerstoneImage = stackViewport.getCornerstoneImage?.() || null;
   const modalityLut = currentImageId
     ? (cornerstone.metaData.get('modalityLutModule', currentImageId) as
-      | {
-        rescaleSlope?: number;
-        rescaleIntercept?: number;
-      }
-      | undefined)
+        | {
+            rescaleSlope?: number;
+            rescaleIntercept?: number;
+          }
+        | undefined)
     : undefined;
   const voiLut = currentImageId
     ? (cornerstone.metaData.get('voiLutModule', currentImageId) as
-      | {
-        windowWidth?: number[] | number;
-        windowCenter?: number[] | number;
-        voiLUTFunction?: string;
-      }
-      | undefined)
+        | {
+            windowWidth?: number[] | number;
+            windowCenter?: number[] | number;
+            voiLUTFunction?: string;
+          }
+        | undefined)
     : undefined;
   const metadataWindowWidth = Array.isArray(voiLut?.windowWidth)
     ? toFiniteNumber(voiLut?.windowWidth?.[0])
@@ -2966,14 +3711,14 @@ function logPanoViewportSnapshot(
     },
     cornerstoneImage: cornerstoneImage
       ? {
-        imageId: cornerstoneImage.imageId,
-        minPixelValue: cornerstoneImage.minPixelValue,
-        maxPixelValue: cornerstoneImage.maxPixelValue,
-        slope: cornerstoneImage.slope,
-        intercept: cornerstoneImage.intercept,
-        windowWidth: cornerstoneImage.windowWidth,
-        windowCenter: cornerstoneImage.windowCenter,
-      }
+          imageId: cornerstoneImage.imageId,
+          minPixelValue: cornerstoneImage.minPixelValue,
+          maxPixelValue: cornerstoneImage.maxPixelValue,
+          slope: cornerstoneImage.slope,
+          intercept: cornerstoneImage.intercept,
+          windowWidth: cornerstoneImage.windowWidth,
+          windowCenter: cornerstoneImage.windowCenter,
+        }
       : null,
     metadata: {
       modalityLutSlope: toFiniteNumber(modalityLut?.rescaleSlope),
@@ -2983,20 +3728,23 @@ function logPanoViewportSnapshot(
       voiLUTFunction: voiLut?.voiLUTFunction,
     },
   });
-  console.log('[CPR-PANO-SNAPSHOT-JSON]', JSON.stringify({
-    runId,
-    stage,
-    viewportId: viewport.id,
-    currentImageId,
-    isPanoScheme: typeof currentImageId === 'string' && currentImageId.startsWith('pano://'),
-    viewportVoiRange: properties.voiRange ?? null,
-    viewportVoiLutFunction: properties.VOILUTFunction ?? null,
-    imageWindowWidth: cornerstoneImage?.windowWidth ?? null,
-    imageWindowCenter: cornerstoneImage?.windowCenter ?? null,
-    metadataWindowWidth,
-    metadataWindowCenter,
-    metadataVoiLutFunction: voiLut?.voiLUTFunction ?? null,
-  }));
+  console.log(
+    '[CPR-PANO-SNAPSHOT-JSON]',
+    JSON.stringify({
+      runId,
+      stage,
+      viewportId: viewport.id,
+      currentImageId,
+      isPanoScheme: typeof currentImageId === 'string' && currentImageId.startsWith('pano://'),
+      viewportVoiRange: properties.voiRange ?? null,
+      viewportVoiLutFunction: properties.VOILUTFunction ?? null,
+      imageWindowWidth: cornerstoneImage?.windowWidth ?? null,
+      imageWindowCenter: cornerstoneImage?.windowCenter ?? null,
+      metadataWindowWidth,
+      metadataWindowCenter,
+      metadataVoiLutFunction: voiLut?.voiLUTFunction ?? null,
+    })
+  );
 }
 
 function applyPanoDisplaySettings(
@@ -3006,7 +3754,9 @@ function applyPanoDisplaySettings(
   adaptiveVoi: PanoVoiSettings
 ): void {
   if (!viewport || !isStackViewportLike(viewport)) {
-    console.warn(`[CPR][${runId}] applyPanoDisplaySettings skipped at ${stage}: stack viewport missing`);
+    console.warn(
+      `[CPR][${runId}] applyPanoDisplaySettings skipped at ${stage}: stack viewport missing`
+    );
     return;
   }
 
@@ -3021,22 +3771,28 @@ function applyPanoDisplaySettings(
     colormap: undefined,
     VOILUTFunction: 'LINEAR_EXACT',
   } as any);
-  const appliedProperties = ((viewport as { getProperties?: () => unknown }).getProperties?.() || {}) as {
+  const appliedProperties = ((viewport as { getProperties?: () => unknown }).getProperties?.() ||
+    {}) as {
     voiRange?: { lower?: number; upper?: number };
     VOILUTFunction?: unknown;
   };
-  console.log('[CPR-VOI-APPLY-JSON]', JSON.stringify({
-    runId,
-    stage,
-    requestedVoi: adaptiveVoi,
-    appliedVoiRange: appliedProperties.voiRange ?? null,
-    appliedVoiLutFunction: appliedProperties.VOILUTFunction ?? null,
-  }));
+  console.log(
+    '[CPR-VOI-APPLY-JSON]',
+    JSON.stringify({
+      runId,
+      stage,
+      requestedVoi: adaptiveVoi,
+      appliedVoiRange: appliedProperties.voiRange ?? null,
+      appliedVoiLutFunction: appliedProperties.VOILUTFunction ?? null,
+    })
+  );
 }
 
-function getInitialPanoWindowLevelFromSourceViewport(
-  servicesManager: any
-): { windowWidth: number; windowCenter: number; source: string } {
+function getInitialPanoWindowLevelFromSourceViewport(servicesManager: any): {
+  windowWidth: number;
+  windowCenter: number;
+  source: string;
+} {
   const panoPreset = {
     windowWidth: CPR_VTK_PANO_PRESET_WINDOW_WIDTH,
     windowCenter: CPR_VTK_PANO_PRESET_WINDOW_CENTER,
@@ -3045,20 +3801,14 @@ function getInitialPanoWindowLevelFromSourceViewport(
   if (axialViewport && isVolumeViewportLike(axialViewport)) {
     const axialVolumeViewport = axialViewport as cornerstone.Types.IVolumeViewport;
     const actorUID = axialVolumeViewport.getActors?.()?.[0]?.uid;
-    const properties = ((
-      actorUID
-        ? axialVolumeViewport.getProperties?.(actorUID) || axialVolumeViewport.getProperties?.()
-        : axialVolumeViewport.getProperties?.()
-    ) || {}) as {
+    const properties = ((actorUID
+      ? axialVolumeViewport.getProperties?.(actorUID) || axialVolumeViewport.getProperties?.()
+      : axialVolumeViewport.getProperties?.()) || {}) as {
       voiRange?: { lower?: number; upper?: number };
     };
     const lower = toFiniteNumber(properties.voiRange?.lower);
     const upper = toFiniteNumber(properties.voiRange?.upper);
-    if (
-      Number.isFinite(lower) &&
-      Number.isFinite(upper) &&
-      Number(upper) > Number(lower)
-    ) {
+    if (Number.isFinite(lower) && Number.isFinite(upper) && Number(upper) > Number(lower)) {
       const windowWidth = Number(upper) - Number(lower);
       const axialCenter = Number(lower) + windowWidth / 2;
       const blendedWindowWidth = Math.max(
@@ -3148,7 +3898,11 @@ function selectReadableVtkPanoPreset(params: {
           roundToStep(Math.min(baseSlabHalfMm, desiredSlabHalfMm), 0.05)
         )
       ),
-      slabSamples: toOddSampleCount(Math.min(baseSamples, desiredSamples), 3, averageProjection ? 7 : 11),
+      slabSamples: toOddSampleCount(
+        Math.min(baseSamples, desiredSamples),
+        3,
+        averageProjection ? 7 : 11
+      ),
     },
     {
       label: 'balanced',
@@ -3163,7 +3917,11 @@ function selectReadableVtkPanoPreset(params: {
           )
         )
       ),
-      slabSamples: toOddSampleCount(Math.max(baseSamples, desiredSamples), 5, averageProjection ? 9 : 15),
+      slabSamples: toOddSampleCount(
+        Math.max(baseSamples, desiredSamples),
+        5,
+        averageProjection ? 9 : 15
+      ),
     },
     {
       label: 'broad',
@@ -3172,7 +3930,10 @@ function selectReadableVtkPanoPreset(params: {
         averageProjection ? 0.7 : 0.9,
         Math.min(
           averageProjection ? 1.25 : 2.2,
-          roundToStep(Math.max(baseSlabHalfMm, desiredSlabHalfMm + (averageProjection ? 0.2 : 0.35)), 0.05)
+          roundToStep(
+            Math.max(baseSlabHalfMm, desiredSlabHalfMm + (averageProjection ? 0.2 : 0.35)),
+            0.05
+          )
         )
       ),
       slabSamples: toOddSampleCount(
@@ -3186,22 +3947,26 @@ function selectReadableVtkPanoPreset(params: {
     const slabPenalty = Math.abs(candidate.slabHalfThicknessMm - desiredSlabHalfMm) * 4.2;
     const verticalPenalty = Math.abs(candidate.verticalHalfMm - desiredVerticalHalfMm) * 0.8;
     const samplePenalty = Math.abs(candidate.slabSamples - desiredSamples) * 0.35;
-    const broadPenalty = candidate.slabHalfThicknessMm > (averageProjection ? 1.0 : 1.8)
-      ? averageProjection
-        ? 2.2
-        : 1.5
-      : 0;
+    const broadPenalty =
+      candidate.slabHalfThicknessMm > (averageProjection ? 1.0 : 1.8)
+        ? averageProjection
+          ? 2.2
+          : 1.5
+        : 0;
     const tallPenalty = candidate.verticalHalfMm > 23 ? 0.8 : 0;
     const labelBias =
       candidate.label === 'balanced' ? 1.3 : candidate.label === 'focused' ? 0.9 : 0.3;
     return {
       ...candidate,
-      score: 10 + labelBias - slabPenalty - verticalPenalty - samplePenalty - broadPenalty - tallPenalty,
+      score:
+        10 + labelBias - slabPenalty - verticalPenalty - samplePenalty - broadPenalty - tallPenalty,
     };
   });
-  const selected = candidates
-    .slice()
-    .sort((a, b) => b.score - a.score || a.slabHalfThicknessMm - b.slabHalfThicknessMm)[0] || candidates[0];
+  const selected =
+    candidates
+      .slice()
+      .sort((a, b) => b.score - a.score || a.slabHalfThicknessMm - b.slabHalfThicknessMm)[0] ||
+    candidates[0];
 
   return {
     selected,
@@ -3275,9 +4040,10 @@ function logVtkPanoViewportSnapshot(
   );
 }
 
-function getViewportElementDimensions(
-  viewport: cornerstone.Types.IViewport | null
-): { width: number; height: number } {
+function getViewportElementDimensions(viewport: cornerstone.Types.IViewport | null): {
+  width: number;
+  height: number;
+} {
   const element = viewport?.element as HTMLDivElement | null | undefined;
 
   if (!element) {
@@ -3329,7 +4095,9 @@ async function waitForViewportElementToHaveSize(
         }
 
         if (Date.now() - startedAt >= timeoutMs) {
-          reject(new Error('[CPR] Timed out waiting for the cross-section viewport to report a size.'));
+          reject(
+            new Error('[CPR] Timed out waiting for the cross-section viewport to report a size.')
+          );
           return;
         }
 
@@ -3456,7 +4224,9 @@ function getVolumeViewportDisplayVolumeId(
 ): string | undefined {
   void viewport;
   const sourceVolumeId = cprStateService.getSourceVolumeId();
-  return typeof sourceVolumeId === 'string' && sourceVolumeId.length > 0 ? sourceVolumeId : undefined;
+  return typeof sourceVolumeId === 'string' && sourceVolumeId.length > 0
+    ? sourceVolumeId
+    : undefined;
 }
 
 function captureVolumeViewportDisplayState(
@@ -3522,12 +4292,11 @@ function restoreVolumeViewportDisplayState(
     return;
   }
 
-  (viewport as {
-    setProperties: (
-      properties: typeof nextProperties,
-      volumeId?: string
-    ) => void;
-  }).setProperties(nextProperties, displayState.volumeId);
+  (
+    viewport as {
+      setProperties: (properties: typeof nextProperties, volumeId?: string) => void;
+    }
+  ).setProperties(nextProperties, displayState.volumeId);
 }
 
 type AnnotationLike = {
@@ -3615,7 +4384,10 @@ function cloneAnnotationLike<T>(annotation: T | null | undefined): T | null {
       return structuredCloneImpl(annotation);
     }
   } catch (error) {
-    console.warn('[CPR] structuredClone failed for spline annotation snapshot; falling back to JSON clone.', error);
+    console.warn(
+      '[CPR] structuredClone failed for spline annotation snapshot; falling back to JSON clone.',
+      error
+    );
   }
 
   try {
@@ -3650,7 +4422,10 @@ function ensureSplineAnnotationVisible(
   };
 
   const localAnnotations =
-    (cornerstoneTools.annotation.state.getAnnotations('SplineROI', axialElement) as AnnotationLike[]) || [];
+    (cornerstoneTools.annotation.state.getAnnotations(
+      'SplineROI',
+      axialElement
+    ) as AnnotationLike[]) || [];
   const localCount = localAnnotations.length;
   const hasTargetLocally = annotationUID
     ? localAnnotations.some(annotation => annotation?.annotationUID === annotationUID)
@@ -3696,7 +4471,12 @@ function ensureSplineAnnotationVisible(
   repaintSplineAnnotation();
 
   const restoredLocalCount =
-    (cornerstoneTools.annotation.state.getAnnotations('SplineROI', axialElement) as AnnotationLike[])?.length || 0;
+    (
+      cornerstoneTools.annotation.state.getAnnotations(
+        'SplineROI',
+        axialElement
+      ) as AnnotationLike[]
+    )?.length || 0;
   console.log(
     `[CPR-SPLINE-RESTORE] run=${runId} stage=${stage} restoredUID=${
       snapshotToRestore.annotationUID || 'generated'
@@ -3753,11 +4533,7 @@ function setCrossSectionForFrame(
   const previousCamera = cloneCameraState(crossViewport);
   const previousDisplayState = captureVolumeViewportDisplayState(crossViewport);
   crossViewport.setCamera(
-    buildCrossSectionCameraForFrame(
-      frame,
-      previousCamera,
-      verticalCenterOffsetMm
-    )
+    buildCrossSectionCameraForFrame(frame, previousCamera, verticalCenterOffsetMm)
   );
   const reapplyDisplayState = () => {
     restoreVolumeViewportDisplayState(crossViewport, previousDisplayState);
@@ -3831,19 +4607,22 @@ async function initializeCrossSection(
     verticalCenterOffsetMm,
     verticalCenterOffsetsMm
   );
-  console.log('[CPR-CROSSSECTION-CONFIG-JSON]', JSON.stringify({
-    sourceVolumeId,
-    frameCount: frames.length,
-    initialFrameIndex,
-    verticalHalfHeightMm: toFiniteNumber(verticalHalfHeightMm) ?? null,
-    verticalCenterOffsetMm: toFiniteNumber(verticalCenterOffsetMm) ?? 0,
-    initialFrameVerticalCenterOffsetMm,
-    geometryMode: 'hybrid-volume-voi-custom-camera',
-    samplingOffsetsActive,
-    blendMode: 'avg',
-    slabThicknessMm: CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM,
-    voiMode: 'native-volume-default',
-  }));
+  console.log(
+    '[CPR-CROSSSECTION-CONFIG-JSON]',
+    JSON.stringify({
+      sourceVolumeId,
+      frameCount: frames.length,
+      initialFrameIndex,
+      verticalHalfHeightMm: toFiniteNumber(verticalHalfHeightMm) ?? null,
+      verticalCenterOffsetMm: toFiniteNumber(verticalCenterOffsetMm) ?? 0,
+      initialFrameVerticalCenterOffsetMm,
+      geometryMode: 'hybrid-volume-voi-custom-camera',
+      samplingOffsetsActive,
+      blendMode: 'avg',
+      slabThicknessMm: CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM,
+      voiMode: 'native-volume-default',
+    })
+  );
 
   setViewportVisibility(crossViewport, false);
   try {
@@ -4031,7 +4810,11 @@ function getSourceViewportVerticalDirection(
       Number(cameraUp[1] ?? 0),
       Number(cameraUp[2] ?? 0),
     ];
-    if (Number.isFinite(candidate[0]) && Number.isFinite(candidate[1]) && Number.isFinite(candidate[2])) {
+    if (
+      Number.isFinite(candidate[0]) &&
+      Number.isFinite(candidate[1]) &&
+      Number.isFinite(candidate[2])
+    ) {
       return normalize3(candidate);
     }
   }
@@ -4372,7 +5155,11 @@ export function useCPROrchestrator({
             'cpr-axial',
             4000
           );
-          if (!axialViewportAfterSwitch || !isMountedRef.current || restoreToken !== axialRestoreTokenRef.current) {
+          if (
+            !axialViewportAfterSwitch ||
+            !isMountedRef.current ||
+            restoreToken !== axialRestoreTokenRef.current
+          ) {
             return;
           }
 
@@ -4458,7 +5245,10 @@ export function useCPROrchestrator({
             const startedAt = performance.now();
 
             while (restoreToken === axialRestoreTokenRef.current && isMountedRef.current) {
-              const nextElement = axialViewportAfterSwitch.element as HTMLDivElement | null | undefined;
+              const nextElement = axialViewportAfterSwitch.element as
+                | HTMLDivElement
+                | null
+                | undefined;
               if (nextElement) {
                 return nextElement;
               }
@@ -4473,8 +5263,9 @@ export function useCPROrchestrator({
             return null;
           };
 
-          let phase: 'await-initial-render' | 'await-restored-render' =
-            preservedAxialCamera ? 'await-initial-render' : 'await-restored-render';
+          let phase: 'await-initial-render' | 'await-restored-render' = preservedAxialCamera
+            ? 'await-initial-render'
+            : 'await-restored-render';
 
           pendingAxialRestoreCleanupRef.current = cleanup;
           restoreTimeoutId = window.setTimeout(() => {
@@ -4602,7 +5393,9 @@ export function useCPROrchestrator({
         typeof hpState.protocolId === 'string' && hpState.protocolId.length > 0
           ? hpState.protocolId
           : null;
-      const currentStageIndex = Number.isFinite(hpState.stageIndex) ? Number(hpState.stageIndex) : null;
+      const currentStageIndex = Number.isFinite(hpState.stageIndex)
+        ? Number(hpState.stageIndex)
+        : null;
       const previousProtocolId = lastProtocolIdRef.current;
 
       if (previousProtocolId === 'cpr' && currentProtocolId !== 'cpr') {
@@ -4751,32 +5544,41 @@ export function useCPROrchestrator({
         preservedAxialCamera?.viewPlaneNormal
       );
       const rawControlPoints = projectedSpline.points;
-      console.log('[CPR-SPLINE-PLANE-JSON]', JSON.stringify({
-        runId: debugRunId,
-        rawPointCount: rawControlPointsWorld.length,
-        projectedPointCount: rawControlPoints.length,
-        projected: projectedSpline.diagnostics.projected,
-        maxDistanceMm: projectedSpline.diagnostics.maxDistanceMm,
-        meanDistanceMm: projectedSpline.diagnostics.meanDistanceMm,
-      }));
-      console.log('[CPR-RIGID-SLICE-JSON]', JSON.stringify({
-        runId: debugRunId,
-        enabled: true,
-        slicePlanePoint: preservedAxialCamera?.focalPoint ?? null,
-        slicePlaneNormal: preservedAxialCamera?.viewPlaneNormal ?? null,
-        usesProjectedSplinePlane: projectedSpline.diagnostics.projected,
-        projectedMaxDistanceMm: projectedSpline.diagnostics.maxDistanceMm,
-        projectedMeanDistanceMm: projectedSpline.diagnostics.meanDistanceMm,
-        rigidVerticalCenterOffsetMm: 0,
-      }));
+      console.log(
+        '[CPR-SPLINE-PLANE-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          rawPointCount: rawControlPointsWorld.length,
+          projectedPointCount: rawControlPoints.length,
+          projected: projectedSpline.diagnostics.projected,
+          maxDistanceMm: projectedSpline.diagnostics.maxDistanceMm,
+          meanDistanceMm: projectedSpline.diagnostics.meanDistanceMm,
+        })
+      );
+      console.log(
+        '[CPR-RIGID-SLICE-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          enabled: true,
+          slicePlanePoint: preservedAxialCamera?.focalPoint ?? null,
+          slicePlaneNormal: preservedAxialCamera?.viewPlaneNormal ?? null,
+          usesProjectedSplinePlane: projectedSpline.diagnostics.projected,
+          projectedMaxDistanceMm: projectedSpline.diagnostics.maxDistanceMm,
+          projectedMeanDistanceMm: projectedSpline.diagnostics.meanDistanceMm,
+          rigidVerticalCenterOffsetMm: 0,
+        })
+      );
       const sanitizedSpline = sanitizeSplineControlPoints(rawControlPoints, minSpacing);
       const controlPoints = sanitizedSpline.points;
-      console.log('[CPR-SPLINE-SANITIZED-JSON]', JSON.stringify({
-        runId: debugRunId,
-        rawPointCount: rawControlPointsWorld.length,
-        sanitizedPointCount: controlPoints.length,
-        diagnostics: sanitizedSpline.diagnostics,
-      }));
+      console.log(
+        '[CPR-SPLINE-SANITIZED-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          rawPointCount: rawControlPointsWorld.length,
+          sanitizedPointCount: controlPoints.length,
+          diagnostics: sanitizedSpline.diagnostics,
+        })
+      );
       if (sanitizedSpline.diagnostics.severeJumpDetected) {
         console.warn(
           `[CPR][${debugRunId}] Spline contains one or more suspicious long edges; proceeding with sanitized control points.`,
@@ -4836,7 +5638,7 @@ export function useCPROrchestrator({
       const broadMeanSlabSamples = 15;
       const meanFallbackSlabHalfThicknessMm = 1.0;
       const meanFallbackSlabSamples = 9;
-      const sharpMeanSlabHalfThicknessMm = 0.2;   // ~2 voxels total slab
+      const sharpMeanSlabHalfThicknessMm = 0.2; // ~2 voxels total slab
       const sharpMeanSlabSamples = 3;
       const minimumPanoHeightPx = Math.max(160, Math.round(requestedPanoHeightPx * 0.55));
 
@@ -4876,13 +5678,13 @@ export function useCPROrchestrator({
       const vtkCrossSectionVerticalCenterOffsetMm = 0;
       const vtkLocalCenterOffsetsMm: number[] = [];
 
-      if (CPR_PANO_RENDERER_MODE === 'vtk-cpr') {
+      if (CPR_PANO_DISPLAY_PATH_DEFAULT === 'vtk-reference') {
         console.log(
           `[CPR-VTK-PANO-PRESET] run=${debugRunId} selected=${vtkPresetSelection.selected.label} ` +
-          `score=${formatReadablePanoValue(vtkPresetSelection.selected.score, 2)} ` +
-          `verticalHalfMm=${formatReadablePanoValue(vtkVerticalHalfMm, 2)} ` +
-          `slabHalfMm=${formatReadablePanoValue(vtkSlabHalfThicknessMm, 2)} ` +
-          `slabSamples=${vtkSlabSamples}`
+            `score=${formatReadablePanoValue(vtkPresetSelection.selected.score, 2)} ` +
+            `verticalHalfMm=${formatReadablePanoValue(vtkVerticalHalfMm, 2)} ` +
+            `slabHalfMm=${formatReadablePanoValue(vtkSlabHalfThicknessMm, 2)} ` +
+            `slabSamples=${vtkSlabSamples}`
         );
         console.log(
           '[CPR-VTK-PANO-PRESET-JSON]',
@@ -4902,15 +5704,31 @@ export function useCPROrchestrator({
           })
         );
         console.log(
-          `CPR-VTK-PANO-PATH run=${debugRunId} mode=${CPR_PANO_RENDERER_MODE} targetViewportType=volume sourceVolumeId=${sourceVolumeId} frameCount=${frames.length} projectionMode=${vtkProjectionMode} aggregation=${aggregation} slabThicknessMm=${(
+          `CPR-VTK-PANO-PATH run=${debugRunId} displayedPath=${CPR_PANO_DISPLAY_PATH_DEFAULT} targetViewportType=volume sourceVolumeId=${sourceVolumeId} frameCount=${frames.length} projectionMode=${vtkProjectionMode} aggregation=${aggregation} slabThicknessMm=${(
             vtkSlabHalfThicknessMm * 2
-          ).toFixed(2)} slabSamples=${vtkSlabSamples} widthMm=${(
-            vtkVerticalHalfMm * 2
-          ).toFixed(2)}`
+          ).toFixed(2)} slabSamples=${vtkSlabSamples} widthMm=${(vtkVerticalHalfMm * 2).toFixed(2)}`
         );
+        logPanoDisplayRoute({
+          runId: debugRunId,
+          displayedPath: 'vtk-reference',
+          backend: 'vtk',
+          pipelineMode: `vtk-${String(vtkProjectionMode).toLowerCase()}`,
+          fallbackReason: null,
+        });
+        logReconModeJson({
+          runId: debugRunId,
+          displayedPath: 'vtk-reference',
+          backend: 'vtk',
+          pipelineMode: `vtk-${String(vtkProjectionMode).toLowerCase()}`,
+          reconstructionMode: 'vtk-reference',
+          displaySource: 'vtk-hosted-pano-actor',
+          referencePathAvailable: true,
+          sourceVolumeId,
+          fallbackReason: null,
+        });
 
         console.log(
-          `[CPR-SPLINE-PRESERVE] run=${debugRunId} mode=vtk-cpr annotationUID=${
+          `[CPR-SPLINE-PRESERVE] run=${debugRunId} mode=vtk-reference annotationUID=${
             latestAnnotationUID || 'none'
           } skipping pre-transition spline cleanup`
         );
@@ -4956,6 +5774,7 @@ export function useCPROrchestrator({
               sourceVolumeId,
             });
             await waitForAnimationFrames(1);
+            await ensureViewportTypeByLogicalId(servicesManager, 'cpr-pano', 'volume', debugRunId);
             const panoViewport = await waitForPanoVolumeViewport(servicesManager);
             setViewportVisibility(panoViewport, false);
             await waitForViewportElementToHaveSize(panoViewport);
@@ -4965,10 +5784,7 @@ export function useCPROrchestrator({
             logVtkPanoViewportSnapshot(debugRunId, 'before-attach', panoViewport);
 
             const wl = getInitialPanoWindowLevelFromSourceViewport(servicesManager);
-            const initialPanoVoi = createPanoVoiFromWindowLevel(
-              wl.windowWidth,
-              wl.windowCenter
-            );
+            const initialPanoVoi = createPanoVoiFromWindowLevel(wl.windowWidth, wl.windowCenter);
             setHostedPanoVoiAuthority({
               runId: debugRunId,
               sourceVolumeId,
@@ -5132,7 +5948,7 @@ export function useCPROrchestrator({
         slabHalfThicknessMm,
         slabSamples,
         aggregation,
-        renderBackend: CPR_PANO_RENDER_BACKEND_DEFAULT as 'gpu' | 'cpu',
+        renderBackend: CPR_PANO_RECON_BACKEND_DEFAULT as CprPanoReconBackend,
         verticalDir,
         verticalHalfMm: baseVerticalHalfMm,
         verticalCenterOffsetMm: rigidSliceVerticalCenterOffsetMm,
@@ -5141,11 +5957,11 @@ export function useCPROrchestrator({
       };
       const gpuBackendEnabled: boolean = workerInput.renderBackend !== 'cpu';
       console.log(
-        `[CPR-PANO-PATH] run=${debugRunId} defaultBackend=${workerInput.renderBackend} ` +
-        `gpuBackend=${gpuBackendEnabled ? 'yes' : 'no'} ` +
-        `defaultAggregation=${workerInput.aggregation} ` +
-        `phase1VirtualPano=${gpuBackendEnabled ? 'skip-on-gpu-backend' : 'candidate'} ` +
-        `phase2VirtualPano=${gpuBackendEnabled ? 'skip-on-gpu-backend' : 'candidate'}`
+        `[CPR-PANO-PATH] run=${debugRunId} displayedPath=worker-recon defaultBackend=${workerInput.renderBackend} ` +
+          `gpuBackend=${gpuBackendEnabled ? 'yes' : 'no'} ` +
+          `defaultAggregation=${workerInput.aggregation} ` +
+          `phase1VirtualPano=${gpuBackendEnabled ? 'skip-explicit-on-gpu-backend' : 'candidate'} ` +
+          `phase2VirtualPano=${gpuBackendEnabled ? 'worker-internal-cpu-fallback' : 'candidate'}`
       );
       const runWorkerAttempt = async (
         label: string,
@@ -5174,6 +5990,11 @@ export function useCPROrchestrator({
         slabSamples: number;
         durationMs: number;
         requestOverrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
+        requestedBackend: CprPanoReconBackend;
+        resolvedBackend: CprPanoReconBackend;
+        pipelineMode: string;
+        fallbackReason: string | null;
+        reconstructionMode: string;
         workerTimingMs?: {
           adaptiveCenterSearch?: number;
           pass1And2TwoPassRender?: number;
@@ -5185,7 +6006,8 @@ export function useCPROrchestrator({
       }> => {
         launchedAttemptCount++;
         const attemptStartMs = performance.now();
-        const requestedAggregation = (overrides.aggregation ?? workerInput.aggregation) === 'MEAN' ? 'MEAN' : 'MIP';
+        const requestedAggregation =
+          (overrides.aggregation ?? workerInput.aggregation) === 'MEAN' ? 'MEAN' : 'MIP';
         const requestedRenderBackend =
           (overrides.renderBackend ?? workerInput.renderBackend) === 'cpu' ? 'cpu' : 'gpu';
         const requestedSlabHalfThicknessMm = toPositiveFinite(
@@ -5201,11 +6023,12 @@ export function useCPROrchestrator({
             )
           )
         );
-        const requestedVerticalCenterOffsetMm = toFiniteNumber(
-          rigidVerticalSliceModeEnabled
-            ? rigidSliceVerticalCenterOffsetMm
-            : overrides.verticalCenterOffsetMm ?? workerInput.verticalCenterOffsetMm
-        ) ?? rigidSliceVerticalCenterOffsetMm;
+        const requestedVerticalCenterOffsetMm =
+          toFiniteNumber(
+            rigidVerticalSliceModeEnabled
+              ? rigidSliceVerticalCenterOffsetMm
+              : overrides.verticalCenterOffsetMm ?? workerInput.verticalCenterOffsetMm
+          ) ?? rigidSliceVerticalCenterOffsetMm;
         const overrideVerticalHalfMm = Number(overrides.verticalHalfMm);
         const actualVertHalfMm =
           Number.isFinite(overrideVerticalHalfMm) && overrideVerticalHalfMm > 0
@@ -5220,21 +6043,25 @@ export function useCPROrchestrator({
           (actualVertHalfMm * 2) / Math.max(1, finalPanoHeight - 1),
           minSpacing
         );
-        console.log('[CPR-GPU-REQUEST-JSON]', JSON.stringify({
-          runId: debugRunId,
-          label,
-          renderBackend: requestedRenderBackend,
-          aggregation: requestedAggregation,
-          panoWidth: finalPanoWidth,
-          panoHeight: finalPanoHeight,
-          slabHalfThicknessMm: requestedSlabHalfThicknessMm,
-          slabSamples: requestedSlabSamples,
-          verticalHalfMm: actualVertHalfMm,
-          verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
-        }));
+        console.log(
+          '[CPR-GPU-REQUEST-JSON]',
+          JSON.stringify({
+            runId: debugRunId,
+            label,
+            renderBackend: requestedRenderBackend,
+            aggregation: requestedAggregation,
+            panoWidth: finalPanoWidth,
+            panoHeight: finalPanoHeight,
+            slabHalfThicknessMm: requestedSlabHalfThicknessMm,
+            slabSamples: requestedSlabSamples,
+            verticalHalfMm: actualVertHalfMm,
+            verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
+          })
+        );
         const rawResult = await launchCPRWorker({
           ...workerInput,
           ...overrides,
+          attemptLabel: label,
           panoWidth: finalPanoWidth,
           panoHeight: finalPanoHeight,
           renderBackend: requestedRenderBackend,
@@ -5261,44 +6088,71 @@ export function useCPROrchestrator({
           result.slope,
           result.intercept
         );
-        const summary = summarizeFloatBufferForDebug(summaryPixelData, finalPanoWidth, finalPanoHeight);
+        const summary = summarizeFloatBufferForDebug(
+          summaryPixelData,
+          finalPanoWidth,
+          finalPanoHeight
+        );
         const voi = computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
-        console.log('[CPR-GPU-VOI-APPLY-JSON]', JSON.stringify({
-          runId: debugRunId,
-          label,
-          renderBackend: requestedRenderBackend,
-          slabHalfThicknessMm: requestedSlabHalfThicknessMm,
-          slabSamples: requestedSlabSamples,
-          workerWindowWidth: result.windowWidth,
-          workerWindowCenter: result.windowCenter,
-          adaptiveWindowWidth: voi.windowWidth,
-          adaptiveWindowCenter: voi.windowCenter,
-          minValue: result.minValue,
-          maxValue: result.maxValue,
-          voiSource: 'adaptive',
-        }));
+        console.log(
+          '[CPR-GPU-VOI-APPLY-JSON]',
+          JSON.stringify({
+            runId: debugRunId,
+            label,
+            renderBackend: requestedRenderBackend,
+            slabHalfThicknessMm: requestedSlabHalfThicknessMm,
+            slabSamples: requestedSlabSamples,
+            workerWindowWidth: result.windowWidth,
+            workerWindowCenter: result.windowCenter,
+            adaptiveWindowWidth: voi.windowWidth,
+            adaptiveWindowCenter: voi.windowCenter,
+            minValue: result.minValue,
+            maxValue: result.maxValue,
+            voiSource: 'adaptive',
+          })
+        );
         console.log(
           `[CPR-PANO-VOI] run=${debugRunId} label=${label} backend=${requestedRenderBackend} ` +
-          `source=adaptive ` +
-          `workerWW=${formatReadablePanoValue(result.windowWidth)} ` +
-          `workerWC=${formatReadablePanoValue(result.windowCenter)} ` +
-          `appliedWW=${formatReadablePanoValue(voi.windowWidth)} ` +
-          `appliedWC=${formatReadablePanoValue(voi.windowCenter)} ` +
-          `min=${formatReadablePanoValue(result.minValue)} ` +
-          `max=${formatReadablePanoValue(result.maxValue)}`
+            `source=adaptive ` +
+            `workerWW=${formatReadablePanoValue(result.windowWidth)} ` +
+            `workerWC=${formatReadablePanoValue(result.windowCenter)} ` +
+            `appliedWW=${formatReadablePanoValue(voi.windowWidth)} ` +
+            `appliedWC=${formatReadablePanoValue(voi.windowCenter)} ` +
+            `min=${formatReadablePanoValue(result.minValue)} ` +
+            `max=${formatReadablePanoValue(result.maxValue)}`
         );
         const qualityBase = summary ? scorePanoQuality(summary) : 0;
         const workerDiagnostic =
           result.workerDebugPayload &&
-            typeof result.workerDebugPayload === 'object' &&
-            result.workerDebugPayload.diagnostic &&
-            typeof result.workerDebugPayload.diagnostic === 'object'
+          typeof result.workerDebugPayload === 'object' &&
+          result.workerDebugPayload.diagnostic &&
+          typeof result.workerDebugPayload.diagnostic === 'object'
             ? (result.workerDebugPayload.diagnostic as Record<string, unknown>)
             : null;
-        const actualVerticalCenterOffsetMm = toFiniteNumber(workerDiagnostic?.verticalCenterOffsetMm);
-        const baseVerticalCenterOffsetMm = toFiniteNumber(workerDiagnostic?.baseVerticalCenterOffsetMm);
+        const workerGpuRenderDiagnostic =
+          workerDiagnostic?.gpuRender && typeof workerDiagnostic.gpuRender === 'object'
+            ? (workerDiagnostic.gpuRender as Record<string, unknown>)
+            : null;
+        const routeDiagnostic = resolveWorkerDisplayRouteDiagnostic(result.workerDebugPayload);
+        const resolvedReconstructionMode =
+          toNonEmptyString(workerDiagnostic?.reconstructionMode) ||
+          toNonEmptyString(workerDiagnostic?.pipelineMode) ||
+          routeDiagnostic.pipelineMode;
+        const phase2GatePassed =
+          typeof workerGpuRenderDiagnostic?.phase2GatePassed === 'boolean'
+            ? Boolean(workerGpuRenderDiagnostic.phase2GatePassed)
+            : typeof workerDiagnostic?.phase2GatePassed === 'boolean'
+              ? Boolean(workerDiagnostic.phase2GatePassed)
+              : null;
+        const actualVerticalCenterOffsetMm = toFiniteNumber(
+          workerDiagnostic?.verticalCenterOffsetMm
+        );
+        const baseVerticalCenterOffsetMm = toFiniteNumber(
+          workerDiagnostic?.baseVerticalCenterOffsetMm
+        );
         const fittedVerticalCenterOffsetMm = toFiniteNumber(
-          workerDiagnostic?.fittedVerticalCenterOffsetMm ?? workerDiagnostic?.globalVerticalCenterOffsetMm
+          workerDiagnostic?.fittedVerticalCenterOffsetMm ??
+            workerDiagnostic?.globalVerticalCenterOffsetMm
         );
         const actualCenterDriftMm =
           actualVerticalCenterOffsetMm !== undefined
@@ -5310,11 +6164,11 @@ export function useCPROrchestrator({
             : actualCenterDriftMm;
         const splitPenalty = summary
           ? Math.max(0, summary.fractionBelowMinus950 - 0.3) * 8 +
-          Math.max(0, summary.fractionAbove3000 - 0.2) * 10 +
-          Math.max(0, summary.p50 - 2200) / 300 +
-          Math.max(0, -1700 - summary.p50) / 300 +
-          Math.max(0, summary.max - 12000) / 1500 +
-          Math.max(0, -9000 - summary.min) / 1500
+            Math.max(0, summary.fractionAbove3000 - 0.2) * 10 +
+            Math.max(0, summary.p50 - 2200) / 300 +
+            Math.max(0, -1700 - summary.p50) / 300 +
+            Math.max(0, summary.max - 12000) / 1500 +
+            Math.max(0, -9000 - summary.min) / 1500
           : 8;
         const denseFillPenalty = summary
           ? Math.max(0, summary.p50 - 900) / 90 + Math.max(0, summary.p50 - 1200) / 55
@@ -5323,16 +6177,16 @@ export function useCPROrchestrator({
         const focalTroughPenalty =
           Math.max(0, actualVertHalfMm - 45) / 2.0 +
           Math.max(0, requestedSlabHalfThicknessMm - 0.8) *
-          (requestedAggregation === 'MIP' ? 5 : 3.5);
+            (requestedAggregation === 'MIP' ? 5 : 3.5);
         const lowerBandFillPenalty = summary
           ? Math.max(0, summary.lowerBandP50 + 140) / 38 +
-          Math.max(0, summary.lowerBandBrightFraction - 0.24) * 24 +
-          Math.max(0, summary.lowerBandBrightFraction - 0.55) * 42
+            Math.max(0, summary.lowerBandBrightFraction - 0.24) * 24 +
+            Math.max(0, summary.lowerBandBrightFraction - 0.55) * 42
           : 0;
         const toothBandSaturationPenalty = summary
           ? Math.max(0, summary.toothBandMean - 760) / 65 +
-          Math.max(0, summary.toothBandP10 - 80) / 28 +
-          Math.max(0, summary.toothBandBrightFraction - 0.24) * 22
+            Math.max(0, summary.toothBandP10 - 80) / 28 +
+            Math.max(0, summary.toothBandBrightFraction - 0.24) * 22
           : 0;
         const detailBalanceRatio = summary
           ? summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean)
@@ -5343,14 +6197,16 @@ export function useCPROrchestrator({
         const toothBandContrastRange = summary ? summary.toothBandP90 - summary.toothBandP10 : 0;
         const detailReward = summary
           ? Math.max(-2.5, Math.min(4, (balancedDetailEdgeMean - 55) / 28)) -
-          Math.max(0, detailBalanceRatio - 2.6) * 2.2
+            Math.max(0, detailBalanceRatio - 2.6) * 2.2
           : 0;
         const deformationPenalty = summary
           ? Math.max(0, detailBalanceRatio - 2.8) * 3.6 +
-          Math.max(0, summary.detailBandHorizontalEdgeMean - 240) / 28
+            Math.max(0, summary.detailBandHorizontalEdgeMean - 240) / 28
           : 0;
         const tallFillPenalty = summary
-          ? Math.max(0, actualVertHalfMm - 42) * Math.max(0, summary.lowerBandBrightFraction - 0.45) * 28
+          ? Math.max(0, actualVertHalfMm - 42) *
+            Math.max(0, summary.lowerBandBrightFraction - 0.45) *
+            28
           : 0;
         const noAirPenalty = summary
           ? summary.fractionBelowMinus950 < 0.005
@@ -5361,26 +6217,35 @@ export function useCPROrchestrator({
           : 0;
         const elevatedP01Penalty = summary ? Math.max(0, summary.p01 + 780) / 80 : 0;
         const centerDriftPenalty =
-          Math.max(0, actualCenterDriftMm - 1.5) * 6 +
-          Math.max(0, baseCenterDriftMm - 1.0) * 8;
+          Math.max(0, actualCenterDriftMm - 1.5) * 6 + Math.max(0, baseCenterDriftMm - 1.0) * 8;
         const aggregationPenalty =
           requestedAggregation === 'MIP'
             ? 4.5 + (summary ? Math.max(0, summary.meanAbsDelta - 300) / 45 : 0)
+            : 0;
+        const phase2GatePenalty =
+          requestedRenderBackend === 'gpu' &&
+          routeDiagnostic.backend === 'gpu' &&
+          phase2GatePassed === false
+            ? 30
             : 0;
         const baseHardRejectReason = getHardRejectReason(summary);
         const excessiveCenterDrift =
           actualCenterDriftMm > Math.max(4, actualVertHalfMm * 0.2) ||
           baseCenterDriftMm > Math.max(3.5, actualVertHalfMm * 0.16);
         const hardRejectReason =
-          !baseHardRejectReason && excessiveCenterDrift
-            ? 'vertical-center-drift'
-            : !baseHardRejectReason &&
-                !!summary &&
-                requestedAggregation === 'MEAN' &&
-                actualVertHalfMm > 45 &&
-                summary.lowerBandBrightFraction > 0.64
-              ? 'tall-lower-band-fill'
-              : baseHardRejectReason;
+          requestedRenderBackend === 'gpu' &&
+          routeDiagnostic.backend === 'gpu' &&
+          phase2GatePassed === false
+            ? 'gpu-phase2-gate-failed'
+            : !baseHardRejectReason && excessiveCenterDrift
+              ? 'vertical-center-drift'
+              : !baseHardRejectReason &&
+                  !!summary &&
+                  requestedAggregation === 'MEAN' &&
+                  actualVertHalfMm > 45 &&
+                  summary.lowerBandBrightFraction > 0.64
+                ? 'tall-lower-band-fill'
+                : baseHardRejectReason;
         const hardRejectPenalty = hardRejectReason ? 30 : 0;
         const intensityDomainPenalty = intensityDomain === 'unknown' ? 12 : 0;
         const qualityScore =
@@ -5400,23 +6265,25 @@ export function useCPROrchestrator({
           tallFillPenalty -
           intensityDomainPenalty -
           aggregationPenalty -
+          phase2GatePenalty -
           hardRejectPenalty;
         const attemptDurationMs = performance.now() - attemptStartMs;
         const workerTimingMs =
           result.workerDebugPayload &&
-            typeof result.workerDebugPayload === 'object' &&
-            result.workerDebugPayload.diagnostic &&
-            typeof result.workerDebugPayload.diagnostic === 'object' &&
-            (result.workerDebugPayload.diagnostic as Record<string, unknown>).timingMs &&
-            typeof (result.workerDebugPayload.diagnostic as Record<string, unknown>).timingMs === 'object'
+          typeof result.workerDebugPayload === 'object' &&
+          result.workerDebugPayload.diagnostic &&
+          typeof result.workerDebugPayload.diagnostic === 'object' &&
+          (result.workerDebugPayload.diagnostic as Record<string, unknown>).timingMs &&
+          typeof (result.workerDebugPayload.diagnostic as Record<string, unknown>).timingMs ===
+            'object'
             ? ((result.workerDebugPayload.diagnostic as Record<string, unknown>).timingMs as {
-              adaptiveCenterSearch?: number;
-              pass1And2TwoPassRender?: number;
-              virtualPanoPhase12?: number;
-              suppressionAndDenoise?: number;
-              diagnosticAssembly?: number;
-              total?: number;
-            })
+                adaptiveCenterSearch?: number;
+                pass1And2TwoPassRender?: number;
+                virtualPanoPhase12?: number;
+                suppressionAndDenoise?: number;
+                diagnosticAssembly?: number;
+                total?: number;
+              })
             : null;
 
         console.log(`[CPR][${debugRunId}] pano attempt ${label}`, {
@@ -5425,6 +6292,11 @@ export function useCPROrchestrator({
           qualityBase,
           qualityScore,
           aggregation: requestedAggregation,
+          requestedBackend: requestedRenderBackend,
+          resolvedBackend: routeDiagnostic.backend,
+          pipelineMode: routeDiagnostic.pipelineMode,
+          reconstructionMode: resolvedReconstructionMode,
+          fallbackReason: routeDiagnostic.fallbackReason,
           minValue: result.minValue,
           maxValue: result.maxValue,
           p01: summary?.p01,
@@ -5452,6 +6324,8 @@ export function useCPROrchestrator({
           effectiveIsPreScaled: result.effectiveIsPreScaled,
           rescaleSlope: result.rescaleSlope,
           rescaleIntercept: result.rescaleIntercept,
+          phase2GatePassed,
+          phase2GatePenalty,
           intensityDomainPenalty,
           actualVertHalfMm,
           verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
@@ -5483,20 +6357,23 @@ export function useCPROrchestrator({
           overrides,
         });
         console.log(
-          `[CPR-PANO-ATTEMPT] run=${debugRunId} label=${label} backend=${requestedRenderBackend} ` +
-          `aggregation=${requestedAggregation} score=${formatReadablePanoValue(qualityScore, 2)} ` +
-          `base=${formatReadablePanoValue(qualityBase, 2)} hardReject=${hardRejectReason ?? 'none'} ` +
-          `durationMs=${formatReadablePanoValue(attemptDurationMs, 0)} ` +
-          `p50=${formatReadablePanoValue(summary?.p50)} ` +
-          `meanAbsDelta=${formatReadablePanoValue(summary?.meanAbsDelta)} ` +
-          `lowerBandP50=${formatReadablePanoValue(summary?.lowerBandP50)} ` +
-          `lowerBandBrightPct=${formatReadablePanoValue(
-            summary ? summary.lowerBandBrightFraction * 100 : undefined
-          )} ` +
-          `toothMean=${formatReadablePanoValue(summary?.toothBandMean)} ` +
-          `detailRatio=${formatReadablePanoValue(detailBalanceRatio, 2)} ` +
-          `centerDriftMm=${formatReadablePanoValue(actualCenterDriftMm, 2)} ` +
-          `voi=adaptive`
+          `[CPR-PANO-ATTEMPT] run=${debugRunId} label=${label} requestedBackend=${requestedRenderBackend} ` +
+            `resolvedBackend=${routeDiagnostic.backend} pipelineMode=${routeDiagnostic.pipelineMode} ` +
+            `reconstructionMode=${resolvedReconstructionMode} ` +
+            `fallbackReason=${routeDiagnostic.fallbackReason ?? 'none'} ` +
+            `aggregation=${requestedAggregation} score=${formatReadablePanoValue(qualityScore, 2)} ` +
+            `base=${formatReadablePanoValue(qualityBase, 2)} hardReject=${hardRejectReason ?? 'none'} ` +
+            `durationMs=${formatReadablePanoValue(attemptDurationMs, 0)} ` +
+            `p50=${formatReadablePanoValue(summary?.p50)} ` +
+            `meanAbsDelta=${formatReadablePanoValue(summary?.meanAbsDelta)} ` +
+            `lowerBandP50=${formatReadablePanoValue(summary?.lowerBandP50)} ` +
+            `lowerBandBrightPct=${formatReadablePanoValue(
+              summary ? summary.lowerBandBrightFraction * 100 : undefined
+            )} ` +
+            `toothMean=${formatReadablePanoValue(summary?.toothBandMean)} ` +
+            `detailRatio=${formatReadablePanoValue(detailBalanceRatio, 2)} ` +
+            `centerDriftMm=${formatReadablePanoValue(actualCenterDriftMm, 2)} ` +
+            `voi=adaptive`
         );
         console.log(
           '[CPR-ATTEMPT-JSON]',
@@ -5505,6 +6382,11 @@ export function useCPROrchestrator({
             label,
             qualityBase,
             qualityScore,
+            requestedBackend: requestedRenderBackend,
+            resolvedBackend: routeDiagnostic.backend,
+            pipelineMode: routeDiagnostic.pipelineMode,
+            reconstructionMode: resolvedReconstructionMode,
+            fallbackReason: routeDiagnostic.fallbackReason,
             aggregation: requestedAggregation,
             slabHalfThicknessMm: requestedSlabHalfThicknessMm,
             slabSamples: requestedSlabSamples,
@@ -5515,6 +6397,7 @@ export function useCPROrchestrator({
             huDomain,
             convertedToHu,
             rescaleSkippedAsUnsafe,
+            phase2GatePassed,
             minValue: result.minValue,
             maxValue: result.maxValue,
             p01: summary?.p01 ?? null,
@@ -5542,6 +6425,7 @@ export function useCPROrchestrator({
             tallFillPenalty,
             noAirPenalty,
             elevatedP01Penalty,
+            phase2GatePenalty,
             actualVerticalCenterOffsetMm,
             baseVerticalCenterOffsetMm,
             fittedVerticalCenterOffsetMm,
@@ -5579,6 +6463,11 @@ export function useCPROrchestrator({
           slabSamples: requestedSlabSamples,
           durationMs: attemptDurationMs,
           requestOverrides: { ...overrides },
+          requestedBackend: requestedRenderBackend,
+          resolvedBackend: routeDiagnostic.backend,
+          pipelineMode: routeDiagnostic.pipelineMode,
+          fallbackReason: routeDiagnostic.fallbackReason,
+          reconstructionMode: resolvedReconstructionMode,
           workerTimingMs,
         };
       };
@@ -5588,6 +6477,11 @@ export function useCPROrchestrator({
         qualityBase: number;
         qualityScore: number;
         hardRejectReason: string | null;
+        requestedBackend: CprPanoReconBackend;
+        resolvedBackend: CprPanoReconBackend;
+        pipelineMode: string;
+        fallbackReason: string | null;
+        reconstructionMode: string;
         aggregation: 'MIP' | 'MEAN';
         slabHalfThicknessMm: number;
         slabSamples: number;
@@ -5627,6 +6521,11 @@ export function useCPROrchestrator({
         qualityBase: number;
         qualityScore: number;
         hardRejectReason: string | null;
+        requestedBackend: CprPanoReconBackend;
+        resolvedBackend: CprPanoReconBackend;
+        pipelineMode: string;
+        fallbackReason: string | null;
+        reconstructionMode: string;
         aggregation: 'MIP' | 'MEAN';
         slabHalfThicknessMm: number;
         slabSamples: number;
@@ -5649,6 +6548,11 @@ export function useCPROrchestrator({
           qualityBase: attempt.qualityBase,
           qualityScore: attempt.qualityScore,
           hardRejectReason: attempt.hardRejectReason,
+          requestedBackend: attempt.requestedBackend,
+          resolvedBackend: attempt.resolvedBackend,
+          pipelineMode: attempt.pipelineMode,
+          fallbackReason: attempt.fallbackReason,
+          reconstructionMode: attempt.reconstructionMode,
           aggregation: attempt.aggregation,
           slabHalfThicknessMm: attempt.slabHalfThicknessMm,
           slabSamples: attempt.slabSamples,
@@ -5705,14 +6609,12 @@ export function useCPROrchestrator({
           detailRatio <= 3.4;
         return (
           hasVeryStrongOverallScore ||
-          (
-            attempt.qualityScore >= 16 &&
+          (attempt.qualityScore >= 16 &&
             hasCleanLowerBand &&
             hasCleanToothBand &&
             summary.meanAbsDelta <= 520 &&
             summary.fractionAbove3000 <= 0.005 &&
-            detailRatio <= 3.4
-          )
+            detailRatio <= 3.4)
         );
       };
       const needsFallbackAttempt = (attempt: {
@@ -6011,18 +6913,14 @@ export function useCPROrchestrator({
             (bestHardRejected && !attemptHardRejected) ||
             (bestHardRejected === attemptHardRejected &&
               (bestHardRejected
-                ? (
-                  attemptFallbackScore > bestFallbackScore ||
+                ? attemptFallbackScore > bestFallbackScore ||
                   (Math.abs(attemptFallbackScore - bestFallbackScore) < 1e-6 &&
                     (attempt.qualityScore > bestAttempt.qualityScore ||
                       (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
                         attempt.qualityBase > bestAttempt.qualityBase)))
-                )
-                : (
-                  attempt.qualityScore > bestAttempt.qualityScore ||
+                : attempt.qualityScore > bestAttempt.qualityScore ||
                   (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
-                    attempt.qualityBase > bestAttempt.qualityBase)
-                )))
+                    attempt.qualityBase > bestAttempt.qualityBase)))
           ) {
             bestAttempt = attempt;
           }
@@ -6036,35 +6934,31 @@ export function useCPROrchestrator({
       const shouldRunMipFallbacks =
         !gpuBackendEnabled &&
         !earlyExitReason &&
-        (
-          !!bestAttempt.hardRejectReason ||
+        (!!bestAttempt.hardRejectReason ||
           (bestAttempt.qualityScore < 0 && isLikelyPoorPanoQuality(bestAttempt.summary)) ||
           !!(
             bestAttempt.summary &&
-            (
-              bestAttempt.summary.lowerBandBrightFraction > 0.78 ||
-              bestAttempt.summary.lowerBandP50 > 260
-            )
-          )
-        );
+            (bestAttempt.summary.lowerBandBrightFraction > 0.78 ||
+              bestAttempt.summary.lowerBandP50 > 260)
+          ));
 
       if (shouldRunMipFallbacks) {
         const mipFallbackConfigs: Array<{
           label: string;
           overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
         }> = [
-            {
-              label: 'retry-balanced-mip-narrow-fallback',
-              overrides: {
-                modalityLutOverride: true,
-                verticalHalfMm: narrowVerticalHalfMm,
-                verticalCenterOffsetMm: mandibularCenterOffsetMm,
-                slabHalfThicknessMm: balancedSlabHalfThicknessMm,
-                slabSamples: balancedSlabSamples,
-                aggregation: 'MIP',
-              },
+          {
+            label: 'retry-balanced-mip-narrow-fallback',
+            overrides: {
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: mandibularCenterOffsetMm,
+              slabHalfThicknessMm: balancedSlabHalfThicknessMm,
+              slabSamples: balancedSlabSamples,
+              aggregation: 'MIP',
             },
-          ];
+          },
+        ];
 
         for (const retryConfig of mipFallbackConfigs) {
           launchedMipFallbackCount++;
@@ -6092,15 +6986,15 @@ export function useCPROrchestrator({
       const phase2BaseAttempt = gpuBackendEnabled
         ? null
         : attemptResults
-          .filter(attempt => attempt.aggregation === 'MEAN')
-          .sort((a, b) => {
-            const aHardRejected = !!a.hardRejectReason;
-            const bHardRejected = !!b.hardRejectReason;
-            if (aHardRejected !== bHardRejected) {
-              return aHardRejected ? 1 : -1;
-            }
-            return (b.qualityScore - a.qualityScore) || (b.qualityBase - a.qualityBase);
-          })[0] || null;
+            .filter(attempt => attempt.aggregation === 'MEAN')
+            .sort((a, b) => {
+              const aHardRejected = !!a.hardRejectReason;
+              const bHardRejected = !!b.hardRejectReason;
+              if (aHardRejected !== bHardRejected) {
+                return aHardRejected ? 1 : -1;
+              }
+              return b.qualityScore - a.qualityScore || b.qualityBase - a.qualityBase;
+            })[0] || null;
       const phase1VirtualPano: {
         executed: boolean;
         skippedReason: string | null;
@@ -6115,7 +7009,7 @@ export function useCPROrchestrator({
         diagnostics: null,
       };
       if (gpuBackendEnabled) {
-        phase1VirtualPano.skippedReason = 'GPU_BACKEND_ACTIVE';
+        phase1VirtualPano.skippedReason = 'GPU_BACKEND_ACTIVE_WORKER_INTERNAL_FALLBACK';
       } else if (!phase2BaseAttempt) {
         phase1VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
       } else {
@@ -6135,22 +7029,22 @@ export function useCPROrchestrator({
           });
           const phase1DiagnosticPayload =
             phase1Result.workerDebugPayload &&
-              typeof phase1Result.workerDebugPayload === 'object' &&
-              phase1Result.workerDebugPayload.diagnostic &&
-              typeof phase1Result.workerDebugPayload.diagnostic === 'object'
+            typeof phase1Result.workerDebugPayload === 'object' &&
+            phase1Result.workerDebugPayload.diagnostic &&
+            typeof phase1Result.workerDebugPayload.diagnostic === 'object'
               ? (phase1Result.workerDebugPayload.diagnostic as Record<string, unknown>)
               : null;
           phase1VirtualPano.executed = true;
           phase1VirtualPano.timingMs =
             phase1DiagnosticPayload &&
-              phase1DiagnosticPayload.timingMs &&
-              typeof phase1DiagnosticPayload.timingMs === 'object'
+            phase1DiagnosticPayload.timingMs &&
+            typeof phase1DiagnosticPayload.timingMs === 'object'
               ? (phase1DiagnosticPayload.timingMs as Record<string, unknown>)
               : null;
           phase1VirtualPano.diagnostics =
             phase1DiagnosticPayload &&
-              phase1DiagnosticPayload.virtualPanoPhase12 &&
-              typeof phase1DiagnosticPayload.virtualPanoPhase12 === 'object'
+            phase1DiagnosticPayload.virtualPanoPhase12 &&
+            typeof phase1DiagnosticPayload.virtualPanoPhase12 === 'object'
               ? (phase1DiagnosticPayload.virtualPanoPhase12 as Record<string, unknown>)
               : null;
         } catch (phase1Error) {
@@ -6169,10 +7063,10 @@ export function useCPROrchestrator({
       );
       console.log(
         `[CPR-PHASE1] run=${debugRunId} base=${phase2BaseAttempt?.label ?? 'none'} ` +
-        `aggregation=${phase2BaseAttempt?.aggregation ?? 'none'} ` +
-        `executed=${phase1VirtualPano.executed ? 'yes' : 'no'} ` +
-        `skipped=${phase1VirtualPano.skippedReason ?? 'none'} ` +
-        `error=${phase1VirtualPano.error ?? 'none'}`
+          `aggregation=${phase2BaseAttempt?.aggregation ?? 'none'} ` +
+          `executed=${phase1VirtualPano.executed ? 'yes' : 'no'} ` +
+          `skipped=${phase1VirtualPano.skippedReason ?? 'none'} ` +
+          `error=${phase1VirtualPano.error ?? 'none'}`
       );
       const phase2VirtualPano: {
         executed: boolean;
@@ -6197,7 +7091,7 @@ export function useCPROrchestrator({
       };
       let phase2WorkerResult: CPRWorkerLaunchResult | null = null;
       if (gpuBackendEnabled) {
-        phase2VirtualPano.skippedReason = 'GPU_BACKEND_ACTIVE';
+        phase2VirtualPano.skippedReason = 'GPU_BACKEND_ACTIVE_WORKER_INTERNAL_FALLBACK';
       } else if (!phase2BaseAttempt) {
         phase2VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
       } else {
@@ -6217,9 +7111,9 @@ export function useCPROrchestrator({
           });
           const phase2DiagnosticPayload =
             phase2Result.workerDebugPayload &&
-              typeof phase2Result.workerDebugPayload === 'object' &&
-              phase2Result.workerDebugPayload.diagnostic &&
-              typeof phase2Result.workerDebugPayload.diagnostic === 'object'
+            typeof phase2Result.workerDebugPayload === 'object' &&
+            phase2Result.workerDebugPayload.diagnostic &&
+            typeof phase2Result.workerDebugPayload.diagnostic === 'object'
               ? (phase2Result.workerDebugPayload.diagnostic as Record<string, unknown>)
               : null;
           const phase2Summary = summarizeFloatBufferForDebug(
@@ -6234,16 +7128,16 @@ export function useCPROrchestrator({
           );
           const phase2RenderDiagnostics =
             phase2DiagnosticPayload &&
-              phase2DiagnosticPayload.virtualPanoRender &&
-              typeof phase2DiagnosticPayload.virtualPanoRender === 'object'
+            phase2DiagnosticPayload.virtualPanoRender &&
+            typeof phase2DiagnosticPayload.virtualPanoRender === 'object'
               ? (phase2DiagnosticPayload.virtualPanoRender as Record<string, unknown>)
               : null;
 
           phase2VirtualPano.executed = true;
           phase2VirtualPano.timingMs =
             phase2DiagnosticPayload &&
-              phase2DiagnosticPayload.timingMs &&
-              typeof phase2DiagnosticPayload.timingMs === 'object'
+            phase2DiagnosticPayload.timingMs &&
+            typeof phase2DiagnosticPayload.timingMs === 'object'
               ? (phase2DiagnosticPayload.timingMs as Record<string, unknown>)
               : null;
           phase2VirtualPano.diagnostics = phase2RenderDiagnostics;
@@ -6251,13 +7145,10 @@ export function useCPROrchestrator({
           phase2VirtualPano.voi = phase2Voi;
           const phase2RejectReasons =
             phase2RenderDiagnostics && Array.isArray(phase2RenderDiagnostics.rejectReasons)
-              ? phase2RenderDiagnostics.rejectReasons.filter(
-                reason => typeof reason === 'string'
-              )
+              ? phase2RenderDiagnostics.rejectReasons.filter(reason => typeof reason === 'string')
               : [];
           phase2VirtualPano.usedAsDisplayedOutput =
-            !!phase2RenderDiagnostics &&
-            phase2RenderDiagnostics.usedAsOutput === true;
+            !!phase2RenderDiagnostics && phase2RenderDiagnostics.usedAsOutput === true;
           const acceptedByLowerBandTolerance =
             !!phase2RenderDiagnostics &&
             phase2RenderDiagnostics.acceptedByLowerBandTolerance === true;
@@ -6269,10 +7160,7 @@ export function useCPROrchestrator({
             phase2RejectReasons[0] === 'lower-band-bright-fraction-too-high'
           ) {
             phase2VirtualPano.borderlineAcceptedReason = 'lower-band-bright-fraction-only-rejected';
-          } else if (
-            phase2RenderDiagnostics &&
-            phase2RenderDiagnostics.usedAsOutput !== true
-          ) {
+          } else if (phase2RenderDiagnostics && phase2RenderDiagnostics.usedAsOutput !== true) {
             phase2VirtualPano.borderlineAcceptedReason = 'phase2-rejected-by-worker';
           }
           phase2WorkerResult = phase2Result;
@@ -6292,67 +7180,65 @@ export function useCPROrchestrator({
       );
       console.log(
         `[CPR-PHASE2] run=${debugRunId} base=${phase2BaseAttempt?.label ?? 'none'} ` +
-        `aggregation=${phase2BaseAttempt?.aggregation ?? 'none'} ` +
-        `executed=${phase2VirtualPano.executed ? 'yes' : 'no'} ` +
-        `usedAsOutput=${phase2VirtualPano.usedAsDisplayedOutput ? 'yes' : 'no'} ` +
-        `skipped=${phase2VirtualPano.skippedReason ?? 'none'} ` +
-        `borderline=${phase2VirtualPano.borderlineAcceptedReason ?? 'none'} ` +
-        `error=${phase2VirtualPano.error ?? 'none'}`
+          `aggregation=${phase2BaseAttempt?.aggregation ?? 'none'} ` +
+          `executed=${phase2VirtualPano.executed ? 'yes' : 'no'} ` +
+          `usedAsOutput=${phase2VirtualPano.usedAsDisplayedOutput ? 'yes' : 'no'} ` +
+          `skipped=${phase2VirtualPano.skippedReason ?? 'none'} ` +
+          `borderline=${phase2VirtualPano.borderlineAcceptedReason ?? 'none'} ` +
+          `error=${phase2VirtualPano.error ?? 'none'}`
       );
-      const rankedAttempts = attemptAudit
-        .slice()
-        .sort((a, b) => {
-          const aHardRejected = !!a.hardRejectReason;
-          const bHardRejected = !!b.hardRejectReason;
-          if (aHardRejected !== bHardRejected) {
-            return aHardRejected ? 1 : -1;
+      const rankedAttempts = attemptAudit.slice().sort((a, b) => {
+        const aHardRejected = !!a.hardRejectReason;
+        const bHardRejected = !!b.hardRejectReason;
+        if (aHardRejected !== bHardRejected) {
+          return aHardRejected ? 1 : -1;
+        }
+        if (aHardRejected && bHardRejected) {
+          const fallbackDelta =
+            scoreHardRejectedPanoFallback({
+              sampledCount: a.sampledCount ?? 0,
+              min: a.min ?? 0,
+              max: a.max ?? 0,
+              p01: a.p01 ?? 0,
+              p50: a.p50 ?? 0,
+              p99: a.p99 ?? 0,
+              fractionBelowMinus950: a.fractionBelowMinus950 ?? 0,
+              fractionAbove3000: a.fractionAbove3000 ?? 0,
+              meanAbsDelta: a.meanAbsDelta ?? 0,
+              toothBandMean: a.toothBandMean ?? 0,
+              toothBandP10: a.toothBandP10 ?? 0,
+              toothBandP90: a.toothBandP90 ?? 0,
+              toothBandBrightFraction: a.toothBandBrightFraction ?? 0,
+              lowerBandP50: a.lowerBandP50 ?? 0,
+              lowerBandBrightFraction: a.lowerBandBrightFraction ?? 0,
+              detailBandHorizontalEdgeMean: a.detailBandHorizontalEdgeMean ?? 0,
+              detailBandVerticalEdgeMean: a.detailBandVerticalEdgeMean ?? 0,
+            }) -
+            scoreHardRejectedPanoFallback({
+              sampledCount: b.sampledCount ?? 0,
+              min: b.min ?? 0,
+              max: b.max ?? 0,
+              p01: b.p01 ?? 0,
+              p50: b.p50 ?? 0,
+              p99: b.p99 ?? 0,
+              fractionBelowMinus950: b.fractionBelowMinus950 ?? 0,
+              fractionAbove3000: b.fractionAbove3000 ?? 0,
+              meanAbsDelta: b.meanAbsDelta ?? 0,
+              toothBandMean: b.toothBandMean ?? 0,
+              toothBandP10: b.toothBandP10 ?? 0,
+              toothBandP90: b.toothBandP90 ?? 0,
+              toothBandBrightFraction: b.toothBandBrightFraction ?? 0,
+              lowerBandP50: b.lowerBandP50 ?? 0,
+              lowerBandBrightFraction: b.lowerBandBrightFraction ?? 0,
+              detailBandHorizontalEdgeMean: b.detailBandHorizontalEdgeMean ?? 0,
+              detailBandVerticalEdgeMean: b.detailBandVerticalEdgeMean ?? 0,
+            });
+          if (Math.abs(fallbackDelta) > 1e-6) {
+            return fallbackDelta > 0 ? -1 : 1;
           }
-          if (aHardRejected && bHardRejected) {
-            const fallbackDelta =
-              scoreHardRejectedPanoFallback({
-                sampledCount: a.sampledCount ?? 0,
-                min: a.min ?? 0,
-                max: a.max ?? 0,
-                p01: a.p01 ?? 0,
-                p50: a.p50 ?? 0,
-                p99: a.p99 ?? 0,
-                fractionBelowMinus950: a.fractionBelowMinus950 ?? 0,
-                fractionAbove3000: a.fractionAbove3000 ?? 0,
-                meanAbsDelta: a.meanAbsDelta ?? 0,
-                toothBandMean: a.toothBandMean ?? 0,
-                toothBandP10: a.toothBandP10 ?? 0,
-                toothBandP90: a.toothBandP90 ?? 0,
-                toothBandBrightFraction: a.toothBandBrightFraction ?? 0,
-                lowerBandP50: a.lowerBandP50 ?? 0,
-                lowerBandBrightFraction: a.lowerBandBrightFraction ?? 0,
-                detailBandHorizontalEdgeMean: a.detailBandHorizontalEdgeMean ?? 0,
-                detailBandVerticalEdgeMean: a.detailBandVerticalEdgeMean ?? 0,
-              }) -
-              scoreHardRejectedPanoFallback({
-                sampledCount: b.sampledCount ?? 0,
-                min: b.min ?? 0,
-                max: b.max ?? 0,
-                p01: b.p01 ?? 0,
-                p50: b.p50 ?? 0,
-                p99: b.p99 ?? 0,
-                fractionBelowMinus950: b.fractionBelowMinus950 ?? 0,
-                fractionAbove3000: b.fractionAbove3000 ?? 0,
-                meanAbsDelta: b.meanAbsDelta ?? 0,
-                toothBandMean: b.toothBandMean ?? 0,
-                toothBandP10: b.toothBandP10 ?? 0,
-                toothBandP90: b.toothBandP90 ?? 0,
-                toothBandBrightFraction: b.toothBandBrightFraction ?? 0,
-                lowerBandP50: b.lowerBandP50 ?? 0,
-                lowerBandBrightFraction: b.lowerBandBrightFraction ?? 0,
-                detailBandHorizontalEdgeMean: b.detailBandHorizontalEdgeMean ?? 0,
-                detailBandVerticalEdgeMean: b.detailBandVerticalEdgeMean ?? 0,
-              });
-            if (Math.abs(fallbackDelta) > 1e-6) {
-              return fallbackDelta > 0 ? -1 : 1;
-            }
-          }
-          return (b.qualityScore - a.qualityScore) || (b.qualityBase - a.qualityBase);
-        });
+        }
+        return b.qualityScore - a.qualityScore || b.qualityBase - a.qualityBase;
+      });
       const selectedAttempt = rankedAttempts[0];
       const runnerUpAttempt = rankedAttempts.length > 1 ? rankedAttempts[1] : null;
       console.log(
@@ -6369,18 +7255,182 @@ export function useCPROrchestrator({
           },
         })
       );
+      const bestAttemptRouteDiagnostic = resolveWorkerDisplayRouteDiagnostic(
+        bestAttempt.workerDebugPayload
+      );
+      const selectedDisplayedOutputMode = phase2VirtualPano.usedAsDisplayedOutput
+        ? 'virtualPanoPhase2'
+        : resolveDisplayedOutputModeFromWorkerResult({
+            routeDiagnostic: bestAttemptRouteDiagnostic,
+            workerDebugPayload: bestAttempt.workerDebugPayload,
+          });
+      const selectedDisplayedSourceLabel = phase2VirtualPano.usedAsDisplayedOutput
+        ? phase2BaseAttempt?.label ?? bestAttempt.label
+        : bestAttempt.label;
+      const selectedDisplayedSourceAggregation = phase2VirtualPano.usedAsDisplayedOutput
+        ? phase2BaseAttempt?.aggregation ?? bestAttempt.aggregation
+        : bestAttempt.aggregation;
+      const topGpuAttempt =
+        attemptResults
+          .filter(
+            attempt =>
+              attempt.requestedBackend === 'gpu' && attempt.resolvedBackend === 'gpu'
+          )
+          .slice()
+          .sort(compareRankedPanoOutputs)[0] ?? null;
+      const topCpuVirtualPanoAttempt =
+        attemptResults
+          .filter(
+            attempt =>
+              attempt.resolvedBackend === 'cpu' && attempt.reconstructionMode === 'virtualPano'
+          )
+          .slice()
+          .sort(compareRankedPanoOutputs)[0] ?? null;
+      const topLegacyAttempt =
+        attemptResults
+          .filter(
+            attempt => attempt.resolvedBackend === 'cpu' && attempt.reconstructionMode === 'legacy'
+          )
+          .slice()
+          .sort(compareRankedPanoOutputs)[0] ?? null;
+      const explicitPhase2QualityGateCandidate =
+        phase2WorkerResult && phase2VirtualPano.summary && phase2BaseAttempt
+          ? buildPhase4QualityGateCandidate({
+              attemptLabel: phase2BaseAttempt.label,
+              displayedPath: 'worker-recon',
+              sourceVolumeId,
+              summary: phase2VirtualPano.summary,
+              qualityBase: scorePanoQuality(phase2VirtualPano.summary),
+              qualityScore: scorePanoQuality(phase2VirtualPano.summary),
+              hardRejectReason: getHardRejectReason(phase2VirtualPano.summary),
+              workerDebugPayload: phase2WorkerResult.workerDebugPayload ?? null,
+            })
+          : null;
+      const gpuQualityGateCandidate = topGpuAttempt
+        ? buildPhase4QualityGateCandidate({
+            attemptLabel: topGpuAttempt.label,
+            displayedPath: 'worker-recon',
+            sourceVolumeId,
+            summary: topGpuAttempt.summary,
+            qualityBase: topGpuAttempt.qualityBase,
+            qualityScore: topGpuAttempt.qualityScore,
+            hardRejectReason: topGpuAttempt.hardRejectReason,
+            workerDebugPayload: topGpuAttempt.workerDebugPayload ?? null,
+          })
+        : null;
+      const cpuQualityGateCandidate =
+        explicitPhase2QualityGateCandidate ??
+        (topCpuVirtualPanoAttempt
+          ? buildPhase4QualityGateCandidate({
+              attemptLabel: topCpuVirtualPanoAttempt.label,
+              displayedPath: 'worker-recon',
+              sourceVolumeId,
+              summary: topCpuVirtualPanoAttempt.summary,
+              qualityBase: topCpuVirtualPanoAttempt.qualityBase,
+              qualityScore: topCpuVirtualPanoAttempt.qualityScore,
+              hardRejectReason: topCpuVirtualPanoAttempt.hardRejectReason,
+              workerDebugPayload: topCpuVirtualPanoAttempt.workerDebugPayload ?? null,
+            })
+          : null);
+      const legacyQualityGateCandidate = topLegacyAttempt
+        ? buildPhase4QualityGateCandidate({
+            attemptLabel: topLegacyAttempt.label,
+            displayedPath: 'worker-recon',
+            sourceVolumeId,
+            summary: topLegacyAttempt.summary,
+            qualityBase: topLegacyAttempt.qualityBase,
+            qualityScore: topLegacyAttempt.qualityScore,
+            hardRejectReason: topLegacyAttempt.hardRejectReason,
+            workerDebugPayload: topLegacyAttempt.workerDebugPayload ?? null,
+          })
+        : null;
+      const selectedQualityGateCandidate =
+        phase2VirtualPano.usedAsDisplayedOutput && explicitPhase2QualityGateCandidate
+          ? explicitPhase2QualityGateCandidate
+          : buildPhase4QualityGateCandidate({
+              attemptLabel: bestAttempt.label,
+              displayedPath: 'worker-recon',
+              sourceVolumeId,
+              summary: bestAttempt.summary,
+              qualityBase: bestAttempt.qualityBase,
+              qualityScore: bestAttempt.qualityScore,
+              hardRejectReason: bestAttempt.hardRejectReason,
+              workerDebugPayload: bestAttempt.workerDebugPayload ?? null,
+            });
+      const qualityGateSelectionReason = selectedQualityGateCandidate.pass
+        ? selectedQualityGateCandidate.candidateSource === 'worker-gpu-support-surface'
+          ? 'gpu-candidate-passed'
+          : selectedQualityGateCandidate.candidateSource === 'worker-cpu-virtual-pano'
+            ? gpuQualityGateCandidate && !gpuQualityGateCandidate.pass
+              ? 'gpu-rejected-cpu-selected'
+              : 'cpu-selected'
+            : selectedQualityGateCandidate.requestedReconstructionMode === 'legacy'
+              ? 'explicit-legacy-selection'
+              : 'legacy-fallback-allowed'
+        : CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK
+          ? 'selected-after-gate-failure-reference-or-legacy-allowed'
+          : 'selected-after-gate-failure-reference-and-legacy-blocked';
+      const qualityGateFallbackSummary = {
+        selectionReason: qualityGateSelectionReason,
+        referenceOrLegacyFallbackAllowed: CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK,
+        finalSelectedOutput: summarizePhase4QualityGateCandidate(selectedQualityGateCandidate),
+        candidates: {
+          gpu: summarizePhase4QualityGateCandidate(gpuQualityGateCandidate),
+          cpu: summarizePhase4QualityGateCandidate(cpuQualityGateCandidate),
+          legacy: summarizePhase4QualityGateCandidate(legacyQualityGateCandidate),
+        },
+      };
+      console.log(
+        '[CPR-QUALITY-GATE-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          displayedPath: 'worker-recon',
+          backend: selectedQualityGateCandidate.backend,
+          reconstructionMode: selectedQualityGateCandidate.reconstructionMode,
+          sourceVolumeId,
+          selectionRule: {
+            primary: 'worker-gpu-support-surface',
+            secondary: 'worker-cpu-virtual-pano',
+            tertiary: 'reference-or-legacy-only-if-flag-enabled',
+          },
+          referencePathAvailable: true,
+          referenceOrLegacyFallbackAllowed: CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK,
+          displayedOutputMode: selectedDisplayedOutputMode,
+          displayedSourceLabel: selectedDisplayedSourceLabel,
+          displayedSourceAggregation: selectedDisplayedSourceAggregation,
+          finalSelectedOutput: qualityGateFallbackSummary.finalSelectedOutput,
+          candidates: qualityGateFallbackSummary.candidates,
+          fallbackPath: {
+            selectionReason: qualityGateSelectionReason,
+            gpuRejected: gpuQualityGateCandidate ? !gpuQualityGateCandidate.pass : null,
+            gpuRejectReasons: gpuQualityGateCandidate?.rejectReasons ?? [],
+            cpuRejected: cpuQualityGateCandidate ? !cpuQualityGateCandidate.pass : null,
+            cpuRejectReasons: cpuQualityGateCandidate?.rejectReasons ?? [],
+            legacyRejected: legacyQualityGateCandidate ? !legacyQualityGateCandidate.pass : null,
+            legacyRejectReasons: legacyQualityGateCandidate?.rejectReasons ?? [],
+            selectedDespiteGateFailure: !selectedQualityGateCandidate.pass,
+          },
+          attemptExecution: {
+            attemptCount: launchedAttemptCount,
+            mipFallbackCount: launchedMipFallbackCount,
+            totalDurationMs: Math.round(totalAttemptDurationMs),
+            earlyExitReason,
+          },
+        })
+      );
       console.log(
         '[CPR-SELECTED-JSON]',
         JSON.stringify({
           runId: debugRunId,
           selectedLabel: bestAttempt.label,
-          displayedOutputMode: phase2VirtualPano.usedAsDisplayedOutput ? 'virtualPanoPhase2' : 'legacy',
-          displayedSourceLabel: phase2VirtualPano.usedAsDisplayedOutput
-            ? phase2BaseAttempt?.label ?? bestAttempt.label
-            : bestAttempt.label,
-          displayedSourceAggregation: phase2VirtualPano.usedAsDisplayedOutput
-            ? phase2BaseAttempt?.aggregation ?? bestAttempt.aggregation
-            : bestAttempt.aggregation,
+          displayedOutputMode: selectedDisplayedOutputMode,
+          selectedRequestedBackend: bestAttempt.requestedBackend,
+          selectedResolvedBackend: bestAttempt.resolvedBackend,
+          selectedPipelineMode: bestAttempt.pipelineMode,
+          selectedFallbackReason: bestAttempt.fallbackReason,
+          selectedReconstructionMode: bestAttempt.reconstructionMode,
+          displayedSourceLabel: selectedDisplayedSourceLabel,
+          displayedSourceAggregation: selectedDisplayedSourceAggregation,
           selectedAggregation: bestAttempt.aggregation,
           selectedActualVertHalfMm: bestAttempt.actualVertHalfMm,
           selectedSlabHalfThicknessMm: bestAttempt.slabHalfThicknessMm,
@@ -6391,6 +7441,7 @@ export function useCPROrchestrator({
           selectedHardRejectReason: bestAttempt.hardRejectReason,
           selectedQualityScore: bestAttempt.qualityScore,
           selectedQualityBase: bestAttempt.qualityBase,
+          selectedPhase2GatePassed: bestAttemptRouteDiagnostic.phase2GatePassed,
           selectedSummary: phase2VirtualPano.usedAsDisplayedOutput
             ? phase2VirtualPano.summary
             : bestAttempt.summary,
@@ -6409,11 +7460,16 @@ export function useCPROrchestrator({
             earlyExitReason,
           },
           runnerUp: runnerUpAttempt,
-          scoreDeltaToRunnerUp:
-            runnerUpAttempt ? bestAttempt.qualityScore - runnerUpAttempt.qualityScore : null,
-          baseDeltaToRunnerUp:
-            runnerUpAttempt ? bestAttempt.qualityBase - runnerUpAttempt.qualityBase : null,
+          scoreDeltaToRunnerUp: runnerUpAttempt
+            ? bestAttempt.qualityScore - runnerUpAttempt.qualityScore
+            : null,
+          baseDeltaToRunnerUp: runnerUpAttempt
+            ? bestAttempt.qualityBase - runnerUpAttempt.qualityBase
+            : null,
           selectedMatchesRankedTop: selectedAttempt?.label === bestAttempt.label,
+          qualityGateSelectionReason,
+          qualityGateSelectedOutput: qualityGateFallbackSummary.finalSelectedOutput,
+          qualityGateCandidates: qualityGateFallbackSummary.candidates,
         })
       );
 
@@ -6444,7 +7500,8 @@ export function useCPROrchestrator({
       let panoWorkerResult = bestAttempt.result;
       let panoDebugSummary = bestAttempt.summary;
       let adaptiveVoi = bestAttempt.voi;
-      let displayedOutputMode: 'legacy' | 'virtualPanoPhase2' = 'legacy';
+      let displayedOutputMode: 'legacy' | 'workerGpuPhase2' | 'virtualPanoPhase2' =
+        selectedDisplayedOutputMode;
       let displayedSourceLabel = bestAttempt.label;
       let displayedSourceAggregation = bestAttempt.aggregation;
       let selectedPanoWidth = bestAttempt.panoWidth;
@@ -6471,41 +7528,56 @@ export function useCPROrchestrator({
         selectedColumnPixelSpacing = phase2BaseAttempt.columnPixelSpacing;
         selectedRowPixelSpacing = phase2BaseAttempt.rowPixelSpacing;
       }
-      const displayedWorkerDebugPayload =
-        phase2VirtualPano.usedAsDisplayedOutput
-          ? phase2WorkerResult?.workerDebugPayload ?? null
-          : bestAttempt.workerDebugPayload ?? null;
+      const displayedWorkerDebugPayload = phase2VirtualPano.usedAsDisplayedOutput
+        ? phase2WorkerResult?.workerDebugPayload ?? null
+        : bestAttempt.workerDebugPayload ?? null;
+      const displayedRouteDiagnostic = resolveWorkerDisplayRouteDiagnostic(
+        displayedWorkerDebugPayload
+      );
       const displayedWorkerDiagnostic =
         displayedWorkerDebugPayload &&
-          typeof displayedWorkerDebugPayload === 'object' &&
-          displayedWorkerDebugPayload.diagnostic &&
-          typeof displayedWorkerDebugPayload.diagnostic === 'object'
+        typeof displayedWorkerDebugPayload === 'object' &&
+        displayedWorkerDebugPayload.diagnostic &&
+        typeof displayedWorkerDebugPayload.diagnostic === 'object'
           ? (displayedWorkerDebugPayload.diagnostic as Record<string, unknown>)
           : null;
-      const selectedLocalCenterOffsetsMm = Array.isArray(displayedWorkerDiagnostic?.localCenterOffsetsMm)
+      const selectedLocalCenterOffsetsMm = Array.isArray(
+        displayedWorkerDiagnostic?.localCenterOffsetsMm
+      )
         ? displayedWorkerDiagnostic.localCenterOffsetsMm
-          .map(value => Number(value))
-          .filter(value => Number.isFinite(value))
+            .map(value => Number(value))
+            .filter(value => Number.isFinite(value))
         : [];
       const crossSectionVerticalCenterOffsetMm =
         (phase2VirtualPano.usedAsDisplayedOutput
           ? phase2BaseAttempt?.verticalCenterOffsetMm
           : bestAttempt.verticalCenterOffsetMm) ?? 0;
-      console.log('[CPR-CROSSSECTION-GEOMETRY-JSON]', JSON.stringify({
-        runId: debugRunId,
-        displayedOutputMode,
-        correctedFrameCount: frames.length,
-        sourceFrameCount: frames.length,
-        usingWorkerLocalCenterOffsets: selectedLocalCenterOffsetsMm.length === frames.length,
-        crossSectionVerticalCenterOffsetMm,
-        localCenterOffsetsFirst8: selectedLocalCenterOffsetsMm.slice(0, 8),
-        geometryPolicy: 'worker-offsets-render-only',
-      }));
+      console.log(
+        '[CPR-CROSSSECTION-GEOMETRY-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          displayedOutputMode,
+          correctedFrameCount: frames.length,
+          sourceFrameCount: frames.length,
+          usingWorkerLocalCenterOffsets: selectedLocalCenterOffsetsMm.length === frames.length,
+          crossSectionVerticalCenterOffsetMm,
+          localCenterOffsetsFirst8: selectedLocalCenterOffsetsMm.slice(0, 8),
+          geometryPolicy: 'worker-offsets-render-only',
+        })
+      );
       console.log(`[CPR][${debugRunId}] selected pano attempt`, {
         label: bestAttempt.label,
         displayedOutputMode,
         displayedSourceLabel,
         displayedSourceAggregation,
+        displayedPath: 'worker-recon',
+        displayedBackend: displayedRouteDiagnostic.backend,
+        displayedPipelineMode: displayedRouteDiagnostic.pipelineMode,
+        fallbackReason: displayedRouteDiagnostic.fallbackReason,
+        phase2GatePassed: displayedRouteDiagnostic.phase2GatePassed,
+        qualityGateSelectionReason,
+        qualityGateRejectReasons: selectedQualityGateCandidate.rejectReasons,
+        qualityGatePassed: selectedQualityGateCandidate.pass,
         qualityBase: bestAttempt.qualityBase,
         qualityScore: bestAttempt.qualityScore,
         hardRejectReason: bestAttempt.hardRejectReason,
@@ -6523,7 +7595,6 @@ export function useCPROrchestrator({
         columnPixelSpacing: selectedColumnPixelSpacing,
         rowPixelSpacing: selectedRowPixelSpacing,
       });
-
       if (panoDebugSummary) {
         console.log(`[CPR][${debugRunId}] Worker pano output stats (sampled)`, {
           min: panoDebugSummary.min,
@@ -6546,16 +7617,19 @@ export function useCPROrchestrator({
           configuredVoiUpper: adaptiveVoi.upper,
         });
 
-        if (panoDebugSummary.fractionAbove3000 > 0.6 || panoDebugSummary.fractionBelowMinus950 > 0.6) {
+        if (
+          panoDebugSummary.fractionAbove3000 > 0.6 ||
+          panoDebugSummary.fractionBelowMinus950 > 0.6
+        ) {
           console.warn(
             `[CPR][${debugRunId}] Majority of pano samples are outside reference band [-950, 3000]. ` +
-            `Adaptive VOI is [${adaptiveVoi.lower.toFixed(0)}, ${adaptiveVoi.upper.toFixed(0)}].`
+              `Adaptive VOI is [${adaptiveVoi.lower.toFixed(0)}, ${adaptiveVoi.upper.toFixed(0)}].`
           );
         }
       }
 
       console.log(
-        `[CPR-SPLINE-PRESERVE] run=${debugRunId} mode=legacy-worker annotationUID=${
+        `[CPR-SPLINE-PRESERVE] run=${debugRunId} mode=worker-recon annotationUID=${
           latestAnnotationUID || 'none'
         } skipping pre-transition spline cleanup`
       );
@@ -6588,7 +7662,10 @@ export function useCPROrchestrator({
             'legacy-after-stage-switch'
           );
 
-          if (panoWorkerResult.pixelData.length !== panoWorkerResult.width * panoWorkerResult.height) {
+          if (
+            panoWorkerResult.pixelData.length !==
+            panoWorkerResult.width * panoWorkerResult.height
+          ) {
             throw new Error('Dimension mismatch');
           }
 
@@ -6598,6 +7675,17 @@ export function useCPROrchestrator({
             meanMap: panoWorkerResult.meanMap,
             maxMap: panoWorkerResult.maxMap,
             sampleCountMap: panoWorkerResult.sampleCountMap,
+            debugMaps: panoWorkerResult.debugMaps,
+            probeContext: {
+              runId: debugRunId,
+              displayedPath: 'worker-recon',
+              backend: displayedRouteDiagnostic.backend,
+              requestedBackend: displayedRouteDiagnostic.requestedBackend,
+              pipelineMode: displayedRouteDiagnostic.pipelineMode,
+              reconstructionMode:
+                toNonEmptyString(displayedWorkerDiagnostic?.reconstructionMode) ??
+                displayedOutputMode,
+            },
             width: panoWorkerResult.width,
             height: panoWorkerResult.height,
             minValue: panoWorkerResult.minValue,
@@ -6629,33 +7717,37 @@ export function useCPROrchestrator({
             columnPixelSpacing: selectedColumnPixelSpacing,
             rowPixelSpacing: selectedRowPixelSpacing,
           });
-          console.log('[CPR-LOADER-METADATA-JSON]', JSON.stringify({
-            runId: debugRunId,
-            displayedOutputMode,
-            panoImageId,
-            minValue: panoWorkerResult.minValue,
-            maxValue: panoWorkerResult.maxValue,
-            intensityDomain: bestAttempt.intensityDomain,
-            windowWidth: adaptiveVoi.windowWidth,
-            windowCenter: adaptiveVoi.windowCenter,
-            voiLower: adaptiveVoi.lower,
-            voiUpper: adaptiveVoi.upper,
-            slope: panoWorkerResult.slope,
-            intercept: panoWorkerResult.intercept,
-            width: panoWorkerResult.width,
-            height: panoWorkerResult.height,
-            columnPixelSpacing: selectedColumnPixelSpacing,
-            rowPixelSpacing: selectedRowPixelSpacing,
-            selectedAttempt: {
-              label: bestAttempt.label,
-              aggregation: bestAttempt.aggregation,
-              verticalCenterOffsetMm: bestAttempt.verticalCenterOffsetMm,
-              slabHalfThicknessMm: bestAttempt.slabHalfThicknessMm,
-              slabSamples: bestAttempt.slabSamples,
-              qualityScore: bestAttempt.qualityScore,
-            },
-          }));
+          console.log(
+            '[CPR-LOADER-METADATA-JSON]',
+            JSON.stringify({
+              runId: debugRunId,
+              displayedOutputMode,
+              panoImageId,
+              minValue: panoWorkerResult.minValue,
+              maxValue: panoWorkerResult.maxValue,
+              intensityDomain: bestAttempt.intensityDomain,
+              windowWidth: adaptiveVoi.windowWidth,
+              windowCenter: adaptiveVoi.windowCenter,
+              voiLower: adaptiveVoi.lower,
+              voiUpper: adaptiveVoi.upper,
+              slope: panoWorkerResult.slope,
+              intercept: panoWorkerResult.intercept,
+              width: panoWorkerResult.width,
+              height: panoWorkerResult.height,
+              columnPixelSpacing: selectedColumnPixelSpacing,
+              rowPixelSpacing: selectedRowPixelSpacing,
+              selectedAttempt: {
+                label: bestAttempt.label,
+                aggregation: bestAttempt.aggregation,
+                verticalCenterOffsetMm: bestAttempt.verticalCenterOffsetMm,
+                slabHalfThicknessMm: bestAttempt.slabHalfThicknessMm,
+                slabSamples: bestAttempt.slabSamples,
+                qualityScore: bestAttempt.qualityScore,
+              },
+            })
+          );
 
+          await ensureViewportTypeByLogicalId(servicesManager, 'cpr-pano', 'stack', debugRunId);
           const panoViewport = await waitForPanoStackViewport(servicesManager);
           logPanoViewportSnapshot(debugRunId, 'before-setStack', panoViewport);
           await panoViewport.setStack([panoImageId], 0);
@@ -6668,6 +7760,60 @@ export function useCPROrchestrator({
           logPanoViewportSnapshot(debugRunId, 'after-setProperties', panoViewport);
           panoViewport.render();
           logPanoViewportSnapshot(debugRunId, 'after-render', panoViewport);
+          logPanoDisplayRoute({
+            runId: debugRunId,
+            displayedPath: 'worker-recon',
+            backend: displayedRouteDiagnostic.backend,
+            requestedBackend: displayedRouteDiagnostic.requestedBackend,
+            pipelineMode: displayedRouteDiagnostic.pipelineMode,
+            fallbackReason: displayedRouteDiagnostic.fallbackReason,
+          });
+          logReconModeJson({
+            runId: debugRunId,
+            displayedPath: 'worker-recon',
+            backend: displayedRouteDiagnostic.backend,
+            requestedBackend: displayedRouteDiagnostic.requestedBackend,
+            pipelineMode: displayedRouteDiagnostic.pipelineMode,
+            reconstructionMode: displayedOutputMode,
+            displaySource: 'panoImageLoader',
+            referencePathAvailable: true,
+            sourceVolumeId,
+            fallbackReason: displayedRouteDiagnostic.fallbackReason,
+            phase2GatePassed: displayedRouteDiagnostic.phase2GatePassed,
+          });
+          const shouldLogReconFallback =
+            displayedRouteDiagnostic.backend !== displayedRouteDiagnostic.requestedBackend ||
+            !!displayedRouteDiagnostic.fallbackReason ||
+            phase2VirtualPano.usedAsDisplayedOutput ||
+            !!phase1VirtualPano.error ||
+            !!phase2VirtualPano.error ||
+            !selectedQualityGateCandidate.pass;
+          if (shouldLogReconFallback) {
+            console.log(
+              '[CPR-RECON-FALLBACK-JSON]',
+              JSON.stringify({
+                runId: debugRunId,
+                displayedPath: 'worker-recon',
+                backend: displayedRouteDiagnostic.backend,
+                requestedBackend: displayedRouteDiagnostic.requestedBackend,
+                pipelineMode: displayedRouteDiagnostic.pipelineMode,
+                reconstructionMode: displayedOutputMode,
+                sourceVolumeId,
+                referencePathAvailable: true,
+                displaySource: 'panoImageLoader',
+                fallbackReason: displayedRouteDiagnostic.fallbackReason,
+                phase2GatePassed: displayedRouteDiagnostic.phase2GatePassed,
+                displayedOutputMode,
+                displayedSourceLabel,
+                displayedSourceAggregation,
+                selectedAttemptLabel: bestAttempt.label,
+                selectedAttemptHardRejectReason: bestAttempt.hardRejectReason,
+                qualityGate: qualityGateFallbackSummary,
+                phase1VirtualPano,
+                phase2VirtualPano,
+              })
+            );
+          }
           // Re-assert VOI after first rendered frame in case stack initialization re-applies defaults.
           if (panoViewport.element) {
             let reappliedOnRender = false;
@@ -6745,6 +7891,30 @@ export function useCPROrchestrator({
           });
         } catch (innerErr) {
           const msg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+          console.log(
+            '[CPR-RECON-FALLBACK-JSON]',
+            JSON.stringify({
+              runId: debugRunId,
+              displayedPath: 'worker-recon',
+              backend: displayedRouteDiagnostic.backend,
+              requestedBackend: displayedRouteDiagnostic.requestedBackend,
+              pipelineMode: displayedRouteDiagnostic.pipelineMode,
+              reconstructionMode: displayedOutputMode,
+              sourceVolumeId,
+              referencePathAvailable: true,
+              displaySource: 'panoImageLoader',
+              fallbackReason: `display-attach-failed:${msg}`,
+              phase2GatePassed: displayedRouteDiagnostic.phase2GatePassed,
+              displayedOutputMode,
+              displayedSourceLabel,
+              displayedSourceAggregation,
+              selectedAttemptLabel: bestAttempt.label,
+              selectedAttemptHardRejectReason: bestAttempt.hardRejectReason,
+              qualityGate: qualityGateFallbackSummary,
+              phase1VirtualPano,
+              phase2VirtualPano,
+            })
+          );
           console.error(`[CPR][${debugRunId}] Pipeline failed after HP switch:`, msg);
           clearPendingAxialViewportRestore('legacy-stage1-failed');
           setAxialTransitioning(false, 'legacy-stage1-failed');
@@ -6833,10 +8003,7 @@ export function useCPROrchestrator({
         setError(msg);
       }
     }
-  }, [
-    commandsManager,
-    clearCprRuntimeState,
-  ]);
+  }, [commandsManager, clearCprRuntimeState]);
 
   const flushSliderFrameChange = useCallback(() => {
     sliderAnimationFrameRef.current = null;
@@ -6912,7 +8079,7 @@ export function useCPROrchestrator({
   }, [onSliderChange]);
 
   useEffect(() => {
-    if (CPR_PANO_RENDERER_MODE !== 'vtk-cpr') {
+    if (CPR_PANO_DISPLAY_PATH_DEFAULT !== 'vtk-reference') {
       return;
     }
 
@@ -6942,7 +8109,7 @@ export function useCPROrchestrator({
   }, [getLiveHostedPano, rearmPanoCameraBridgeFromLiveViewport]);
 
   useEffect(() => {
-    if (CPR_PANO_RENDERER_MODE !== 'vtk-cpr' || typeof document === 'undefined') {
+    if (CPR_PANO_DISPLAY_PATH_DEFAULT !== 'vtk-reference' || typeof document === 'undefined') {
       return;
     }
 
@@ -6962,7 +8129,8 @@ export function useCPROrchestrator({
       }
 
       const logicalViewportId =
-        cornerstoneViewportService.getViewportInfo(viewportId)?.viewportOptions?.viewportId || viewportId;
+        cornerstoneViewportService.getViewportInfo(viewportId)?.viewportOptions?.viewportId ||
+        viewportId;
       if (logicalViewportId !== 'cpr-pano' && logicalViewportId !== 'cpr-crosssection') {
         return;
       }
@@ -7040,7 +8208,7 @@ export function useCPROrchestrator({
   }, [getLiveHostedPano, scheduleHostedPanoVoiRepair, servicesManager, setHostedPanoVoiAuthority]);
 
   useEffect(() => {
-    if (CPR_PANO_RENDERER_MODE !== 'vtk-cpr' || typeof document === 'undefined') {
+    if (CPR_PANO_DISPLAY_PATH_DEFAULT !== 'vtk-reference' || typeof document === 'undefined') {
       return;
     }
 
@@ -7059,7 +8227,8 @@ export function useCPROrchestrator({
       }
 
       const logicalViewportId =
-        cornerstoneViewportService.getViewportInfo(viewportId)?.viewportOptions?.viewportId || viewportId;
+        cornerstoneViewportService.getViewportInfo(viewportId)?.viewportOptions?.viewportId ||
+        viewportId;
       if (logicalViewportId !== 'cpr-pano') {
         return;
       }
@@ -7127,7 +8296,11 @@ export function useCPROrchestrator({
     document.addEventListener(cornerstone.Enums.Events.CAMERA_MODIFIED, onCameraModified, true);
 
     return () => {
-      document.removeEventListener(cornerstone.Enums.Events.CAMERA_MODIFIED, onCameraModified, true);
+      document.removeEventListener(
+        cornerstone.Enums.Events.CAMERA_MODIFIED,
+        onCameraModified,
+        true
+      );
     };
   }, [rearmPanoCameraBridgeFromLiveViewport, servicesManager]);
 

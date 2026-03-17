@@ -1,4 +1,5 @@
 import * as cornerstone from '@cornerstonejs/core';
+import type { GpuPanoDebugMaps } from './cprGpuRenderer';
 
 import {
   SyntheticCprIntensityDomain,
@@ -10,6 +11,15 @@ export interface PanoImagePayload {
   meanMap?: Float32Array;
   maxMap?: Float32Array;
   sampleCountMap?: Float32Array;
+  debugMaps?: GpuPanoDebugMaps;
+  probeContext?: {
+    runId?: string | null;
+    displayedPath?: string | null;
+    backend?: string | null;
+    requestedBackend?: string | null;
+    pipelineMode?: string | null;
+    reconstructionMode?: string | null;
+  };
   width: number;
   height: number;
   minValue: number;

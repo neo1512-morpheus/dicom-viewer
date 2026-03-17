@@ -1,4 +1,5 @@
 import { disposeGpuPanoRenderer, renderPanoGpu } from './cprGpuRenderer';
+import type { GpuPanoDebugMaps, GpuPanoDiagnostics } from './cprGpuRenderer';
 import {
   createHuScalarTransform,
   normalizeScalarDataToHuFloat32,
@@ -46,8 +47,11 @@ interface CPRWorkerInput {
   pixelRepresentation?: number;
   isPreScaled?: boolean;
   debugRunId?: string;
+  attemptLabel?: string;
   reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
   renderBackend?: 'gpu' | 'cpu';
+  allowLegacyFallback?: boolean;
+  sourceVolumeId?: string;
 }
 
 interface CPRWorkerVolumeState {
@@ -97,8 +101,11 @@ interface CPRWorkerRenderInput {
   allowStoredValueNormalization?: boolean;
   disableStoredValueNormalization?: boolean;
   debugRunId?: string;
+  attemptLabel?: string;
   reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
   renderBackend?: 'gpu' | 'cpu';
+  allowLegacyFallback?: boolean;
+  sourceVolumeId?: string;
 }
 
 interface CPRWorkerDisposeInput {
@@ -127,6 +134,18 @@ function isMat4ArrayLike(value: unknown): value is ArrayLike<number> {
   return true;
 }
 
+function resolveReconstructionMode(value: unknown): 'legacy' | 'virtualPanoPhase1' | 'virtualPano' {
+  return value === 'virtualPanoPhase1' || value === 'virtualPano' || value === 'legacy'
+    ? value
+    : 'legacy';
+}
+
+function resolveCpuFallbackReconstructionMode(
+  requestedMode: 'legacy' | 'virtualPanoPhase1' | 'virtualPano'
+): 'virtualPano' {
+  return requestedMode === 'virtualPano' ? requestedMode : 'virtualPano';
+}
+
 interface CPRWorkerSuccess {
   type: 'SUCCESS';
   requestId: string;
@@ -134,6 +153,7 @@ interface CPRWorkerSuccess {
   meanMap?: Float32Array;
   maxMap?: Float32Array;
   sampleCountMap?: Float32Array;
+  debugMaps?: GpuPanoDebugMaps;
   panoWidth: number;
   panoHeight: number;
   minValue: number;
@@ -186,12 +206,11 @@ function dot3(a: [number, number, number], b: [number, number, number]): number 
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
-function cross3(a: [number, number, number], b: [number, number, number]): [number, number, number] {
-  return [
-    a[1] * b[2] - a[2] * b[1],
-    a[2] * b[0] - a[0] * b[2],
-    a[0] * b[1] - a[1] * b[0],
-  ];
+function cross3(
+  a: [number, number, number],
+  b: [number, number, number]
+): [number, number, number] {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 }
 
 function percentile(values: number[], q: number): number {
@@ -220,9 +239,12 @@ function worldToVoxel(
 ): [number, number, number] {
   if (isMat4ArrayLike(worldToIndex)) {
     // vtk.js mat4 layout is column-major.
-    const vi = worldToIndex[0] * wx + worldToIndex[4] * wy + worldToIndex[8] * wz + worldToIndex[12];
-    const vj = worldToIndex[1] * wx + worldToIndex[5] * wy + worldToIndex[9] * wz + worldToIndex[13];
-    const vk = worldToIndex[2] * wx + worldToIndex[6] * wy + worldToIndex[10] * wz + worldToIndex[14];
+    const vi =
+      worldToIndex[0] * wx + worldToIndex[4] * wy + worldToIndex[8] * wz + worldToIndex[12];
+    const vj =
+      worldToIndex[1] * wx + worldToIndex[5] * wy + worldToIndex[9] * wz + worldToIndex[13];
+    const vk =
+      worldToIndex[2] * wx + worldToIndex[6] * wy + worldToIndex[10] * wz + worldToIndex[14];
     return [vi, vj, vk];
   }
 
@@ -515,11 +537,7 @@ function quantizePanoForStackDisplay(
 
 void quantizePanoForStackDisplay;
 
-function validateGpuReadback(
-  pixelData: Float32Array,
-  panoWidth: number,
-  panoHeight: number
-): void {
+function validateGpuReadback(pixelData: Float32Array, panoWidth: number, panoHeight: number): void {
   const expectedLength = Math.max(0, panoWidth * panoHeight);
   if (!(pixelData instanceof Float32Array) || pixelData.length !== expectedLength) {
     throw new Error(
@@ -597,11 +615,15 @@ function resolveScalarSamplingPolicy(input: CPRWorkerInput): ScalarSamplingPolic
   };
 }
 
-function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
+function generateGpuPanorama(
+  input: CPRWorkerInput,
+  volumeCacheKey: string
+): {
   pixelData: Float32Array;
   meanMap: Float32Array;
   maxMap: Float32Array;
   sampleCountMap: Float32Array;
+  debugMaps?: GpuPanoDebugMaps;
   pipelineMode: 'single-pass' | 'multi-pass';
   minValue: number;
   maxValue: number;
@@ -611,6 +633,7 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
   requestedModalityLutApplied: boolean;
   storedValueNormalizationApplied: boolean;
   unsignedPackedArtifactDetected: boolean;
+  diagnostics?: GpuPanoDiagnostics;
   diagnosticPayload: Record<string, unknown>;
   outputSignature: {
     sampledCount: number;
@@ -639,7 +662,9 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
   } = input;
   const scalarPolicy = resolveScalarSamplingPolicy(input);
   if (!isMat4ArrayLike(worldToIndex)) {
-    throw new Error('[CPR-GPU] Missing authoritative worldToIndex mat4. Falling back to CPU preserves parity.');
+    throw new Error(
+      '[CPR-GPU] Missing authoritative worldToIndex mat4. Falling back to CPU preserves parity.'
+    );
   }
 
   const effectiveVerticalDir =
@@ -655,19 +680,20 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
     : 0;
   const requestedSlabSamples = Math.max(1, Math.min(64, Math.floor(slabSamples)));
   const startedAt = performance.now();
+  const requestedRenderBackend = input.renderBackend === 'cpu' ? 'cpu' : 'gpu';
   const formatGpuReadableValue = (value: number | null | undefined, fractionDigits = 1): string =>
     Number.isFinite(value) ? Number(value).toFixed(fractionDigits) : 'na';
   console.log(
     `[CPR-GPU-WORKER] run=${input.debugRunId ?? 'na'} requestedAggregation=${aggregation} ` +
-    `reconstructionMode=${reconstructionMode ?? 'legacy'} ` +
-    `effectivePipeline=renderer-selected ` +
-    `virtualPano=${reconstructionMode === 'legacy' ? 'off' : 'gpu-internal'} ` +
-    `backgroundSuppression=renderer-internal denoise=renderer-internal ` +
-    `pano=${panoWidth}x${panoHeight} ` +
-    `verticalHalfMm=${formatGpuReadableValue(effectiveVerticalHalfMm)} ` +
-    `centerOffsetMm=${formatGpuReadableValue(verticalCenterOffsetMm)} ` +
-    `slabHalfMm=${formatGpuReadableValue(slabHalfThicknessMm)} ` +
-    `slabSamples=${requestedSlabSamples}`
+      `reconstructionMode=${reconstructionMode ?? 'legacy'} ` +
+      `effectivePipeline=renderer-selected ` +
+      `virtualPano=${reconstructionMode === 'legacy' ? 'off' : 'gpu-internal'} ` +
+      `backgroundSuppression=renderer-internal denoise=renderer-internal ` +
+      `pano=${panoWidth}x${panoHeight} ` +
+      `verticalHalfMm=${formatGpuReadableValue(effectiveVerticalHalfMm)} ` +
+      `centerOffsetMm=${formatGpuReadableValue(verticalCenterOffsetMm)} ` +
+      `slabHalfMm=${formatGpuReadableValue(slabHalfThicknessMm)} ` +
+      `slabSamples=${requestedSlabSamples}`
   );
   const gpuResult = renderPanoGpu(
     {
@@ -694,39 +720,120 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
       applyRescale: scalarPolicy.shouldApplyModalityLut,
       normalizationSignature: scalarPolicy.normalizationSignature,
       normalizeStoredSample: scalarPolicy.normalizeStoredSample,
+      returnDebugSidecars: !!input.debugRunId,
     },
     volumeCacheKey
   );
   validateGpuReadback(gpuResult.pixelData, panoWidth, panoHeight);
   const elapsedMs = performance.now() - startedAt;
-  const {
-    minValue,
-    maxValue,
-    windowWidth,
-    windowCenter,
-  } = computeAutoDisplayWindow(gpuResult.pixelData);
-  console.log('[CPR-GPU-WORKER-RESULT-JSON]', JSON.stringify({
-    debugRunId: input.debugRunId ?? null,
-    renderBackend: 'gpu',
+  const { minValue, maxValue, windowWidth, windowCenter } = computeAutoDisplayWindow(
+    gpuResult.pixelData
+  );
+  const phase2GatePassed = gpuResult.diagnostics?.phase2GatePassed === true;
+  const gpuLogContext = {
+    runId: input.debugRunId ?? null,
+    attemptLabel: input.attemptLabel ?? null,
+    displayedPath: 'worker-recon',
+    backend: 'gpu',
+    reconstructionMode: reconstructionMode ?? 'legacy',
+    sourceVolumeId: input.sourceVolumeId ?? null,
     pipelineMode: gpuResult.pipelineMode,
-    panoWidth,
-    panoHeight,
-    requestedSlabHalfThicknessMm: slabHalfThicknessMm,
-    requestedSlabSamples,
-    slabHalfThicknessMm,
-    slabSamples: requestedSlabSamples,
-    minValue,
-    maxValue,
-    windowWidth,
-    windowCenter,
-  }));
+  };
+  console.log(
+    '[CPR-GPU-WORKER-RESULT-JSON]',
+    JSON.stringify({
+      runId: input.debugRunId ?? null,
+      attemptLabel: input.attemptLabel ?? null,
+      displayedPath: 'worker-recon',
+      backend: 'gpu',
+      requestedBackend: requestedRenderBackend,
+      reconstructionMode: reconstructionMode ?? 'legacy',
+      sourceVolumeId: input.sourceVolumeId ?? null,
+      pipelineMode: gpuResult.pipelineMode,
+      expectedPipelineMode: gpuResult.diagnostics?.expectedPipelineMode ?? 'multi-pass',
+      phase2GatePassed,
+      panoWidth,
+      panoHeight,
+      requestedSlabHalfThicknessMm: slabHalfThicknessMm,
+      requestedSlabSamples,
+      slabHalfThicknessMm,
+      slabSamples: requestedSlabSamples,
+      minValue,
+      maxValue,
+      windowWidth,
+      windowCenter,
+    })
+  );
   console.log(
     `[CPR-GPU-WORKER-RESULT] run=${input.debugRunId ?? 'na'} ` +
-    `pipeline=${gpuResult.pipelineMode} ` +
-    `min=${formatGpuReadableValue(minValue)} max=${formatGpuReadableValue(maxValue)} ` +
-    `windowWidth=${formatGpuReadableValue(windowWidth)} ` +
-    `windowCenter=${formatGpuReadableValue(windowCenter)} ` +
-    `elapsedMs=${formatGpuReadableValue(elapsedMs, 0)}`
+      `pipeline=${gpuResult.pipelineMode} ` +
+      `min=${formatGpuReadableValue(minValue)} max=${formatGpuReadableValue(maxValue)} ` +
+      `windowWidth=${formatGpuReadableValue(windowWidth)} ` +
+      `windowCenter=${formatGpuReadableValue(windowCenter)} ` +
+      `elapsedMs=${formatGpuReadableValue(elapsedMs, 0)} ` +
+      `phase2Gate=${phase2GatePassed ? 'pass' : 'fail'}`
+  );
+  console.log(
+    '[CPR-SUPPORT-SURFACE-JSON]',
+    JSON.stringify(
+      gpuResult.diagnostics?.supportSurface
+        ? {
+            ...gpuLogContext,
+            ...gpuResult.diagnostics.supportSurface,
+          }
+        : {
+            ...gpuLogContext,
+            skippedReason:
+              gpuResult.pipelineMode === 'multi-pass'
+                ? 'support-diagnostics-unavailable'
+                : 'pipeline-not-multi-pass',
+          }
+    )
+  );
+  console.log(
+    '[CPR-DRR-JSON]',
+    JSON.stringify(
+      gpuResult.diagnostics?.drr
+        ? {
+            ...gpuLogContext,
+            ...gpuResult.diagnostics.drr,
+          }
+        : {
+            ...gpuLogContext,
+            skippedReason:
+              gpuResult.pipelineMode === 'multi-pass'
+                ? 'drr-diagnostics-unavailable'
+                : 'pipeline-not-multi-pass',
+          }
+    )
+  );
+  console.log(
+    '[CPR-TONE-MAP-JSON]',
+    JSON.stringify(
+      gpuResult.diagnostics?.toneMap
+        ? {
+            ...gpuLogContext,
+            ...gpuResult.diagnostics.toneMap,
+          }
+        : {
+            ...gpuLogContext,
+            skippedReason:
+              gpuResult.pipelineMode === 'multi-pass'
+                ? 'tone-diagnostics-unavailable'
+                : 'pipeline-not-multi-pass',
+          }
+    )
+  );
+  console.log(
+    '[CPR-SIDECAR-MAPS-JSON]',
+    JSON.stringify({
+      ...gpuLogContext,
+      ...(gpuResult.diagnostics?.sidecarMaps ?? {
+        debugEnabled: !!input.debugRunId,
+        attachedMaps: [],
+        attachedByteLength: 0,
+      }),
+    })
   );
   const outputSignature = computeOutputSignature(gpuResult.pixelData);
   const usesPerColumnVerticalDirs = frames.some(
@@ -738,6 +845,7 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
     meanMap: gpuResult.meanMap,
     maxMap: gpuResult.maxMap,
     sampleCountMap: gpuResult.sampleCountMap,
+    debugMaps: gpuResult.debugMaps,
     pipelineMode: gpuResult.pipelineMode,
     minValue,
     maxValue,
@@ -747,8 +855,13 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
     requestedModalityLutApplied: scalarPolicy.requestedModalityLutApplied,
     storedValueNormalizationApplied: scalarPolicy.shouldNormalizeStoredValues,
     unsignedPackedArtifactDetected: scalarPolicy.unsignedPackedArtifactDetected,
+    diagnostics: gpuResult.diagnostics,
     diagnosticPayload: {
       renderBackend: 'gpu',
+      requestedRenderBackend,
+      pipelineMode: gpuResult.pipelineMode,
+      fallbackReason: phase2GatePassed ? null : 'gpu-phase2-gate-failed',
+      attemptLabel: input.attemptLabel ?? null,
       reconstructionMode: reconstructionMode ?? 'legacy',
       verticalHalfMm: effectiveVerticalHalfMm,
       globalVerticalCenterOffsetMm: 0,
@@ -772,11 +885,18 @@ function generateGpuPanorama(input: CPRWorkerInput, volumeCacheKey: string): {
       gpuRender: {
         enabled: true,
         pipelineMode: gpuResult.pipelineMode,
+        expectedPipelineMode: gpuResult.diagnostics?.expectedPipelineMode ?? 'multi-pass',
+        phase2GatePassed,
+        degradedModeReason: gpuResult.diagnostics?.degradedModeReason ?? null,
         volumeCacheKey,
         usedPerColumnVerticalDirs: usesPerColumnVerticalDirs,
         authoritativeWorldToIndex: true,
         modalityLutApplied: scalarPolicy.shouldApplyModalityLut,
         storedValueNormalizationApplied: scalarPolicy.shouldNormalizeStoredValues,
+        supportSurface: gpuResult.diagnostics?.supportSurface ?? null,
+        drr: gpuResult.diagnostics?.drr ?? null,
+        toneMap: gpuResult.diagnostics?.toneMap ?? null,
+        sidecarMaps: gpuResult.diagnostics?.sidecarMaps ?? null,
       },
       outputDisplayWindow: {
         lower: minValue,
@@ -911,8 +1031,7 @@ function suppressLowerBackgroundUniformly(
   let maxAttenuation = 0;
 
   for (let row = startRow; row < panoHeight; row++) {
-    const baseAttenuation =
-      0.52 * smoothstep01((row - startRow) / Math.max(1, endRow - startRow));
+    const baseAttenuation = 0.52 * smoothstep01((row - startRow) / Math.max(1, endRow - startRow));
     if (baseAttenuation <= 0.001) {
       continue;
     }
@@ -942,9 +1061,13 @@ function suppressLowerBackgroundUniformly(
 
   return {
     coverageFraction:
-      pixelData.length > 0 ? Math.round((attenuatedPixelCount / pixelData.length) * 100000) / 100000 : 0,
+      pixelData.length > 0
+        ? Math.round((attenuatedPixelCount / pixelData.length) * 100000) / 100000
+        : 0,
     meanAttenuation:
-      attenuatedPixelCount > 0 ? Math.round((attenuationSum / attenuatedPixelCount) * 100000) / 100000 : 0,
+      attenuatedPixelCount > 0
+        ? Math.round((attenuationSum / attenuatedPixelCount) * 100000) / 100000
+        : 0,
     maxAttenuation: Math.round(maxAttenuation * 100000) / 100000,
   };
 }
@@ -1227,8 +1350,57 @@ function renderVirtualPanoFromSupportPath(params: {
     retainedWeightFractionCount > 0 ? retainedWeightFractionSum / retainedWeightFractionCount : 0;
   const offTroughEnergyRatio = onSupportEnergy > 1e-6 ? offSupportEnergy / onSupportEnergy : 0;
   const rejectReasons: string[] = [];
-  const acceptedByLowerBandTolerance = true;
-  const usedAsOutput = true;
+  if (eligibleSampleFraction < 0.015) {
+    rejectReasons.push('eligible-sample-fraction-too-low');
+  }
+  if (retainedWeightFractionMean < 0.02) {
+    rejectReasons.push('retained-weight-fraction-too-low');
+  }
+  if (emptyFallbackFraction > 0.18) {
+    rejectReasons.push('empty-fallback-fraction-too-high');
+  }
+  if (offTroughEnergyRatio > 1.1) {
+    rejectReasons.push('off-trough-energy-too-high');
+  }
+  if (summary.supportDepthClampFraction > 0.32) {
+    rejectReasons.push('support-depth-clamp-fraction-too-high');
+  }
+  if (summary.range < 900) {
+    rejectReasons.push('range-too-low');
+  }
+  if (toothBandContrastRange < 240) {
+    rejectReasons.push('tooth-band-contrast-too-low');
+  }
+  if (summary.toothBandMean > 920 || summary.toothBandP10 > 180) {
+    rejectReasons.push('tooth-band-saturation');
+  }
+  if (summary.lowerBandBrightFraction > 0.62) {
+    rejectReasons.push('lower-band-bright-fraction-too-high');
+  }
+  if (summary.lowerBandMean > 40) {
+    rejectReasons.push('lower-band-mean-too-high');
+  }
+  if (lowerSuppressionRatio > 0.82) {
+    rejectReasons.push('lower-suppression-ratio-too-high');
+  }
+  const lowerBandOnlyRejectReasons = new Set([
+    'lower-band-bright-fraction-too-high',
+    'lower-band-mean-too-high',
+    'lower-suppression-ratio-too-high',
+  ]);
+  const nonLowerBandRejectReasons = rejectReasons.filter(
+    reason => !lowerBandOnlyRejectReasons.has(reason)
+  );
+  const acceptedByLowerBandTolerance =
+    rejectReasons.length > 0 &&
+    nonLowerBandRejectReasons.length === 0 &&
+    summary.lowerBandBrightFraction <= 0.76 &&
+    summary.lowerBandMean <= 120 &&
+    toothBandContrastRange >= 260 &&
+    emptyFallbackFraction <= 0.12 &&
+    retainedWeightFractionMean >= 0.04 &&
+    offTroughEnergyRatio <= 0.9;
+  const usedAsOutput = rejectReasons.length === 0 || acceptedByLowerBandTolerance;
   let supportTiltMeanAbsMm = 0;
   let supportTiltMaxAbsMm = 0;
   for (let col = 0; col < panoWidth; col++) {
@@ -1404,7 +1576,11 @@ function computeWeightedHighBandMean(
     return -1000;
   }
 
-  if (count > 1 && Number.isFinite(values[count - 2]) && values[count - 1] - values[count - 2] > 850) {
+  if (
+    count > 1 &&
+    Number.isFinite(values[count - 2]) &&
+    values[count - 1] - values[count - 2] > 850
+  ) {
     values[count - 1] = 0.5 * (values[count - 1] + values[count - 2]);
   }
 
@@ -1605,10 +1781,7 @@ function suppressLowerBackground(
       );
       const depthBias = (row - rowSearchStart) / Math.max(1, rowSearchEnd - rowSearchStart);
       const candidateScore =
-        localIntensity * 0.34 +
-        transitionContrast * 0.38 +
-        edgeSupport * 0.38 +
-        depthBias * 0.12;
+        localIntensity * 0.34 + transitionContrast * 0.38 + edgeSupport * 0.38 + depthBias * 0.12;
       if (candidateScore > bestScore) {
         bestScore = candidateScore;
         bestRow = row;
@@ -1624,7 +1797,11 @@ function suppressLowerBackground(
     smoothFloatSeries(toothBandBottomRows, width, rowScratchA, 3);
     smoothFloatSeries(toothBandBottomRows, width, rowScratchB, 2);
     for (let col = 0; col < width; col++) {
-      toothBandBottomRows[col] = clampNumber(toothBandBottomRows[col], rowSearchStart, rowSearchEnd);
+      toothBandBottomRows[col] = clampNumber(
+        toothBandBottomRows[col],
+        rowSearchStart,
+        rowSearchEnd
+      );
     }
   }
 
@@ -1667,7 +1844,7 @@ function suppressLowerBackground(
       );
       const intensityProtect = clampNumber(
         (value - intensityProtectThreshold) /
-        Math.max(80, Math.abs(intensityProtectThreshold) * 0.25 + 120),
+          Math.max(80, Math.abs(intensityProtectThreshold) * 0.25 + 120),
         0,
         1
       );
@@ -1709,15 +1886,19 @@ function suppressLowerBackground(
       min: Number.isFinite(minBandBottomRow) ? Math.round(minBandBottomRow * 1000) / 1000 : 0,
       max: Number.isFinite(maxBandBottomRow) ? Math.round(maxBandBottomRow * 1000) / 1000 : 0,
       mean: width > 0 ? Math.round((bandBottomRowSum / width) * 1000) / 1000 : 0,
-      first8: Array.from(toothBandBottomRows.subarray(0, Math.min(8, toothBandBottomRows.length))).map(
-        value => Math.round(Number(value) * 1000) / 1000
-      ),
+      first8: Array.from(
+        toothBandBottomRows.subarray(0, Math.min(8, toothBandBottomRows.length))
+      ).map(value => Math.round(Number(value) * 1000) / 1000),
     },
     backgroundSuppression: {
       coverageFraction:
-        pixelData.length > 0 ? Math.round((attenuatedPixelCount / pixelData.length) * 100000) / 100000 : 0,
+        pixelData.length > 0
+          ? Math.round((attenuatedPixelCount / pixelData.length) * 100000) / 100000
+          : 0,
       meanAttenuation:
-        attenuatedPixelCount > 0 ? Math.round((attenuationSum / attenuatedPixelCount) * 100000) / 100000 : 0,
+        attenuatedPixelCount > 0
+          ? Math.round((attenuationSum / attenuatedPixelCount) * 100000) / 100000
+          : 0,
       maxAttenuation: Math.round(maxAttenuation * 100000) / 100000,
     },
   };
@@ -1783,7 +1964,8 @@ function runBandDPOptimization(
         if (score <= Number(candidateScores[candidateBase + slot])) continue;
         for (let shift = candidateCount - 1; shift > slot; shift--) {
           candidateScores[candidateBase + shift] = candidateScores[candidateBase + shift - 1];
-          candidateDepthIndices[candidateBase + shift] = candidateDepthIndices[candidateBase + shift - 1];
+          candidateDepthIndices[candidateBase + shift] =
+            candidateDepthIndices[candidateBase + shift - 1];
         }
         candidateScores[candidateBase + slot] = score;
         candidateDepthIndices[candidateBase + slot] = depth;
@@ -1871,7 +2053,13 @@ function runBandDPOptimization(
   return selectedDepthMm;
 }
 
-function generatePanorama(input: CPRWorkerInput): {
+function generatePanorama(
+  input: CPRWorkerInput,
+  options?: {
+    requestedReconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+    gpuFallbackCause?: 'gpu-render-failed' | 'gpu-phase2-gate-failed' | null;
+  }
+): {
   pixelData: Float32Array;
   minValue: number;
   maxValue: number;
@@ -1915,11 +2103,16 @@ function generatePanorama(input: CPRWorkerInput): {
     aggregation,
   } = input;
 
-  const reconstructionMode = 'legacy';
+  const requestedReconstructionMode = resolveReconstructionMode(
+    options?.requestedReconstructionMode ?? input.reconstructionMode
+  );
+  const candidateReconstructionMode = resolveReconstructionMode(input.reconstructionMode);
+  const reconstructionMode = candidateReconstructionMode;
+  const allowLegacyFallback = input.allowLegacyFallback === true;
   const rigidVerticalSliceMode = input.rigidVerticalSliceMode === true;
-  const enableVirtualPanoPhase1 = false;
-  const enableVirtualPanoRender = false;
-  const shouldComputeVirtualPano = false;
+  const enableVirtualPanoPhase1 = reconstructionMode !== 'legacy';
+  const enableVirtualPanoRender = reconstructionMode === 'virtualPano';
+  const shouldComputeVirtualPano = enableVirtualPanoPhase1;
   const _t0_start = performance.now();
   const hasWorldToIndex = isMat4ArrayLike(worldToIndex);
   const invDir = hasWorldToIndex ? [] : invertMatrix3(direction);
@@ -1928,7 +2121,7 @@ function generatePanorama(input: CPRWorkerInput): {
   let maxValue = -Infinity;
   const aggregationMode = aggregation === 'MEAN' ? 'MEAN' : 'MIP';
   const isMeanAggregation = aggregationMode === 'MEAN';
-  let robustMipTopCount = 1;
+  const robustMipTopCount = 1;
   const scalarPolicy = resolveScalarSamplingPolicy(input);
   const safeSlope = scalarPolicy.safeSlope;
   const safeIntercept = scalarPolicy.safeIntercept;
@@ -1974,10 +2167,15 @@ function generatePanorama(input: CPRWorkerInput): {
   const slabStepMm = slabSampleCount > 1 ? (slabHalfThicknessMm * 2) / (slabSampleCount - 1) : 0;
   const focalTroughSigmaMm =
     slabHalfThicknessMm > 0
-      ? Math.max(0.35, minVolumeSpacingMm * 0.6, slabHalfThicknessMm * (isMeanAggregation ? 0.52 : 0.48))
+      ? Math.max(
+          0.35,
+          minVolumeSpacingMm * 0.6,
+          slabHalfThicknessMm * (isMeanAggregation ? 0.52 : 0.48)
+        )
       : 0.35;
   const focalTroughSigmaSq2 = 2 * focalTroughSigmaMm * focalTroughSigmaMm;
   const [nx, ny, nz] = dimensions;
+  let selectedReconstructionMode: 'legacy' | 'virtualPanoPhase1' | 'virtualPano' = 'legacy';
 
   // Compute a gentle fit offset along the vertical direction to keep the
   // requested sampling window mostly inside the volume. This should only
@@ -2044,10 +2242,7 @@ function generatePanorama(input: CPRWorkerInput): {
     }
     if (Number.isFinite(minRequiredOffset) && Number.isFinite(maxAllowedOffset)) {
       if (minRequiredOffset <= maxAllowedOffset) {
-        fittedVerticalCenterOffsetMm = Math.max(
-          minRequiredOffset,
-          Math.min(0, maxAllowedOffset)
-        );
+        fittedVerticalCenterOffsetMm = Math.max(minRequiredOffset, Math.min(0, maxAllowedOffset));
       } else {
         // No single offset can fit the entire window for all frames; choose least-violation midpoint.
         fittedVerticalCenterOffsetMm = (minRequiredOffset + maxAllowedOffset) / 2;
@@ -2067,12 +2262,14 @@ function generatePanorama(input: CPRWorkerInput): {
       : 0;
   const clampedRequestedCenterOffsetMm = rigidVerticalSliceMode
     ? 0
-    : Math.max(-baseCenterOffsetLimitMm, Math.min(baseCenterOffsetLimitMm, requestedCenterOffsetMm));
+    : Math.max(
+        -baseCenterOffsetLimitMm,
+        Math.min(baseCenterOffsetLimitMm, requestedCenterOffsetMm)
+      );
   const clampedFittedVerticalCenterOffsetMm = rigidVerticalSliceMode
     ? 0
     : clampNumber(fittedVerticalCenterOffsetMm, -fitOffsetLimitMm, fitOffsetLimitMm);
-  let verticalCenterOffsetMm =
-    clampedRequestedCenterOffsetMm + clampedFittedVerticalCenterOffsetMm;
+  let verticalCenterOffsetMm = clampedRequestedCenterOffsetMm + clampedFittedVerticalCenterOffsetMm;
   verticalCenterOffsetMm = Math.max(
     -baseCenterOffsetLimitMm,
     Math.min(baseCenterOffsetLimitMm, verticalCenterOffsetMm)
@@ -2093,7 +2290,8 @@ function generatePanorama(input: CPRWorkerInput): {
     }
   }
 
-  const _dbgFirstFive: Array<{ row: number; vi: number; vj: number; vk: number; sample: number }> = [];
+  const _dbgFirstFive: Array<{ row: number; vi: number; vj: number; vk: number; sample: number }> =
+    [];
   let _dbgChecked = 0;
   let _dbgOob = 0;
   const reductionDiagnostics = {
@@ -2137,21 +2335,23 @@ function generatePanorama(input: CPRWorkerInput): {
   const adaptiveCenterSearchHalfRangeMm = rigidVerticalSliceMode
     ? 0
     : Math.min(
-      isMeanAggregation ? 5.4 : 4.2,
-      Math.max(
-        isMeanAggregation ? 1.6 : 1.2,
-        effectiveVerticalHalfMm * (isMeanAggregation ? 0.34 : 0.24)
-      )
-    );
+        isMeanAggregation ? 5.4 : 4.2,
+        Math.max(
+          isMeanAggregation ? 1.6 : 1.2,
+          effectiveVerticalHalfMm * (isMeanAggregation ? 0.34 : 0.24)
+        )
+      );
   const adaptiveCandidateCount = rigidVerticalSliceMode
     ? 1
     : Math.max(
-      7,
-      Math.min(
-        11,
-        Math.round((adaptiveCenterSearchHalfRangeMm * 2) / Math.max(0.5, minVolumeSpacingMm * 2.5)) + 1
-      )
-    );
+        7,
+        Math.min(
+          11,
+          Math.round(
+            (adaptiveCenterSearchHalfRangeMm * 2) / Math.max(0.5, minVolumeSpacingMm * 2.5)
+          ) + 1
+        )
+      );
   const adaptiveProfileSampleCount = 15;
   const adaptiveProfileLowerBandCount = Math.max(4, Math.floor(adaptiveProfileSampleCount * 0.32));
   const adaptiveProfileUpperBandCount = Math.max(5, Math.ceil(adaptiveProfileSampleCount * 0.5));
@@ -2162,18 +2362,21 @@ function generatePanorama(input: CPRWorkerInput): {
   const baseAdaptiveCenterMaxDeviationMm = rigidVerticalSliceMode
     ? 0
     : Math.min(
-      isMeanAggregation ? 4.2 : 3.4,
-      Math.max(
-        isMeanAggregation ? 1.6 : 1.2,
-        effectiveVerticalHalfMm * (isMeanAggregation ? 0.26 : 0.2)
-      )
-    );
+        isMeanAggregation ? 4.2 : 3.4,
+        Math.max(
+          isMeanAggregation ? 1.6 : 1.2,
+          effectiveVerticalHalfMm * (isMeanAggregation ? 0.26 : 0.2)
+        )
+      );
   const adaptiveCenterMaxAdjacentDeltaMm = rigidVerticalSliceMode
     ? 0
     : Math.max(
-      minVolumeSpacingMm * 0.9,
-      Math.min(isMeanAggregation ? 0.55 : 0.42, minVolumeSpacingMm * (isMeanAggregation ? 2.4 : 1.8))
-    );
+        minVolumeSpacingMm * 0.9,
+        Math.min(
+          isMeanAggregation ? 0.55 : 0.42,
+          minVolumeSpacingMm * (isMeanAggregation ? 2.4 : 1.8)
+        )
+      );
   const adaptiveContinuityPenaltyScale = isMeanAggregation ? 10 : 8;
   const profileSampleBuffer = new Float32Array(adaptiveProfileSampleCount);
   const profileSampleScratch = new Float32Array(adaptiveProfileSampleCount);
@@ -2216,7 +2419,8 @@ function generatePanorama(input: CPRWorkerInput): {
         weightedSum += Number(curvatureFactorRaw[col + 1]) * 0.25;
         weightTotal += 0.25;
       }
-      curvatureScratch[col] = weightTotal > 0 ? weightedSum / weightTotal : Number(curvatureFactorRaw[col]);
+      curvatureScratch[col] =
+        weightTotal > 0 ? weightedSum / weightTotal : Number(curvatureFactorRaw[col]);
     }
     curvatureFactorByCol.set(curvatureScratch);
   } else {
@@ -2391,9 +2595,10 @@ function generatePanorama(input: CPRWorkerInput): {
 
     for (let candidateIndex = 0; candidateIndex < adaptiveCandidateCount; candidateIndex++) {
       const t =
-        adaptiveCandidateCount <= 1 ? 0.5 : candidateIndex / Math.max(1, adaptiveCandidateCount - 1);
-      const candidateCenterOffsetMm =
-        safeSearchMin + (safeSearchMax - safeSearchMin) * t;
+        adaptiveCandidateCount <= 1
+          ? 0.5
+          : candidateIndex / Math.max(1, adaptiveCandidateCount - 1);
+      const candidateCenterOffsetMm = safeSearchMin + (safeSearchMax - safeSearchMin) * t;
 
       for (let sampleIndex = 0; sampleIndex < adaptiveProfileSampleCount; sampleIndex++) {
         const fraction =
@@ -2425,7 +2630,9 @@ function generatePanorama(input: CPRWorkerInput): {
       );
 
       const profileValues = Array.from(profileSampleBuffer.subarray(0, adaptiveProfileSampleCount));
-      const lowerBandValues = profileValues.slice(adaptiveProfileSampleCount - adaptiveProfileLowerBandCount);
+      const lowerBandValues = profileValues.slice(
+        adaptiveProfileSampleCount - adaptiveProfileLowerBandCount
+      );
       const upperBandValues = profileValues.slice(0, adaptiveProfileUpperBandCount);
       const profileP20 = percentile(profileValues, 0.2);
       const profileP50 = percentile(profileValues, 0.5);
@@ -2501,7 +2708,12 @@ function generatePanorama(input: CPRWorkerInput): {
         localCenterMaxOffsetsMm[col]
       );
     }
-    smoothFloatSeries(localCenterScratch, panoWidth, localCenterOffsetsMm, isMeanAggregation ? 3 : 2);
+    smoothFloatSeries(
+      localCenterScratch,
+      panoWidth,
+      localCenterOffsetsMm,
+      isMeanAggregation ? 3 : 2
+    );
     localCenterOffsetsMm.set(localCenterScratch);
   }
 
@@ -2599,7 +2811,8 @@ function generatePanorama(input: CPRWorkerInput): {
       );
     }
   }
-  const meanLocalCenterOffsetMm = panoWidth > 0 ? localCenterOffsetSumMm / panoWidth : verticalCenterOffsetMm;
+  const meanLocalCenterOffsetMm =
+    panoWidth > 0 ? localCenterOffsetSumMm / panoWidth : verticalCenterOffsetMm;
   const panoCenterRow = panoHeightDen / 2;
   if (rigidVerticalSliceMode) {
     for (let col = 0; col < panoWidth; col++) {
@@ -2612,7 +2825,8 @@ function generatePanorama(input: CPRWorkerInput): {
       halfHeightByCol[col] = Math.max(1, panoCenterRow);
 
       for (let row = 0; row < panoHeight; row++) {
-        const vertOffsetMm = columnVerticalCenterOffsetMm + (effectiveVerticalHalfMm - row * vertStepMm);
+        const vertOffsetMm =
+          columnVerticalCenterOffsetMm + (effectiveVerticalHalfMm - row * vertStepMm);
         const bx = px + vertOffsetMm * vertDirX;
         const by = py + vertOffsetMm * vertDirY;
         const bz = pz + vertOffsetMm * vertDirZ;
@@ -2645,7 +2859,36 @@ function generatePanorama(input: CPRWorkerInput): {
     maxValue = finalRange.maxValue;
     const windowWidth = maxValue - minValue;
     const windowCenter = minValue + windowWidth / 2;
+    const requestedRenderBackend = input.renderBackend === 'cpu' ? 'cpu' : 'gpu';
+    const rigidFallbackReason =
+      options?.gpuFallbackCause === 'gpu-phase2-gate-failed'
+        ? 'gpu-phase2-gate-failed-cpu-legacy-fallback'
+        : options?.gpuFallbackCause === 'gpu-render-failed'
+          ? 'gpu-render-failed-cpu-legacy-fallback'
+          : null;
+    const rigidOutputSelection = {
+      requestedReconstructionMode,
+      candidateReconstructionMode: reconstructionMode,
+      selectedReconstructionMode: 'legacy',
+      virtualPanoAttempted: false,
+      virtualPanoAccepted: false,
+      virtualPanoRejected: false,
+      acceptedByLowerBandTolerance: false,
+      legacyFallbackAllowed: allowLegacyFallback,
+      rejectReasons: [] as string[],
+      fallbackReason: rigidFallbackReason,
+    };
     const diagnosticPayload = {
+      renderBackend: 'cpu',
+      requestedRenderBackend,
+      pipelineMode: 'legacy',
+      fallbackReason: rigidFallbackReason,
+      reconstructionMode: 'legacy',
+      requestedReconstructionMode,
+      candidateReconstructionMode: reconstructionMode,
+      phase2GatePassed: options?.gpuFallbackCause === 'gpu-phase2-gate-failed' ? false : null,
+      outputSelection: rigidOutputSelection,
+      legacyFallbackAllowed: allowLegacyFallback,
       oobRate: {
         checked: _dbgChecked,
         oob: _dbgOob,
@@ -2684,9 +2927,9 @@ function generatePanorama(input: CPRWorkerInput): {
           Math.abs(maxLocalCenterOffsetMm - verticalCenterOffsetMm)
         ),
         maxAdjacentDeltaMm: maxLocalCenterAdjacentDeltaMm,
-        first8: Array.from(localCenterOffsetsMm.subarray(0, Math.min(8, localCenterOffsetsMm.length))).map(
-          value => Math.round(Number(value) * 1000) / 1000
-        ),
+        first8: Array.from(
+          localCenterOffsetsMm.subarray(0, Math.min(8, localCenterOffsetsMm.length))
+        ).map(value => Math.round(Number(value) * 1000) / 1000),
       },
       localCenterOffsetsMm: Array.from(localCenterOffsetsMm).map(
         value => Math.round(Number(value) * 1000) / 1000
@@ -2821,7 +3064,12 @@ function generatePanorama(input: CPRWorkerInput): {
       isMeanAggregation ? 2 : 1
     );
     finalRenderProfilePeakValues[col] =
-      profileSampleBuffer[Math.max(0, Math.min(adaptiveProfileSampleCount - 1, Math.floor(adaptiveProfileSampleCount / 2)))];
+      profileSampleBuffer[
+        Math.max(
+          0,
+          Math.min(adaptiveProfileSampleCount - 1, Math.floor(adaptiveProfileSampleCount / 2))
+        )
+      ];
     const profileValues = Array.from(profileSampleBuffer.subarray(0, adaptiveProfileSampleCount));
     finalRenderProfileFloorValues[col] = percentile(profileValues, 0.25);
   }
@@ -2833,7 +3081,8 @@ function generatePanorama(input: CPRWorkerInput): {
     const columnVerticalCenterOffsetMm = localCenterOffsetsMm[col];
 
     for (let row = 0; row < panoHeight; row++) {
-      const vertOffsetMm = columnVerticalCenterOffsetMm + (effectiveVerticalHalfMm - row * vertStepMm);
+      const vertOffsetMm =
+        columnVerticalCenterOffsetMm + (effectiveVerticalHalfMm - row * vertStepMm);
       const pixelIdx = planeIndex(col, row, panoWidth);
       const bx = px + vertOffsetMm * vertDirX;
       const by = py + vertOffsetMm * vertDirY;
@@ -3072,7 +3321,8 @@ function generatePanorama(input: CPRWorkerInput): {
         ? 'PHASE1_DIAGNOSTICS_ONLY'
         : 'RECONSTRUCTION_MODE_DISABLED',
   };
-  let virtualRenderUsedAsOutput = false;
+  let virtualPanoAcceptedByGate = false;
+  let virtualPanoSelectedForOutput = false;
   if (shouldComputeVirtualPano) {
     const virtualPanoDepthHalfRangeMm = 6.0;
     const virtualPanoDepthStepMm = 0.25;
@@ -3099,13 +3349,22 @@ function generatePanorama(input: CPRWorkerInput): {
       return Math.max(0, Math.min(panoHeight - 1, row));
     };
 
-    const toothBandStartRow = Math.min(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
+    const toothBandStartRow = Math.min(
+      rowFromNormalizedOffset(-0.35),
+      rowFromNormalizedOffset(0.55)
+    );
     const toothBandEndRow = Math.max(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
     const topBandStartRow = Math.min(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.05));
     const topBandEndRow = Math.max(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.05));
-    const bottomBandStartRow = Math.min(rowFromNormalizedOffset(0.15), rowFromNormalizedOffset(0.65));
+    const bottomBandStartRow = Math.min(
+      rowFromNormalizedOffset(0.15),
+      rowFromNormalizedOffset(0.65)
+    );
     const bottomBandEndRow = Math.max(rowFromNormalizedOffset(0.15), rowFromNormalizedOffset(0.65));
-    const lowerBandStartRow = Math.min(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
+    const lowerBandStartRow = Math.min(
+      rowFromNormalizedOffset(0.65),
+      rowFromNormalizedOffset(1.15)
+    );
     const lowerBandEndRow = Math.max(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
     const virtualThresholdRowStep = 2;
     const virtualThresholdDepthStep = 2;
@@ -3121,7 +3380,8 @@ function generatePanorama(input: CPRWorkerInput): {
       const columnVerticalCenterOffsetMm = Number(localCenterOffsetsMm[col]);
 
       for (let row = 0; row < panoHeight; row++) {
-        const vertOffsetMm = columnVerticalCenterOffsetMm + (effectiveVerticalHalfMm - row * vertStepMm);
+        const vertOffsetMm =
+          columnVerticalCenterOffsetMm + (effectiveVerticalHalfMm - row * vertStepMm);
         const pixelIndex = planeIndex(col, row, panoWidth);
         const bx = px + vertOffsetMm * vertDirX;
         const by = py + vertOffsetMm * vertDirY;
@@ -3139,21 +3399,22 @@ function generatePanorama(input: CPRWorkerInput): {
       }
     }
 
-    applyLightGaussianBlur3D(
-      virtualPanoStack,
-      panoWidth,
-      panoHeight,
-      virtualPanoDepthSamples
-    );
+    applyLightGaussianBlur3D(virtualPanoStack, panoWidth, panoHeight, virtualPanoDepthSamples);
 
     for (let col = 0; col < panoWidth; col++) {
       const toothThresholdSamples: number[] = [];
       const gradientSamples: number[] = [];
 
-      for (let depth = thresholdDepthStart; depth <= thresholdDepthEnd; depth += virtualThresholdDepthStep) {
+      for (
+        let depth = thresholdDepthStart;
+        depth <= thresholdDepthEnd;
+        depth += virtualThresholdDepthStep
+      ) {
         for (let row = toothBandStartRow; row <= toothBandEndRow; row += virtualThresholdRowStep) {
           const pixelIndex = planeIndex(col, row, panoWidth);
-          const value = Number(virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]);
+          const value = Number(
+            virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]
+          );
           if (Number.isFinite(value)) {
             toothThresholdSamples.push(value);
           }
@@ -3165,9 +3426,15 @@ function generatePanorama(input: CPRWorkerInput): {
         depth < Math.min(virtualPanoDepthSamples - 1, thresholdDepthEnd + 1);
         depth += virtualThresholdDepthStep
       ) {
-        for (let row = toothBandStartRow + 1; row < toothBandEndRow; row += virtualThresholdRowStep) {
+        for (
+          let row = toothBandStartRow + 1;
+          row < toothBandEndRow;
+          row += virtualThresholdRowStep
+        ) {
           const pixelIndex = planeIndex(col, row, panoWidth);
-          const centerValue = Number(virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]);
+          const centerValue = Number(
+            virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]
+          );
           if (!Number.isFinite(centerValue)) {
             continue;
           }
@@ -3178,10 +3445,14 @@ function generatePanorama(input: CPRWorkerInput): {
             virtualPanoStack[stackIndex(depth - 1, pixelIndex, virtualPanoPlaneSize)]
           );
           const plusRow = Number(
-            virtualPanoStack[stackIndex(depth, planeIndex(col, row + 1, panoWidth), virtualPanoPlaneSize)]
+            virtualPanoStack[
+              stackIndex(depth, planeIndex(col, row + 1, panoWidth), virtualPanoPlaneSize)
+            ]
           );
           const minusRow = Number(
-            virtualPanoStack[stackIndex(depth, planeIndex(col, row - 1, panoWidth), virtualPanoPlaneSize)]
+            virtualPanoStack[
+              stackIndex(depth, planeIndex(col, row - 1, panoWidth), virtualPanoPlaneSize)
+            ]
           );
           if (
             Number.isFinite(plusDepth) &&
@@ -3189,7 +3460,9 @@ function generatePanorama(input: CPRWorkerInput): {
             Number.isFinite(plusRow) &&
             Number.isFinite(minusRow)
           ) {
-            gradientSamples.push(Math.abs(plusDepth - minusDepth) + 0.5 * Math.abs(plusRow - minusRow));
+            gradientSamples.push(
+              Math.abs(plusDepth - minusDepth) + 0.5 * Math.abs(plusRow - minusRow)
+            );
           }
         }
       }
@@ -3205,7 +3478,6 @@ function generatePanorama(input: CPRWorkerInput): {
     smoothFloatSeries(virtualSoftThresholdByCol, panoWidth, virtualThresholdScratch, 2);
     smoothFloatSeries(virtualHardThresholdByCol, panoWidth, virtualThresholdScratch, 2);
     smoothFloatSeries(virtualGradCapByCol, panoWidth, virtualThresholdScratch, 1);
-
 
     for (let col = 0; col < panoWidth; col++) {
       const softThreshold = Number(virtualSoftThresholdByCol[col]);
@@ -3225,7 +3497,9 @@ function generatePanorama(input: CPRWorkerInput): {
 
         for (let row = topBandStartRow; row <= topBandEndRow; row++) {
           const pixelIndex = planeIndex(col, row, panoWidth);
-          const centerValue = Number(virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]);
+          const centerValue = Number(
+            virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]
+          );
           if (!Number.isFinite(centerValue)) {
             continue;
           }
@@ -3237,7 +3511,9 @@ function generatePanorama(input: CPRWorkerInput): {
 
         for (let row = bottomBandStartRow; row <= bottomBandEndRow; row++) {
           const pixelIndex = planeIndex(col, row, panoWidth);
-          const centerValue = Number(virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]);
+          const centerValue = Number(
+            virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]
+          );
           if (!Number.isFinite(centerValue)) {
             continue;
           }
@@ -3249,7 +3525,9 @@ function generatePanorama(input: CPRWorkerInput): {
 
         for (let row = toothBandStartRow; row <= toothBandEndRow; row++) {
           const pixelIndex = planeIndex(col, row, panoWidth);
-          const centerValue = Number(virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]);
+          const centerValue = Number(
+            virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]
+          );
           if (!Number.isFinite(centerValue)) {
             continue;
           }
@@ -3263,12 +3541,12 @@ function generatePanorama(input: CPRWorkerInput): {
             );
             const plusRow = Number(
               virtualPanoStack[
-              stackIndex(depth, planeIndex(col, row + 1, panoWidth), virtualPanoPlaneSize)
+                stackIndex(depth, planeIndex(col, row + 1, panoWidth), virtualPanoPlaneSize)
               ]
             );
             const minusRow = Number(
               virtualPanoStack[
-              stackIndex(depth, planeIndex(col, row - 1, panoWidth), virtualPanoPlaneSize)
+                stackIndex(depth, planeIndex(col, row - 1, panoWidth), virtualPanoPlaneSize)
               ]
             );
             if (
@@ -3287,7 +3565,9 @@ function generatePanorama(input: CPRWorkerInput): {
 
         for (let row = lowerBandStartRow; row <= lowerBandEndRow; row++) {
           const pixelIndex = planeIndex(col, row, panoWidth);
-          const value = Number(virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]);
+          const value = Number(
+            virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]
+          );
           if (!Number.isFinite(value)) {
             continue;
           }
@@ -3302,8 +3582,7 @@ function generatePanorama(input: CPRWorkerInput): {
         const lowMean = lowCount > 0 ? lowAccum / lowCount : 0;
         const depthMm = Number(virtualPanoDepthOffsetsMm[depth]);
         const edgeDistanceMm = virtualPanoDepthHalfRangeMm - Math.abs(depthMm);
-        const edgePenalty =
-          edgeDistanceMm <= 2.5 ? 0.45 * (1 - edgeDistanceMm / 2.5) : 0;
+        const edgePenalty = edgeDistanceMm <= 2.5 ? 0.45 * (1 - edgeDistanceMm / 2.5) : 0;
         const depthCenterPenalty =
           0.12 * Math.pow(Math.abs(depthMm) / Math.max(virtualPanoDepthHalfRangeMm, 1e-6), 1.5);
         const crownBiasPenalty = Math.max(0, topHardMean - bottomHardMean) * 0.18;
@@ -3406,7 +3685,8 @@ function generatePanorama(input: CPRWorkerInput): {
     // Support-path diagnostics
     const bandDiagnostics = bandLabels.map((label, b) => {
       const depths = bandDepthsMm[b];
-      let bMin = Infinity, bMax = -Infinity;
+      let bMin = Infinity,
+        bMax = -Infinity;
       for (let col = 0; col < panoWidth; col++) {
         const d = Number(depths[col]);
         bMin = Math.min(bMin, d);
@@ -3435,7 +3715,8 @@ function generatePanorama(input: CPRWorkerInput): {
         interBandDeltaCount++;
       }
     }
-    const interBandDeltaMeanMm = interBandDeltaCount > 0 ? interBandDeltaSum / interBandDeltaCount : 0;
+    const interBandDeltaMeanMm =
+      interBandDeltaCount > 0 ? interBandDeltaSum / interBandDeltaCount : 0;
 
     virtualPanoPhase12Diagnostics = {
       enabled: true,
@@ -3461,10 +3742,8 @@ function generatePanorama(input: CPRWorkerInput): {
         depthMaxMm: Number.isFinite(virtualDepthMaxMm) ? virtualDepthMaxMm : 0,
         depthStdMm: virtualDepthStdMm,
         pathJumpP95Mm: virtualPathJumpP95Mm,
-        supportDepthClampFraction:
-          panoWidth > 0 ? virtualSupportDepthClampCount / panoWidth : 0,
-        supportEdgeShelfFraction:
-          panoWidth > 0 ? virtualSupportEdgeShelfCount / panoWidth : 0,
+        supportDepthClampFraction: panoWidth > 0 ? virtualSupportDepthClampCount / panoWidth : 0,
+        supportEdgeShelfFraction: panoWidth > 0 ? virtualSupportEdgeShelfCount / panoWidth : 0,
         selectedDepthFirst8Mm: Array.from(
           virtualSelectedDepthMm.subarray(0, Math.min(8, virtualSelectedDepthMm.length))
         ).map(value => Math.round(Number(value) * 1000) / 1000),
@@ -3500,15 +3779,21 @@ function generatePanorama(input: CPRWorkerInput): {
         lowerBandBrightFraction: virtualRender.summary.lowerBandBrightFraction,
         lowerBandMean: virtualRender.summary.lowerBandMean,
         toothBandMean: virtualRender.summary.toothBandMean,
-        toothBandContrastRange: virtualRender.summary.toothBandP90 - virtualRender.summary.toothBandP10,
+        toothBandContrastRange:
+          virtualRender.summary.toothBandP90 - virtualRender.summary.toothBandP10,
         range: virtualRender.summary.range,
         minValue: virtualRender.summary.minValue,
         maxValue: virtualRender.summary.maxValue,
         ...virtualRender.diagnostics,
       };
 
-      if (virtualRender.diagnostics.usedAsOutput) {
-        virtualRenderUsedAsOutput = true;
+      const keepRejectedVirtualPanoOutput =
+        !virtualRender.diagnostics.usedAsOutput && !allowLegacyFallback;
+
+      if (virtualRender.diagnostics.usedAsOutput || keepRejectedVirtualPanoOutput) {
+        virtualPanoAcceptedByGate = virtualRender.diagnostics.usedAsOutput;
+        virtualPanoSelectedForOutput = true;
+        selectedReconstructionMode = 'virtualPano';
         pixelData.set(virtualRender.pixelData);
         const virtualRange = computeArrayMinMax(pixelData);
         minValue = virtualRange.minValue;
@@ -3560,6 +3845,61 @@ function generatePanorama(input: CPRWorkerInput): {
   maxValue = finalRange.maxValue;
   const windowWidth = maxValue - minValue;
   const windowCenter = minValue + windowWidth / 2;
+  const virtualPanoRejectReasons = Array.isArray(
+    (virtualPanoRenderDiagnostics as { rejectReasons?: unknown }).rejectReasons
+  )
+    ? ((virtualPanoRenderDiagnostics as { rejectReasons: unknown[] }).rejectReasons.filter(
+        reason => typeof reason === 'string'
+      ) as string[])
+    : [];
+  const acceptedByLowerBandTolerance =
+    (virtualPanoRenderDiagnostics as { acceptedByLowerBandTolerance?: unknown })
+      .acceptedByLowerBandTolerance === true;
+  const virtualPanoAttempted = enableVirtualPanoRender;
+  const virtualPanoRejected = virtualPanoAttempted && !virtualPanoAcceptedByGate;
+  const gpuFallbackCause = options?.gpuFallbackCause ?? null;
+  const fallbackReason =
+    gpuFallbackCause === 'gpu-phase2-gate-failed'
+      ? virtualPanoAcceptedByGate
+        ? 'gpu-phase2-gate-failed-cpu-virtual-pano-fallback'
+        : enableVirtualPanoRender
+          ? allowLegacyFallback
+            ? 'gpu-phase2-gate-failed-cpu-virtual-pano-rejected'
+            : 'gpu-phase2-gate-failed-cpu-virtual-pano-rejected-no-legacy-fallback'
+          : allowLegacyFallback
+            ? 'gpu-phase2-gate-failed-cpu-legacy-fallback'
+            : 'gpu-phase2-gate-failed-no-legacy-fallback'
+      : gpuFallbackCause === 'gpu-render-failed'
+        ? virtualPanoAcceptedByGate
+          ? 'gpu-render-failed-cpu-virtual-pano-fallback'
+          : enableVirtualPanoRender
+            ? allowLegacyFallback
+              ? 'gpu-render-failed-cpu-virtual-pano-rejected'
+              : 'gpu-render-failed-cpu-virtual-pano-rejected-no-legacy-fallback'
+            : allowLegacyFallback
+              ? 'gpu-render-failed-cpu-legacy-fallback'
+              : 'gpu-render-failed-no-legacy-fallback'
+        : requestedReconstructionMode === 'virtualPano' && virtualPanoRejected
+          ? allowLegacyFallback
+            ? 'cpu-virtual-pano-rejected-legacy-fallback'
+            : 'cpu-virtual-pano-rejected-no-legacy-fallback'
+          : null;
+  if (!virtualPanoSelectedForOutput && allowLegacyFallback) {
+    selectedReconstructionMode = 'legacy';
+  }
+  const outputSelection = {
+    requestedReconstructionMode,
+    candidateReconstructionMode,
+    selectedReconstructionMode,
+    virtualPanoAttempted,
+    virtualPanoAccepted: virtualPanoAcceptedByGate,
+    virtualPanoRejected,
+    virtualPanoSelectedForOutput,
+    acceptedByLowerBandTolerance,
+    legacyFallbackAllowed: allowLegacyFallback,
+    rejectReasons: virtualPanoRejectReasons,
+    fallbackReason,
+  };
 
   let meanTurnAngleDeg = 0;
   let maxTurnAngleDeg = 0;
@@ -3587,7 +3927,18 @@ function generatePanorama(input: CPRWorkerInput): {
   meanCurvatureFactor = panoWidth > 0 ? meanCurvatureFactor / panoWidth : 0;
   const _t5_beforePayload = performance.now();
 
+  const requestedRenderBackend = input.renderBackend === 'cpu' ? 'cpu' : 'gpu';
   const diagnosticPayload = {
+    renderBackend: 'cpu',
+    requestedRenderBackend,
+    pipelineMode: selectedReconstructionMode,
+    fallbackReason,
+    reconstructionMode: selectedReconstructionMode,
+    requestedReconstructionMode,
+    candidateReconstructionMode,
+    phase2GatePassed: gpuFallbackCause === 'gpu-phase2-gate-failed' ? false : null,
+    outputSelection,
+    legacyFallbackAllowed: allowLegacyFallback,
     oobRate: {
       checked: _dbgChecked,
       oob: _dbgOob,
@@ -3601,9 +3952,9 @@ function generatePanorama(input: CPRWorkerInput): {
     verticalAxisMode: 'frameS',
     slabDir: slabDirs?.[0]
       ? {
-        N_slab: slabDirs[0],
-        tangent: frames[0].T ?? null,
-      }
+          N_slab: slabDirs[0],
+          tangent: frames[0].T ?? null,
+        }
       : null,
     verticalWindowMode: rigidVerticalSliceMode
       ? 'rigid-spline-slice-window'
@@ -3628,9 +3979,9 @@ function generatePanorama(input: CPRWorkerInput): {
         Math.abs(maxLocalCenterOffsetMm - verticalCenterOffsetMm)
       ),
       maxAdjacentDeltaMm: maxLocalCenterAdjacentDeltaMm,
-      first8: Array.from(localCenterOffsetsMm.subarray(0, Math.min(8, localCenterOffsetsMm.length))).map(
-        value => Math.round(Number(value) * 1000) / 1000
-      ),
+      first8: Array.from(
+        localCenterOffsetsMm.subarray(0, Math.min(8, localCenterOffsetsMm.length))
+      ).map(value => Math.round(Number(value) * 1000) / 1000),
     },
     localCenterOffsetsMm: Array.from(localCenterOffsetsMm).map(
       value => Math.round(Number(value) * 1000) / 1000
@@ -3653,10 +4004,18 @@ function generatePanorama(input: CPRWorkerInput): {
       turnAngleMaxDeg: maxTurnAngleDeg,
       curvatureFactorMean: meanCurvatureFactor,
       curvatureFactorMax: maxCurvatureFactor,
-      halfRangeMmMin: Number.isFinite(minSearchHalfRangeMm) ? minSearchHalfRangeMm : adaptiveCenterSearchHalfRangeMm,
-      halfRangeMmMax: Number.isFinite(maxSearchHalfRangeMm) ? maxSearchHalfRangeMm : adaptiveCenterSearchHalfRangeMm,
-      maxDeviationMmMin: Number.isFinite(minMaxDeviationMm) ? minMaxDeviationMm : baseAdaptiveCenterMaxDeviationMm,
-      maxDeviationMmMax: Number.isFinite(maxMaxDeviationMm) ? maxMaxDeviationMm : baseAdaptiveCenterMaxDeviationMm,
+      halfRangeMmMin: Number.isFinite(minSearchHalfRangeMm)
+        ? minSearchHalfRangeMm
+        : adaptiveCenterSearchHalfRangeMm,
+      halfRangeMmMax: Number.isFinite(maxSearchHalfRangeMm)
+        ? maxSearchHalfRangeMm
+        : adaptiveCenterSearchHalfRangeMm,
+      maxDeviationMmMin: Number.isFinite(minMaxDeviationMm)
+        ? minMaxDeviationMm
+        : baseAdaptiveCenterMaxDeviationMm,
+      maxDeviationMmMax: Number.isFinite(maxMaxDeviationMm)
+        ? maxMaxDeviationMm
+        : baseAdaptiveCenterMaxDeviationMm,
     },
     slabSampling: {
       requestedSamples: baseSlabSampleCount,
@@ -3670,7 +4029,7 @@ function generatePanorama(input: CPRWorkerInput): {
       blend: effectiveDenoiseBlend,
       requestedBlend: denoiseBlend,
       applied: denoiseApplied,
-      virtualRenderUsedAsOutput,
+      virtualRenderUsedAsOutput: virtualPanoSelectedForOutput,
     },
     timingMs: {
       adaptiveCenterSearch: Math.round(_t1_afterAdaptiveCenter - _t0_start),
@@ -3698,6 +4057,88 @@ function generatePanorama(input: CPRWorkerInput): {
     firstFrameWorldPos: frames?.[0]?.position ?? null,
     lastFrameWorldPos: frames?.[frames.length - 1]?.position ?? null,
   };
+  const cpuLogContext = {
+    runId: input.debugRunId ?? null,
+    attemptLabel: input.attemptLabel ?? null,
+    displayedPath: 'worker-recon',
+    backend: 'cpu',
+    requestedBackend: requestedRenderBackend,
+    requestedReconstructionMode,
+    reconstructionMode: selectedReconstructionMode,
+    candidateReconstructionMode,
+    sourceVolumeId: input.sourceVolumeId ?? null,
+    pipelineMode: selectedReconstructionMode,
+    fallbackReason,
+    legacyFallbackAllowed: allowLegacyFallback,
+  };
+  console.log(
+    '[CPR-SUPPORT-SURFACE-JSON]',
+    JSON.stringify(
+      virtualPanoPhase12Diagnostics.enabled === true
+        ? {
+            ...cpuLogContext,
+            ...virtualPanoPhase12Diagnostics,
+          }
+        : {
+            ...cpuLogContext,
+            skippedReason:
+              (virtualPanoPhase12Diagnostics as { skippedReason?: unknown }).skippedReason ??
+              'virtual-pano-disabled',
+          }
+    )
+  );
+  console.log(
+    '[CPR-DRR-JSON]',
+    JSON.stringify(
+      virtualPanoRenderDiagnostics.enabled === true
+        ? {
+            ...cpuLogContext,
+            ...virtualPanoRenderDiagnostics,
+          }
+        : {
+            ...cpuLogContext,
+            skippedReason:
+              (virtualPanoRenderDiagnostics as { skippedReason?: unknown }).skippedReason ??
+              'virtual-pano-render-disabled',
+          }
+    )
+  );
+  console.log(
+    '[CPR-TONE-MAP-JSON]',
+    JSON.stringify({
+      ...cpuLogContext,
+      enabled: virtualPanoRenderDiagnostics.enabled === true,
+      usedAsOutput: virtualPanoSelectedForOutput,
+      acceptedByGate: virtualPanoAcceptedByGate,
+      outputDisplayWindow: {
+        lower: minValue,
+        upper: maxValue,
+        windowWidth,
+        windowCenter,
+      },
+      outputSelection,
+      rejectReasons: virtualPanoRejectReasons,
+    })
+  );
+  console.log(
+    '[CPR-SIDECAR-MAPS-JSON]',
+    JSON.stringify({
+      ...cpuLogContext,
+      debugEnabled: !!input.debugRunId,
+      attachedMaps: [],
+      attachedByteLength: 0,
+    })
+  );
+  if (gpuFallbackCause) {
+    console.log(
+      '[CPR-CPU-FALLBACK-JSON]',
+      JSON.stringify({
+        ...cpuLogContext,
+        gpuFallbackCause,
+        outputSelection,
+      })
+    );
+  }
   const outputPixelPreview = Array.from(pixelData.subarray(0, Math.min(5, pixelData.length)));
   const outputSignature = computeOutputSignature(pixelData);
   return {
@@ -3758,8 +4199,11 @@ function buildRenderInput(
     allowStoredValueNormalization: render.allowStoredValueNormalization,
     disableStoredValueNormalization: render.disableStoredValueNormalization,
     debugRunId: render.debugRunId,
+    attemptLabel: render.attemptLabel,
     reconstructionMode: render.reconstructionMode,
     renderBackend: render.renderBackend,
+    allowLegacyFallback: render.allowLegacyFallback,
+    sourceVolumeId: render.sourceVolumeId,
   };
 }
 
@@ -3802,14 +4246,17 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
         disableStoredValueNormalization: input.disableStoredValueNormalization,
       });
       if (policy.heuristicOverride && input.isPreScaled !== true) {
-        console.warn('[CPR-worker] INIT_VOLUME detected already-scaled HU source data; bypassing secondary rescale.', {
-          sampledMin: policy.sampledMin,
-          sampledMax: policy.sampledMax,
-          rescaleSlope: policy.safeSlope,
-          rescaleIntercept: policy.safeIntercept,
-          bitsStored: policy.safeBitsStored,
-          pixelRepresentation: input.pixelRepresentation,
-        });
+        console.warn(
+          '[CPR-worker] INIT_VOLUME detected already-scaled HU source data; bypassing secondary rescale.',
+          {
+            sampledMin: policy.sampledMin,
+            sampledMax: policy.sampledMax,
+            rescaleSlope: policy.safeSlope,
+            rescaleIntercept: policy.safeIntercept,
+            bitsStored: policy.safeBitsStored,
+            pixelRepresentation: input.pixelRepresentation,
+          }
+        );
       }
       const normalized = normalizeScalarDataToHuFloat32({
         scalarData: input.scalarData,
@@ -3876,6 +4323,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       meanMap?: Float32Array;
       maxMap?: Float32Array;
       sampleCountMap?: Float32Array;
+      debugMaps?: GpuPanoDebugMaps;
     };
     let renderResult:
       | ReturnType<typeof generateGpuPanorama>
@@ -3892,11 +4340,13 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
           | 'unsignedPackedArtifactDetected'
           | 'diagnosticPayload'
           | 'outputSignature'
-        > & OptionalGpuDiagnosticMaps)
+        > &
+          OptionalGpuDiagnosticMaps)
       | undefined;
 
     if (renderBackend === 'gpu') {
       let lastGpuError: unknown = null;
+      let gpuFallbackCause: 'gpu-render-failed' | 'gpu-phase2-gate-failed' | null = null;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           renderResult = generateGpuPanorama(renderInput, input.sessionKey);
@@ -3913,14 +4363,71 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
           try {
             disposeGpuPanoRenderer();
           } catch (disposeError) {
-            console.warn('[CPR-GPU] Failed to dispose GPU renderer after render failure.', disposeError);
+            console.warn(
+              '[CPR-GPU] Failed to dispose GPU renderer after render failure.',
+              disposeError
+            );
           }
         }
       }
 
+      const gpuRenderDiagnostics =
+        renderResult && 'diagnostics' in renderResult ? renderResult.diagnostics : null;
+      const gpuPipelineMode =
+        renderResult && 'pipelineMode' in renderResult ? renderResult.pipelineMode : 'unknown';
+      const gpuPhase2GateFailed = !!renderResult && gpuRenderDiagnostics?.phase2GatePassed === false;
+
       if (!renderResult) {
-        console.warn('[CPR-GPU] Falling back to CPU panorama renderer after GPU retry failure.', lastGpuError);
-        renderResult = generatePanorama(renderInput);
+        gpuFallbackCause = 'gpu-render-failed';
+        console.warn(
+          '[CPR-GPU] Falling back to CPU virtual pano renderer after GPU retry failure.',
+          lastGpuError
+        );
+      } else if (gpuPhase2GateFailed) {
+        gpuFallbackCause = 'gpu-phase2-gate-failed';
+        console.warn(
+          '[CPR-GPU] GPU panorama missed the Phase 2 gate. Falling back to CPU virtual pano renderer.',
+          {
+            runId: renderInput.debugRunId ?? null,
+            attemptLabel: renderInput.attemptLabel ?? null,
+            pipelineMode: gpuPipelineMode,
+          }
+        );
+      }
+
+      if (gpuFallbackCause) {
+        const requestedReconstructionMode = resolveReconstructionMode(
+          renderInput.reconstructionMode
+        );
+        const cpuFallbackReconstructionMode = resolveCpuFallbackReconstructionMode(
+          requestedReconstructionMode
+        );
+        console.log(
+          '[CPR-CPU-FALLBACK-JSON]',
+          JSON.stringify({
+            runId: renderInput.debugRunId ?? null,
+            attemptLabel: renderInput.attemptLabel ?? null,
+            displayedPath: 'worker-recon',
+            backend: 'cpu',
+            requestedBackend: 'gpu',
+            requestedReconstructionMode,
+            cpuFallbackReconstructionMode,
+            gpuFallbackCause,
+            legacyFallbackAllowed: renderInput.allowLegacyFallback === true,
+            sourceVolumeId: renderInput.sourceVolumeId ?? null,
+          })
+        );
+        renderResult = generatePanorama(
+          {
+            ...renderInput,
+            renderBackend: 'cpu',
+            reconstructionMode: cpuFallbackReconstructionMode,
+          },
+          {
+            requestedReconstructionMode,
+            gpuFallbackCause,
+          }
+        );
       }
     } else {
       renderResult = generatePanorama(renderInput);
@@ -3931,6 +4438,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       meanMap,
       maxMap,
       sampleCountMap,
+      debugMaps,
       minValue,
       maxValue,
       windowWidth,
@@ -3959,6 +4467,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       meanMap,
       maxMap,
       sampleCountMap,
+      debugMaps,
       panoWidth: renderInput.panoWidth,
       panoHeight: renderInput.panoHeight,
       minValue,
@@ -3977,16 +4486,28 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       },
     };
 
-    const transferList: Transferable[] = [displayPixelData.pixelData.buffer];
-    if (meanMap?.buffer) {
-      transferList.push(meanMap.buffer);
-    }
-    if (maxMap?.buffer) {
-      transferList.push(maxMap.buffer);
-    }
-    if (sampleCountMap?.buffer) {
-      transferList.push(sampleCountMap.buffer);
-    }
+    const transferList: Transferable[] = [];
+    const transferBufferSet = new Set<ArrayBufferLike>();
+    const pushTransferBuffer = (typedArray?: ArrayBufferView | null) => {
+      if (!typedArray?.buffer || transferBufferSet.has(typedArray.buffer)) {
+        return;
+      }
+      transferBufferSet.add(typedArray.buffer);
+      transferList.push(typedArray.buffer as Transferable);
+    };
+    pushTransferBuffer(displayPixelData.pixelData);
+    pushTransferBuffer(meanMap);
+    pushTransferBuffer(maxMap);
+    pushTransferBuffer(sampleCountMap);
+    pushTransferBuffer(debugMaps?.supportDepthMap);
+    pushTransferBuffer(debugMaps?.supportConfidenceMap);
+    pushTransferBuffer(debugMaps?.supportSpreadMap);
+    pushTransferBuffer(debugMaps?.supportDensityMap);
+    pushTransferBuffer(debugMaps?.totalAttenuationMap);
+    pushTransferBuffer(debugMaps?.lowerPenaltyMap);
+    pushTransferBuffer(debugMaps?.participatingSampleCountMap);
+    pushTransferBuffer(debugMaps?.toneResponseMap);
+    pushTransferBuffer(debugMaps?.troughHalfWidthMap);
 
     // eslint-disable-next-line no-restricted-globals
     (self as unknown as Worker).postMessage(response, transferList);

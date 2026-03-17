@@ -35,6 +35,99 @@ export interface GpuPanoInput {
 
     /** Optional normalizer for packed stored values (bit alignment, sign extension). */
     normalizeStoredSample?: (value: number) => number;
+    returnDebugSidecars?: boolean;
+}
+
+export interface GpuPanoDebugMaps {
+    supportDepthMap?: Float32Array;
+    supportConfidenceMap?: Float32Array;
+    supportSpreadMap?: Float32Array;
+    supportDensityMap?: Float32Array;
+    totalAttenuationMap?: Float32Array;
+    lowerPenaltyMap?: Float32Array;
+    participatingSampleCountMap?: Float32Array;
+    toneResponseMap?: Float32Array;
+    troughHalfWidthMap?: Float32Array;
+}
+
+export interface GpuSupportSurfaceDiagnostics {
+    depthMinMm: number;
+    depthMaxMm: number;
+    depthStdMm: number;
+    pathJumpP95Mm: number;
+    clampFraction: number;
+    confidenceP10: number;
+    confidenceP50: number;
+    confidenceP90: number;
+    spreadP50Mm: number;
+    spreadP90Mm: number;
+    densityP50: number;
+    densityP90: number;
+    selectedDepthFirst8Mm: number[];
+}
+
+export interface GpuDrrDiagnostics {
+    slabHalfThicknessMm: number;
+    requestedSlabSamples: number;
+    effectiveRaySampleCountMin: number;
+    effectiveRaySampleCountP50: number;
+    effectiveRaySampleCountP90: number;
+    effectiveRaySampleCountMax: number;
+    troughSigmaP10Mm: number;
+    troughSigmaP50Mm: number;
+    troughSigmaP90Mm: number;
+    approxTroughHalfWidthP50Mm: number;
+    totalAttenuationP10: number;
+    totalAttenuationP50: number;
+    totalAttenuationP90: number;
+    fogAttenuationP50: number;
+    fogAttenuationP90: number;
+    participatingSamplesP10: number;
+    participatingSamplesP50: number;
+    participatingSamplesP90: number;
+    localTransmittanceP10: number;
+    localTransmittanceP50: number;
+    localTransmittanceP90: number;
+}
+
+export interface GpuToneMapDiagnostics {
+    inputAttenuationP01: number;
+    inputAttenuationP50: number;
+    inputAttenuationP99: number;
+    toneResponseP01: number;
+    toneResponseP50: number;
+    toneResponseP99: number;
+    outputHuP01: number;
+    outputHuP50: number;
+    outputHuP99: number;
+    lowerPenaltyP50: number;
+    lowerPenaltyP90: number;
+    blackClipFraction: number;
+    whiteClipFraction: number;
+    toneCurve: {
+        attenuationStrength: number;
+        gamma: number;
+        outputHuMin: number;
+        outputHuMax: number;
+        lowConfidenceFogSuppression: number;
+        highConfidenceFogSuppression: number;
+        lowConfidenceFogFloor: number;
+        highConfidenceFogFloor: number;
+    };
+}
+
+export interface GpuPanoDiagnostics {
+    expectedPipelineMode: 'multi-pass';
+    phase2GatePassed: boolean;
+    degradedModeReason?: string | null;
+    supportSurface?: GpuSupportSurfaceDiagnostics;
+    drr?: GpuDrrDiagnostics;
+    toneMap?: GpuToneMapDiagnostics;
+    sidecarMaps?: {
+        debugEnabled: boolean;
+        attachedMaps: string[];
+        attachedByteLength: number;
+    };
 }
 
 export interface GpuPanoResult {
@@ -47,6 +140,8 @@ export interface GpuPanoResult {
     minValue: number;
     maxValue: number;
     pipelineMode: 'single-pass' | 'multi-pass';
+    debugMaps?: GpuPanoDebugMaps;
+    diagnostics?: GpuPanoDiagnostics;
 }
 
 const GPU_DEBUG_MODE_OFF = 0;
@@ -54,6 +149,39 @@ const GPU_DEBUG_MODE_RAY_START = 1;
 const GPU_DEBUG_MODE_RAY_DIRECTION = 2;
 const GPU_DEBUG_MODE_SPLINE_VECTOR = 3;
 const ACTIVE_GPU_DEBUG_MODE = GPU_DEBUG_MODE_OFF;
+const EXPECTED_GPU_PIPELINE_MODE: 'multi-pass' = 'multi-pass';
+const SUPPORT_PATH_ROW_START_FRACTION = 0.18;
+const SUPPORT_PATH_ROW_END_FRACTION = 0.82;
+const TONE_RESPONSE_BLACK_CLIP_THRESHOLD = 0.02;
+const TONE_RESPONSE_WHITE_CLIP_THRESHOLD = 0.98;
+const GPU_DRR_MODEL_PARAMS = {
+    broadSigmaSlabScale: 0.45,
+    broadSigmaNativePitchScale: 1.0,
+    focusedSpreadScale: 0.9,
+    focusedNativePitchBias: 0.35,
+    focusedSigmaMinNativePitchScale: 0.85,
+    focusedSigmaMaxSlabScale: 0.45,
+    focusedSigmaMaxNativePitchScale: 1.05,
+    confidenceBlendLow: 0.18,
+    confidenceBlendHigh: 0.72,
+    confidenceSigmaExpansion: 1.35,
+    attenuationConfidenceLow: 0.08,
+    attenuationConfidenceHigh: 0.48,
+    approxTroughBoundarySigmaMultiplier: 2.0,
+};
+const GPU_TONE_MODEL_PARAMS = {
+    lowConfidenceFogFloor: 0.16,
+    highConfidenceFogFloor: 0.08,
+    lowConfidenceFogSuppression: 0.72,
+    highConfidenceFogSuppression: 0.88,
+    attenuationConfidenceLow: 0.1,
+    attenuationConfidenceHigh: 0.5,
+    lowConfidenceAttenuationScale: 0.45,
+    attenuationStrength: 3.5,
+    gamma: 0.92,
+    outputHuMin: -860,
+    outputHuMax: 2650,
+};
 
 // ─── Shaders ─────────────────────────────────────────────────────────
 const VERT_SRC = `#version 300 es
@@ -530,6 +658,7 @@ void main() {
   float totalAttenuation = 0.0;
   float fogAttenuation = 0.0;
   float denseAttenuation = 0.0;
+  float participatingSamples = 0.0;
   bool hasValidSample = false;
 
   const int MAX_SLAB = 64;
@@ -554,6 +683,7 @@ void main() {
     totalAttenuation += mu * supportWeight * segmentLength * mix(0.35, 1.0, confidenceGate);
     fogAttenuation += muFog * supportWeight * segmentLength * mix(0.08, 0.32, supportConfidence);
     denseAttenuation += max(mu - muFog, 0.0) * supportWeight * segmentLength;
+    participatingSamples += supportWeight;
     hasValidSample = true;
   }
 
@@ -566,7 +696,7 @@ void main() {
     max(totalAttenuation, 0.0),
     max(fogAttenuation, 0.0),
     supportConfidence,
-    max(denseAttenuation, 0.0)
+    max(participatingSamples, 0.0)
   );
 }
 `;
@@ -603,7 +733,7 @@ void main() {
   radiographSignal = pow(clamp(radiographSignal, 0.0, 1.0), 0.92);
 
   float finalHu = mix(-860.0, 2650.0, radiographSignal);
-  fragColor = vec4(finalHu, gentlySuppressedAttenuation, fogAttenuation, 1.0);
+  fragColor = vec4(finalHu, gentlySuppressedAttenuation, fogAttenuation, radiographSignal);
 }
 `;
 
@@ -926,6 +1056,484 @@ function computeMinMax(buffer: Float32Array): { minValue: number; maxValue: numb
         return { minValue: 0, maxValue: 0 };
     }
     return { minValue, maxValue };
+}
+
+interface FramebufferReadback {
+    channel0: Float32Array;
+    channel1: Float32Array;
+    channel2: Float32Array;
+    channel3: Float32Array;
+    rawMin: number;
+    rawMax: number;
+}
+
+interface BufferSummary {
+    sampledCount: number;
+    min: number;
+    max: number;
+    mean: number;
+    stdDev: number;
+    p01: number;
+    p10: number;
+    p50: number;
+    p90: number;
+    p95: number;
+    p99: number;
+}
+
+function clampNumber(value: number, minValue: number, maxValue: number): number {
+    return Math.min(maxValue, Math.max(minValue, value));
+}
+
+function mixNumber(a: number, b: number, t: number): number {
+    return a + (b - a) * t;
+}
+
+function smoothstepNumber(edge0: number, edge1: number, value: number): number {
+    if (Math.abs(edge1 - edge0) <= 1e-6) {
+        return value < edge0 ? 0 : 1;
+    }
+
+    const t = clampNumber((value - edge0) / (edge1 - edge0), 0, 1);
+    return t * t * (3 - 2 * t);
+}
+
+function percentileFromSorted(values: number[], q: number): number {
+    if (!values.length) {
+        return NaN;
+    }
+
+    const clampedQ = clampNumber(q, 0, 1);
+    const position = clampedQ * (values.length - 1);
+    const lowIndex = Math.floor(position);
+    const highIndex = Math.ceil(position);
+    if (lowIndex === highIndex) {
+        return values[lowIndex];
+    }
+
+    const t = position - lowIndex;
+    return values[lowIndex] * (1 - t) + values[highIndex] * t;
+}
+
+function roundFinite(value: number, fractionDigits = 3): number {
+    return Number.isFinite(value) ? Number(value.toFixed(fractionDigits)) : 0;
+}
+
+function summarizeFiniteBuffer(buffer: Float32Array, maxSamples = 40000): BufferSummary | null {
+    if (!buffer.length) {
+        return null;
+    }
+
+    const samples: number[] = [];
+    const step = Math.max(1, Math.floor(buffer.length / maxSamples));
+    let min = Infinity;
+    let max = -Infinity;
+    let sum = 0;
+    let sumSquares = 0;
+
+    for (let i = 0; i < buffer.length; i += step) {
+        const value = Number(buffer[i]);
+        if (!Number.isFinite(value)) {
+            continue;
+        }
+
+        samples.push(value);
+        min = Math.min(min, value);
+        max = Math.max(max, value);
+        sum += value;
+        sumSquares += value * value;
+    }
+
+    if (!samples.length || !Number.isFinite(min) || !Number.isFinite(max)) {
+        return null;
+    }
+
+    samples.sort((a, b) => a - b);
+    const sampledCount = samples.length;
+    const mean = sum / sampledCount;
+    const variance = Math.max(sumSquares / sampledCount - mean * mean, 0);
+
+    return {
+        sampledCount,
+        min,
+        max,
+        mean,
+        stdDev: Math.sqrt(variance),
+        p01: percentileFromSorted(samples, 0.01),
+        p10: percentileFromSorted(samples, 0.1),
+        p50: percentileFromSorted(samples, 0.5),
+        p90: percentileFromSorted(samples, 0.9),
+        p95: percentileFromSorted(samples, 0.95),
+        p99: percentileFromSorted(samples, 0.99),
+    };
+}
+
+function computeClampFraction(buffer: Float32Array, clampLimitMm: number): number {
+    if (!buffer.length || !Number.isFinite(clampLimitMm) || clampLimitMm <= 0) {
+        return 0;
+    }
+
+    const thresholdMm = Math.max(clampLimitMm * 0.96, clampLimitMm - 0.1);
+    let finiteCount = 0;
+    let clampedCount = 0;
+    for (let i = 0; i < buffer.length; i++) {
+        const value = Number(buffer[i]);
+        if (!Number.isFinite(value)) {
+            continue;
+        }
+
+        finiteCount++;
+        if (Math.abs(value) >= thresholdMm) {
+            clampedCount++;
+        }
+    }
+
+    return finiteCount > 0 ? clampedCount / finiteCount : 0;
+}
+
+function collapseSupportPathByColumn(
+    depthMap: Float32Array,
+    confidenceMap: Float32Array,
+    width: number,
+    height: number
+): { pathDepthMm: Float32Array; pathConfidence: Float32Array } {
+    const pathDepthMm = new Float32Array(width);
+    const pathConfidence = new Float32Array(width);
+    const startRow = Math.max(0, Math.floor(height * SUPPORT_PATH_ROW_START_FRACTION));
+    const endRow = Math.min(height - 1, Math.ceil(height * SUPPORT_PATH_ROW_END_FRACTION));
+    const fallbackRow = Math.max(0, Math.min(height - 1, Math.round((height - 1) * 0.5)));
+
+    for (let col = 0; col < width; col++) {
+        let weightedDepth = 0;
+        let weightedConfidence = 0;
+        let weightSum = 0;
+
+        for (let row = startRow; row <= endRow; row++) {
+            const index = row * width + col;
+            const depth = Number(depthMap[index]);
+            const confidence = clampNumber(Number(confidenceMap[index]), 0, 1);
+            if (!Number.isFinite(depth) || !Number.isFinite(confidence)) {
+                continue;
+            }
+
+            const weight = confidence > 1e-4 ? confidence * confidence : 0;
+            if (weight <= 0) {
+                continue;
+            }
+
+            weightedDepth += depth * weight;
+            weightedConfidence += confidence * weight;
+            weightSum += weight;
+        }
+
+        if (weightSum > 1e-5) {
+            pathDepthMm[col] = weightedDepth / weightSum;
+            pathConfidence[col] = weightedConfidence / weightSum;
+            continue;
+        }
+
+        const fallbackIndex = fallbackRow * width + col;
+        pathDepthMm[col] = Number(depthMap[fallbackIndex]) || 0;
+        pathConfidence[col] = clampNumber(Number(confidenceMap[fallbackIndex]) || 0, 0, 1);
+    }
+
+    return { pathDepthMm, pathConfidence };
+}
+
+function computeAdjacentDeltaP95(values: Float32Array): number {
+    if (values.length < 2) {
+        return 0;
+    }
+
+    const deltas: number[] = [];
+    for (let i = 1; i < values.length; i++) {
+        const current = Number(values[i]);
+        const previous = Number(values[i - 1]);
+        if (!Number.isFinite(current) || !Number.isFinite(previous)) {
+            continue;
+        }
+        deltas.push(Math.abs(current - previous));
+    }
+
+    if (!deltas.length) {
+        return 0;
+    }
+
+    deltas.sort((a, b) => a - b);
+    return percentileFromSorted(deltas, 0.95);
+}
+
+function multiplyDirectionByWorldToIndex(
+    worldToIndex: Float32Array,
+    directionVector: [number, number, number]
+): [number, number, number] {
+    return [
+        worldToIndex[0] * directionVector[0] + worldToIndex[4] * directionVector[1] + worldToIndex[8] * directionVector[2],
+        worldToIndex[1] * directionVector[0] + worldToIndex[5] * directionVector[1] + worldToIndex[9] * directionVector[2],
+        worldToIndex[2] * directionVector[0] + worldToIndex[6] * directionVector[1] + worldToIndex[10] * directionVector[2],
+    ];
+}
+
+function computeNativeSlabPitchMmForFrames(
+    worldToIndex: Float32Array,
+    frames: GpuPanoInput['frames']
+): Float32Array {
+    const nativePitchMmByCol = new Float32Array(frames.length);
+    for (let col = 0; col < frames.length; col++) {
+        const directionVector = frames[col]?.N_slab ?? [0, 0, 1];
+        const indexVector = multiplyDirectionByWorldToIndex(worldToIndex, directionVector);
+        const indexUnitsPerMm = Math.hypot(indexVector[0], indexVector[1], indexVector[2]);
+        nativePitchMmByCol[col] =
+            indexUnitsPerMm <= 1e-5
+                ? 0.2
+                : clampNumber(1 / indexUnitsPerMm, 0.05, 2.0);
+    }
+    return nativePitchMmByCol;
+}
+
+function computeRaySampleCountForJs(
+    slabWidthMm: number,
+    nativeSlabPitchMm: number,
+    requestedSampleCount: number
+): number {
+    const maxSlabSamples = 64;
+    let pitchAlignedSampleCount = 1;
+    if (slabWidthMm > 1e-4) {
+        const safeNativePitchMm = Math.max(nativeSlabPitchMm, 1e-4);
+        pitchAlignedSampleCount = Math.min(
+            maxSlabSamples,
+            Math.max(3, Math.ceil(slabWidthMm / safeNativePitchMm) + 1)
+        );
+    }
+
+    return Math.min(maxSlabSamples, Math.max(Math.max(requestedSampleCount, 1), pitchAlignedSampleCount));
+}
+
+function buildSupportSigmaMap(
+    supportSpreadMap: Float32Array,
+    supportConfidenceMap: Float32Array,
+    nativePitchMmByCol: Float32Array,
+    width: number,
+    height: number,
+    slabHalfThicknessMm: number
+): Float32Array {
+    const supportSigmaMap = new Float32Array(width * height);
+    for (let row = 0; row < height; row++) {
+        for (let col = 0; col < width; col++) {
+            const index = row * width + col;
+            const supportSpreadMm = Math.max(Number(supportSpreadMap[index]), 0.1);
+            const supportConfidence = clampNumber(Number(supportConfidenceMap[index]), 0, 1);
+            const nativePitchMm = Number(nativePitchMmByCol[col]) || 0.2;
+            const broadSigmaMm = Math.max(
+                slabHalfThicknessMm * GPU_DRR_MODEL_PARAMS.broadSigmaSlabScale,
+                nativePitchMm * GPU_DRR_MODEL_PARAMS.broadSigmaNativePitchScale
+            );
+            const focusedSigmaMm = clampNumber(
+                supportSpreadMm * GPU_DRR_MODEL_PARAMS.focusedSpreadScale +
+                    nativePitchMm * GPU_DRR_MODEL_PARAMS.focusedNativePitchBias,
+                nativePitchMm * GPU_DRR_MODEL_PARAMS.focusedSigmaMinNativePitchScale,
+                Math.max(
+                    slabHalfThicknessMm * GPU_DRR_MODEL_PARAMS.focusedSigmaMaxSlabScale,
+                    nativePitchMm * GPU_DRR_MODEL_PARAMS.focusedSigmaMaxNativePitchScale
+                )
+            );
+            const sigmaMix = smoothstepNumber(
+                GPU_DRR_MODEL_PARAMS.confidenceBlendLow,
+                GPU_DRR_MODEL_PARAMS.confidenceBlendHigh,
+                supportConfidence
+            );
+            supportSigmaMap[index] = Math.min(
+                broadSigmaMm,
+                mixNumber(
+                    focusedSigmaMm,
+                    focusedSigmaMm * GPU_DRR_MODEL_PARAMS.confidenceSigmaExpansion,
+                    sigmaMix
+                )
+            );
+        }
+    }
+
+    return supportSigmaMap;
+}
+
+function buildLocalTransmittanceMap(totalAttenuationMap: Float32Array): Float32Array {
+    const localTransmittanceMap = new Float32Array(totalAttenuationMap.length);
+    for (let i = 0; i < totalAttenuationMap.length; i++) {
+        const attenuation = Math.max(0, Number(totalAttenuationMap[i]));
+        localTransmittanceMap[i] = Math.exp(-attenuation);
+    }
+    return localTransmittanceMap;
+}
+
+function computeFractionByThreshold(
+    buffer: Float32Array,
+    predicate: (value: number) => boolean
+): number {
+    if (!buffer.length) {
+        return 0;
+    }
+
+    let finiteCount = 0;
+    let matchedCount = 0;
+    for (let i = 0; i < buffer.length; i++) {
+        const value = Number(buffer[i]);
+        if (!Number.isFinite(value)) {
+            continue;
+        }
+
+        finiteCount++;
+        if (predicate(value)) {
+            matchedCount++;
+        }
+    }
+
+    return finiteCount > 0 ? matchedCount / finiteCount : 0;
+}
+
+function sumByteLength(buffers: Array<Float32Array | undefined>): number {
+    let total = 0;
+    for (let i = 0; i < buffers.length; i++) {
+        total += buffers[i]?.byteLength ?? 0;
+    }
+    return total;
+}
+
+function buildSupportSurfaceDiagnostics(
+    supportDepthMap: Float32Array,
+    supportConfidenceMap: Float32Array,
+    supportSpreadMap: Float32Array,
+    supportDensityMap: Float32Array,
+    width: number,
+    height: number,
+    slabHalfThicknessMm: number
+): GpuSupportSurfaceDiagnostics {
+    const collapsedPath = collapseSupportPathByColumn(supportDepthMap, supportConfidenceMap, width, height);
+    const pathDepthSummary = summarizeFiniteBuffer(collapsedPath.pathDepthMm);
+    const confidenceSummary = summarizeFiniteBuffer(supportConfidenceMap);
+    const spreadSummary = summarizeFiniteBuffer(supportSpreadMap);
+    const densitySummary = summarizeFiniteBuffer(supportDensityMap);
+
+    return {
+        depthMinMm: roundFinite(pathDepthSummary?.min ?? 0),
+        depthMaxMm: roundFinite(pathDepthSummary?.max ?? 0),
+        depthStdMm: roundFinite(pathDepthSummary?.stdDev ?? 0),
+        pathJumpP95Mm: roundFinite(computeAdjacentDeltaP95(collapsedPath.pathDepthMm)),
+        clampFraction: roundFinite(computeClampFraction(collapsedPath.pathDepthMm, slabHalfThicknessMm), 4),
+        confidenceP10: roundFinite(confidenceSummary?.p10 ?? 0),
+        confidenceP50: roundFinite(confidenceSummary?.p50 ?? 0),
+        confidenceP90: roundFinite(confidenceSummary?.p90 ?? 0),
+        spreadP50Mm: roundFinite(spreadSummary?.p50 ?? 0),
+        spreadP90Mm: roundFinite(spreadSummary?.p90 ?? 0),
+        densityP50: roundFinite(densitySummary?.p50 ?? 0),
+        densityP90: roundFinite(densitySummary?.p90 ?? 0),
+        selectedDepthFirst8Mm: Array.from(
+            collapsedPath.pathDepthMm.subarray(0, Math.min(8, collapsedPath.pathDepthMm.length))
+        ).map(value => roundFinite(Number(value))),
+    };
+}
+
+function buildDrrDiagnostics(
+    totalAttenuationMap: Float32Array,
+    fogAttenuationMap: Float32Array,
+    participatingSampleCountMap: Float32Array,
+    supportSigmaMap: Float32Array,
+    localTransmittanceMap: Float32Array,
+    nativePitchMmByCol: Float32Array,
+    slabHalfThicknessMm: number,
+    requestedSlabSamples: number
+): GpuDrrDiagnostics {
+    const raySampleCounts = new Float32Array(nativePitchMmByCol.length);
+    const slabWidthMm = Math.max(0, slabHalfThicknessMm * 2);
+    for (let col = 0; col < nativePitchMmByCol.length; col++) {
+        raySampleCounts[col] = computeRaySampleCountForJs(
+            slabWidthMm,
+            nativePitchMmByCol[col],
+            requestedSlabSamples
+        );
+    }
+
+    const rayCountSummary = summarizeFiniteBuffer(raySampleCounts);
+    const sigmaSummary = summarizeFiniteBuffer(supportSigmaMap);
+    const totalSummary = summarizeFiniteBuffer(totalAttenuationMap);
+    const fogSummary = summarizeFiniteBuffer(fogAttenuationMap);
+    const participatingSummary = summarizeFiniteBuffer(participatingSampleCountMap);
+    const transmittanceSummary = summarizeFiniteBuffer(localTransmittanceMap);
+
+    return {
+        slabHalfThicknessMm: roundFinite(slabHalfThicknessMm),
+        requestedSlabSamples,
+        effectiveRaySampleCountMin: roundFinite(rayCountSummary?.min ?? 0),
+        effectiveRaySampleCountP50: roundFinite(rayCountSummary?.p50 ?? 0),
+        effectiveRaySampleCountP90: roundFinite(rayCountSummary?.p90 ?? 0),
+        effectiveRaySampleCountMax: roundFinite(rayCountSummary?.max ?? 0),
+        troughSigmaP10Mm: roundFinite(sigmaSummary?.p10 ?? 0),
+        troughSigmaP50Mm: roundFinite(sigmaSummary?.p50 ?? 0),
+        troughSigmaP90Mm: roundFinite(sigmaSummary?.p90 ?? 0),
+        approxTroughHalfWidthP50Mm: roundFinite(
+            (sigmaSummary?.p50 ?? 0) * GPU_DRR_MODEL_PARAMS.approxTroughBoundarySigmaMultiplier
+        ),
+        totalAttenuationP10: roundFinite(totalSummary?.p10 ?? 0),
+        totalAttenuationP50: roundFinite(totalSummary?.p50 ?? 0),
+        totalAttenuationP90: roundFinite(totalSummary?.p90 ?? 0),
+        fogAttenuationP50: roundFinite(fogSummary?.p50 ?? 0),
+        fogAttenuationP90: roundFinite(fogSummary?.p90 ?? 0),
+        participatingSamplesP10: roundFinite(participatingSummary?.p10 ?? 0),
+        participatingSamplesP50: roundFinite(participatingSummary?.p50 ?? 0),
+        participatingSamplesP90: roundFinite(participatingSummary?.p90 ?? 0),
+        localTransmittanceP10: roundFinite(transmittanceSummary?.p10 ?? 0, 4),
+        localTransmittanceP50: roundFinite(transmittanceSummary?.p50 ?? 0, 4),
+        localTransmittanceP90: roundFinite(transmittanceSummary?.p90 ?? 0, 4),
+    };
+}
+
+function buildToneMapDiagnostics(
+    inputAttenuationMap: Float32Array,
+    lowerPenaltyMap: Float32Array,
+    toneResponseMap: Float32Array,
+    outputHuMap: Float32Array
+): GpuToneMapDiagnostics {
+    const inputSummary = summarizeFiniteBuffer(inputAttenuationMap);
+    const penaltySummary = summarizeFiniteBuffer(lowerPenaltyMap);
+    const toneSummary = summarizeFiniteBuffer(toneResponseMap);
+    const outputSummary = summarizeFiniteBuffer(outputHuMap);
+
+    return {
+        inputAttenuationP01: roundFinite(inputSummary?.p01 ?? 0),
+        inputAttenuationP50: roundFinite(inputSummary?.p50 ?? 0),
+        inputAttenuationP99: roundFinite(inputSummary?.p99 ?? 0),
+        toneResponseP01: roundFinite(toneSummary?.p01 ?? 0, 4),
+        toneResponseP50: roundFinite(toneSummary?.p50 ?? 0, 4),
+        toneResponseP99: roundFinite(toneSummary?.p99 ?? 0, 4),
+        outputHuP01: roundFinite(outputSummary?.p01 ?? 0),
+        outputHuP50: roundFinite(outputSummary?.p50 ?? 0),
+        outputHuP99: roundFinite(outputSummary?.p99 ?? 0),
+        lowerPenaltyP50: roundFinite(penaltySummary?.p50 ?? 0),
+        lowerPenaltyP90: roundFinite(penaltySummary?.p90 ?? 0),
+        blackClipFraction: roundFinite(
+            computeFractionByThreshold(
+                toneResponseMap,
+                value => value <= TONE_RESPONSE_BLACK_CLIP_THRESHOLD
+            ),
+            4
+        ),
+        whiteClipFraction: roundFinite(
+            computeFractionByThreshold(
+                toneResponseMap,
+                value => value >= TONE_RESPONSE_WHITE_CLIP_THRESHOLD
+            ),
+            4
+        ),
+        toneCurve: {
+            attenuationStrength: GPU_TONE_MODEL_PARAMS.attenuationStrength,
+            gamma: GPU_TONE_MODEL_PARAMS.gamma,
+            outputHuMin: GPU_TONE_MODEL_PARAMS.outputHuMin,
+            outputHuMax: GPU_TONE_MODEL_PARAMS.outputHuMax,
+            lowConfidenceFogSuppression: GPU_TONE_MODEL_PARAMS.lowConfidenceFogSuppression,
+            highConfidenceFogSuppression: GPU_TONE_MODEL_PARAMS.highConfidenceFogSuppression,
+            lowConfidenceFogFloor: GPU_TONE_MODEL_PARAMS.lowConfidenceFogFloor,
+            highConfidenceFogFloor: GPU_TONE_MODEL_PARAMS.highConfidenceFogFloor,
+        },
+    };
 }
 
 function resetGpuRendererState(): void {
@@ -1282,18 +1890,11 @@ function ensureFbo(gl: WebGL2RenderingContext, w: number, h: number): void {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-function readFramebufferResult(
+function readFramebufferChannels(
     gl: WebGL2RenderingContext,
     width: number,
     height: number
-): {
-    pixelData: Float32Array;
-    meanMap: Float32Array;
-    maxMap: Float32Array;
-    sampleCountMap: Float32Array;
-    rawMin: number;
-    rawMax: number;
-} {
+): FramebufferReadback {
     gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
     const rgbaBuffer = new Float32Array(width * height * 4);
     gl.readPixels(0, 0, width, height, gl.RGBA, gl.FLOAT, rgbaBuffer);
@@ -1302,10 +1903,10 @@ function readFramebufferResult(
         throw new Error(`GPU pano readPixels failed with WebGL error ${readbackError}.`);
     }
 
-    const pixelData = new Float32Array(width * height);
-    const meanMap = new Float32Array(width * height);
-    const maxMap = new Float32Array(width * height);
-    const sampleCountMap = new Float32Array(width * height);
+    const channel0 = new Float32Array(width * height);
+    const channel1 = new Float32Array(width * height);
+    const channel2 = new Float32Array(width * height);
+    const channel3 = new Float32Array(width * height);
     let rawMin = Infinity;
     let rawMax = -Infinity;
 
@@ -1314,23 +1915,23 @@ function readFramebufferResult(
         for (let col = 0; col < width; col++) {
             const dstIndex = row * width + col;
             const srcIndex = (srcRow * width + col) * 4;
-            const finalValue = rgbaBuffer[srcIndex];
-            pixelData[dstIndex] = finalValue;
-            meanMap[dstIndex] = rgbaBuffer[srcIndex + 1];
-            maxMap[dstIndex] = rgbaBuffer[srcIndex + 2];
-            sampleCountMap[dstIndex] = rgbaBuffer[srcIndex + 3];
-            if (Number.isFinite(finalValue)) {
-                if (finalValue < rawMin) rawMin = finalValue;
-                if (finalValue > rawMax) rawMax = finalValue;
+            const channel0Value = rgbaBuffer[srcIndex];
+            channel0[dstIndex] = channel0Value;
+            channel1[dstIndex] = rgbaBuffer[srcIndex + 1];
+            channel2[dstIndex] = rgbaBuffer[srcIndex + 2];
+            channel3[dstIndex] = rgbaBuffer[srcIndex + 3];
+            if (Number.isFinite(channel0Value)) {
+                if (channel0Value < rawMin) rawMin = channel0Value;
+                if (channel0Value > rawMax) rawMax = channel0Value;
             }
         }
     }
 
     return {
-        pixelData,
-        meanMap,
-        maxMap,
-        sampleCountMap,
+        channel0,
+        channel1,
+        channel2,
+        channel3,
         rawMin,
         rawMax,
     };
@@ -1347,6 +1948,7 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         rescaleSlope, rescaleIntercept, applyRescale,
         normalizationSignature,
         normalizeStoredSample,
+        returnDebugSidecars = false,
     } = input;
     const safePanoWidth = Math.max(1, Math.floor(Number(panoWidth) || 1));
     const safePanoHeight = Math.max(1, Math.floor(Number(panoHeight) || 1));
@@ -1354,13 +1956,21 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
     const formatReadableGpuValue = (value: number | null | undefined, fractionDigits = 1): string =>
         Number.isFinite(value) ? Number(value).toFixed(fractionDigits) : 'na';
     const multiPassPipelineEnabled = !!(_supportProgram && _supportSmoothProgram && _drrProgram && _toneProgram);
+    const pipelineMode: 'single-pass' | 'multi-pass' = multiPassPipelineEnabled ? 'multi-pass' : 'single-pass';
+    const phase2GatePassed = pipelineMode === EXPECTED_GPU_PIPELINE_MODE;
     console.log(
-        `[CPR-GPU-PIPELINE] mode=${multiPassPipelineEnabled ? 'multi-pass' : 'single-pass'} ` +
+        `[CPR-GPU-PIPELINE] mode=${pipelineMode} expected=${EXPECTED_GPU_PIPELINE_MODE} ` +
+        `phase2Gate=${phase2GatePassed ? 'pass' : 'fail'} ` +
         `panoShader=${_panoProgram ? 'on' : 'off'} supportShader=${_supportProgram ? 'on' : 'off'} ` +
         `supportSmoothShader=${_supportSmoothProgram ? 'on' : 'off'} drrShader=${_drrProgram ? 'on' : 'off'} ` +
         `toneShader=${_toneProgram ? 'on' : 'off'} pano=${safePanoWidth}x${safePanoHeight} ` +
         `slabHalfMm=${formatReadableGpuValue(slabHalfThicknessMm)} slabSamples=${Math.max(1, Math.min(64, slabSamples | 0))}`
     );
+    if (!phase2GatePassed) {
+        console.warn(
+            '[CPR-GPU] Multi-pass support-surface routing is not active. Phase 2 quality tuning should stop until the GPU pipeline is back on multi-pass.'
+        );
+    }
 
     uploadVolumeTexture(
         gl,
@@ -1407,6 +2017,14 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
     let sampleCountMap: Float32Array;
     let rawMin = Infinity;
     let rawMax = -Infinity;
+    let supportReadback: FramebufferReadback | null = null;
+    let drrReadback: FramebufferReadback | null = null;
+    let debugMaps: GpuPanoDebugMaps | undefined;
+    let diagnostics: GpuPanoDiagnostics = {
+        expectedPipelineMode: EXPECTED_GPU_PIPELINE_MODE,
+        phase2GatePassed,
+        degradedModeReason: phase2GatePassed ? null : 'multi-pass-unavailable-single-pass-fallback',
+    };
 
     if (multiPassPipelineEnabled) {
         if (!_supportFboA || !_supportFboB || !_drrFbo || !_fbo || !_supportTexA || !_supportTexB || !_drrTex) {
@@ -1447,6 +2065,14 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         setUniform1i(gl, _toneProgram, 'uPanoWidth', safePanoWidth);
         setUniform1i(gl, _toneProgram, 'uPanoHeight', safePanoHeight);
         drawFullscreenTriangle(gl);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, _supportFboB);
+        supportReadback = readFramebufferChannels(gl, safePanoWidth, safePanoHeight);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, _drrFbo);
+        drrReadback = readFramebufferChannels(gl, safePanoWidth, safePanoHeight);
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, _fbo);
     } else {
         gl.bindFramebuffer(gl.FRAMEBUFFER, _fbo);
         gl.useProgram(_panoProgram);
@@ -1457,12 +2083,12 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         drawFullscreenTriangle(gl);
     }
 
-    const readback = readFramebufferResult(gl, safePanoWidth, safePanoHeight);
+    const readback = readFramebufferChannels(gl, safePanoWidth, safePanoHeight);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    pixelData = readback.pixelData;
-    meanMap = readback.meanMap;
-    maxMap = readback.maxMap;
-    sampleCountMap = readback.sampleCountMap;
+    pixelData = readback.channel0;
+    meanMap = readback.channel1;
+    maxMap = readback.channel2;
+    sampleCountMap = readback.channel3;
     rawMin = readback.rawMin;
     rawMax = readback.rawMax;
     console.log('[GPU-RAW-MINMAX]', {
@@ -1470,14 +2096,94 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         max: Number.isFinite(rawMax) ? rawMax : null,
     });
 
+    if (multiPassPipelineEnabled && supportReadback && drrReadback) {
+        const w2iMat = coerceWorldToIndexMat4(worldToIndex ?? undefined);
+        const nativePitchMmByCol = computeNativeSlabPitchMmForFrames(w2iMat, frames);
+        const supportSigmaMap = buildSupportSigmaMap(
+            supportReadback.channel2,
+            supportReadback.channel1,
+            nativePitchMmByCol,
+            safePanoWidth,
+            safePanoHeight,
+            slabHalfThicknessMm
+        );
+        const localTransmittanceMap = buildLocalTransmittanceMap(drrReadback.channel0);
+        const troughHalfWidthMap = new Float32Array(supportSigmaMap.length);
+        for (let i = 0; i < supportSigmaMap.length; i++) {
+            troughHalfWidthMap[i] =
+                supportSigmaMap[i] * GPU_DRR_MODEL_PARAMS.approxTroughBoundarySigmaMultiplier;
+        }
+
+        diagnostics = {
+            ...diagnostics,
+            supportSurface: buildSupportSurfaceDiagnostics(
+                supportReadback.channel0,
+                supportReadback.channel1,
+                supportReadback.channel2,
+                supportReadback.channel3,
+                safePanoWidth,
+                safePanoHeight,
+                slabHalfThicknessMm
+            ),
+            drr: buildDrrDiagnostics(
+                drrReadback.channel0,
+                drrReadback.channel1,
+                drrReadback.channel3,
+                supportSigmaMap,
+                localTransmittanceMap,
+                nativePitchMmByCol,
+                slabHalfThicknessMm,
+                requestedSlabSamples
+            ),
+            toneMap: buildToneMapDiagnostics(meanMap, drrReadback.channel1, sampleCountMap, pixelData),
+        };
+
+        if (returnDebugSidecars) {
+            debugMaps = {
+                supportDepthMap: supportReadback.channel0,
+                supportConfidenceMap: supportReadback.channel1,
+                supportSpreadMap: supportReadback.channel2,
+                supportDensityMap: supportReadback.channel3,
+                totalAttenuationMap: drrReadback.channel0,
+                lowerPenaltyMap: drrReadback.channel1,
+                participatingSampleCountMap: drrReadback.channel3,
+                toneResponseMap: sampleCountMap,
+                troughHalfWidthMap,
+            };
+        }
+    }
+
+    diagnostics.sidecarMaps = {
+        debugEnabled: returnDebugSidecars,
+        attachedMaps: debugMaps
+            ? Object.entries(debugMaps)
+                .filter(([, value]) => !!value)
+                .map(([name]) => name)
+            : [],
+        attachedByteLength: debugMaps
+            ? sumByteLength([
+                debugMaps.supportDepthMap,
+                debugMaps.supportConfidenceMap,
+                debugMaps.supportSpreadMap,
+                debugMaps.supportDensityMap,
+                debugMaps.totalAttenuationMap,
+                debugMaps.lowerPenaltyMap,
+                debugMaps.participatingSampleCountMap,
+                debugMaps.toneResponseMap,
+                debugMaps.troughHalfWidthMap,
+            ])
+            : 0,
+    };
+
     const { minValue, maxValue } = computeMinMax(pixelData);
     const elapsed = performance.now() - t0;
     console.log(
-        `[CPR-GPU-RESULT] mode=${multiPassPipelineEnabled ? 'multi-pass' : 'single-pass'} ` +
+        `[CPR-GPU-RESULT] mode=${pipelineMode} ` +
         `rawMin=${formatReadableGpuValue(rawMin)} rawMax=${formatReadableGpuValue(rawMax)} ` +
         `finalMin=${formatReadableGpuValue(minValue)} finalMax=${formatReadableGpuValue(maxValue)} ` +
         `elapsedMs=${formatReadableGpuValue(elapsed, 0)} ` +
-        `reduction=${multiPassPipelineEnabled ? 'support-surface-drr-tone' : 'gaussian-focal-trough-weighted-mean'}`
+        `reduction=${multiPassPipelineEnabled ? 'support-surface-drr-tone' : 'gaussian-focal-trough-weighted-mean'} ` +
+        `phase2Gate=${phase2GatePassed ? 'pass' : 'fail'}`
     );
     console.log(`[CPR-GPU] ${multiPassPipelineEnabled ? 'Multi-pass support-surface panoramic projection' : 'Single-pass continuous-geometry hybrid projection'} complete: ${safePanoWidth}x${safePanoHeight} in ${elapsed.toFixed(1)}ms`, {
         minValue,
@@ -1488,6 +2194,8 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
             ? 'support estimation + support smoothing + DRR attenuation + tone mapping'
             : 'gaussian focal-trough weighted accumulation (sigma 1.5 mm)',
         debugMode: ACTIVE_GPU_DEBUG_MODE,
+        phase2GatePassed,
+        sidecarMaps: diagnostics.sidecarMaps?.attachedMaps ?? [],
     });
 
     return {
@@ -1499,7 +2207,9 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
         height: safePanoHeight,
         minValue,
         maxValue,
-        pipelineMode: multiPassPipelineEnabled ? 'multi-pass' : 'single-pass',
+        pipelineMode,
+        debugMaps,
+        diagnostics,
     };
 }
 

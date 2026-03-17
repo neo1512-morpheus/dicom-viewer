@@ -161,6 +161,29 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     return viewportId === 'cpr-pano' || this.getLogicalViewportId(viewportId) === 'cpr-pano';
   }
 
+  private viewportMatchesType(
+    viewport: Types.IViewport | null | undefined,
+    viewportType: csEnums.ViewportType
+  ): boolean {
+    if (!viewport) {
+      return false;
+    }
+
+    if (viewportType === csEnums.ViewportType.STACK) {
+      return viewport instanceof StackViewport;
+    }
+
+    if (viewportType === csEnums.ViewportType.VOLUME_3D) {
+      return viewport instanceof VolumeViewport3D;
+    }
+
+    if (viewportType === csEnums.ViewportType.ORTHOGRAPHIC) {
+      return viewport instanceof BaseVolumeViewport && !(viewport instanceof VolumeViewport3D);
+    }
+
+    return false;
+  }
+
   private isWebGLUnavailableError(error: unknown): boolean {
     const message =
       (typeof error === 'object' && error && 'message' in error
@@ -574,6 +597,17 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // and we would lose the presentation.
     this.storePresentation({ viewportId: viewportInfo.getViewportId() });
 
+    const previousViewportType = viewportInfo.getViewportType();
+    let existingViewport: Types.IViewport | null = null;
+    try {
+      existingViewport = renderingEngine.getViewport(viewportId) ?? null;
+    } catch (error) {
+      console.warn(
+        `[CornerstoneViewportService] Failed to inspect current viewport ${viewportId} before update`,
+        error
+      );
+    }
+
     // override the viewportOptions and displaySetOptions with the public ones
     // since those are the newly set ones, we set them here so that it handles defaults
     const displaySetOptions = viewportInfo.setPublicDisplaySetOptions(publicDisplaySetOptions);
@@ -584,6 +618,36 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const background = viewportInfo.getBackground();
     const orientation = viewportInfo.getOrientation();
     const displayArea = viewportInfo.getDisplayArea();
+    const requestedViewportType = viewportInfo.getViewportType();
+    const viewportTypeChanged = previousViewportType !== requestedViewportType;
+    const runtimeViewportMismatch =
+      !!existingViewport && !this.viewportMatchesType(existingViewport, requestedViewportType);
+
+    if (viewportTypeChanged || runtimeViewportMismatch) {
+      console.log(
+        `[CornerstoneViewportService] Recreating viewport ${viewportId} for type sync`,
+        {
+          previousViewportType,
+          requestedViewportType,
+          runtimeViewportType: existingViewport?.constructor?.name || 'none',
+          viewportTypeChanged,
+          runtimeViewportMismatch,
+        }
+      );
+
+      try {
+        renderingEngine.disableElement(viewportId);
+      } catch (disableError) {
+        if (!this.isWebGLUnavailableError(disableError)) {
+          console.warn(
+            `[CornerstoneViewportService] Failed to disable viewport ${viewportId} before type recreation`,
+            disableError
+          );
+        }
+      }
+
+      this.viewportsDisplaySets.delete(viewportId);
+    }
 
     const viewportInput: Types.PublicViewportInput = {
       viewportId,
@@ -654,6 +718,20 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
           `[CornerstoneViewportService] Discarding LUT presentation due to type mismatch: ${presentations.lutPresentation.viewportType} !== ${currentViewportType}`
         );
         presentations.lutPresentation = undefined;
+      }
+    }
+
+    if (presentations?.positionPresentation) {
+      const currentViewportType = viewportInfo.getViewportType();
+
+      if (
+        presentations.positionPresentation.viewportType &&
+        presentations.positionPresentation.viewportType !== currentViewportType
+      ) {
+        console.log(
+          `[CornerstoneViewportService] Discarding position presentation due to type mismatch: ${presentations.positionPresentation.viewportType} !== ${currentViewportType}`
+        );
+        presentations.positionPresentation = undefined;
       }
     }
 

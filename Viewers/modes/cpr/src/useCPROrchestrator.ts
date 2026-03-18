@@ -604,7 +604,7 @@ function isLikelyPoorPanoQuality(summary: FloatBufferDebugSummary | null): boole
     summary.toothBandBrightFraction > 0.36 &&
     summary.toothBandP10 > 120 &&
     summary.toothBandP90 > 1450;
-  const hasWeakToothBandContrast = toothBandContrastRange < 260;
+  const hasWeakToothBandContrast = toothBandContrastRange < 120;
   const hasWeakDentalSeparation = balancedDetailEdgeMean < 38;
   const hasShearWarping = summary.detailBandHorizontalEdgeMean > 220 && detailAnisotropyRatio > 3;
 
@@ -1039,7 +1039,7 @@ function buildPhase4QualityGateCandidate(params: {
   }
   if (
     metrics.toothBandContrastRange !== null &&
-    metrics.toothBandContrastRange < 350
+    metrics.toothBandContrastRange < 150
   ) {
     rejectReasons.push('tooth-band-contrast-too-low');
   }
@@ -1065,7 +1065,7 @@ function buildPhase4QualityGateCandidate(params: {
       ? 'lower-band-tolerated-in-worker'
       : lowerBandOnlyRejects &&
           (params.qualityScore ?? Number.NEGATIVE_INFINITY) >= 12 &&
-          (metrics.toothBandContrastRange ?? 0) >= 350
+          (metrics.toothBandContrastRange ?? 0) >= 150
         ? 'lower-band-only-borderline'
         : null;
 
@@ -1436,8 +1436,18 @@ function computeAdaptivePanoVoi(
       };
     }
 
-    const minHuWindowWidth = summary && summary.detailBandHorizontalEdgeMean >= 85 ? 1600 : 1750;
-    const maxDentalWindowWidth = summary && summary.lowerBandBrightFraction > 0.45 ? 2200 : 2500;
+    const dataRangeWidth =
+      summary && Number.isFinite(summary.p99) && Number.isFinite(summary.p01)
+        ? Math.max(1, Number(summary.p99) - Number(summary.p01))
+        : windowWidth;
+    const minHuWindowWidth = Math.min(
+      dataRangeWidth * 1.15,
+      summary && summary.detailBandHorizontalEdgeMean >= 85 ? 1600 : 1750
+    );
+    const maxDentalWindowWidth = Math.min(
+      dataRangeWidth * 3.0,
+      summary && summary.lowerBandBrightFraction > 0.45 ? 2200 : 2500
+    );
     const widthWithMin = Math.max(windowWidth, minHuWindowWidth);
     const cappedWidth = Math.min(widthWithMin, maxDentalWindowWidth);
     const dentalCenterMin = -120;
@@ -3892,70 +3902,92 @@ function selectReadableVtkPanoPreset(params: {
       label: 'focused',
       verticalHalfMm: Math.max(14, Math.min(20, roundToStep(desiredVerticalHalfMm - 1.5, 0.5))),
       slabHalfThicknessMm: Math.max(
-        0.35,
+        averageProjection ? 1.5 : 0.35,
         Math.min(
-          averageProjection ? 0.65 : 0.9,
-          roundToStep(Math.min(baseSlabHalfMm, desiredSlabHalfMm), 0.05)
+          averageProjection ? 1.7 : 0.9,
+          roundToStep(
+            averageProjection
+              ? Math.max(Math.min(baseSlabHalfMm, 1.7), Math.min(desiredSlabHalfMm, 1.7), 1.5)
+              : Math.min(baseSlabHalfMm, desiredSlabHalfMm),
+            averageProjection ? 0.1 : 0.05
+          )
         )
       ),
       slabSamples: toOddSampleCount(
-        Math.min(baseSamples, desiredSamples),
-        3,
-        averageProjection ? 7 : 11
+        averageProjection
+          ? Math.max(Math.min(baseSamples, 9), Math.min(desiredSamples, 9), 9)
+          : Math.min(baseSamples, desiredSamples),
+        averageProjection ? 9 : 3,
+        averageProjection ? 9 : 11
       ),
     },
     {
       label: 'balanced',
       verticalHalfMm: Math.max(15, Math.min(22, roundToStep(desiredVerticalHalfMm, 0.5))),
       slabHalfThicknessMm: Math.max(
-        averageProjection ? 0.45 : 0.5,
+        averageProjection ? 1.75 : 0.5,
         Math.min(
-          averageProjection ? 0.95 : 1.4,
+          averageProjection ? 2.0 : 1.4,
           roundToStep(
-            Math.max(desiredSlabHalfMm, Math.min(baseSlabHalfMm, averageProjection ? 0.95 : 1.4)),
-            0.05
+            averageProjection
+              ? Math.max(Math.min(baseSlabHalfMm, 2.0), Math.min(desiredSlabHalfMm, 2.0), 1.75)
+              : Math.max(desiredSlabHalfMm, Math.min(baseSlabHalfMm, 1.4)),
+            averageProjection ? 0.1 : 0.05
           )
         )
       ),
       slabSamples: toOddSampleCount(
-        Math.max(baseSamples, desiredSamples),
-        5,
-        averageProjection ? 9 : 15
+        averageProjection
+          ? Math.max(Math.min(baseSamples, 11), Math.min(desiredSamples, 11), 11)
+          : Math.max(baseSamples, desiredSamples),
+        averageProjection ? 11 : 5,
+        averageProjection ? 11 : 15
       ),
     },
     {
       label: 'broad',
       verticalHalfMm: Math.max(16, Math.min(24, roundToStep(desiredVerticalHalfMm + 2, 0.5))),
       slabHalfThicknessMm: Math.max(
-        averageProjection ? 0.7 : 0.9,
+        averageProjection ? 1.9 : 0.9,
         Math.min(
-          averageProjection ? 1.25 : 2.2,
+          averageProjection ? 2.0 : 2.2,
           roundToStep(
-            Math.max(baseSlabHalfMm, desiredSlabHalfMm + (averageProjection ? 0.2 : 0.35)),
-            0.05
+            Math.max(
+              averageProjection
+                ? Math.min(baseSlabHalfMm, 2.0)
+                : baseSlabHalfMm,
+              averageProjection
+                ? Math.min(desiredSlabHalfMm + 0.15, 2.0)
+                : desiredSlabHalfMm + 0.35
+            ),
+            averageProjection ? 0.1 : 0.05
           )
         )
       ),
       slabSamples: toOddSampleCount(
-        Math.max(baseSamples, desiredSamples + (averageProjection ? 0 : 2)),
-        averageProjection ? 5 : 7,
+        averageProjection
+          ? Math.max(Math.min(baseSamples, 11), Math.min(desiredSamples + 2, 11), 11)
+          : Math.max(baseSamples, desiredSamples + 2),
+        averageProjection ? 11 : 7,
         averageProjection ? 11 : 19
       ),
     },
   ];
   const candidates = rawCandidates.map(candidate => {
-    const slabPenalty = Math.abs(candidate.slabHalfThicknessMm - desiredSlabHalfMm) * 4.2;
+    const slabPenalty =
+      Math.abs(candidate.slabHalfThicknessMm - desiredSlabHalfMm) * (averageProjection ? 0.9 : 4.2);
     const verticalPenalty = Math.abs(candidate.verticalHalfMm - desiredVerticalHalfMm) * 0.8;
-    const samplePenalty = Math.abs(candidate.slabSamples - desiredSamples) * 0.35;
+    const samplePenalty =
+      Math.abs(candidate.slabSamples - desiredSamples) * (averageProjection ? 0.12 : 0.35);
     const broadPenalty =
-      candidate.slabHalfThicknessMm > (averageProjection ? 1.0 : 1.8)
+      candidate.slabHalfThicknessMm > (averageProjection ? 2.0 : 1.8)
         ? averageProjection
-          ? 2.2
+          ? 0.15
           : 1.5
         : 0;
     const tallPenalty = candidate.verticalHalfMm > 23 ? 0.8 : 0;
     const labelBias =
-      candidate.label === 'balanced' ? 1.3 : candidate.label === 'focused' ? 0.9 : 0.3;
+      candidate.label === 'balanced' ? 1.2 : candidate.label === 'focused' ? 1.0 : 0.9;
     return {
       ...candidate,
       score:
@@ -5630,16 +5662,16 @@ export function useCPROrchestrator({
       const balancedSlabSamples = 9;
       const fastSlabHalfThicknessMm = 1.2;
       const fastSlabSamples = 7;
-      const balancedMeanSlabHalfThicknessMm = 1.5;
+      const balancedMeanSlabHalfThicknessMm = 1.75;
       const balancedMeanSlabSamples = 11;
-      const focusedMeanSlabHalfThicknessMm = 0.35;
-      const focusedMeanSlabSamples = 3;
+      const focusedMeanSlabHalfThicknessMm = 1.5;
+      const focusedMeanSlabSamples = 9;
       const broadMeanSlabHalfThicknessMm = 2.0;
-      const broadMeanSlabSamples = 15;
-      const meanFallbackSlabHalfThicknessMm = 1.0;
-      const meanFallbackSlabSamples = 9;
-      const sharpMeanSlabHalfThicknessMm = 0.2; // ~2 voxels total slab
-      const sharpMeanSlabSamples = 3;
+      const broadMeanSlabSamples = 11;
+      const meanFallbackSlabHalfThicknessMm = 2.0;
+      const meanFallbackSlabSamples = 11;
+      const sharpMeanSlabHalfThicknessMm = 1.25;
+      const sharpMeanSlabSamples = 7;
       const minimumPanoHeightPx = Math.max(160, Math.round(requestedPanoHeightPx * 0.55));
 
       const verticalDir = getSourceViewportVerticalDirection(
@@ -6176,8 +6208,14 @@ export function useCPROrchestrator({
         const specklePenalty = summary ? Math.max(0, summary.meanAbsDelta - 460) / 60 : 0;
         const focalTroughPenalty =
           Math.max(0, actualVertHalfMm - 45) / 2.0 +
-          Math.max(0, requestedSlabHalfThicknessMm - 0.8) *
-            (requestedAggregation === 'MIP' ? 5 : 3.5);
+          Math.max(
+            0,
+            requestedSlabHalfThicknessMm - (requestedAggregation === 'MIP' ? 0.8 : 1.8)
+          ) * (requestedAggregation === 'MIP' ? 5 : 1.4);
+        const supportSurfaceMetrics = extractPhase4QualityGateMetrics(
+          summary,
+          result.workerDebugPayload
+        );
         const lowerBandFillPenalty = summary
           ? Math.max(0, summary.lowerBandP50 + 140) / 38 +
             Math.max(0, summary.lowerBandBrightFraction - 0.24) * 24 +
@@ -6232,11 +6270,21 @@ export function useCPROrchestrator({
         const excessiveCenterDrift =
           actualCenterDriftMm > Math.max(4, actualVertHalfMm * 0.2) ||
           baseCenterDriftMm > Math.max(3.5, actualVertHalfMm * 0.16);
+        const unstableSupportSurface =
+          requestedRenderBackend === 'gpu' &&
+          routeDiagnostic.backend === 'gpu' &&
+          requestedAggregation === 'MEAN' &&
+          ((supportSurfaceMetrics.supportDepthStdMm !== null &&
+            supportSurfaceMetrics.supportDepthStdMm > 0.65) ||
+            (supportSurfaceMetrics.pathJumpP95Mm !== null &&
+              supportSurfaceMetrics.pathJumpP95Mm > 1.4));
         const hardRejectReason =
           requestedRenderBackend === 'gpu' &&
           routeDiagnostic.backend === 'gpu' &&
           phase2GatePassed === false
             ? 'gpu-phase2-gate-failed'
+            : !baseHardRejectReason && unstableSupportSurface
+              ? 'support-surface-instability'
             : !baseHardRejectReason && excessiveCenterDrift
               ? 'vertical-center-drift'
               : !baseHardRejectReason &&
@@ -6305,6 +6353,8 @@ export function useCPROrchestrator({
           meanAbsDelta: summary?.meanAbsDelta,
           lowerBandP50: summary?.lowerBandP50,
           lowerBandBrightFraction: summary?.lowerBandBrightFraction,
+          supportDepthStdMm: supportSurfaceMetrics.supportDepthStdMm,
+          pathJumpP95Mm: supportSurfaceMetrics.pathJumpP95Mm,
           detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean,
           detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean,
           fractionBelowMinus950: summary?.fractionBelowMinus950,
@@ -6773,7 +6823,7 @@ export function useCPROrchestrator({
             aggregation: 'MEAN',
           },
         });
-        // Sharp MEAN attempts - thin slab for maximum tooth separation
+        // Sharp MEAN attempts - still volumetric, but slightly tighter than the main DRR slabs
         retryConfigs.push({
           label: 'retry-mean-sharp-narrow',
           overrides: {

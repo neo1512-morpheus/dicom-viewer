@@ -433,6 +433,29 @@ function applyLightBilateralDenoise(
   return true;
 }
 
+const GPU_RESIDUAL_DENOISE_BLEND = 0.16;
+
+function buildGpuResidualDenoiseWeights(
+  lowerPenaltyMap: Float32Array,
+  toneResponseMap: Float32Array
+): Float32Array {
+  const length = Math.min(lowerPenaltyMap.length, toneResponseMap.length);
+  const weights = new Float32Array(length);
+
+  for (let i = 0; i < length; i++) {
+    const lowerPenalty = clampNumber(Number(lowerPenaltyMap[i]) || 0, 0, 2.5);
+    const toneResponse = clampNumber(Number(toneResponseMap[i]) || 0, 0, 1);
+    const lowerPenaltyGate = clampNumber(lowerPenalty / 0.28, 0, 1);
+    weights[i] = clampNumber(
+      0.10 + lowerPenaltyGate * (1 - toneResponse * 0.72),
+      0.06,
+      1
+    );
+  }
+
+  return weights;
+}
+
 function computeArrayMinMax(buffer: Float32Array): { minValue: number; maxValue: number } {
   let minValue = Infinity;
   let maxValue = -Infinity;
@@ -499,6 +522,70 @@ function computeAutoDisplayWindow(pixelData: Float32Array): {
     windowCenter: safeMin + windowWidth / 2,
   };
 }
+
+function summarizeFiniteFloat32Buffer(buffer: Float32Array): {
+  min: number;
+  max: number;
+  p10: number;
+  p50: number;
+  p90: number;
+} | null {
+  const samples: number[] = [];
+
+  for (let i = 0; i < buffer.length; i++) {
+    const value = Number(buffer[i]);
+    if (Number.isFinite(value)) {
+      samples.push(value);
+    }
+  }
+
+  if (!samples.length) {
+    return null;
+  }
+
+  return {
+    min: percentile(samples, 0),
+    max: percentile(samples, 1),
+    p10: percentile(samples, 0.1),
+    p50: percentile(samples, 0.5),
+    p90: percentile(samples, 0.9),
+  };
+}
+
+const VIRTUAL_PANO_DP_MODEL_PARAMS = {
+  jumpCostLinear: 0.34,
+  jumpCostExtra: 0.24,
+  jumpSoftThresholdMm: 0.4,
+};
+
+const CPU_VIRTUAL_PANO_MODEL_PARAMS = {
+  thresholdSoftPercentile: 0.36,
+  thresholdHardPercentile: 0.68,
+  gradCapPercentile: 0.85,
+  supportMeanWeight: 0.68,
+  gradientWeight: 0.3,
+  balanceWeight: 0.16,
+  lowBandPenaltyWeight: 0.78,
+  edgePenaltyScale: 0.58,
+  depthCenterPenaltyScale: 0.16,
+  crownBiasPenaltyScale: 0.32,
+  pathSmoothPasses: 3,
+  supportSigmaMm: 0.75,
+  supportEnergyWindowScale: 1.9,
+  alphaScale: 0.9,
+  emissionDenScale: 1.65,
+  emissionDenMin: 170,
+  lowerPenaltyRowStart: 0.58,
+  lowerPenaltyRowEnd: 0.94,
+  lowerPenaltyBase: 0.05,
+  lowerPenaltyLowConfidenceScale: 0.32,
+  attenuationStrength: 2.85,
+  gamma: 1.12,
+  signalFloor: 0.015,
+  signalCeiling: 0.97,
+  outputHuMin: -930,
+  outputHuMax: 2250,
+};
 
 function quantizePanoForStackDisplay(
   pixelData: Float32Array,
@@ -688,7 +775,7 @@ function generateGpuPanorama(
       `reconstructionMode=${reconstructionMode ?? 'legacy'} ` +
       `effectivePipeline=renderer-selected ` +
       `virtualPano=${reconstructionMode === 'legacy' ? 'off' : 'gpu-internal'} ` +
-      `backgroundSuppression=renderer-internal denoise=renderer-internal ` +
+      `backgroundSuppression=renderer-internal denoise=renderer-internal+worker-residual ` +
       `pano=${panoWidth}x${panoHeight} ` +
       `verticalHalfMm=${formatGpuReadableValue(effectiveVerticalHalfMm)} ` +
       `centerOffsetMm=${formatGpuReadableValue(verticalCenterOffsetMm)} ` +
@@ -725,6 +812,15 @@ function generateGpuPanorama(
     volumeCacheKey
   );
   validateGpuReadback(gpuResult.pixelData, panoWidth, panoHeight);
+  const gpuResidualDenoiseApplied =
+    gpuResult.pipelineMode === 'multi-pass' &&
+    applyLightBilateralDenoise(
+      gpuResult.pixelData,
+      panoWidth,
+      panoHeight,
+      GPU_RESIDUAL_DENOISE_BLEND,
+      buildGpuResidualDenoiseWeights(gpuResult.maxMap, gpuResult.sampleCountMap)
+    );
   const elapsedMs = performance.now() - startedAt;
   const { minValue, maxValue, windowWidth, windowCenter } = computeAutoDisplayWindow(
     gpuResult.pixelData
@@ -758,6 +854,9 @@ function generateGpuPanorama(
       requestedSlabSamples,
       slabHalfThicknessMm,
       slabSamples: requestedSlabSamples,
+      residualDenoiseBlend:
+        gpuResult.pipelineMode === 'multi-pass' ? GPU_RESIDUAL_DENOISE_BLEND : 0,
+      residualDenoiseApplied: gpuResidualDenoiseApplied,
       minValue,
       maxValue,
       windowWidth,
@@ -771,6 +870,7 @@ function generateGpuPanorama(
       `windowWidth=${formatGpuReadableValue(windowWidth)} ` +
       `windowCenter=${formatGpuReadableValue(windowCenter)} ` +
       `elapsedMs=${formatGpuReadableValue(elapsedMs, 0)} ` +
+      `residualDenoise=${gpuResidualDenoiseApplied ? 'on' : 'off'} ` +
       `phase2Gate=${phase2GatePassed ? 'pass' : 'fail'}`
   );
   console.log(
@@ -893,6 +993,10 @@ function generateGpuPanorama(
         authoritativeWorldToIndex: true,
         modalityLutApplied: scalarPolicy.shouldApplyModalityLut,
         storedValueNormalizationApplied: scalarPolicy.shouldNormalizeStoredValues,
+        residualDenoise: {
+          blend: gpuResult.pipelineMode === 'multi-pass' ? GPU_RESIDUAL_DENOISE_BLEND : 0,
+          applied: gpuResidualDenoiseApplied,
+        },
         supportSurface: gpuResult.diagnostics?.supportSurface ?? null,
         drr: gpuResult.diagnostics?.drr ?? null,
         toneMap: gpuResult.diagnostics?.toneMap ?? null,
@@ -1180,6 +1284,7 @@ function renderVirtualPanoFromSupportPath(params: {
 }): {
   pixelData: Float32Array;
   summary: ReturnType<typeof summarizeVirtualPanoOutput>;
+  debugMaps: GpuPanoDebugMaps;
   diagnostics: {
     enabled: boolean;
     usedAsOutput: boolean;
@@ -1204,6 +1309,16 @@ function renderVirtualPanoFromSupportPath(params: {
     supportTiltMeanAbsMm: number;
     supportTiltMaxAbsMm: number;
     supportDepthFirst8Mm: number[];
+    troughSigmaMm: number;
+    approxTroughHalfWidthMm: number;
+    lowerPenaltyP50: number;
+    lowerPenaltyP90: number;
+    toneResponseP50: number;
+    toneResponseP90: number;
+    attenuationStrength: number;
+    gamma: number;
+    outputHuMin: number;
+    outputHuMax: number;
   };
 } {
   const {
@@ -1236,10 +1351,20 @@ function renderVirtualPanoFromSupportPath(params: {
   let lowerBandSuppressedCount = 0;
   let lowerBandAttenuationSum = 0;
   let lowerBandAttenuationMax = 0;
-  const SUPPORT_SIGMA_MM = 0.9;
+  const supportDepthMap = new Float32Array(planeSize);
+  const supportConfidenceMap = new Float32Array(planeSize);
+  const totalAttenuationMap = new Float32Array(planeSize);
+  const lowerPenaltyMap = new Float32Array(planeSize);
+  const participatingSampleCountMap = new Float32Array(planeSize);
+  const toneResponseMap = new Float32Array(planeSize);
+  const troughHalfWidthMap = new Float32Array(planeSize);
+  const SUPPORT_SIGMA_MM = CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSigmaMm;
   const SUPPORT_DENOM = 2.0 * SUPPORT_SIGMA_MM * SUPPORT_SIGMA_MM;
-  const SUPPORT_ENERGY_WINDOW_MM = SUPPORT_SIGMA_MM * 2.0;
-  const ALPHA_SCALE = 0.82;
+  const SUPPORT_ENERGY_WINDOW_MM =
+    SUPPORT_SIGMA_MM * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnergyWindowScale;
+  const SUPPORT_HALF_WIDTH_MM =
+    SUPPORT_SIGMA_MM * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnergyWindowScale;
+  const ALPHA_SCALE = CPU_VIRTUAL_PANO_MODEL_PARAMS.alphaScale;
 
   for (let row = 0; row < panoHeight; row++) {
     const yNorm = panoCenterRow > 0 ? (row - panoCenterRow) / panoCenterRow : 0;
@@ -1255,7 +1380,10 @@ function renderVirtualPanoFromSupportPath(params: {
       const softThreshold = Number(softThresholdByCol[col]);
       const hardThreshold = Number(hardThresholdByCol[col]);
       const hardDen = Math.max(hardThreshold - softThreshold, 80);
-      const emissionDen = Math.max(hardDen * 1.4, 140);
+      const emissionDen = Math.max(
+        hardDen * CPU_VIRTUAL_PANO_MODEL_PARAMS.emissionDenScale,
+        CPU_VIRTUAL_PANO_MODEL_PARAMS.emissionDenMin
+      );
       let retainedSampleCount = 0;
       let validDepthCount = 0;
       let accumulatedSignal = 0;
@@ -1310,18 +1438,60 @@ function renderVirtualPanoFromSupportPath(params: {
       }
 
       const attenuationSignal = clampNumber(accumulatedSignal, 0, 1);
+      const supportConfidence =
+        validDepthCount > 0 ? clampNumber(retainedSampleCount / validDepthCount, 0, 1) : 0;
+      const pseudoAttenuation =
+        attenuationSignal > 0 ? -Math.log(Math.max(1e-3, 1 - attenuationSignal)) : 0;
+      const lowerPenaltyRow =
+        yNorm <= CPU_VIRTUAL_PANO_MODEL_PARAMS.lowerPenaltyRowStart
+          ? 0
+          : smoothstep01(
+              (yNorm - CPU_VIRTUAL_PANO_MODEL_PARAMS.lowerPenaltyRowStart) /
+                Math.max(
+                  1e-3,
+                  CPU_VIRTUAL_PANO_MODEL_PARAMS.lowerPenaltyRowEnd -
+                    CPU_VIRTUAL_PANO_MODEL_PARAMS.lowerPenaltyRowStart
+                )
+            );
+      const lowerPenalty =
+        lowerPenaltyRow *
+        (CPU_VIRTUAL_PANO_MODEL_PARAMS.lowerPenaltyBase +
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowerPenaltyLowConfidenceScale * (1 - supportConfidence));
+      const correctedAttenuation = Math.max(0, pseudoAttenuation - lowerPenalty);
+      let toneResponse =
+        1 -
+        Math.exp(
+          -CPU_VIRTUAL_PANO_MODEL_PARAMS.attenuationStrength * correctedAttenuation
+        );
+      toneResponse = Math.pow(clampNumber(toneResponse, 0, 1), CPU_VIRTUAL_PANO_MODEL_PARAMS.gamma);
+      toneResponse = smoothstepRange(
+        CPU_VIRTUAL_PANO_MODEL_PARAMS.signalFloor,
+        CPU_VIRTUAL_PANO_MODEL_PARAMS.signalCeiling,
+        toneResponse
+      );
       if (retainedSampleCount <= 0 || validDepthCount <= 0) {
         fallbackNoEligibleCount++;
         pixelData[pixelIndex] = -1000;
       } else {
-        pixelData[pixelIndex] = -1000 + attenuationSignal * 2600;
+        pixelData[pixelIndex] =
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin +
+          toneResponse *
+            (CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMax -
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin);
       }
+      supportDepthMap[pixelIndex] = supportDepthMm;
+      supportConfidenceMap[pixelIndex] = supportConfidence;
+      totalAttenuationMap[pixelIndex] = correctedAttenuation;
+      lowerPenaltyMap[pixelIndex] = lowerPenalty;
+      participatingSampleCountMap[pixelIndex] = retainedSampleCount;
+      toneResponseMap[pixelIndex] = retainedSampleCount > 0 && validDepthCount > 0 ? toneResponse : 0;
+      troughHalfWidthMap[pixelIndex] = SUPPORT_HALF_WIDTH_MM;
 
       if (yNorm >= 0.65) {
         lowerBandRenderCount++;
-        lowerBandAttenuationSum += 1 - attenuationSignal;
-        lowerBandAttenuationMax = Math.max(lowerBandAttenuationMax, 1 - attenuationSignal);
-        if (attenuationSignal < 0.15) {
+        lowerBandAttenuationSum += lowerPenalty;
+        lowerBandAttenuationMax = Math.max(lowerBandAttenuationMax, lowerPenalty);
+        if (toneResponse < 0.12) {
           lowerBandSuppressedCount++;
         }
       }
@@ -1409,10 +1579,21 @@ function renderVirtualPanoFromSupportPath(params: {
     supportTiltMaxAbsMm = Math.max(supportTiltMaxAbsMm, absTiltMm);
   }
   supportTiltMeanAbsMm = panoWidth > 0 ? supportTiltMeanAbsMm / panoWidth : 0;
+  const lowerPenaltySummary = summarizeFiniteFloat32Buffer(lowerPenaltyMap);
+  const toneResponseSummary = summarizeFiniteFloat32Buffer(toneResponseMap);
 
   return {
     pixelData,
     summary,
+    debugMaps: {
+      supportDepthMap,
+      supportConfidenceMap,
+      totalAttenuationMap,
+      lowerPenaltyMap,
+      participatingSampleCountMap,
+      toneResponseMap,
+      troughHalfWidthMap,
+    },
     diagnostics: {
       enabled: true,
       usedAsOutput,
@@ -1446,6 +1627,16 @@ function renderVirtualPanoFromSupportPath(params: {
       supportDepthFirst8Mm: Array.from(
         selectedDepthMm.subarray(0, Math.min(8, selectedDepthMm.length))
       ).map(value => Math.round(Number(value) * 1000) / 1000),
+      troughSigmaMm: SUPPORT_SIGMA_MM,
+      approxTroughHalfWidthMm: SUPPORT_HALF_WIDTH_MM,
+      lowerPenaltyP50: lowerPenaltySummary?.p50 ?? 0,
+      lowerPenaltyP90: lowerPenaltySummary?.p90 ?? 0,
+      toneResponseP50: toneResponseSummary?.p50 ?? 0,
+      toneResponseP90: toneResponseSummary?.p90 ?? 0,
+      attenuationStrength: CPU_VIRTUAL_PANO_MODEL_PARAMS.attenuationStrength,
+      gamma: CPU_VIRTUAL_PANO_MODEL_PARAMS.gamma,
+      outputHuMin: CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin,
+      outputHuMax: CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMax,
     },
   };
 }
@@ -2011,7 +2202,10 @@ function runBandDPOptimization(
         if (prevDepthIndex < 0 || !Number.isFinite(prevDp[prevSlot])) continue;
         const prevDepthMm = Number(depthOffsetsMm[prevDepthIndex]);
         const jumpMm = Math.abs(depthMm - prevDepthMm);
-        const transitionCost = 0.28 * jumpMm + 0.18 * Math.max(0, jumpMm - 0.5);
+        const transitionCost =
+          VIRTUAL_PANO_DP_MODEL_PARAMS.jumpCostLinear * jumpMm +
+          VIRTUAL_PANO_DP_MODEL_PARAMS.jumpCostExtra *
+            Math.max(0, jumpMm - VIRTUAL_PANO_DP_MODEL_PARAMS.jumpSoftThresholdMm);
         const candidateCost =
           prevDp[prevSlot] + transitionCost - Number(candidateScores[candidateBase + slot]);
         if (candidateCost < bestCost) {
@@ -2061,6 +2255,7 @@ function generatePanorama(
   }
 ): {
   pixelData: Float32Array;
+  debugMaps?: GpuPanoDebugMaps;
   minValue: number;
   maxValue: number;
   windowWidth: number;
@@ -3319,10 +3514,11 @@ function generatePanorama(
       ? 'NOT_RENDERED'
       : enableVirtualPanoPhase1
         ? 'PHASE1_DIAGNOSTICS_ONLY'
-        : 'RECONSTRUCTION_MODE_DISABLED',
+      : 'RECONSTRUCTION_MODE_DISABLED',
   };
   let virtualPanoAcceptedByGate = false;
   let virtualPanoSelectedForOutput = false;
+  let finalDebugMaps: GpuPanoDebugMaps | undefined;
   if (shouldComputeVirtualPano) {
     const virtualPanoDepthHalfRangeMm = 6.0;
     const virtualPanoDepthStepMm = 0.25;
@@ -3468,11 +3664,17 @@ function generatePanorama(
       }
 
       virtualSoftThresholdByCol[col] =
-        toothThresholdSamples.length > 0 ? percentile(toothThresholdSamples, 0.3) : -250;
+        toothThresholdSamples.length > 0
+          ? percentile(toothThresholdSamples, CPU_VIRTUAL_PANO_MODEL_PARAMS.thresholdSoftPercentile)
+          : -250;
       virtualHardThresholdByCol[col] =
-        toothThresholdSamples.length > 0 ? percentile(toothThresholdSamples, 0.6) : 250;
+        toothThresholdSamples.length > 0
+          ? percentile(toothThresholdSamples, CPU_VIRTUAL_PANO_MODEL_PARAMS.thresholdHardPercentile)
+          : 250;
       virtualGradCapByCol[col] =
-        gradientSamples.length > 0 ? Math.max(1, percentile(gradientSamples, 0.9)) : 200;
+        gradientSamples.length > 0
+          ? Math.max(1, percentile(gradientSamples, CPU_VIRTUAL_PANO_MODEL_PARAMS.gradCapPercentile))
+          : 200;
     }
 
     smoothFloatSeries(virtualSoftThresholdByCol, panoWidth, virtualThresholdScratch, 2);
@@ -3580,16 +3782,25 @@ function generatePanorama(
         const supportMean = Math.min(topHardMean, bottomHardMean);
         const gradMean = gradCount > 0 ? gradAccum / gradCount : 0;
         const lowMean = lowCount > 0 ? lowAccum / lowCount : 0;
+        const crownRootBalance =
+          1 - clampNumber(Math.abs(topHardMean - bottomHardMean) * 1.35, 0, 1);
         const depthMm = Number(virtualPanoDepthOffsetsMm[depth]);
         const edgeDistanceMm = virtualPanoDepthHalfRangeMm - Math.abs(depthMm);
-        const edgePenalty = edgeDistanceMm <= 2.5 ? 0.45 * (1 - edgeDistanceMm / 2.5) : 0;
+        const edgePenalty =
+          edgeDistanceMm <= 2.5
+            ? CPU_VIRTUAL_PANO_MODEL_PARAMS.edgePenaltyScale * (1 - edgeDistanceMm / 2.5)
+            : 0;
         const depthCenterPenalty =
-          0.12 * Math.pow(Math.abs(depthMm) / Math.max(virtualPanoDepthHalfRangeMm, 1e-6), 1.5);
-        const crownBiasPenalty = Math.max(0, topHardMean - bottomHardMean) * 0.18;
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.depthCenterPenaltyScale *
+          Math.pow(Math.abs(depthMm) / Math.max(virtualPanoDepthHalfRangeMm, 1e-6), 1.5);
+        const crownBiasPenalty =
+          Math.max(0, topHardMean - bottomHardMean) *
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.crownBiasPenaltyScale;
         const score =
-          0.62 * supportMean +
-          0.24 * gradMean -
-          0.55 * lowMean -
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.supportMeanWeight * supportMean +
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean +
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.balanceWeight * crownRootBalance -
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowBandPenaltyWeight * lowMean -
           edgePenalty -
           depthCenterPenalty -
           crownBiasPenalty;
@@ -3606,7 +3817,7 @@ function generatePanorama(
       virtualPanoDepthOffsetsMm,
       virtualPanoCandidateCount,
       virtualDpSmoothScratch,
-      2
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.pathSmoothPasses
     );
     const bandLabels = ['support'] as const;
     const bandAnchorRows = [Math.round((toothBandStartRow + toothBandEndRow) * 0.5)];
@@ -3643,7 +3854,12 @@ function generatePanorama(
 
     // Re-smooth the selected support path.
     for (let b = 0; b < bandDepthsMm.length; b++) {
-      smoothFloatSeries(bandDepthsMm[b], panoWidth, virtualDpSmoothScratch, 2);
+      smoothFloatSeries(
+        bandDepthsMm[b],
+        panoWidth,
+        virtualDpSmoothScratch,
+        CPU_VIRTUAL_PANO_MODEL_PARAMS.pathSmoothPasses
+      );
     }
 
     // Single-path support diagnostics
@@ -3795,6 +4011,7 @@ function generatePanorama(
         virtualPanoSelectedForOutput = true;
         selectedReconstructionMode = 'virtualPano';
         pixelData.set(virtualRender.pixelData);
+        finalDebugMaps = virtualRender.debugMaps;
         const virtualRange = computeArrayMinMax(pixelData);
         minValue = virtualRange.minValue;
         maxValue = virtualRange.maxValue;
@@ -4107,6 +4324,7 @@ function generatePanorama(
     '[CPR-TONE-MAP-JSON]',
     JSON.stringify({
       ...cpuLogContext,
+      ...(virtualPanoRenderDiagnostics.enabled === true ? virtualPanoRenderDiagnostics : {}),
       enabled: virtualPanoRenderDiagnostics.enabled === true,
       usedAsOutput: virtualPanoSelectedForOutput,
       acceptedByGate: virtualPanoAcceptedByGate,
@@ -4125,8 +4343,23 @@ function generatePanorama(
     JSON.stringify({
       ...cpuLogContext,
       debugEnabled: !!input.debugRunId,
-      attachedMaps: [],
-      attachedByteLength: 0,
+      attachedMaps: finalDebugMaps
+        ? Object.entries(finalDebugMaps)
+            .filter(([, value]) => !!value)
+            .map(([name]) => name)
+        : [],
+      attachedByteLength: finalDebugMaps
+        ? (finalDebugMaps.supportDepthMap?.byteLength ?? 0) +
+          (finalDebugMaps.supportConfidenceMap?.byteLength ?? 0) +
+          (finalDebugMaps.supportSpreadMap?.byteLength ?? 0) +
+          (finalDebugMaps.supportDensityMap?.byteLength ?? 0) +
+          (finalDebugMaps.totalAttenuationMap?.byteLength ?? 0) +
+          (finalDebugMaps.fogAttenuationMap?.byteLength ?? 0) +
+          (finalDebugMaps.lowerPenaltyMap?.byteLength ?? 0) +
+          (finalDebugMaps.participatingSampleCountMap?.byteLength ?? 0) +
+          (finalDebugMaps.toneResponseMap?.byteLength ?? 0) +
+          (finalDebugMaps.troughHalfWidthMap?.byteLength ?? 0)
+        : 0,
     })
   );
   if (gpuFallbackCause) {
@@ -4143,6 +4376,7 @@ function generatePanorama(
   const outputSignature = computeOutputSignature(pixelData);
   return {
     pixelData,
+    debugMaps: finalDebugMaps,
     minValue,
     maxValue,
     windowWidth,
@@ -4504,6 +4738,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
     pushTransferBuffer(debugMaps?.supportSpreadMap);
     pushTransferBuffer(debugMaps?.supportDensityMap);
     pushTransferBuffer(debugMaps?.totalAttenuationMap);
+    pushTransferBuffer(debugMaps?.fogAttenuationMap);
     pushTransferBuffer(debugMaps?.lowerPenaltyMap);
     pushTransferBuffer(debugMaps?.participatingSampleCountMap);
     pushTransferBuffer(debugMaps?.toneResponseMap);

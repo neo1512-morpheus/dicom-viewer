@@ -97,6 +97,7 @@ export interface GpuDrrDiagnostics {
         lowerPenaltyDenseScale: number;
         lowerPenaltyRowStart: number;
         lowerPenaltyRowEnd: number;
+        troughSigmaHardCapMm: number;
     };
 }
 
@@ -183,8 +184,8 @@ const GPU_SUPPORT_MODEL_PARAMS = {
     superiorPenaltyEnd: 0.16,
     densityConfidenceLow: 0.04,
     densityConfidenceHigh: 0.18,
-    peakHuConfidenceLow: 700,
-    peakHuConfidenceHigh: 1700,
+    peakHuConfidenceLow: 380,
+    peakHuConfidenceHigh: 1200,
     enamelBandLowHu: 350,
     enamelBandPeakHu: 550,
     enamelBandHighHu: 1850,
@@ -195,8 +196,8 @@ const GPU_SUPPORT_MODEL_PARAMS = {
     superiorOffsetPenaltyStartMm: 0.02,
     superiorOffsetPenaltyEndMm: 0.26,
     superiorOffsetPenaltyScale: 0.52,
-    positiveDepthClampStartMm: 0.02,
-    positiveDepthClampEndMm: 0.22,
+    positiveDepthClampStartMm: 0.30,
+    positiveDepthClampEndMm: 0.60,
     positiveDepthClampTargetMm: -0.12,
     positiveDepthClampConfidenceLow: 0.10,
     positiveDepthClampConfidenceHigh: 0.30,
@@ -224,6 +225,7 @@ const GPU_DRR_MODEL_PARAMS = {
     lowerPenaltyRowStart: 0.62,
     lowerPenaltyRowEnd: 0.96,
     approxTroughBoundarySigmaMultiplier: 1.7,
+    troughSigmaHardCapMm: 0.3,
 };
 const GPU_TONE_MODEL_PARAMS = {
     lowConfidenceFogSuppression: 0.12,
@@ -236,8 +238,8 @@ const GPU_TONE_MODEL_PARAMS = {
     highConfidencePenaltyRetention: 0.86,
     attenuationConfidenceLow: 0.12,
     attenuationConfidenceHigh: 0.58,
-    lowConfidenceAttenuationScale: 0.92,
-    exposureScale: 3.0,
+    lowConfidenceAttenuationScale: 1.8,
+    exposureScale: 2.4,
     sigmoidMidpoint: 0.085,
     sigmoidSlope: 3.8,
     sigmoidWhitePoint: 1.2,
@@ -381,9 +383,11 @@ const ATTENUATION_MODEL_GLSL = `
 float pseudoAttenuationFromHu(float hu) {
   float softTissue = 0.0065 * smoothstep(-950.0, -180.0, hu);
   float cancellousBone = 0.0220 * smoothstep(-120.0, 420.0, hu);
-  float denseBone = 0.0600 * smoothstep(180.0, 1350.0, hu);
-  float enamel = 0.1700 * smoothstep(850.0, 3200.0, hu);
-  return softTissue + cancellousBone + denseBone + enamel;
+  float metalRollOff = 1.0 - smoothstep(1800.0, 2600.0, hu);
+  float denseBone = 0.0600 * smoothstep(180.0, 1350.0, hu) * metalRollOff;
+  float enamel = 0.1700 * smoothstep(850.0, 3200.0, hu) * metalRollOff;
+  float toothAttenuationGain = mix(1.0, 6.5, smoothstep(350.0, 550.0, hu));
+  return (softTissue + cancellousBone + denseBone + enamel) * toothAttenuationGain;
 }
 
 float softFogAttenuationFromHu(float hu) {
@@ -409,10 +413,11 @@ float enamelBandSupportFromHu(float hu) {
 
 float supportResponseFromHu(float hu) {
   float rootSupport = smoothstep(180.0, 900.0, hu);
-  float dentinSupport = smoothstep(520.0, 1600.0, hu);
+  float dentinSupport = smoothstep(500.0, 1400.0, hu);
   float enamelBandSupport = enamelBandSupportFromHu(hu);
-  float enamelSupport = smoothstep(950.0, 2600.0, hu);
-  float denseBias = smoothstep(760.0, 2200.0, hu);
+  float metalSuppressSupport = 1.0 - smoothstep(1800.0, 2600.0, hu);
+  float enamelSupport = smoothstep(950.0, 1800.0, hu) * metalSuppressSupport;
+  float denseBias = smoothstep(1100.0, 1800.0, hu) * metalSuppressSupport;
   float combined =
     0.24 * rootSupport +
     0.72 * dentinSupport +
@@ -577,6 +582,8 @@ void main() {
   float bestSupportScore = 0.0;
   float bestSupportOffsetMm = 0.0;
   float peakHu = -1000.0;
+  float prevSampleHu = 0.0;
+  bool hasPrevSampleHu = false;
   bool hasValidSample = false;
 
   const int MAX_SLAB = 64;
@@ -592,9 +599,12 @@ void main() {
     }
 
     float hu = sampleHu(uvw);
+    float huGradient = hasPrevSampleHu ? hu - prevSampleHu : 0.0;
+    float edgeBonus = smoothstep(0.0, 150.0, huGradient);
+    float gradientPenalty = 1.0 - smoothstep(-100.0, 0.0, huGradient);
     float supportResponse = supportResponseFromHu(hu);
     float enamelBandSupport = enamelBandSupportFromHu(hu);
-    float denseBias = smoothstep(850.0, 2600.0, hu);
+    float denseBias = smoothstep(500.0, 1800.0, hu);
     float inferiorOffsetGate =
       1.0 -
       smoothstep(
@@ -629,11 +639,14 @@ void main() {
       mix(0.78, 1.45, denseBias) *
       mix(1.0, 1.65, enamelBandSupport) *
       mix(1.0, 0.62, superiorOffsetGate);
+    candidateScore *= (1.0 + edgeBonus * 0.7) * (1.0 - gradientPenalty * 0.5);
     if (candidateScore > bestSupportScore) {
       bestSupportScore = candidateScore;
       bestSupportOffsetMm = slabOffset;
     }
     peakHu = max(peakHu, hu);
+    prevSampleHu = hu;
+    hasPrevSampleHu = true;
     hasValidSample = true;
   }
 
@@ -721,7 +734,7 @@ void main() {
   float weightSum = centerWeight;
 
   for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -2; dx <= 2; dx++) {
+    for (int dx = -4; dx <= 4; dx++) {
       if (dx == 0 && dy == 0) {
         continue;
       }
@@ -732,7 +745,7 @@ void main() {
       vec4 sampleValue = texelFetch(uSupportData, sampleCoord, 0);
       float confidence = clamp(sampleValue.g, 0.0, 1.0);
       float spatialWeight =
-        exp(-0.5 * (float(dx * dx) / 1.35 + float(dy * dy) / 0.80));
+        exp(-0.5 * (float(dx * dx) / 6.25 + float(dy * dy) / 0.80));
       float depthDelta = sampleValue.r - centerDepthMm;
       float depthWeight = exp(-(depthDelta * depthDelta) / (2.0 * 0.55 * 0.55));
       float confidenceDelta = confidence - centerConfidence;
@@ -862,6 +875,7 @@ void main() {
       )
     )
   );
+  supportSigmaMm = min(supportSigmaMm, ${GPU_DRR_MODEL_PARAMS.troughSigmaHardCapMm.toFixed(3)});
   float supportDenom = 2.0 * supportSigmaMm * supportSigmaMm;
   float confidenceGate = smoothstep(
     ${GPU_DRR_MODEL_PARAMS.attenuationConfidenceLow.toFixed(3)},
@@ -991,8 +1005,8 @@ void main() {
         ),
     totalAttenuation *
       mix(
-        ${GPU_TONE_MODEL_PARAMS.lowConfidenceFogRetention.toFixed(3)},
-        ${GPU_TONE_MODEL_PARAMS.highConfidenceFogRetention.toFixed(3)},
+          ${GPU_TONE_MODEL_PARAMS.lowConfidenceFogRetention.toFixed(3)},
+          ${GPU_TONE_MODEL_PARAMS.highConfidenceFogRetention.toFixed(3)},
         supportConfidence
       )
   );
@@ -1016,11 +1030,7 @@ void main() {
   gentlySuppressedAttenuation *= mix(
     ${GPU_TONE_MODEL_PARAMS.lowConfidenceAttenuationScale.toFixed(3)},
     1.0,
-    smoothstep(
-      ${GPU_TONE_MODEL_PARAMS.attenuationConfidenceLow.toFixed(3)},
-      ${GPU_TONE_MODEL_PARAMS.attenuationConfidenceHigh.toFixed(3)},
-      supportConfidence
-    )
+    smoothstep(0.000, 0.080, supportConfidence)
   );
   gentlySuppressedAttenuation *= mix(1.0, 0.96, inferiorPenalty * (1.0 - supportConfidence));
 
@@ -1647,11 +1657,14 @@ function buildSupportSigmaMap(
                 supportConfidence
             );
             supportSigmaMap[index] = Math.min(
-                broadSigmaMm,
-                mixNumber(
-                    focusedSigmaMm,
-                    focusedSigmaMm * GPU_DRR_MODEL_PARAMS.confidenceSigmaExpansion,
-                    sigmaMix
+                GPU_DRR_MODEL_PARAMS.troughSigmaHardCapMm,
+                Math.min(
+                    broadSigmaMm,
+                    mixNumber(
+                        focusedSigmaMm,
+                        focusedSigmaMm * GPU_DRR_MODEL_PARAMS.confidenceSigmaExpansion,
+                        sigmaMix
+                    )
                 )
             );
         }
@@ -1797,6 +1810,7 @@ function buildDrrDiagnostics(
             lowerPenaltyDenseScale: GPU_DRR_MODEL_PARAMS.lowerPenaltyDenseScale,
             lowerPenaltyRowStart: GPU_DRR_MODEL_PARAMS.lowerPenaltyRowStart,
             lowerPenaltyRowEnd: GPU_DRR_MODEL_PARAMS.lowerPenaltyRowEnd,
+            troughSigmaHardCapMm: GPU_DRR_MODEL_PARAMS.troughSigmaHardCapMm,
         },
     };
 }

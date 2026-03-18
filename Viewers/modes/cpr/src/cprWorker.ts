@@ -371,28 +371,20 @@ function applyLightBilateralDenoise(
   blendWeight: number,
   backgroundWeights?: Float32Array
 ): boolean {
-  if (width < 3 || height < 3 || blendWeight <= 0) {
+  const radius = 2;
+  if (width < radius * 2 + 1 || height < radius * 2 + 1 || blendWeight <= 0) {
     return false;
   }
 
   const source = new Float32Array(pixelData);
+  const sigmaSpatial = 1.25;
+  const sigmaSpatialDen = 2 * sigmaSpatial * sigmaSpatial;
   const sigmaRange = 220;
   const sigmaRangeDen = 2 * sigmaRange * sigmaRange;
   const clampedBlend = Math.max(0, Math.min(0.6, blendWeight));
 
-  const neighbors: Array<[number, number, number]> = [
-    [-1, -1, 0.45],
-    [0, -1, 0.7],
-    [1, -1, 0.45],
-    [-1, 0, 0.7],
-    [1, 0, 0.7],
-    [-1, 1, 0.45],
-    [0, 1, 0.7],
-    [1, 1, 0.45],
-  ];
-
-  for (let row = 1; row < height - 1; row++) {
-    for (let col = 1; col < width - 1; col++) {
+  for (let row = radius; row < height - radius; row++) {
+    for (let col = radius; col < width - radius; col++) {
       const index = row * width + col;
       const center = source[index];
       if (!Number.isFinite(center)) {
@@ -412,17 +404,23 @@ function applyLightBilateralDenoise(
       let weightedSum = center;
       let weightTotal = 1;
 
-      for (let n = 0; n < neighbors.length; n++) {
-        const [dx, dy, spatialWeight] = neighbors[n];
-        const neighborValue = source[(row + dy) * width + (col + dx)];
-        if (!Number.isFinite(neighborValue)) {
-          continue;
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          if (dx === 0 && dy === 0) {
+            continue;
+          }
+          const neighborValue = source[(row + dy) * width + (col + dx)];
+          if (!Number.isFinite(neighborValue)) {
+            continue;
+          }
+          const distance2 = dx * dx + dy * dy;
+          const spatialWeight = Math.exp(-distance2 / sigmaSpatialDen);
+          const delta = neighborValue - center;
+          const rangeWeight = Math.exp(-(delta * delta) / sigmaRangeDen);
+          const weight = spatialWeight * rangeWeight;
+          weightedSum += neighborValue * weight;
+          weightTotal += weight;
         }
-        const delta = neighborValue - center;
-        const rangeWeight = Math.exp(-(delta * delta) / sigmaRangeDen);
-        const weight = spatialWeight * rangeWeight;
-        weightedSum += neighborValue * weight;
-        weightTotal += weight;
       }
 
       const filtered = weightTotal > 0 ? weightedSum / weightTotal : center;
@@ -446,8 +444,9 @@ function buildGpuResidualDenoiseWeights(
     const lowerPenalty = clampNumber(Number(lowerPenaltyMap[i]) || 0, 0, 2.5);
     const toneResponse = clampNumber(Number(toneResponseMap[i]) || 0, 0, 1);
     const lowerPenaltyGate = clampNumber(lowerPenalty / 0.28, 0, 1);
+    const edgeSignal = clampNumber(lowerPenaltyGate + toneResponse * 0.5, 0, 1);
     weights[i] = clampNumber(
-      0.10 + lowerPenaltyGate * (1 - toneResponse * 0.72),
+      0.95 + (0.08 - 0.95) * edgeSignal,
       0.06,
       1
     );

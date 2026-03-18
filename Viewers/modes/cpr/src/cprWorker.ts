@@ -433,7 +433,7 @@ function applyLightBilateralDenoise(
   return true;
 }
 
-const GPU_RESIDUAL_DENOISE_BLEND = 0.16;
+const GPU_RESIDUAL_DENOISE_BLEND = 0.38;
 
 function buildGpuResidualDenoiseWeights(
   lowerPenaltyMap: Float32Array,

@@ -184,8 +184,8 @@ const GPU_SUPPORT_MODEL_PARAMS = {
     superiorPenaltyEnd: 0.16,
     densityConfidenceLow: 0.04,
     densityConfidenceHigh: 0.18,
-    peakHuConfidenceLow: 380,
-    peakHuConfidenceHigh: 1200,
+    peakHuConfidenceLow: 700,
+    peakHuConfidenceHigh: 1700,
     enamelBandLowHu: 350,
     enamelBandPeakHu: 550,
     enamelBandHighHu: 1850,
@@ -196,8 +196,8 @@ const GPU_SUPPORT_MODEL_PARAMS = {
     superiorOffsetPenaltyStartMm: 0.02,
     superiorOffsetPenaltyEndMm: 0.26,
     superiorOffsetPenaltyScale: 0.52,
-    positiveDepthClampStartMm: 0.30,
-    positiveDepthClampEndMm: 0.60,
+    positiveDepthClampStartMm: 0.02,
+    positiveDepthClampEndMm: 0.22,
     positiveDepthClampTargetMm: -0.12,
     positiveDepthClampConfidenceLow: 0.10,
     positiveDepthClampConfidenceHigh: 0.30,
@@ -239,7 +239,7 @@ const GPU_TONE_MODEL_PARAMS = {
     attenuationConfidenceLow: 0.12,
     attenuationConfidenceHigh: 0.58,
     lowConfidenceAttenuationScale: 1.8,
-    exposureScale: 2.4,
+    exposureScale: 3.0,
     sigmoidMidpoint: 0.085,
     sigmoidSlope: 3.8,
     sigmoidWhitePoint: 1.2,
@@ -383,11 +383,10 @@ const ATTENUATION_MODEL_GLSL = `
 float pseudoAttenuationFromHu(float hu) {
   float softTissue = 0.0065 * smoothstep(-950.0, -180.0, hu);
   float cancellousBone = 0.0220 * smoothstep(-120.0, 420.0, hu);
-  float metalRollOff = 1.0 - smoothstep(1800.0, 2600.0, hu);
+  float metalRollOff = 1.0 - smoothstep(1100.0, 1900.0, hu);
   float denseBone = 0.0600 * smoothstep(180.0, 1350.0, hu) * metalRollOff;
   float enamel = 0.1700 * smoothstep(850.0, 3200.0, hu) * metalRollOff;
-  float toothAttenuationGain = mix(1.0, 6.5, smoothstep(350.0, 550.0, hu));
-  return (softTissue + cancellousBone + denseBone + enamel) * toothAttenuationGain;
+  return softTissue + cancellousBone + denseBone + enamel;
 }
 
 float softFogAttenuationFromHu(float hu) {
@@ -415,7 +414,7 @@ float supportResponseFromHu(float hu) {
   float rootSupport = smoothstep(180.0, 900.0, hu);
   float dentinSupport = smoothstep(500.0, 1400.0, hu);
   float enamelBandSupport = enamelBandSupportFromHu(hu);
-  float metalSuppressSupport = 1.0 - smoothstep(1800.0, 2600.0, hu);
+  float metalSuppressSupport = 1.0 - smoothstep(1100.0, 1900.0, hu);
   float enamelSupport = smoothstep(950.0, 1800.0, hu) * metalSuppressSupport;
   float denseBias = smoothstep(1100.0, 1800.0, hu) * metalSuppressSupport;
   float combined =
@@ -604,7 +603,9 @@ void main() {
     float gradientPenalty = 1.0 - smoothstep(-100.0, 0.0, huGradient);
     float supportResponse = supportResponseFromHu(hu);
     float enamelBandSupport = enamelBandSupportFromHu(hu);
-    float denseBias = smoothstep(500.0, 1800.0, hu);
+    float metalSuppressLoop =
+      1.0 - smoothstep(1100.0, 1900.0, hu);
+    float denseBias = smoothstep(500.0, 1800.0, hu) * metalSuppressLoop;
     float inferiorOffsetGate =
       1.0 -
       smoothstep(
@@ -734,7 +735,7 @@ void main() {
   float weightSum = centerWeight;
 
   for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -4; dx <= 4; dx++) {
+    for (int dx = -2; dx <= 2; dx++) {
       if (dx == 0 && dy == 0) {
         continue;
       }
@@ -745,7 +746,7 @@ void main() {
       vec4 sampleValue = texelFetch(uSupportData, sampleCoord, 0);
       float confidence = clamp(sampleValue.g, 0.0, 1.0);
       float spatialWeight =
-        exp(-0.5 * (float(dx * dx) / 6.25 + float(dy * dy) / 0.80));
+        exp(-0.5 * (float(dx * dx) / 1.35 + float(dy * dy) / 0.80));
       float depthDelta = sampleValue.r - centerDepthMm;
       float depthWeight = exp(-(depthDelta * depthDelta) / (2.0 * 0.55 * 0.55));
       float confidenceDelta = confidence - centerConfidence;
@@ -875,7 +876,12 @@ void main() {
       )
     )
   );
-  supportSigmaMm = min(supportSigmaMm, ${GPU_DRR_MODEL_PARAMS.troughSigmaHardCapMm.toFixed(3)});
+  float sigmaHardCapMm = mix(
+    0.60,
+    ${GPU_DRR_MODEL_PARAMS.troughSigmaHardCapMm.toFixed(3)},
+    smoothstep(0.18, 0.62, supportConfidence)
+  );
+  supportSigmaMm = min(supportSigmaMm, sigmaHardCapMm);
   float supportDenom = 2.0 * supportSigmaMm * supportSigmaMm;
   float confidenceGate = smoothstep(
     ${GPU_DRR_MODEL_PARAMS.attenuationConfidenceLow.toFixed(3)},
@@ -986,7 +992,9 @@ void main() {
   float totalAttenuation = max(drr.r, 0.0);
   float lowerPenalty = max(drr.g, 0.0);
   float fogAttenuation = max(drr.b, 0.0);
+  float participatingSamples = max(drr.a, 0.0);
   float supportConfidence = clamp(supportData.g, 0.0, 1.0);
+  float supportDensity = clamp(supportData.a, 0.0, 1.0);
   float displayRowNorm =
     float((uPanoHeight - 1) - outputRow) / max(float(uPanoHeight - 1), 1.0);
   float inferiorPenalty = smoothstep(
@@ -1027,11 +1035,20 @@ void main() {
         ),
     retainedPenaltyFloor
   );
-  gentlySuppressedAttenuation *= mix(
-    ${GPU_TONE_MODEL_PARAMS.lowConfidenceAttenuationScale.toFixed(3)},
-    1.0,
-    smoothstep(0.000, 0.080, supportConfidence)
-  );
+  float lowConfidenceGate =
+    1.0 - smoothstep(0.02, 0.12, supportConfidence);
+  float lowDensityGate =
+    1.0 - smoothstep(0.06, 0.18, supportDensity);
+  float lowPenaltyGate =
+    1.0 - smoothstep(0.010, 0.050, lowerPenalty);
+  float stableParticipationGate =
+    smoothstep(1.8, 2.8, participatingSamples);
+  float backgroundLiftGate =
+    lowConfidenceGate *
+    lowDensityGate *
+    lowPenaltyGate *
+    stableParticipationGate;
+  gentlySuppressedAttenuation *= mix(1.0, 1.22, backgroundLiftGate);
   gentlySuppressedAttenuation *= mix(1.0, 0.96, inferiorPenalty * (1.0 - supportConfidence));
 
   float radiographSignal = normalizedSigmoidTone(
@@ -1656,8 +1673,14 @@ function buildSupportSigmaMap(
                 GPU_DRR_MODEL_PARAMS.confidenceBlendHigh,
                 supportConfidence
             );
-            supportSigmaMap[index] = Math.min(
+            const sigmaHardCapMix = smoothstepNumber(0.18, 0.62, supportConfidence);
+            const sigmaHardCapMm = mixNumber(
+                0.60,
                 GPU_DRR_MODEL_PARAMS.troughSigmaHardCapMm,
+                sigmaHardCapMix
+            );
+            supportSigmaMap[index] = Math.min(
+                sigmaHardCapMm,
                 Math.min(
                     broadSigmaMm,
                     mixNumber(

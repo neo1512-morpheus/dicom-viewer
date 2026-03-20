@@ -1436,29 +1436,35 @@ function computeAdaptivePanoVoi(
       };
     }
 
-    const cappedUpperPercentile =
-      summary && Number.isFinite(summary.p99)
-        ? Math.min(
-            Number(summary.p99),
-            Number.isFinite(summary.p50) ? Number(summary.p50) + 900 : Number(summary.p99)
-          )
-        : adaptiveUpper;
     const dataRangeWidth =
-      summary && Number.isFinite(summary.p01)
-        ? Math.max(1, cappedUpperPercentile - Number(summary.p01))
+      summary && Number.isFinite(summary.p99) && Number.isFinite(summary.p01)
+        ? Math.max(1, Number(summary.p99) - Number(summary.p01))
         : windowWidth;
-    const percentileCenter =
-      summary && Number.isFinite(summary.p01)
-        ? (Number(summary.p01) + cappedUpperPercentile) / 2
-        : windowCenter;
-    const targetWindowWidth = Math.max(dataRangeWidth * 1.3, 150);
-    const cappedLower = percentileCenter - targetWindowWidth / 2;
-    const cappedUpper = percentileCenter + targetWindowWidth / 2;
+    const minHuWindowWidth = Math.min(
+      dataRangeWidth * 1.15,
+      summary && summary.detailBandHorizontalEdgeMean >= 85 ? 1600 : 1750
+    );
+    const maxDentalWindowWidth = Math.min(
+      dataRangeWidth * 3.0,
+      summary && summary.lowerBandBrightFraction > 0.45 ? 2200 : 2500
+    );
+    const widthWithMin = Math.max(windowWidth, minHuWindowWidth);
+    const cappedWidth = Math.min(widthWithMin, maxDentalWindowWidth);
+    const dentalCenterMin = -120;
+    const dentalCenterMax = 380;
+    const biasedCenter =
+      windowCenter < dentalCenterMin
+        ? windowCenter + (dentalCenterMin - windowCenter) * 0.4
+        : windowCenter > dentalCenterMax
+          ? windowCenter - (windowCenter - dentalCenterMax) * 0.4
+          : windowCenter;
+    const cappedLower = biasedCenter - cappedWidth / 2;
+    const cappedUpper = biasedCenter + cappedWidth / 2;
     return {
       lower: cappedLower,
       upper: cappedUpper,
-      windowWidth: targetWindowWidth,
-      windowCenter: percentileCenter,
+      windowWidth: cappedWidth,
+      windowCenter: biasedCenter,
     };
   }
 

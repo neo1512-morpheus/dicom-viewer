@@ -905,7 +905,6 @@ void main() {
     ${GPU_DRR_MODEL_PARAMS.supportWeightPowerHighConfidence.toFixed(3)},
     confidenceGate
   );
-
   float totalAttenuation = 0.0;
   float fogAttenuation = 0.0;
   float lowerPenaltyAccum = 0.0;
@@ -1035,20 +1034,22 @@ void main() {
         ),
     retainedPenaltyFloor
   );
-  float lowConfidenceGate =
-    1.0 - smoothstep(0.02, 0.12, supportConfidence);
+  float backgroundSuppressionConfidenceGate =
+    1.0 - smoothstep(0.0004, 0.0016, supportConfidence);
   float lowDensityGate =
     1.0 - smoothstep(0.06, 0.18, supportDensity);
   float lowPenaltyGate =
     1.0 - smoothstep(0.010, 0.050, lowerPenalty);
   float stableParticipationGate =
     smoothstep(1.8, 2.8, participatingSamples);
-  float backgroundLiftGate =
-    lowConfidenceGate *
+  float backgroundSuppressionGate =
+    backgroundSuppressionConfidenceGate *
     lowDensityGate *
     lowPenaltyGate *
     stableParticipationGate;
-  gentlySuppressedAttenuation *= mix(1.0, 1.22, backgroundLiftGate);
+  // Keep the commit's tooth attenuation behavior and only suppress
+  // the extremely low-confidence background cluster.
+  gentlySuppressedAttenuation *= mix(1.0, 0.43, backgroundSuppressionGate);
   gentlySuppressedAttenuation *= mix(1.0, 0.96, inferiorPenalty * (1.0 - supportConfidence));
 
   float radiographSignal = normalizedSigmoidTone(

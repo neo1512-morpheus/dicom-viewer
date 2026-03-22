@@ -388,6 +388,12 @@ interface FloatBufferDebugSummary {
   lowerBandBrightFraction: number;
   detailBandHorizontalEdgeMean: number;
   detailBandVerticalEdgeMean: number;
+  backgroundToneSampleCount?: number;
+  backgroundToneP95?: number;
+  backgroundToneP99?: number;
+  backgroundToneMax?: number;
+  backgroundOutlierFraction05?: number;
+  backgroundOutlierFraction10?: number;
 }
 
 interface PanoVoiSettings {
@@ -1151,7 +1157,8 @@ function percentileFromSorted(values: number[], q: number): number {
 function summarizeFloatBufferForDebug(
   buffer: Float32Array | Uint16Array,
   width?: number,
-  height?: number
+  height?: number,
+  debugMaps?: PanoImagePayload['debugMaps']
 ): FloatBufferDebugSummary | null {
   if (!buffer || buffer.length === 0) {
     return null;
@@ -1180,6 +1187,14 @@ function summarizeFloatBufferForDebug(
   let detailBandHorizontalEdgeCount = 0;
   let detailBandVerticalEdgeAccum = 0;
   let detailBandVerticalEdgeCount = 0;
+  const toneResponseMap = debugMaps?.toneResponseMap;
+  const supportConfidenceMap = debugMaps?.supportConfidenceMap;
+  const lowerPenaltyMap = debugMaps?.lowerPenaltyMap;
+  const participatingSampleCountMap = debugMaps?.participatingSampleCountMap;
+  const backgroundToneSamples: number[] = [];
+  let backgroundToneOutlierCount05 = 0;
+  let backgroundToneOutlierCount10 = 0;
+  let backgroundToneMax = 0;
 
   for (let i = 0; i < buffer.length; i += step) {
     const value = Number(buffer[i]);
@@ -1229,6 +1244,13 @@ function summarizeFloatBufferForDebug(
     const lowerBandEndRow = Math.max(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
     const detailBandStartRow = Math.max(0, Math.floor(safeHeight * 0.12));
     const detailBandEndRow = Math.min(safeHeight - 1, Math.ceil(safeHeight * 0.72));
+    const canSampleBackgroundTone = !!toneResponseMap && !!supportConfidenceMap;
+    const backgroundSupportConfidenceMax = 0.03;
+    const backgroundLowerPenaltyMax = 0.05;
+    const backgroundParticipatingSampleCountMin = 0.5;
+    const backgroundHuMax = -300;
+    const backgroundToneOutlierThreshold05 = 0.05;
+    const backgroundToneOutlierThreshold10 = 0.1;
 
     for (let row = 0; row < safeHeight; row += rowStep) {
       for (let col = 0; col < safeWidth; col += colStep) {
@@ -1273,6 +1295,33 @@ function summarizeFloatBufferForDebug(
             }
           }
         }
+
+        if (canSampleBackgroundTone && value <= backgroundHuMax) {
+          const toneResponse = readOptionalProbeMapValue(toneResponseMap, index);
+          const supportConfidence = readOptionalProbeMapValue(supportConfidenceMap, index);
+          if (toneResponse !== undefined && supportConfidence !== undefined) {
+            const lowerPenalty = readOptionalProbeMapValue(lowerPenaltyMap, index) ?? 0;
+            const participatingSampleCount =
+              readOptionalProbeMapValue(participatingSampleCountMap, index) ?? 1;
+            if (
+              supportConfidence <= backgroundSupportConfidenceMax &&
+              lowerPenalty <= backgroundLowerPenaltyMax &&
+              participatingSampleCount >= backgroundParticipatingSampleCountMin
+            ) {
+              const clampedTone = Math.max(0, Math.min(1, toneResponse));
+              backgroundToneSamples.push(clampedTone);
+              if (clampedTone > backgroundToneOutlierThreshold05) {
+                backgroundToneOutlierCount05++;
+              }
+              if (clampedTone > backgroundToneOutlierThreshold10) {
+                backgroundToneOutlierCount10++;
+              }
+              if (clampedTone > backgroundToneMax) {
+                backgroundToneMax = clampedTone;
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -1287,6 +1336,9 @@ function summarizeFloatBufferForDebug(
   }
   if (lowerBandSamples.length) {
     lowerBandSamples.sort((a, b) => a - b);
+  }
+  if (backgroundToneSamples.length) {
+    backgroundToneSamples.sort((a, b) => a - b);
   }
   const sampledCount = samples.length;
 
@@ -1314,6 +1366,20 @@ function summarizeFloatBufferForDebug(
       detailBandVerticalEdgeCount > 0
         ? detailBandVerticalEdgeAccum / detailBandVerticalEdgeCount
         : 0,
+    backgroundToneSampleCount: backgroundToneSamples.length,
+    backgroundToneP95: backgroundToneSamples.length
+      ? percentileFromSorted(backgroundToneSamples, 0.95)
+      : 0,
+    backgroundToneP99: backgroundToneSamples.length
+      ? percentileFromSorted(backgroundToneSamples, 0.99)
+      : 0,
+    backgroundToneMax,
+    backgroundOutlierFraction05: backgroundToneSamples.length
+      ? backgroundToneOutlierCount05 / backgroundToneSamples.length
+      : 0,
+    backgroundOutlierFraction10: backgroundToneSamples.length
+      ? backgroundToneOutlierCount10 / backgroundToneSamples.length
+      : 0,
   };
 }
 
@@ -6123,9 +6189,12 @@ export function useCPROrchestrator({
         const summary = summarizeFloatBufferForDebug(
           summaryPixelData,
           finalPanoWidth,
-          finalPanoHeight
+          finalPanoHeight,
+          result.debugMaps
         );
-        const voi = computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
+        const workerVoi = createPanoVoiFromWindowLevel(result.windowWidth, result.windowCenter);
+        const voi = workerVoi ?? computeAdaptivePanoVoi(summary, result.minValue, result.maxValue);
+        const voiSource = workerVoi ? 'worker-window-passthrough' : 'adaptive-fallback';
         console.log(
           '[CPR-GPU-VOI-APPLY-JSON]',
           JSON.stringify({
@@ -6136,16 +6205,16 @@ export function useCPROrchestrator({
             slabSamples: requestedSlabSamples,
             workerWindowWidth: result.windowWidth,
             workerWindowCenter: result.windowCenter,
-            adaptiveWindowWidth: voi.windowWidth,
-            adaptiveWindowCenter: voi.windowCenter,
+            appliedWindowWidth: voi.windowWidth,
+            appliedWindowCenter: voi.windowCenter,
             minValue: result.minValue,
             maxValue: result.maxValue,
-            voiSource: 'adaptive',
+            voiSource,
           })
         );
         console.log(
           `[CPR-PANO-VOI] run=${debugRunId} label=${label} backend=${requestedRenderBackend} ` +
-            `source=adaptive ` +
+            `source=${voiSource} ` +
             `workerWW=${formatReadablePanoValue(result.windowWidth)} ` +
             `workerWC=${formatReadablePanoValue(result.windowCenter)} ` +
             `appliedWW=${formatReadablePanoValue(voi.windowWidth)} ` +
@@ -6353,6 +6422,12 @@ export function useCPROrchestrator({
           meanAbsDelta: summary?.meanAbsDelta,
           lowerBandP50: summary?.lowerBandP50,
           lowerBandBrightFraction: summary?.lowerBandBrightFraction,
+          backgroundToneSampleCount: summary?.backgroundToneSampleCount,
+          backgroundToneP95: summary?.backgroundToneP95,
+          backgroundToneP99: summary?.backgroundToneP99,
+          backgroundToneMax: summary?.backgroundToneMax,
+          backgroundOutlierFraction05: summary?.backgroundOutlierFraction05,
+          backgroundOutlierFraction10: summary?.backgroundOutlierFraction10,
           supportDepthStdMm: supportSurfaceMetrics.supportDepthStdMm,
           pathJumpP95Mm: supportSurfaceMetrics.pathJumpP95Mm,
           detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean,
@@ -6420,6 +6495,15 @@ export function useCPROrchestrator({
             `lowerBandBrightPct=${formatReadablePanoValue(
               summary ? summary.lowerBandBrightFraction * 100 : undefined
             )} ` +
+            `bgToneP99=${formatReadablePanoValue(summary?.backgroundToneP99, 3)} ` +
+            `bgBrightPct05=${formatReadablePanoValue(
+              summary ? summary.backgroundOutlierFraction05 * 100 : undefined,
+              1
+            )} ` +
+            `bgBrightPct10=${formatReadablePanoValue(
+              summary ? summary.backgroundOutlierFraction10 * 100 : undefined,
+              1
+            )} ` +
             `toothMean=${formatReadablePanoValue(summary?.toothBandMean)} ` +
             `detailRatio=${formatReadablePanoValue(detailBalanceRatio, 2)} ` +
             `centerDriftMm=${formatReadablePanoValue(actualCenterDriftMm, 2)} ` +
@@ -6460,6 +6544,12 @@ export function useCPROrchestrator({
             toothBandBrightFraction: summary?.toothBandBrightFraction ?? null,
             lowerBandP50: summary?.lowerBandP50 ?? null,
             lowerBandBrightFraction: summary?.lowerBandBrightFraction ?? null,
+            backgroundToneSampleCount: summary?.backgroundToneSampleCount ?? null,
+            backgroundToneP95: summary?.backgroundToneP95 ?? null,
+            backgroundToneP99: summary?.backgroundToneP99 ?? null,
+            backgroundToneMax: summary?.backgroundToneMax ?? null,
+            backgroundOutlierFraction05: summary?.backgroundOutlierFraction05 ?? null,
+            backgroundOutlierFraction10: summary?.backgroundOutlierFraction10 ?? null,
             detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean ?? null,
             detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean ?? null,
             toothBandSaturationPenalty,
@@ -6551,6 +6641,12 @@ export function useCPROrchestrator({
         toothBandBrightFraction: number | null;
         lowerBandP50: number | null;
         lowerBandBrightFraction: number | null;
+        backgroundToneSampleCount: number | null;
+        backgroundToneP95: number | null;
+        backgroundToneP99: number | null;
+        backgroundToneMax: number | null;
+        backgroundOutlierFraction05: number | null;
+        backgroundOutlierFraction10: number | null;
         detailBandHorizontalEdgeMean: number | null;
         detailBandVerticalEdgeMean: number | null;
         fractionBelowMinus950: number | null;
@@ -6622,6 +6718,12 @@ export function useCPROrchestrator({
           toothBandBrightFraction: attempt.summary?.toothBandBrightFraction ?? null,
           lowerBandP50: attempt.summary?.lowerBandP50 ?? null,
           lowerBandBrightFraction: attempt.summary?.lowerBandBrightFraction ?? null,
+          backgroundToneSampleCount: attempt.summary?.backgroundToneSampleCount ?? null,
+          backgroundToneP95: attempt.summary?.backgroundToneP95 ?? null,
+          backgroundToneP99: attempt.summary?.backgroundToneP99 ?? null,
+          backgroundToneMax: attempt.summary?.backgroundToneMax ?? null,
+          backgroundOutlierFraction05: attempt.summary?.backgroundOutlierFraction05 ?? null,
+          backgroundOutlierFraction10: attempt.summary?.backgroundOutlierFraction10 ?? null,
           detailBandHorizontalEdgeMean: attempt.summary?.detailBandHorizontalEdgeMean ?? null,
           detailBandVerticalEdgeMean: attempt.summary?.detailBandVerticalEdgeMean ?? null,
           fractionBelowMinus950: attempt.summary?.fractionBelowMinus950 ?? null,
@@ -7169,7 +7271,8 @@ export function useCPROrchestrator({
           const phase2Summary = summarizeFloatBufferForDebug(
             phase2Result.pixelData,
             phase2BaseAttempt.panoWidth,
-            phase2BaseAttempt.panoHeight
+            phase2BaseAttempt.panoHeight,
+            phase2Result.debugMaps
           );
           const phase2Voi = computeAdaptivePanoVoi(
             phase2Summary,
@@ -7658,6 +7761,12 @@ export function useCPROrchestrator({
           toothBandBrightFraction: panoDebugSummary.toothBandBrightFraction,
           lowerBandP50: panoDebugSummary.lowerBandP50,
           lowerBandBrightFraction: panoDebugSummary.lowerBandBrightFraction,
+          backgroundToneSampleCount: panoDebugSummary.backgroundToneSampleCount,
+          backgroundToneP95: panoDebugSummary.backgroundToneP95,
+          backgroundToneP99: panoDebugSummary.backgroundToneP99,
+          backgroundToneMax: panoDebugSummary.backgroundToneMax,
+          backgroundOutlierFraction05: panoDebugSummary.backgroundOutlierFraction05,
+          backgroundOutlierFraction10: panoDebugSummary.backgroundOutlierFraction10,
           detailBandHorizontalEdgeMean: panoDebugSummary.detailBandHorizontalEdgeMean,
           detailBandVerticalEdgeMean: panoDebugSummary.detailBandVerticalEdgeMean,
           fractionBelowMinus950: panoDebugSummary.fractionBelowMinus950,

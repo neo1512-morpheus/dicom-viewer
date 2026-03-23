@@ -49,6 +49,7 @@ const CPR_PANO_TARGET_ASPECT = 3.2;
 const CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM = 1.5;
 const CPR_CROSSSECTION_DEFAULT_BLEND_MODE = cornerstone.Enums.BlendModes.AVERAGE_INTENSITY_BLEND;
 const CPR_CROSSSECTION_RENDER_WAIT_TIMEOUT_MS = 1500;
+const CPR_TEMP_DEBUG_PIN_DISPLAYED_ATTEMPT_LABELS: readonly string[] = [];
 let activePanoDebugProbeCleanup: (() => void) | null = null;
 
 type PanoDebugProbeSample = {
@@ -61,9 +62,33 @@ type PanoDebugProbeSample = {
   rayMax?: number;
   maxLift?: number;
   validSampleCount?: number;
+  rawSupportDepthMm?: number;
+  rawSupportConfidence?: number;
+  rawSupportSpreadMm?: number;
+  rawSupportDensity?: number;
+  rawSupportPeakDominance?: number;
+  rawSupportPeakValidity?: number;
+  rawSupportPeakConflict?: number;
+  rawSupportSecondPeakRatio?: number;
+  rawSupportPeakSeparationMm?: number;
+  rawSupportPeakAmbiguity?: number;
+  rawSupportLocalJumpMm?: number;
+  rawSupportContinuity?: number;
+  supportFailureDisplay?: number;
   supportDepthMm?: number;
   supportConfidence?: number;
   supportSpreadMm?: number;
+  supportDensity?: number;
+  supportLocalJumpMm?: number;
+  supportContinuity?: number;
+  invalidSupportBlackout?: number;
+  supportDepthDeltaMm?: number;
+  supportConfidenceDelta?: number;
+  supportSpreadDeltaMm?: number;
+  supportDensityDelta?: number;
+  nominalTroughHalfWidthMm?: number;
+  effectiveTroughHalfWidthMm?: number;
+  backgroundTroughNarrowGate?: number;
   troughLowerMm?: number;
   troughUpperMm?: number;
   lowerPenalty?: number;
@@ -130,12 +155,92 @@ function readPanoDebugProbeSample(
       ? Number(payload.sampleCountMap[index])
       : undefined;
   const supportDepthMm = readOptionalProbeMapValue(payload.debugMaps?.supportDepthMap, index);
+  const rawSupportDepthMm = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportDepthMap,
+    index
+  );
   const supportConfidence = readOptionalProbeMapValue(
     payload.debugMaps?.supportConfidenceMap,
     index
   );
+  const rawSupportConfidence = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportConfidenceMap,
+    index
+  );
   const supportSpreadMm = readOptionalProbeMapValue(payload.debugMaps?.supportSpreadMap, index);
-  const troughHalfWidthMm = readOptionalProbeMapValue(payload.debugMaps?.troughHalfWidthMap, index);
+  const rawSupportSpreadMm = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportSpreadMap,
+    index
+  );
+  const supportDensity = readOptionalProbeMapValue(payload.debugMaps?.supportDensityMap, index);
+  const rawSupportDensity = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportDensityMap,
+    index
+  );
+  const rawSupportPeakDominance = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportPeakDominanceMap,
+    index
+  );
+  const rawSupportPeakValidity = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportPeakValidityMap,
+    index
+  );
+  const rawSupportPeakConflict = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportPeakConflictMap,
+    index
+  );
+  const rawSupportSecondPeakRatio = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportSecondPeakRatioMap,
+    index
+  );
+  const rawSupportPeakSeparationMm = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportPeakSeparationMap,
+    index
+  );
+  const rawSupportPeakAmbiguity = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportPeakAmbiguityMap,
+    index
+  );
+  const rawSupportLocalJumpMm = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportLocalJumpMap,
+    index
+  );
+  const rawSupportContinuity = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportContinuityMap,
+    index
+  );
+  const supportFailureDisplay = readOptionalProbeMapValue(
+    payload.debugMaps?.supportFailureDisplayMap,
+    index
+  );
+  const supportLocalJumpMm = readOptionalProbeMapValue(
+    payload.debugMaps?.supportLocalJumpMap,
+    index
+  );
+  const supportContinuity = readOptionalProbeMapValue(
+    payload.debugMaps?.supportContinuityMap,
+    index
+  );
+  const nominalTroughHalfWidthMm = readOptionalProbeMapValue(
+    payload.debugMaps?.troughHalfWidthMap,
+    index
+  );
+  const effectiveTroughHalfWidthMm = readOptionalProbeMapValue(
+    payload.debugMaps?.effectiveTroughHalfWidthMap,
+    index
+  );
+  const backgroundTroughNarrowGate = readOptionalProbeMapValue(
+    payload.debugMaps?.backgroundTroughNarrowGateMap,
+    index
+  );
+  const invalidSupportBlackout = readOptionalProbeMapValue(
+    payload.debugMaps?.invalidSupportBlackoutMap,
+    index
+  );
+  const troughHalfWidthMm =
+    typeof effectiveTroughHalfWidthMm === 'number'
+      ? effectiveTroughHalfWidthMm
+      : nominalTroughHalfWidthMm;
   const lowerPenalty = readOptionalProbeMapValue(payload.debugMaps?.lowerPenaltyMap, index);
   const totalAttenuation = readOptionalProbeMapValue(payload.debugMaps?.totalAttenuationMap, index);
   const toneMappedValue = readOptionalProbeMapValue(payload.debugMaps?.toneResponseMap, index);
@@ -159,9 +264,45 @@ function readPanoDebugProbeSample(
         ? Number(rayMax) - Number(meanHu)
         : undefined,
     validSampleCount: Number.isFinite(validSampleCount) ? validSampleCount : undefined,
+    rawSupportDepthMm,
+    rawSupportConfidence,
+    rawSupportSpreadMm,
+    rawSupportDensity,
+    rawSupportPeakDominance,
+    rawSupportPeakValidity,
+    rawSupportPeakConflict,
+    rawSupportSecondPeakRatio,
+    rawSupportPeakSeparationMm,
+    rawSupportPeakAmbiguity,
+    rawSupportLocalJumpMm,
+    rawSupportContinuity,
+    supportFailureDisplay,
     supportDepthMm,
     supportConfidence,
     supportSpreadMm,
+    supportDensity,
+    supportLocalJumpMm,
+    supportContinuity,
+    supportDepthDeltaMm:
+      typeof supportDepthMm === 'number' && typeof rawSupportDepthMm === 'number'
+        ? supportDepthMm - rawSupportDepthMm
+        : undefined,
+    supportConfidenceDelta:
+      typeof supportConfidence === 'number' && typeof rawSupportConfidence === 'number'
+        ? supportConfidence - rawSupportConfidence
+        : undefined,
+    supportSpreadDeltaMm:
+      typeof supportSpreadMm === 'number' && typeof rawSupportSpreadMm === 'number'
+        ? supportSpreadMm - rawSupportSpreadMm
+        : undefined,
+    supportDensityDelta:
+      typeof supportDensity === 'number' && typeof rawSupportDensity === 'number'
+        ? supportDensity - rawSupportDensity
+        : undefined,
+    nominalTroughHalfWidthMm,
+    effectiveTroughHalfWidthMm,
+    backgroundTroughNarrowGate,
+    invalidSupportBlackout,
     troughLowerMm:
       typeof supportDepthMm === 'number' && typeof troughHalfWidthMm === 'number'
         ? supportDepthMm - troughHalfWidthMm
@@ -306,8 +447,33 @@ function installPanoDebugProbe(
           backend: sample.backend ?? null,
           pipelineMode: sample.pipelineMode ?? null,
           reconstructionMode: sample.reconstructionMode ?? null,
+          rawSupportDepthMm: sample.rawSupportDepthMm ?? null,
+          rawSupportConfidence: sample.rawSupportConfidence ?? null,
+          rawSupportSpreadMm: sample.rawSupportSpreadMm ?? null,
+          rawSupportDensity: sample.rawSupportDensity ?? null,
+          rawSupportPeakDominance: sample.rawSupportPeakDominance ?? null,
+          rawSupportPeakValidity: sample.rawSupportPeakValidity ?? null,
+          rawSupportPeakConflict: sample.rawSupportPeakConflict ?? null,
+          rawSupportSecondPeakRatio: sample.rawSupportSecondPeakRatio ?? null,
+          rawSupportPeakSeparationMm: sample.rawSupportPeakSeparationMm ?? null,
+          rawSupportPeakAmbiguity: sample.rawSupportPeakAmbiguity ?? null,
+          rawSupportLocalJumpMm: sample.rawSupportLocalJumpMm ?? null,
+          rawSupportContinuity: sample.rawSupportContinuity ?? null,
+          supportFailureDisplay: sample.supportFailureDisplay ?? null,
           supportDepthMm: sample.supportDepthMm ?? null,
           supportConfidence: sample.supportConfidence ?? null,
+          supportSpreadMm: sample.supportSpreadMm ?? null,
+          supportDensity: sample.supportDensity ?? null,
+          supportLocalJumpMm: sample.supportLocalJumpMm ?? null,
+          supportContinuity: sample.supportContinuity ?? null,
+          supportDepthDeltaMm: sample.supportDepthDeltaMm ?? null,
+          supportConfidenceDelta: sample.supportConfidenceDelta ?? null,
+          supportSpreadDeltaMm: sample.supportSpreadDeltaMm ?? null,
+          supportDensityDelta: sample.supportDensityDelta ?? null,
+          nominalTroughHalfWidthMm: sample.nominalTroughHalfWidthMm ?? null,
+          effectiveTroughHalfWidthMm: sample.effectiveTroughHalfWidthMm ?? null,
+          backgroundTroughNarrowGate: sample.backgroundTroughNarrowGate ?? null,
+          invalidSupportBlackout: sample.invalidSupportBlackout ?? null,
           troughLowerMm: sample.troughLowerMm ?? null,
           troughUpperMm: sample.troughUpperMm ?? null,
           localTransmittance: sample.localTransmittance ?? null,
@@ -845,6 +1011,7 @@ interface Phase4QualityGateMetrics {
   supportConfidenceP10: number | null;
   supportConfidenceP50: number | null;
   supportConfidenceP90: number | null;
+  blackClipFraction: number | null;
   fractionBelowMinus950: number | null;
   fractionAbove3000: number | null;
 }
@@ -874,18 +1041,25 @@ interface Phase4QualityGateCandidate {
 
 function compareRankedPanoOutputs(
   a: {
+    qualityGatePassed?: boolean | null;
     qualityBase: number;
     qualityScore: number;
     hardRejectReason: string | null;
     summary: FloatBufferDebugSummary | null;
   },
   b: {
+    qualityGatePassed?: boolean | null;
     qualityBase: number;
     qualityScore: number;
     hardRejectReason: string | null;
     summary: FloatBufferDebugSummary | null;
   }
 ): number {
+  const aGatePassed = a.qualityGatePassed ?? true;
+  const bGatePassed = b.qualityGatePassed ?? true;
+  if (aGatePassed !== bGatePassed) {
+    return aGatePassed ? -1 : 1;
+  }
   const aHardRejected = !!a.hardRejectReason;
   const bHardRejected = !!b.hardRejectReason;
   if (aHardRejected !== bHardRejected) {
@@ -933,6 +1107,7 @@ function extractPhase4QualityGateMetrics(
   const diagnostic = readPhase4DiagnosticRecord(workerDebugPayload?.diagnostic);
   const gpuRender = readPhase4DiagnosticRecord(diagnostic?.gpuRender);
   const gpuSupportSurface = readPhase4DiagnosticRecord(gpuRender?.supportSurface);
+  const gpuToneMap = readPhase4DiagnosticRecord(gpuRender?.toneMap);
   const virtualPanoPhase12 = readPhase4DiagnosticRecord(diagnostic?.virtualPanoPhase12);
   const cpuSupportSurface = readPhase4DiagnosticRecord(virtualPanoPhase12?.supportSurface);
   const virtualPanoRender = readPhase4DiagnosticRecord(diagnostic?.virtualPanoRender);
@@ -958,6 +1133,9 @@ function extractPhase4QualityGateMetrics(
     supportConfidenceP10: readPhase4DiagnosticNumber(supportSurface?.confidenceP10),
     supportConfidenceP50: readPhase4DiagnosticNumber(supportSurface?.confidenceP50),
     supportConfidenceP90: readPhase4DiagnosticNumber(supportSurface?.confidenceP90),
+    blackClipFraction:
+      readPhase4DiagnosticNumber(gpuToneMap?.blackClipFraction) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.blackClipFraction),
     fractionBelowMinus950: summary?.fractionBelowMinus950 ?? null,
     fractionAbove3000: summary?.fractionAbove3000 ?? null,
   };
@@ -6073,6 +6251,8 @@ export function useCPROrchestrator({
         intensityDomain: SyntheticCprIntensityDomain;
         qualityBase: number;
         qualityScore: number;
+        qualityGatePassed: boolean;
+        qualityGateRejectReasons: string[];
         hardRejectReason: string | null;
         huDomain: boolean;
         convertedToHu: boolean;
@@ -6325,6 +6505,11 @@ export function useCPROrchestrator({
         const elevatedP01Penalty = summary ? Math.max(0, summary.p01 + 780) / 80 : 0;
         const centerDriftPenalty =
           Math.max(0, actualCenterDriftMm - 1.5) * 6 + Math.max(0, baseCenterDriftMm - 1.0) * 8;
+        const blackClipPenalty =
+          supportSurfaceMetrics.blackClipFraction !== null
+            ? Math.max(0, supportSurfaceMetrics.blackClipFraction - 0.42) * 18 +
+              Math.max(0, supportSurfaceMetrics.blackClipFraction - 0.52) * 26
+            : 0;
         const aggregationPenalty =
           requestedAggregation === 'MIP'
             ? 4.5 + (summary ? Math.max(0, summary.meanAbsDelta - 300) / 45 : 0)
@@ -6378,12 +6563,25 @@ export function useCPROrchestrator({
           noAirPenalty -
           elevatedP01Penalty -
           centerDriftPenalty -
+          blackClipPenalty -
           deformationPenalty -
           tallFillPenalty -
           intensityDomainPenalty -
           aggregationPenalty -
           phase2GatePenalty -
           hardRejectPenalty;
+        const qualityGateCandidate = buildPhase4QualityGateCandidate({
+          attemptLabel: label,
+          displayedPath: 'worker-recon',
+          sourceVolumeId,
+          summary,
+          qualityBase,
+          qualityScore,
+          hardRejectReason,
+          workerDebugPayload: result.workerDebugPayload ?? null,
+        });
+        const qualityGatePassed = qualityGateCandidate.pass;
+        const qualityGateRejectReasons = qualityGateCandidate.rejectReasons;
         const attemptDurationMs = performance.now() - attemptStartMs;
         const workerTimingMs =
           result.workerDebugPayload &&
@@ -6408,6 +6606,8 @@ export function useCPROrchestrator({
           workerTimingMs,
           qualityBase,
           qualityScore,
+          qualityGatePassed,
+          qualityGateRejectReasons,
           aggregation: requestedAggregation,
           requestedBackend: requestedRenderBackend,
           resolvedBackend: routeDiagnostic.backend,
@@ -6430,6 +6630,7 @@ export function useCPROrchestrator({
           backgroundOutlierFraction10: summary?.backgroundOutlierFraction10,
           supportDepthStdMm: supportSurfaceMetrics.supportDepthStdMm,
           pathJumpP95Mm: supportSurfaceMetrics.pathJumpP95Mm,
+          blackClipFraction: supportSurfaceMetrics.blackClipFraction,
           detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean,
           detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean,
           fractionBelowMinus950: summary?.fractionBelowMinus950,
@@ -6470,6 +6671,7 @@ export function useCPROrchestrator({
           noAirPenalty,
           elevatedP01Penalty,
           centerDriftPenalty,
+          blackClipPenalty,
           toothBandMean: summary?.toothBandMean,
           toothBandP10: summary?.toothBandP10,
           toothBandP90: summary?.toothBandP90,
@@ -6504,6 +6706,7 @@ export function useCPROrchestrator({
               summary ? summary.backgroundOutlierFraction10 * 100 : undefined,
               1
             )} ` +
+            `blackClip=${formatReadablePanoValue(supportSurfaceMetrics.blackClipFraction, 3)} ` +
             `toothMean=${formatReadablePanoValue(summary?.toothBandMean)} ` +
             `detailRatio=${formatReadablePanoValue(detailBalanceRatio, 2)} ` +
             `centerDriftMm=${formatReadablePanoValue(actualCenterDriftMm, 2)} ` +
@@ -6516,6 +6719,8 @@ export function useCPROrchestrator({
             label,
             qualityBase,
             qualityScore,
+            qualityGatePassed,
+            qualityGateRejectReasons,
             requestedBackend: requestedRenderBackend,
             resolvedBackend: routeDiagnostic.backend,
             pipelineMode: routeDiagnostic.pipelineMode,
@@ -6552,6 +6757,7 @@ export function useCPROrchestrator({
             backgroundOutlierFraction10: summary?.backgroundOutlierFraction10 ?? null,
             detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean ?? null,
             detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean ?? null,
+            blackClipFraction: supportSurfaceMetrics.blackClipFraction,
             toothBandSaturationPenalty,
             fractionBelowMinus950: summary?.fractionBelowMinus950 ?? null,
             fractionAbove3000: summary?.fractionAbove3000 ?? null,
@@ -6565,6 +6771,7 @@ export function useCPROrchestrator({
             tallFillPenalty,
             noAirPenalty,
             elevatedP01Penalty,
+            blackClipPenalty,
             phase2GatePenalty,
             actualVerticalCenterOffsetMm,
             baseVerticalCenterOffsetMm,
@@ -6588,6 +6795,8 @@ export function useCPROrchestrator({
           intensityDomain,
           qualityBase,
           qualityScore,
+          qualityGatePassed,
+          qualityGateRejectReasons,
           hardRejectReason,
           huDomain,
           convertedToHu,
@@ -6614,6 +6823,8 @@ export function useCPROrchestrator({
 
       const attemptAudit: Array<{
         label: string;
+        qualityGatePassed: boolean;
+        qualityGateRejectReasons: string[];
         qualityBase: number;
         qualityScore: number;
         hardRejectReason: string | null;
@@ -6664,6 +6875,8 @@ export function useCPROrchestrator({
       const attemptResults: Array<Awaited<ReturnType<typeof runWorkerAttempt>>> = [];
       const recordAttemptAudit = (attempt: {
         label: string;
+        qualityGatePassed: boolean;
+        qualityGateRejectReasons: string[];
         qualityBase: number;
         qualityScore: number;
         hardRejectReason: string | null;
@@ -6691,6 +6904,8 @@ export function useCPROrchestrator({
       }): void => {
         attemptAudit.push({
           label: attempt.label,
+          qualityGatePassed: attempt.qualityGatePassed,
+          qualityGateRejectReasons: attempt.qualityGateRejectReasons,
           qualityBase: attempt.qualityBase,
           qualityScore: attempt.qualityScore,
           hardRejectReason: attempt.hardRejectReason,
@@ -7057,22 +7272,26 @@ export function useCPROrchestrator({
         for (const retryConfig of retryConfigs) {
           const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
           recordAttempt(attempt);
+          const bestGatePassed = bestAttempt.qualityGatePassed;
+          const attemptGatePassed = attempt.qualityGatePassed;
           const bestHardRejected = !!bestAttempt.hardRejectReason;
           const attemptHardRejected = !!attempt.hardRejectReason;
           const bestFallbackScore = scoreHardRejectedPanoFallback(bestAttempt.summary);
           const attemptFallbackScore = scoreHardRejectedPanoFallback(attempt.summary);
           if (
-            (bestHardRejected && !attemptHardRejected) ||
-            (bestHardRejected === attemptHardRejected &&
-              (bestHardRejected
-                ? attemptFallbackScore > bestFallbackScore ||
-                  (Math.abs(attemptFallbackScore - bestFallbackScore) < 1e-6 &&
-                    (attempt.qualityScore > bestAttempt.qualityScore ||
+            (!bestGatePassed && attemptGatePassed) ||
+            (bestGatePassed === attemptGatePassed &&
+              ((bestHardRejected && !attemptHardRejected) ||
+                (bestHardRejected === attemptHardRejected &&
+                  (bestHardRejected
+                    ? attemptFallbackScore > bestFallbackScore ||
+                      (Math.abs(attemptFallbackScore - bestFallbackScore) < 1e-6 &&
+                        (attempt.qualityScore > bestAttempt.qualityScore ||
+                          (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
+                            attempt.qualityBase > bestAttempt.qualityBase)))
+                    : attempt.qualityScore > bestAttempt.qualityScore ||
                       (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
-                        attempt.qualityBase > bestAttempt.qualityBase)))
-                : attempt.qualityScore > bestAttempt.qualityScore ||
-                  (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
-                    attempt.qualityBase > bestAttempt.qualityBase)))
+                        attempt.qualityBase > bestAttempt.qualityBase)))))
           ) {
             bestAttempt = attempt;
           }
@@ -7116,14 +7335,18 @@ export function useCPROrchestrator({
           launchedMipFallbackCount++;
           const attempt = await runWorkerAttempt(retryConfig.label, retryConfig.overrides);
           recordAttempt(attempt);
+          const bestGatePassed = bestAttempt.qualityGatePassed;
+          const attemptGatePassed = attempt.qualityGatePassed;
           const bestHardRejected = !!bestAttempt.hardRejectReason;
           const attemptHardRejected = !!attempt.hardRejectReason;
           if (
-            (bestHardRejected && !attemptHardRejected) ||
-            (bestHardRejected === attemptHardRejected &&
-              (attempt.qualityScore > bestAttempt.qualityScore ||
-                (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
-                  attempt.qualityBase > bestAttempt.qualityBase)))
+            (!bestGatePassed && attemptGatePassed) ||
+            (bestGatePassed === attemptGatePassed &&
+              ((bestHardRejected && !attemptHardRejected) ||
+                (bestHardRejected === attemptHardRejected &&
+                  (attempt.qualityScore > bestAttempt.qualityScore ||
+                    (Math.abs(attempt.qualityScore - bestAttempt.qualityScore) < 1e-6 &&
+                      attempt.qualityBase > bestAttempt.qualityBase)))))
           ) {
             bestAttempt = attempt;
           }
@@ -7140,6 +7363,9 @@ export function useCPROrchestrator({
         : attemptResults
             .filter(attempt => attempt.aggregation === 'MEAN')
             .sort((a, b) => {
+              if (a.qualityGatePassed !== b.qualityGatePassed) {
+                return a.qualityGatePassed ? -1 : 1;
+              }
               const aHardRejected = !!a.hardRejectReason;
               const bHardRejected = !!b.hardRejectReason;
               if (aHardRejected !== bHardRejected) {
@@ -7341,6 +7567,9 @@ export function useCPROrchestrator({
           `error=${phase2VirtualPano.error ?? 'none'}`
       );
       const rankedAttempts = attemptAudit.slice().sort((a, b) => {
+        if (a.qualityGatePassed !== b.qualityGatePassed) {
+          return a.qualityGatePassed ? -1 : 1;
+        }
         const aHardRejected = !!a.hardRejectReason;
         const bHardRejected = !!b.hardRejectReason;
         if (aHardRejected !== bHardRejected) {
@@ -7394,12 +7623,28 @@ export function useCPROrchestrator({
       });
       const selectedAttempt = rankedAttempts[0];
       const runnerUpAttempt = rankedAttempts.length > 1 ? rankedAttempts[1] : null;
+      const temporarilyPinnedDisplayedAttempt = phase2VirtualPano.usedAsDisplayedOutput
+        ? null
+        : CPR_TEMP_DEBUG_PIN_DISPLAYED_ATTEMPT_LABELS.map(label =>
+            attemptResults.find(
+              attempt =>
+                attempt.label === label &&
+                !!attempt.result &&
+                attempt.result.pixelData.length === attempt.result.width * attempt.result.height &&
+                !!attempt.voi
+            )
+          ).find(
+            (
+              attempt
+            ): attempt is NonNullable<(typeof attemptResults)[number]> => !!attempt
+          ) ?? null;
       console.log(
         '[CPR-ATTEMPT-LIST-JSON]',
         JSON.stringify({
           runId: debugRunId,
           attempts: attemptAudit,
           selectedLabel: bestAttempt.label,
+          temporaryDisplayedAttemptLabel: temporarilyPinnedDisplayedAttempt?.label ?? null,
           attemptExecution: {
             attemptCount: launchedAttemptCount,
             mipFallbackCount: launchedMipFallbackCount,
@@ -7553,6 +7798,12 @@ export function useCPROrchestrator({
           displayedSourceAggregation: selectedDisplayedSourceAggregation,
           finalSelectedOutput: qualityGateFallbackSummary.finalSelectedOutput,
           candidates: qualityGateFallbackSummary.candidates,
+          temporaryDisplayPin: {
+            active: !!temporarilyPinnedDisplayedAttempt,
+            requestedLabels: CPR_TEMP_DEBUG_PIN_DISPLAYED_ATTEMPT_LABELS,
+            displayedAttemptLabel: temporarilyPinnedDisplayedAttempt?.label ?? null,
+            rankedTopLabel: bestAttempt.label,
+          },
           fallbackPath: {
             selectionReason: qualityGateSelectionReason,
             gpuRejected: gpuQualityGateCandidate ? !gpuQualityGateCandidate.pass : null,
@@ -7576,7 +7827,10 @@ export function useCPROrchestrator({
         JSON.stringify({
           runId: debugRunId,
           selectedLabel: bestAttempt.label,
+          rankedTopLabel: bestAttempt.label,
           displayedOutputMode: selectedDisplayedOutputMode,
+          temporaryDisplayPinned: !!temporarilyPinnedDisplayedAttempt,
+          temporaryDisplayedAttemptLabel: temporarilyPinnedDisplayedAttempt?.label ?? null,
           selectedRequestedBackend: bestAttempt.requestedBackend,
           selectedResolvedBackend: bestAttempt.resolvedBackend,
           selectedPipelineMode: bestAttempt.pipelineMode,
@@ -7650,18 +7904,19 @@ export function useCPROrchestrator({
         );
       }
 
-      let panoWorkerResult = bestAttempt.result;
-      let panoDebugSummary = bestAttempt.summary;
-      let adaptiveVoi = bestAttempt.voi;
+      const displayedAttempt = temporarilyPinnedDisplayedAttempt ?? bestAttempt;
+      let panoWorkerResult = displayedAttempt.result;
+      let panoDebugSummary = displayedAttempt.summary;
+      let adaptiveVoi = displayedAttempt.voi;
       let displayedOutputMode: 'legacy' | 'workerGpuPhase2' | 'virtualPanoPhase2' =
         selectedDisplayedOutputMode;
-      let displayedSourceLabel = bestAttempt.label;
-      let displayedSourceAggregation = bestAttempt.aggregation;
-      let selectedPanoWidth = bestAttempt.panoWidth;
-      let selectedPanoHeight = bestAttempt.panoHeight;
-      let selectedActualVertHalfMm = bestAttempt.actualVertHalfMm;
-      let selectedColumnPixelSpacing = bestAttempt.columnPixelSpacing;
-      let selectedRowPixelSpacing = bestAttempt.rowPixelSpacing;
+      let displayedSourceLabel = displayedAttempt.label;
+      let displayedSourceAggregation = displayedAttempt.aggregation;
+      let selectedPanoWidth = displayedAttempt.panoWidth;
+      let selectedPanoHeight = displayedAttempt.panoHeight;
+      let selectedActualVertHalfMm = displayedAttempt.actualVertHalfMm;
+      let selectedColumnPixelSpacing = displayedAttempt.columnPixelSpacing;
+      let selectedRowPixelSpacing = displayedAttempt.rowPixelSpacing;
       if (
         phase2VirtualPano.usedAsDisplayedOutput &&
         phase2WorkerResult &&
@@ -7683,7 +7938,7 @@ export function useCPROrchestrator({
       }
       const displayedWorkerDebugPayload = phase2VirtualPano.usedAsDisplayedOutput
         ? phase2WorkerResult?.workerDebugPayload ?? null
-        : bestAttempt.workerDebugPayload ?? null;
+        : displayedAttempt.workerDebugPayload ?? null;
       const displayedRouteDiagnostic = resolveWorkerDisplayRouteDiagnostic(
         displayedWorkerDebugPayload
       );
@@ -7704,7 +7959,7 @@ export function useCPROrchestrator({
       const crossSectionVerticalCenterOffsetMm =
         (phase2VirtualPano.usedAsDisplayedOutput
           ? phase2BaseAttempt?.verticalCenterOffsetMm
-          : bestAttempt.verticalCenterOffsetMm) ?? 0;
+          : displayedAttempt.verticalCenterOffsetMm) ?? 0;
       console.log(
         '[CPR-CROSSSECTION-GEOMETRY-JSON]',
         JSON.stringify({
@@ -7720,6 +7975,8 @@ export function useCPROrchestrator({
       );
       console.log(`[CPR][${debugRunId}] selected pano attempt`, {
         label: bestAttempt.label,
+        displayedAttemptLabel: displayedAttempt.label,
+        temporaryDisplayPinned: !!temporarilyPinnedDisplayedAttempt,
         displayedOutputMode,
         displayedSourceLabel,
         displayedSourceAggregation,
@@ -7734,17 +7991,17 @@ export function useCPROrchestrator({
         qualityBase: bestAttempt.qualityBase,
         qualityScore: bestAttempt.qualityScore,
         hardRejectReason: bestAttempt.hardRejectReason,
-        aggregation: bestAttempt.aggregation,
-        intensityDomain: bestAttempt.intensityDomain,
-        huDomain: bestAttempt.huDomain,
-        convertedToHu: bestAttempt.convertedToHu,
-        rescaleSkippedAsUnsafe: bestAttempt.rescaleSkippedAsUnsafe,
+        aggregation: displayedAttempt.aggregation,
+        intensityDomain: displayedAttempt.intensityDomain,
+        huDomain: displayedAttempt.huDomain,
+        convertedToHu: displayedAttempt.convertedToHu,
+        rescaleSkippedAsUnsafe: displayedAttempt.rescaleSkippedAsUnsafe,
         panoWidth: selectedPanoWidth,
         panoHeight: selectedPanoHeight,
         actualVertHalfMm: selectedActualVertHalfMm,
-        verticalCenterOffsetMm: bestAttempt.verticalCenterOffsetMm,
-        slabHalfThicknessMm: bestAttempt.slabHalfThicknessMm,
-        slabSamples: bestAttempt.slabSamples,
+        verticalCenterOffsetMm: displayedAttempt.verticalCenterOffsetMm,
+        slabHalfThicknessMm: displayedAttempt.slabHalfThicknessMm,
+        slabSamples: displayedAttempt.slabSamples,
         columnPixelSpacing: selectedColumnPixelSpacing,
         rowPixelSpacing: selectedRowPixelSpacing,
       });
@@ -7849,8 +8106,8 @@ export function useCPROrchestrator({
             height: panoWorkerResult.height,
             minValue: panoWorkerResult.minValue,
             maxValue: panoWorkerResult.maxValue,
-            huDomain: bestAttempt.huDomain,
-            intensityDomain: bestAttempt.intensityDomain,
+            huDomain: displayedAttempt.huDomain,
+            intensityDomain: displayedAttempt.intensityDomain,
             windowWidth: adaptiveVoi.windowWidth,
             windowCenter: adaptiveVoi.windowCenter,
             slope: panoWorkerResult.slope,
@@ -7864,7 +8121,7 @@ export function useCPROrchestrator({
             panoImageId,
             minValue: panoWorkerResult.minValue,
             maxValue: panoWorkerResult.maxValue,
-            intensityDomain: bestAttempt.intensityDomain,
+            intensityDomain: displayedAttempt.intensityDomain,
             windowWidth: adaptiveVoi.windowWidth,
             windowCenter: adaptiveVoi.windowCenter,
             voiLower: adaptiveVoi.lower,
@@ -7884,7 +8141,7 @@ export function useCPROrchestrator({
               panoImageId,
               minValue: panoWorkerResult.minValue,
               maxValue: panoWorkerResult.maxValue,
-              intensityDomain: bestAttempt.intensityDomain,
+              intensityDomain: displayedAttempt.intensityDomain,
               windowWidth: adaptiveVoi.windowWidth,
               windowCenter: adaptiveVoi.windowCenter,
               voiLower: adaptiveVoi.lower,
@@ -7896,12 +8153,14 @@ export function useCPROrchestrator({
               columnPixelSpacing: selectedColumnPixelSpacing,
               rowPixelSpacing: selectedRowPixelSpacing,
               selectedAttempt: {
-                label: bestAttempt.label,
-                aggregation: bestAttempt.aggregation,
-                verticalCenterOffsetMm: bestAttempt.verticalCenterOffsetMm,
-                slabHalfThicknessMm: bestAttempt.slabHalfThicknessMm,
-                slabSamples: bestAttempt.slabSamples,
-                qualityScore: bestAttempt.qualityScore,
+                label: displayedAttempt.label,
+                aggregation: displayedAttempt.aggregation,
+                verticalCenterOffsetMm: displayedAttempt.verticalCenterOffsetMm,
+                slabHalfThicknessMm: displayedAttempt.slabHalfThicknessMm,
+                slabSamples: displayedAttempt.slabSamples,
+                qualityScore: displayedAttempt.qualityScore,
+                rankedTopLabel: bestAttempt.label,
+                temporaryDisplayPinned: !!temporarilyPinnedDisplayedAttempt,
               },
             })
           );
@@ -7966,6 +8225,8 @@ export function useCPROrchestrator({
                 displayedSourceLabel,
                 displayedSourceAggregation,
                 selectedAttemptLabel: bestAttempt.label,
+                displayedAttemptLabel: displayedAttempt.label,
+                temporaryDisplayPinned: !!temporarilyPinnedDisplayedAttempt,
                 selectedAttemptHardRejectReason: bestAttempt.hardRejectReason,
                 qualityGate: qualityGateFallbackSummary,
                 phase1VirtualPano,
@@ -8068,6 +8329,8 @@ export function useCPROrchestrator({
               displayedSourceLabel,
               displayedSourceAggregation,
               selectedAttemptLabel: bestAttempt.label,
+              displayedAttemptLabel: displayedAttempt.label,
+              temporaryDisplayPinned: !!temporarilyPinnedDisplayedAttempt,
               selectedAttemptHardRejectReason: bestAttempt.hardRejectReason,
               qualityGate: qualityGateFallbackSummary,
               phase1VirtualPano,

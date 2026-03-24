@@ -242,10 +242,10 @@ const GPU_SUPPORT_MODEL_PARAMS = {
   inferiorPenaltyEnd: 0.96,
   superiorPenaltyStart: 0.02,
   superiorPenaltyEnd: 0.16,
-  densityConfidenceLow: 0.03,
-  densityConfidenceHigh: 0.14,
-  peakHuConfidenceLow: 320,
-  peakHuConfidenceHigh: 1200,
+  densityConfidenceLow: 0.015,
+  densityConfidenceHigh: 0.08,
+  peakHuConfidenceLow: 150,
+  peakHuConfidenceHigh: 900,
   peakDominanceValidityLow: 0.12,
   peakDominanceValidityHigh: 0.34,
   secondPeakRatioPenaltyLow: 0.56,
@@ -326,7 +326,7 @@ const GPU_TONE_MODEL_PARAMS = {
   attenuationConfidenceHigh: 0.58,
   lowConfidenceAttenuationScale: 1.8,
   exposureScale: 6.5,
-  sigmoidMidpoint: 0.085,
+  sigmoidMidpoint: 0.18,
   sigmoidSlope: 3.8,
   sigmoidWhitePoint: 1.2,
   postCurveGamma: 1.0,
@@ -476,7 +476,7 @@ bool computeSampleUvw(
 
 const ATTENUATION_MODEL_GLSL = `
 float pseudoAttenuationFromHu(float hu) {
-  float softTissue = 0.0065 * smoothstep(-950.0, -180.0, hu);
+  float softTissue = 0.0065 * smoothstep(-50.0, 150.0, hu);
   float cancellousBone = 0.0220 * smoothstep(-120.0, 420.0, hu);
   float metalRollOff = 1.0 - smoothstep(1100.0, 1900.0, hu);
   float denseBone = 0.0600 * smoothstep(180.0, 1350.0, hu) * metalRollOff;
@@ -506,8 +506,8 @@ float enamelBandSupportFromHu(float hu) {
 }
 
 float supportResponseFromHu(float hu) {
-  float rootSupport = smoothstep(180.0, 900.0, hu);
-  float dentinSupport = smoothstep(500.0, 1400.0, hu);
+  float rootSupport = smoothstep(80.0, 700.0, hu);
+  float dentinSupport = smoothstep(300.0, 1200.0, hu);
   float enamelBandSupport = enamelBandSupportFromHu(hu);
   float metalSuppressSupport = 1.0 - smoothstep(1100.0, 1900.0, hu);
   float enamelSupport = smoothstep(950.0, 1800.0, hu) * metalSuppressSupport;
@@ -523,8 +523,8 @@ float supportResponseFromHu(float hu) {
 float denseSupportFromHu(float hu) {
   float enamelBandSupport = enamelBandSupportFromHu(hu);
   float metalSuppressSupport = 1.0 - smoothstep(1100.0, 1900.0, hu);
-  float dentinCore = smoothstep(650.0, 1500.0, hu) * metalSuppressSupport;
-  float enamelCore = smoothstep(900.0, 1750.0, hu) * metalSuppressSupport;
+  float dentinCore = smoothstep(450.0, 1300.0, hu) * metalSuppressSupport;
+  float enamelCore = smoothstep(700.0, 1550.0, hu) * metalSuppressSupport;
   float combined =
     0.36 * dentinCore +
     1.00 * enamelBandSupport +
@@ -939,8 +939,8 @@ void main() {
 	  float nonToothBandGate =
 	    1.0 -
 	    smoothstep(
-	      0.12,
-	      0.32,
+	      0.06,
+	      0.18,
 	      toothBandPrior
 	    );
 	  float rowBackgroundDensityGate = smoothstep(0.06, 0.22, rawSupportDensity);
@@ -1421,7 +1421,7 @@ void main() {
     supportSigmaMm *
     ${GPU_DRR_MODEL_PARAMS.approxTroughBoundarySigmaMultiplier.toFixed(3)} *
     mix(1.0, 0.42, backgroundTroughNarrowGate);
-  float troughSlabFloor = nativeSlabPitchMm * 1.8;
+  float troughSlabFloor = nativeSlabPitchMm * 1.0;
   troughHalfWidthMm = max(troughHalfWidthMm, troughSlabFloor);
   float confidenceGate = smoothstep(
     ${GPU_DRR_MODEL_PARAMS.attenuationConfidenceLow.toFixed(3)},
@@ -1580,7 +1580,7 @@ void main() {
     retainedPenaltyFloor
   );
   float backgroundSuppressionConfidenceGate =
-    1.0 - smoothstep(0.0004, 0.0016, supportConfidence);
+    1.0 - smoothstep(0.002, 0.010, supportConfidence);
   float lowDensityGate =
     1.0 - smoothstep(0.06, 0.18, supportDensity);
   float lowPenaltyGate =
@@ -1591,7 +1591,9 @@ void main() {
     lowPenaltyGate;
   float weakToothProtect =
     smoothstep(0.002, 0.015, supportDensity) *
-    smoothstep(1.8, 3.2, participatingSamples);
+    smoothstep(1.8, 3.2, participatingSamples) *
+    smoothstep(0.12, 0.22, displayRowNorm) *
+    (1.0 - smoothstep(0.82, 0.92, displayRowNorm));
   backgroundSuppressionGate *= (1.0 - weakToothProtect);
   // Keep the commit's tooth attenuation behavior and only suppress
   // the extremely low-confidence background cluster.
@@ -1603,19 +1605,23 @@ void main() {
     (1.0 - smoothstep(0.12, 0.35, supportConfidence))
   );
   gentlySuppressedAttenuation *= mix(1.0, inferiorSuppressionStrength, inferiorPenalty);
+  // bottomPenalty fires when 1-displayRowNorm > 0.72, i.e. displayRowNorm < 0.28
+  // Due to GL Y-flip, displayRowNorm~0 = VISUAL TOP (Zone B: maxillary/sinus).
+  // Unconditional 95% suppression — no teeth above the crowns.
   float bottomPenalty = smoothstep(0.72, 0.92,
     1.0 - displayRowNorm);
-  float bottomSuppressionStrength = mix(
+  gentlySuppressedAttenuation *= mix(1.0, 0.05, bottomPenalty);
+  // topPenalty fires when displayRowNorm > 0.82
+  // Due to GL Y-flip, displayRowNorm~1 = VISUAL BOTTOM (Zone A: mandible).
+  // Conditional: preserve real tooth roots, suppress only low-confidence bone.
+  float topPenalty = smoothstep(0.82, 0.96, displayRowNorm);
+  float topSuppressionStrength = mix(
     0.96,
     0.30,
     (1.0 - smoothstep(0.08, 0.28, supportDensity)) *
     (1.0 - smoothstep(0.14, 0.40, supportConfidence))
   );
-  gentlySuppressedAttenuation *= mix(
-    1.0,
-    bottomSuppressionStrength,
-    bottomPenalty
-  );
+  gentlySuppressedAttenuation *= mix(1.0, topSuppressionStrength, topPenalty);
   float weakSupportConfidenceGate =
     1.0 - smoothstep(
       ${GPU_TONE_MODEL_PARAMS.invalidSupportBlackoutConfidenceLow.toFixed(3)},
@@ -2642,7 +2648,7 @@ function buildEffectiveTroughHalfWidthMap(
       supportSigmaMm *
       GPU_DRR_MODEL_PARAMS.approxTroughBoundarySigmaMultiplier *
       mixNumber(1.0, 0.42, backgroundTroughNarrowGate);
-    const troughSlabFloor = nativePitchMm * 1.8;
+    const troughSlabFloor = nativePitchMm * 1.0;
     effectiveTroughHalfWidthMap[i] = Math.max(
       effectiveTroughHalfWidthMap[i],
       troughSlabFloor

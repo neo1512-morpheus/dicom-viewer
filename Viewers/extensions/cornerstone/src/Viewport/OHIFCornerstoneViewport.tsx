@@ -59,6 +59,7 @@ function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
   const onRedraw = orchestrator?.onRedraw;
   const isGenerating = orchestrator?.isGenerating ?? false;
   const error = orchestrator?.error ?? null;
+  const warning = orchestrator?.warning ?? null;
   const [hasSpline, setHasSpline] = useState(false);
 
   const setActiveAxialViewport = useCallback(() => {
@@ -170,6 +171,9 @@ function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
         </button>
       </div>
       {error ? <span className="max-w-[300px] truncate text-[11px] text-red-300">{error}</span> : null}
+      {!error && warning ? (
+        <span className="max-w-[300px] truncate text-[11px] text-amber-200">{warning}</span>
+      ) : null}
     </div>
   );
 }

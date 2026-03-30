@@ -52,6 +52,11 @@ export interface GpuPanoDebugMaps {
   rawSupportLocalJumpMap?: Float32Array;
   rawSupportContinuityMap?: Float32Array;
   supportFailureDisplayMap?: Float32Array;
+  upperSupportDepthMap?: Float32Array;
+  lowerSupportDepthMap?: Float32Array;
+  upperSupportConfidenceMap?: Float32Array;
+  lowerSupportConfidenceMap?: Float32Array;
+  supportBlendMap?: Float32Array;
   supportDepthMap?: Float32Array;
   supportConfidenceMap?: Float32Array;
   supportSpreadMap?: Float32Array;
@@ -67,6 +72,12 @@ export interface GpuPanoDebugMaps {
   troughHalfWidthMap?: Float32Array;
   effectiveTroughHalfWidthMap?: Float32Array;
   backgroundTroughNarrowGateMap?: Float32Array;
+  detailHuMap?: Float32Array;
+  contextHuMap?: Float32Array;
+  contextBlendFactorMap?: Float32Array;
+  columnSupportReliabilityMap?: Float32Array;
+  upperDetailHuMap?: Float32Array;
+  lowerDetailHuMap?: Float32Array;
 }
 
 export interface GpuSupportSurfaceDiagnostics {
@@ -74,10 +85,17 @@ export interface GpuSupportSurfaceDiagnostics {
   depthMaxMm: number;
   depthStdMm: number;
   pathJumpP95Mm: number;
+  pathConfidenceP10: number;
+  pathConfidenceP50: number;
+  pathConfidenceP90: number;
   localJumpP50Mm: number;
   localJumpP90Mm: number;
   localJumpP95Mm: number;
   localJumpOutlierFraction: number;
+  lowConfidenceColumnFraction: number;
+  lowContinuityColumnFraction: number;
+  unstableColumnFraction: number;
+  longestUnstableRunColumns: number;
   continuityP10: number;
   continuityP50: number;
   continuityP90: number;
@@ -235,13 +253,13 @@ const SUPPORT_PATH_ROW_END_FRACTION = 0.76;
 const TONE_RESPONSE_BLACK_CLIP_THRESHOLD = 0.02;
 const TONE_RESPONSE_WHITE_CLIP_THRESHOLD = 0.98;
 const GPU_SUPPORT_MODEL_PARAMS = {
-  toothBandCenter: 0.44,
+  toothBandCenter: 0.46,
   toothBandInnerHalfWidth: 0.16,
   toothBandOuterHalfWidth: 0.38,
   inferiorPenaltyStart: 0.62,
   inferiorPenaltyEnd: 0.96,
   superiorPenaltyStart: 0.02,
-  superiorPenaltyEnd: 0.16,
+  superiorPenaltyEnd: 0.18,
   densityConfidenceLow: 0.015,
   densityConfidenceHigh: 0.08,
   peakHuConfidenceLow: 150,
@@ -271,14 +289,14 @@ const GPU_SUPPORT_MODEL_PARAMS = {
   inferiorOffsetBoostScale: 1.22,
   superiorOffsetPenaltyStartMm: 0.02,
   superiorOffsetPenaltyEndMm: 0.26,
-  superiorOffsetPenaltyScale: 0.52,
+  superiorOffsetPenaltyScale: 0.64,
   positiveDepthClampStartMm: 0.02,
-  positiveDepthClampEndMm: 0.22,
-  positiveDepthClampTargetMm: -0.12,
+  positiveDepthClampEndMm: 0.18,
+  positiveDepthClampTargetMm: -0.2,
   positiveDepthClampConfidenceLow: 0.004,
-  positiveDepthClampConfidenceHigh: 0.016,
+  positiveDepthClampConfidenceHigh: 0.028,
   positiveDepthClampDensityLow: 0.03,
-  positiveDepthClampDensityHigh: 0.1,
+  positiveDepthClampDensityHigh: 0.14,
   continuityNeighborAgreementSigmaMm: 0.28,
   continuityOutlierStartMm: 0.22,
   continuityOutlierEndMm: 0.62,
@@ -293,31 +311,31 @@ const GPU_SUPPORT_MODEL_PARAMS = {
 const GPU_DRR_MODEL_PARAMS = {
   broadSigmaSlabScale: 0.34,
   broadSigmaNativePitchScale: 0.9,
-  focusedSpreadScale: 0.72,
+  focusedSpreadScale: 0.66,
   focusedNativePitchBias: 0.22,
   focusedSigmaMinNativePitchScale: 0.72,
   focusedSigmaMaxSlabScale: 0.32,
   focusedSigmaMaxNativePitchScale: 0.92,
   confidenceBlendLow: 0.14,
   confidenceBlendHigh: 0.62,
-  confidenceSigmaExpansion: 1.12,
+  confidenceSigmaExpansion: 1.04,
   attenuationConfidenceLow: 0.12,
   attenuationConfidenceHigh: 0.58,
-  supportWeightPowerLowConfidence: 1.55,
-  supportWeightPowerHighConfidence: 1.08,
+  supportWeightPowerLowConfidence: 1.82,
+  supportWeightPowerHighConfidence: 1.14,
   lowerPenaltyDenseScale: 0.06,
   lowerPenaltyConfidenceLow: 0.1,
   lowerPenaltyConfidenceHigh: 0.55,
   lowerPenaltyRowStart: 0.62,
   lowerPenaltyRowEnd: 0.96,
-  approxTroughBoundarySigmaMultiplier: 1.7,
-  troughSigmaHardCapMm: 0.3,
+  approxTroughBoundarySigmaMultiplier: 1.58,
+  troughSigmaHardCapMm: 0.44,
 };
 const GPU_TONE_MODEL_PARAMS = {
-  lowConfidenceFogSuppression: 0.12,
-  highConfidenceFogSuppression: 0.05,
-  lowConfidenceFogRetention: 0.82,
-  highConfidenceFogRetention: 0.92,
+  lowConfidenceFogSuppression: 0.2,
+  highConfidenceFogSuppression: 0.08,
+  lowConfidenceFogRetention: 0.75,
+  highConfidenceFogRetention: 0.88,
   lowConfidencePenaltySuppression: 0.38,
   highConfidencePenaltySuppression: 0.20,
   lowConfidencePenaltyRetention: 0.72,
@@ -344,6 +362,52 @@ const GPU_TONE_MODEL_PARAMS = {
 };
 
 // ─── Shaders ─────────────────────────────────────────────────────────
+function computeContinuityAdaptiveToleranceMm(spreadMm: number, density: number): number {
+  const spreadGate = smoothstepNumber(
+    GPU_SUPPORT_MODEL_PARAMS.continuityBroadSpreadStartMm,
+    GPU_SUPPORT_MODEL_PARAMS.continuityBroadSpreadEndMm,
+    spreadMm
+  );
+  const densityGate = smoothstepNumber(
+    GPU_SUPPORT_MODEL_PARAMS.continuityDensityLow,
+    GPU_SUPPORT_MODEL_PARAMS.continuityDensityMid,
+    density
+  );
+  const highDensityGate = smoothstepNumber(
+    GPU_SUPPORT_MODEL_PARAMS.continuityHighDensityStart,
+    GPU_SUPPORT_MODEL_PARAMS.continuityHighDensityEnd,
+    density
+  );
+  const baseToleranceMm = mixNumber(
+    GPU_SUPPORT_MODEL_PARAMS.continuityOutlierStartMm,
+    GPU_SUPPORT_MODEL_PARAMS.continuityOutlierEndMm,
+    spreadGate * densityGate
+  );
+  const densityScale = 1 + 0.10 * densityGate + 0.08 * highDensityGate;
+  return Math.max(baseToleranceMm * densityScale, 0.04);
+}
+
+function computeContinuityExcessJumpMm(
+  jumpMm: number,
+  spreadMm: number,
+  density: number
+): number {
+  return Math.max(0, jumpMm - computeContinuityAdaptiveToleranceMm(spreadMm, density));
+}
+
+function computeContinuityFailureGate(
+  jumpMm: number,
+  spreadMm: number,
+  density: number
+): number {
+  const excessJumpMm = computeContinuityExcessJumpMm(jumpMm, spreadMm, density);
+  return smoothstepNumber(
+    0,
+    GPU_SUPPORT_MODEL_PARAMS.continuityNeighborAgreementSigmaMm,
+    excessJumpMm
+  );
+}
+
 const VERT_SRC = `#version 300 es
 void main() {
   // Fullscreen triangle: 3 vertices cover the clip-space quad
@@ -669,11 +733,11 @@ void main() {
       displayRowNorm
     );
   float rowPrior = clamp(
-    mix(0.70, 1.18, toothBandPrior) *
-    mix(1.0, 0.55, inferiorPenalty) *
-    mix(0.84, 1.0, 1.0 - superiorPenalty),
-    0.30,
-    1.24
+    mix(0.84, 1.08, toothBandPrior) *
+    mix(1.0, 0.78, inferiorPenalty) *
+    mix(0.90, 1.0, 1.0 - superiorPenalty),
+    0.72,
+    1.12
   );
 
   float nativeSlabPitchMm = computeNativeSlabPitchMm(slabDirIndexPerMm);
@@ -1022,11 +1086,11 @@ void main() {
       displayRowNorm
     );
   float rowPrior = clamp(
-    mix(0.70, 1.18, toothBandPrior) *
-    mix(1.0, 0.55, inferiorPenalty) *
-    mix(0.84, 1.0, 1.0 - superiorPenalty),
-    0.30,
-    1.24
+    mix(0.84, 1.08, toothBandPrior) *
+    mix(1.0, 0.78, inferiorPenalty) *
+    mix(0.90, 1.0, 1.0 - superiorPenalty),
+    0.72,
+    1.12
   );
 
   float nativeSlabPitchMm = computeNativeSlabPitchMm(slabDirIndexPerMm);
@@ -1170,6 +1234,31 @@ uniform int uPanoHeight;
 
 out vec4 fragColor;
 
+float continuityAdaptiveToleranceMm(float spreadMm, float density) {
+  float spreadGate = smoothstep(
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityBroadSpreadStartMm.toFixed(3)},
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityBroadSpreadEndMm.toFixed(3)},
+    spreadMm
+  );
+  float densityGate = smoothstep(
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityDensityLow.toFixed(3)},
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityDensityMid.toFixed(3)},
+    density
+  );
+  float highDensityGate = smoothstep(
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityHighDensityStart.toFixed(3)},
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityHighDensityEnd.toFixed(3)},
+    density
+  );
+  float baseToleranceMm = mix(
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityOutlierStartMm.toFixed(3)},
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityOutlierEndMm.toFixed(3)},
+    spreadGate * densityGate
+  );
+  float densityScale = 1.0 + 0.10 * densityGate + 0.08 * highDensityGate;
+  return max(baseToleranceMm * densityScale, 0.04);
+}
+
 void main() {
   int col = int(gl_FragCoord.x);
   int outputRow = int(gl_FragCoord.y);
@@ -1183,16 +1272,14 @@ void main() {
   float centerDepthMm = centerSample.r;
   float centerConfidence = clamp(centerSample.g, 0.0, 1.0);
   float centerDensity = clamp(centerSample.a, 0.0, 1.0);
+  float centerSpreadMm = max(centerSample.b, 0.0);
   float centerSupportStrength = max(centerConfidence, centerDensity * 0.35);
 
-  float centerWeight = 2.2 + centerSupportStrength * 3.2;
-  float weightedCenter = centerSample.r * centerWeight;
-  float weightedConfidence = centerConfidence * centerWeight;
-  float weightedSpread = centerSample.b * centerWeight;
-  float weightedDensity = centerDensity * centerWeight;
-  float weightSum = centerWeight;
   float rawHorizontalJumpSum = 0.0;
   float rawHorizontalJumpCount = 0.0;
+  float immediateNeighborDepthSum = 0.0;
+  float immediateNeighborConfidenceSum = 0.0;
+  float immediateNeighborWeightSum = 0.0;
 
   if (col > 0) {
     vec4 leftSample = texelFetch(uSupportData, ivec2(col - 1, outputRow), 0);
@@ -1202,6 +1289,11 @@ void main() {
     if (leftSupportStrength > 1e-4) {
       rawHorizontalJumpSum += abs(leftSample.r - centerDepthMm);
       rawHorizontalJumpCount += 1.0;
+      float immediateNeighborWeight =
+        sqrt(max(leftSupportStrength * max(centerSupportStrength, 1e-4), 0.0));
+      immediateNeighborDepthSum += leftSample.r * immediateNeighborWeight;
+      immediateNeighborConfidenceSum += leftConfidence * immediateNeighborWeight;
+      immediateNeighborWeightSum += immediateNeighborWeight;
     }
   }
 
@@ -1213,12 +1305,37 @@ void main() {
     if (rightSupportStrength > 1e-4) {
       rawHorizontalJumpSum += abs(rightSample.r - centerDepthMm);
       rawHorizontalJumpCount += 1.0;
+      float immediateNeighborWeight =
+        sqrt(max(rightSupportStrength * max(centerSupportStrength, 1e-4), 0.0));
+      immediateNeighborDepthSum += rightSample.r * immediateNeighborWeight;
+      immediateNeighborConfidenceSum += rightConfidence * immediateNeighborWeight;
+      immediateNeighborWeightSum += immediateNeighborWeight;
     }
   }
 
   float rawLocalJumpMm =
     rawHorizontalJumpCount > 0.0 ? rawHorizontalJumpSum / rawHorizontalJumpCount : 0.0;
-  float rawContinuityFailureGate = smoothstep(0.26, 0.82, rawLocalJumpMm);
+  float rawContinuityExcessMm =
+    max(0.0, rawLocalJumpMm - continuityAdaptiveToleranceMm(centerSpreadMm, centerDensity));
+  float rawContinuityFailureGate = smoothstep(
+    0.0,
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityNeighborAgreementSigmaMm.toFixed(3)},
+    rawContinuityExcessMm
+  );
+  float continuityRegularizerBlend =
+    rawContinuityFailureGate *
+    ${GPU_SUPPORT_MODEL_PARAMS.continuityRegularizerStrength.toFixed(3)} *
+    (1.0 - smoothstep(0.18, 0.48, centerSupportStrength));
+  float centerWeight = mix(
+    2.2 + centerSupportStrength * 3.2,
+    1.4 + centerSupportStrength * 2.2,
+    continuityRegularizerBlend
+  );
+  float weightedCenter = centerSample.r * centerWeight;
+  float weightedConfidence = centerConfidence * centerWeight;
+  float weightedSpread = centerSample.b * centerWeight;
+  float weightedDensity = centerDensity * centerWeight;
+  float weightSum = centerWeight;
 
   for (int dy = -2; dy <= 2; dy++) {
     for (int dx = -4; dx <= 4; dx++) {
@@ -1267,6 +1384,20 @@ void main() {
   float smoothedConfidence = clamp(weightedConfidence / weightSum, 0.0, 1.0);
   float smoothedSpreadMm = max(weightedSpread / weightSum, 0.1);
   float smoothedDensity = clamp(weightedDensity / weightSum, 0.0, 1.0);
+  if (immediateNeighborWeightSum > 1e-4 && continuityRegularizerBlend > 1e-4) {
+    float immediateNeighborDepthMm = immediateNeighborDepthSum / immediateNeighborWeightSum;
+    float immediateNeighborConfidence = clamp(
+      immediateNeighborConfidenceSum / immediateNeighborWeightSum,
+      0.0,
+      1.0
+    );
+    smoothedCenterMm = mix(smoothedCenterMm, immediateNeighborDepthMm, continuityRegularizerBlend);
+    smoothedConfidence = mix(
+      smoothedConfidence,
+      min(smoothedConfidence, immediateNeighborConfidence),
+      continuityRegularizerBlend * 0.35
+    );
+  }
   if (smoothedConfidence <= 1e-5 && smoothedDensity <= 1e-5) {
     fragColor = vec4(smoothedCenterMm, 0.0, 0.0, 0.0);
     return;
@@ -1597,10 +1728,10 @@ void main() {
   backgroundSuppressionGate *= (1.0 - weakToothProtect);
   // Keep the commit's tooth attenuation behavior and only suppress
   // the extremely low-confidence background cluster.
-  gentlySuppressedAttenuation *= mix(1.0, 0.28, backgroundSuppressionGate);
+  gentlySuppressedAttenuation *= mix(1.0, 0.44, backgroundSuppressionGate);
   float inferiorSuppressionStrength = mix(
-    0.96,
-    0.35,
+    0.98,
+    0.60,
     smoothstep(0.06, 0.22, supportDensity) *
     (1.0 - smoothstep(0.12, 0.35, supportConfidence))
   );
@@ -1616,8 +1747,8 @@ void main() {
   // Conditional: preserve real tooth roots, suppress only low-confidence bone.
   float topPenalty = smoothstep(0.82, 0.96, displayRowNorm);
   float topSuppressionStrength = mix(
-    0.96,
-    0.30,
+    0.98,
+    0.58,
     (1.0 - smoothstep(0.08, 0.28, supportDensity)) *
     (1.0 - smoothstep(0.14, 0.40, supportConfidence))
   );
@@ -2197,6 +2328,50 @@ function collapseSupportPathByColumn(
   return { pathDepthMm, pathConfidence };
 }
 
+function collapseWeightedMapByColumn(
+  map: Float32Array,
+  confidenceMap: Float32Array,
+  width: number,
+  height: number
+): Float32Array {
+  const collapsed = new Float32Array(width);
+  const startRow = Math.max(0, Math.floor(height * SUPPORT_PATH_ROW_START_FRACTION));
+  const endRow = Math.min(height - 1, Math.ceil(height * SUPPORT_PATH_ROW_END_FRACTION));
+  const fallbackRow = Math.max(0, Math.min(height - 1, Math.round((height - 1) * 0.5)));
+
+  for (let col = 0; col < width; col++) {
+    let weightedValue = 0;
+    let weightSum = 0;
+
+    for (let row = startRow; row <= endRow; row++) {
+      const index = row * width + col;
+      const value = Number(map[index]);
+      const confidence = clampNumber(Number(confidenceMap[index]), 0, 1);
+      if (!Number.isFinite(value) || !Number.isFinite(confidence)) {
+        continue;
+      }
+
+      const weight = confidence > 1e-4 ? confidence * confidence : 0;
+      if (weight <= 0) {
+        continue;
+      }
+
+      weightedValue += value * weight;
+      weightSum += weight;
+    }
+
+    if (weightSum > 1e-5) {
+      collapsed[col] = weightedValue / weightSum;
+      continue;
+    }
+
+    const fallbackIndex = fallbackRow * width + col;
+    collapsed[col] = Number(map[fallbackIndex]) || 0;
+  }
+
+  return collapsed;
+}
+
 function computeAdjacentDeltaP95(values: Float32Array): number {
   if (values.length < 2) {
     return 0;
@@ -2218,6 +2393,26 @@ function computeAdjacentDeltaP95(values: Float32Array): number {
 
   deltas.sort((a, b) => a - b);
   return percentileFromSorted(deltas, 0.95);
+}
+
+function computeLongestRunByThreshold(
+  values: Float32Array,
+  predicate: (value: number) => boolean
+): number {
+  let longestRun = 0;
+  let currentRun = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    const value = Number(values[i]);
+    if (Number.isFinite(value) && predicate(value)) {
+      currentRun++;
+      longestRun = Math.max(longestRun, currentRun);
+    } else {
+      currentRun = 0;
+    }
+  }
+
+  return longestRun;
 }
 
 function multiplyDirectionByWorldToIndex(
@@ -2579,12 +2774,16 @@ function buildDebugDisplayHuFromUnitMap(unitMap: Float32Array): Float32Array {
 function buildSupportFailureDisplayMap(
   peakAmbiguityMap: Float32Array,
   rawSupportLocalJumpMap: Float32Array,
-  rawSupportContinuityMap: Float32Array
+  rawSupportContinuityMap: Float32Array,
+  supportSpreadMap: Float32Array,
+  supportDensityMap: Float32Array
 ): Float32Array {
   const length = Math.min(
     peakAmbiguityMap.length,
     rawSupportLocalJumpMap.length,
-    rawSupportContinuityMap.length
+    rawSupportContinuityMap.length,
+    supportSpreadMap.length,
+    supportDensityMap.length
   );
   const supportFailureDisplayMap = new Float32Array(length);
 
@@ -2592,7 +2791,13 @@ function buildSupportFailureDisplayMap(
     const peakAmbiguity = clampNumber(Number(peakAmbiguityMap[i]) || 0, 0, 1);
     const localJumpMm = Math.max(0, Number(rawSupportLocalJumpMap[i]) || 0);
     const continuity = clampNumber(Number(rawSupportContinuityMap[i]) || 0, 0, 1);
-    const jumpGate = smoothstepNumber(0.22, 0.78, localJumpMm);
+    const spreadMm = Math.max(0, Number(supportSpreadMap[i]) || 0);
+    const density = clampNumber(Number(supportDensityMap[i]) || 0, 0, 1);
+    const jumpGate = smoothstepNumber(
+      0,
+      GPU_SUPPORT_MODEL_PARAMS.continuityNeighborAgreementSigmaMm,
+      computeContinuityExcessJumpMm(localJumpMm, spreadMm, density)
+    );
     const continuityFailure = 1 - continuity;
     const continuityFailureGate = smoothstepNumber(0.08, 0.72, continuityFailure);
     const jumpFailure = jumpGate * mixNumber(0.35, 1.0, continuityFailureGate);
@@ -2695,6 +2900,7 @@ function buildSupportContinuityMaps(
   supportDepthMap: Float32Array,
   supportConfidenceMap: Float32Array,
   supportDensityMap: Float32Array,
+  supportSpreadMap: Float32Array,
   width: number,
   height: number
 ): {
@@ -2711,6 +2917,7 @@ function buildSupportContinuityMaps(
       const centerDepth = Number(supportDepthMap[index]);
       const centerConfidence = clampNumber(Number(supportConfidenceMap[index]) || 0, 0, 1);
       const centerDensity = clampNumber(Number(supportDensityMap[index]) || 0, 0, 1);
+      const centerSpreadMm = Math.max(0, Number(supportSpreadMap[index]) || 0);
       const centerSupportStrength = Math.max(centerConfidence, centerDensity * 0.35);
 
       if (!Number.isFinite(centerDepth) || centerSupportStrength <= 1e-4) {
@@ -2753,8 +2960,17 @@ function buildSupportContinuityMaps(
       }
 
       const localJumpMm = deltaSum / deltaCount;
-      localJumpMap[index] = localJumpMm;
-      continuityMap[index] = 1 - smoothstepNumber(0.12, 0.55, localJumpMm);
+      const excessJumpMm = computeContinuityExcessJumpMm(
+        localJumpMm,
+        centerSpreadMm,
+        centerDensity
+      );
+      localJumpMap[index] = excessJumpMm;
+      continuityMap[index] = 1 - smoothstepNumber(
+        0,
+        GPU_SUPPORT_MODEL_PARAMS.continuityNeighborAgreementSigmaMm,
+        excessJumpMm
+      );
     }
   }
 
@@ -2777,6 +2993,7 @@ function buildSupportSurfaceDiagnostics(
 ): GpuSupportSurfaceDiagnostics {
   const collapsedPath = collapseSupportPathByColumn(supportDepthMap, supportConfidenceMap, width, height);
   const pathDepthSummary = summarizeFiniteBuffer(collapsedPath.pathDepthMm);
+  const pathConfidenceSummary = summarizeFiniteBuffer(collapsedPath.pathConfidence);
   const confidenceSummary = summarizeFiniteBuffer(supportConfidenceMap);
   const spreadSummary = summarizeFiniteBuffer(supportSpreadMap);
   const densitySummary = summarizeFiniteBuffer(supportDensityMap);
@@ -2786,6 +3003,7 @@ function buildSupportSurfaceDiagnostics(
       supportDepthMap,
       supportConfidenceMap,
       supportDensityMap,
+      supportSpreadMap,
       width,
       height
     ).localJumpMap;
@@ -2795,9 +3013,32 @@ function buildSupportSurfaceDiagnostics(
       supportDepthMap,
       supportConfidenceMap,
       supportDensityMap,
+      supportSpreadMap,
       width,
       height
     ).continuityMap;
+  const collapsedContinuity = collapseWeightedMapByColumn(
+    resolvedContinuityMap,
+    supportConfidenceMap,
+    width,
+    height
+  );
+  const lowConfidenceColumnFraction = computeFractionByThreshold(
+    collapsedPath.pathConfidence,
+    value => value <= 0.08
+  );
+  const lowContinuityColumnFraction = computeFractionByThreshold(
+    collapsedContinuity,
+    value => value <= 0.45
+  );
+  const unstableColumnFraction = computeFractionByThreshold(
+    collapsedContinuity,
+    value => value <= 0.35
+  );
+  const longestUnstableRunColumns = computeLongestRunByThreshold(
+    collapsedContinuity,
+    value => value <= 0.35
+  );
   const localJumpSummary = summarizeFiniteBuffer(resolvedLocalJumpMap);
   const continuitySummary = summarizeFiniteBuffer(resolvedContinuityMap);
 
@@ -2806,6 +3047,9 @@ function buildSupportSurfaceDiagnostics(
     depthMaxMm: roundFinite(pathDepthSummary?.max ?? 0),
     depthStdMm: roundFinite(pathDepthSummary?.stdDev ?? 0),
     pathJumpP95Mm: roundFinite(computeAdjacentDeltaP95(collapsedPath.pathDepthMm)),
+    pathConfidenceP10: roundFinite(pathConfidenceSummary?.p10 ?? 0, 4),
+    pathConfidenceP50: roundFinite(pathConfidenceSummary?.p50 ?? 0, 4),
+    pathConfidenceP90: roundFinite(pathConfidenceSummary?.p90 ?? 0, 4),
     localJumpP50Mm: roundFinite(localJumpSummary?.p50 ?? 0),
     localJumpP90Mm: roundFinite(localJumpSummary?.p90 ?? 0),
     localJumpP95Mm: roundFinite(localJumpSummary?.p95 ?? 0),
@@ -2813,6 +3057,10 @@ function buildSupportSurfaceDiagnostics(
       computeFractionByThreshold(resolvedLocalJumpMap, value => value >= 0.35),
       4
     ),
+    lowConfidenceColumnFraction: roundFinite(lowConfidenceColumnFraction, 4),
+    lowContinuityColumnFraction: roundFinite(lowContinuityColumnFraction, 4),
+    unstableColumnFraction: roundFinite(unstableColumnFraction, 4),
+    longestUnstableRunColumns,
     continuityP10: roundFinite(continuitySummary?.p10 ?? 0, 4),
     continuityP50: roundFinite(continuitySummary?.p50 ?? 0, 4),
     continuityP90: roundFinite(continuitySummary?.p90 ?? 0, 4),
@@ -3658,6 +3906,7 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
       rawSupportReadback.channel0,
       rawSupportReadback.channel1,
       rawSupportReadback.channel3,
+      rawSupportReadback.channel2,
       safePanoWidth,
       safePanoHeight
     );
@@ -3665,6 +3914,7 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
       supportReadback.channel0,
       supportReadback.channel1,
       supportReadback.channel3,
+      supportReadback.channel2,
       safePanoWidth,
       safePanoHeight
     );
@@ -3689,7 +3939,9 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
     const supportFailureDisplayMap = buildSupportFailureDisplayMap(
       rawSupportPeakDebugReadback.channel3,
       rawSupportContinuityMaps.localJumpMap,
-      rawSupportContinuityMaps.continuityMap
+      rawSupportContinuityMaps.continuityMap,
+      rawSupportReadback.channel2,
+      rawSupportReadback.channel3
     );
     const rawSupportPeakValidityMap = buildRawSupportPeakValidityMap(
       rawSupportPeakDebugReadback.channel0,

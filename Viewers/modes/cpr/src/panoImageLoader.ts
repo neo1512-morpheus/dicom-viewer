@@ -6,6 +6,8 @@ import {
   getFallbackSyntheticCprVoi,
 } from './cprSyntheticDisplay';
 
+export type PanoQualityStatus = 'accepted' | 'degraded';
+
 export interface PanoImagePayload {
   pixelData: Float32Array | Uint16Array;
   meanMap?: Float32Array;
@@ -19,11 +21,20 @@ export interface PanoImagePayload {
     requestedBackend?: string | null;
     pipelineMode?: string | null;
     reconstructionMode?: string | null;
+    qualityStatus?: PanoQualityStatus | null;
+    qualityGateRejectReasons?: string[];
+    qualityGateSelectionReason?: string | null;
+    qualityGateMessage?: string | null;
   };
   width: number;
   height: number;
   minValue: number;
   maxValue: number;
+  qualityGatePassed?: boolean;
+  qualityStatus?: PanoQualityStatus;
+  qualityGateRejectReasons?: string[];
+  qualityGateSelectionReason?: string | null;
+  qualityGateMessage?: string | null;
   huDomain?: boolean;
   intensityDomain?: SyntheticCprIntensityDomain;
   columnPixelSpacing?: number;
@@ -36,10 +47,11 @@ export interface PanoImagePayload {
 
 const panoImageCache = new Map<string, PanoImagePayload>();
 let latestPanoImageId: string | null = null;
-let panoImageCounter = 0;
 const PANO_FRAME_OF_REFERENCE_UID = 'CPR_PANO_FRAME_OF_REFERENCE';
 const PANO_SERIES_INSTANCE_UID = 'CPR_PANO_SERIES_INSTANCE';
 const PANO_STUDY_INSTANCE_UID = 'CPR_PANO_STUDY_INSTANCE';
+export const PANO_IMAGE_ID = 'pano://current';
+let panoImageSequence = 0;
 interface PanoDisplayMetadata {
   minValue: number;
   maxValue: number;
@@ -131,16 +143,44 @@ function getPanoPixelSpacing(payload: PanoImagePayload | null): {
 }
 
 export function createPanoImageId(): string {
-  panoImageCounter += 1;
-  return `pano://current/${Date.now()}-${panoImageCounter}`;
+  panoImageSequence += 1;
+  return `pano://render-${Date.now()}-${panoImageSequence}`;
+}
+
+function evictCachedPanoImage(imageId: string | null | undefined): void {
+  if (!imageId) {
+    return;
+  }
+
+  try {
+    const imageLoadObject = cornerstone.cache.getImageLoadObject(imageId);
+    if (imageLoadObject) {
+      cornerstone.cache.removeImageLoadObject(imageId);
+    }
+  } catch (error) {
+    console.warn('[panoImageLoader] Failed to evict cached pano image.', {
+      imageId,
+      error,
+    });
+  }
 }
 
 export function setPanoImagePayload(imageId: string, payload: PanoImagePayload): void {
+  evictCachedPanoImage(imageId);
   panoImageCache.set(imageId, payload);
   latestPanoImageId = imageId;
 }
 
 export function clearPanoImageCache(): void {
+  const imageIdsToEvict = new Set<string>();
+  for (const imageId of panoImageCache.keys()) {
+    imageIdsToEvict.add(imageId);
+  }
+  if (latestPanoImageId) {
+    imageIdsToEvict.add(latestPanoImageId);
+  }
+
+  imageIdsToEvict.forEach(imageId => evictCachedPanoImage(imageId));
   panoImageCache.clear();
   latestPanoImageId = null;
 }
@@ -207,6 +247,10 @@ function panoImageLoader(imageId: string): {
       slope: image.slope,
       intercept: image.intercept,
       invert: image.invert,
+      qualityGatePassed: payload.qualityGatePassed ?? null,
+      qualityStatus: payload.qualityStatus ?? null,
+      qualityGateRejectReasons: payload.qualityGateRejectReasons ?? [],
+      qualityGateSelectionReason: payload.qualityGateSelectionReason ?? null,
     });
     resolve(image);
   });
@@ -364,7 +408,5 @@ export function registerPanoImageLoader(): void {
     panoMetadataRegistered = true;
   }
 }
-
-export const PANO_IMAGE_ID = 'pano://current';
 
 export { panoImageLoader };

@@ -13,6 +13,71 @@
   <meta name="msapplication-TileColor" content="#fff" />
   <meta name="msapplication-TileImage" content="<%= PUBLIC_URL %>assets/mstile-144x144.png" />
   <meta name="msapplication-config" content="<%= PUBLIC_URL %>assets/browserconfig.xml" />
+  <style>
+    html,
+    body {
+      margin: 0;
+      min-height: 100%;
+      background: #000;
+    }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+    }
+
+    #root {
+      min-height: 100vh;
+    }
+
+    .viewer-boot {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      color: #dbeafe;
+    }
+
+    .viewer-boot__panel {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+      padding: 24px;
+      text-align: center;
+    }
+
+    .viewer-boot__logo {
+      width: 168px;
+      height: auto;
+    }
+
+    .viewer-boot__spinner {
+      width: 56px;
+      height: 56px;
+      border: 3px solid rgba(148, 163, 184, 0.22);
+      border-top-color: #60a5fa;
+      border-radius: 9999px;
+      animation: viewer-boot-spin 1s linear infinite;
+    }
+
+    .viewer-boot__title {
+      font-size: 1.125rem;
+      font-weight: 600;
+      color: #fff;
+    }
+
+    .viewer-boot__subtitle {
+      font-size: 0.925rem;
+      color: #93c5fd;
+    }
+
+    @keyframes viewer-boot-spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
   <script type="text/javascript">
     console.time('scriptToView');
     window.PUBLIC_URL = '<%= PUBLIC_URL %>';
@@ -115,6 +180,14 @@
   <noscript> You need to enable JavaScript to run this app. </noscript>
   <div id="react-portal"></div>
   <div id="root">
+    <div class="viewer-boot" aria-live="polite">
+      <div class="viewer-boot__panel">
+        <img class="viewer-boot__logo" src="<%= PUBLIC_URL %>assets/oroscan-logo.png" alt="Oroscan" />
+        <div class="viewer-boot__spinner" aria-hidden="true"></div>
+        <div class="viewer-boot__title">Loading viewer</div>
+        <div class="viewer-boot__subtitle">Preparing the viewer shell and study bootstrap.</div>
+      </div>
+    </div>
   </div>
 </body>
 

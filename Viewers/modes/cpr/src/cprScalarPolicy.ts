@@ -126,11 +126,16 @@ export function resolveEffectivePreScaledForInit(params: {
       ? Number(rescaleSlope)
       : 1;
   const safeIntercept = Number.isFinite(rescaleIntercept) ? Number(rescaleIntercept) : 0;
-  const hasNonIdentityRescale = Math.abs(safeSlope - 1) > 1e-6 || Math.abs(safeIntercept) > 1e-6;
+  const hasNonIdentityRescale =
+    Math.abs(safeSlope - 1) > 1e-6 || Math.abs(safeIntercept) > 1e-6;
   const sampledRange = sampleScalarRange(scalarData);
   const sampledMin = sampledRange.min;
   const sampledMax = sampledRange.max;
   const looksHuLike = isHuLikeScalarRange(sampledMin, sampledMax);
+  const looksImplausiblyWideRange =
+    Number.isFinite(sampledMin) &&
+    Number.isFinite(sampledMax) &&
+    (sampledMin < -9000 || sampledMax > 14000);
   const safeBitsStored = resolveStoredBitCount(bitsStored, 16);
   const isUnsigned = Number(pixelRepresentation) === 0;
   const storedMin = isUnsigned ? 0 : -(1 << Math.max(safeBitsStored - 1, 0));
@@ -146,10 +151,6 @@ export function resolveEffectivePreScaledForInit(params: {
     Number.isFinite(sampledMax) &&
     sampledMin >= storedMin - storedMargin &&
     sampledMax <= storedMax + storedMargin;
-  const looksImplausiblyWideRange =
-    Number.isFinite(sampledMin) &&
-    Number.isFinite(sampledMax) &&
-    (sampledMin < -9000 || sampledMax > 14000);
 
   if (isPreScaled === true) {
     if (looksHuLike || !hasNonIdentityRescale) {
@@ -378,12 +379,14 @@ export function createHuScalarTransform(params: {
 
     const storedValue = policy.normalizeStoredSample
       ? policy.normalizeStoredSample(value)
-      : decodeStoredScalarValue(
-        value,
-        policy.safeBitsStored,
-        policy.safePixelRepresentation,
-        16
-      );
+      : isPackedIntegerArray(params.scalarData)
+        ? decodeStoredScalarValue(
+            value,
+            policy.safeBitsStored,
+            policy.safePixelRepresentation,
+            16
+          )
+        : value;
     const hu = storedValue * policy.safeSlope + policy.safeIntercept;
     return Number.isFinite(hu) ? hu : policy.safeIntercept;
   };

@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router';
 import PropTypes from 'prop-types';
 import { utils } from '@ohif/core';
-import { DragAndDropProvider, ImageViewerProvider } from '@ohif/ui';
+import { DragAndDropProvider, ImageViewerProvider, LoadingIndicatorProgress } from '@ohif/ui';
 import { useSearchParams } from '@hooks';
 import { useAppConfig } from '@state';
 import ViewportGrid from '@components/ViewportGrid';
@@ -330,7 +330,19 @@ export default function ModeRoute({
   ]);
 
   if (!studyInstanceUIDs || !layoutTemplateData.current || !ExtensionDependenciesLoaded) {
-    return null;
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-black">
+        <div className="flex flex-col items-center justify-center gap-4 px-6 text-center">
+          <LoadingIndicatorProgress className={'h-28 w-28 bg-black'} />
+          <div className="space-y-1">
+            <p className="text-lg font-medium text-white">Loading study</p>
+            <p className="text-sm text-blue-300">
+              Fetching study metadata and preparing the viewer layout.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   const ViewportGridWithDataSource = props => {

@@ -91,6 +91,9 @@ const CPR_CROSSSECTION_DEFAULT_BLEND_MODE = cornerstone.Enums.BlendModes.AVERAGE
 const CPR_CROSSSECTION_RENDER_WAIT_TIMEOUT_MS = 1500;
 const CPR_TEMP_DEBUG_PIN_DISPLAYED_ATTEMPT_LABELS: readonly string[] = [];
 let activePanoDebugProbeCleanup: (() => void) | null = null;
+let activePanoDebugProbeRunId: string | null = null;
+const panoDebugProbeClicksByRun = new Map<string, PanoDebugProbeSample[]>();
+const panoDebugArtifactExportersByRun = new Map<string, () => void>();
 
 function parseCprDebugBooleanFlag(value: string | null | undefined): boolean | null {
   if (typeof value !== 'string') {
@@ -123,30 +126,55 @@ function parseCprDebugBooleanFlag(value: string | null | undefined): boolean | n
   return null;
 }
 
-function shouldExportCprAttemptReport(): boolean {
+function readCprDebugBooleanFlag(
+  queryKeys: readonly string[],
+  storageKeys: readonly string[]
+): boolean | null {
   if (typeof window === 'undefined') {
-    return CPR_DEBUG_EXPORT_ATTEMPT_REPORT_DEFAULT;
+    return null;
   }
 
-  const queryValue = parseCprDebugBooleanFlag(
-    new URLSearchParams(window.location.search).get('cprDebugExportAttemptReport')
-  );
-  if (queryValue !== null) {
-    return queryValue;
+  const searchParams = new URLSearchParams(window.location.search);
+  for (const key of queryKeys) {
+    const queryValue = parseCprDebugBooleanFlag(searchParams.get(key));
+    if (queryValue !== null) {
+      return queryValue;
+    }
   }
 
   try {
-    const storedValue = parseCprDebugBooleanFlag(
-      window.localStorage?.getItem('cpr.debug.exportAttemptReport')
-    );
-    if (storedValue !== null) {
-      return storedValue;
+    for (const key of storageKeys) {
+      const storedValue = parseCprDebugBooleanFlag(window.localStorage?.getItem(key));
+      if (storedValue !== null) {
+        return storedValue;
+      }
     }
   } catch (error) {
-    console.warn('[CPR] Failed to read debug export flag from localStorage.', error);
+    console.warn('[CPR] Failed to read debug flag from localStorage.', error);
   }
 
-  return CPR_DEBUG_EXPORT_ATTEMPT_REPORT_DEFAULT;
+  return null;
+}
+
+function shouldExportCprAttemptReport(): boolean {
+  return (
+    readCprDebugBooleanFlag(
+      ['cprDebugExportAttemptReport'],
+      ['cpr.debug.exportAttemptReport']
+    ) ?? CPR_DEBUG_EXPORT_ATTEMPT_REPORT_DEFAULT
+  );
+}
+
+function shouldForceDisplayGpuCandidateEvenIfRejected(): boolean {
+  return (
+    readCprDebugBooleanFlag(
+      ['cprForceDisplayGpuCandidateEvenIfRejected', 'forceDisplayGpuCandidateEvenIfRejected'],
+      [
+        'cpr.debug.forceDisplayGpuCandidateEvenIfRejected',
+        'forceDisplayGpuCandidateEvenIfRejected',
+      ]
+    ) ?? false
+  );
 }
 
 type PanoDebugProbeSample = {
@@ -169,6 +197,11 @@ type PanoDebugProbeSample = {
   rawSupportSecondPeakRatio?: number;
   rawSupportPeakSeparationMm?: number;
   rawSupportPeakAmbiguity?: number;
+  rawSupportScoreGap?: number;
+  rawSupportDenseFraction?: number;
+  rawSupportPeakHuSupportGate?: number;
+  rawSupportDominantPeakOffsetMm?: number;
+  rawSupportSecondaryPeakOffsetMm?: number;
   rawSupportLocalJumpMm?: number;
   rawSupportContinuity?: number;
   supportFailureDisplay?: number;
@@ -176,6 +209,25 @@ type PanoDebugProbeSample = {
   supportConfidence?: number;
   supportSpreadMm?: number;
   supportDensity?: number;
+  toothBandPrior?: number;
+  dominantDensePeakGate?: number;
+  toothBandStructureGuard?: number;
+  ambiguousBroadSupportPenaltyGate?: number;
+  protectedAmbiguousBroadSupportPenaltyGate?: number;
+  structuralSupportGate?: number;
+  peakStructureValidity?: number;
+  supportValidity?: number;
+  rowConfidenceGate?: number;
+  falseSupportConfidenceGate?: number;
+  falseSupportDensityGate?: number;
+  falseSupportSpreadGate?: number;
+  falseSupportVeto?: number;
+  rowBackgroundDensityGate?: number;
+  rowBackgroundSpreadGate?: number;
+  rowBackgroundPeakHuGate?: number;
+  rowBackgroundEdgeGate?: number;
+  rowBackgroundVeto?: number;
+  supportVetoTriggered?: number;
   supportLocalJumpMm?: number;
   supportContinuity?: number;
   invalidSupportBlackout?: number;
@@ -185,23 +237,48 @@ type PanoDebugProbeSample = {
   supportDensityDelta?: number;
   nominalTroughHalfWidthMm?: number;
   effectiveTroughHalfWidthMm?: number;
+  continuityExpandedTroughHalfWidthMm?: number;
   backgroundTroughNarrowGate?: number;
+  dominantToothBandGate?: number;
+  broadWeakToothBandGate?: number;
+  toothContinuityAdmissionGate?: number;
   troughLowerMm?: number;
   troughUpperMm?: number;
   lowerPenalty?: number;
   localTransmittance?: number;
   toneMappedValue?: number;
+  admissionAccumulation?: number;
+  preToneAccumulation?: number;
+  toneSuppressedAccumulation?: number;
+  toneStageSuppression?: number;
+  blackClip?: number;
+  admissionOnlyHu?: number;
+  toneBypassHu?: number;
+  retainedSampleMask?: number;
+  middleBandLeak?: number;
   participatingSampleCount?: number;
   displayedPath?: string | null;
   backend?: string | null;
   pipelineMode?: string | null;
   reconstructionMode?: string | null;
+  holeMetricBlackClipped?: boolean;
+  holeMetricLowRetained?: boolean;
+  holeMetricLowPreTone?: boolean;
+  holeMetricLeakMarked?: boolean;
+  holeMetricWouldCount?: boolean;
+  holeMetricReasons?: string[];
   mappingMode?: string;
   canvasX?: number;
   canvasY?: number;
 };
 
 function clearPanoDebugProbe(): void {
+  if (activePanoDebugProbeRunId) {
+    panoDebugProbeClicksByRun.delete(activePanoDebugProbeRunId);
+    panoDebugArtifactExportersByRun.delete(activePanoDebugProbeRunId);
+    activePanoDebugProbeRunId = null;
+  }
+
   if (activePanoDebugProbeCleanup) {
     activePanoDebugProbeCleanup();
     activePanoDebugProbeCleanup = null;
@@ -274,6 +351,79 @@ function readPanoDebugProbeSample(
     payload.debugMaps?.rawSupportDensityMap,
     index
   );
+  const toothBandPrior = readOptionalProbeMapValue(payload.debugMaps?.toothBandPriorMap, index);
+  const dominantDensePeakGate = readOptionalProbeMapValue(
+    payload.debugMaps?.dominantDensePeakGateMap,
+    index
+  );
+  const toothBandStructureGuard = readOptionalProbeMapValue(
+    payload.debugMaps?.toothBandStructureGuardMap,
+    index
+  );
+  const ambiguousBroadSupportPenaltyGate = readOptionalProbeMapValue(
+    payload.debugMaps?.ambiguousBroadSupportPenaltyGateMap,
+    index
+  );
+  const protectedAmbiguousBroadSupportPenaltyGate = readOptionalProbeMapValue(
+    payload.debugMaps?.protectedAmbiguousBroadSupportPenaltyGateMap,
+    index
+  );
+  const structuralSupportGate = readOptionalProbeMapValue(
+    payload.debugMaps?.structuralSupportGateMap,
+    index
+  );
+  const peakStructureValidity = readOptionalProbeMapValue(
+    payload.debugMaps?.peakStructureValidityMap,
+    index
+  );
+  const supportValidity = readOptionalProbeMapValue(
+    payload.debugMaps?.supportValidityMap,
+    index
+  );
+  const rowConfidenceGate = readOptionalProbeMapValue(
+    payload.debugMaps?.rowConfidenceGateMap,
+    index
+  );
+  const falseSupportConfidenceGate = readOptionalProbeMapValue(
+    payload.debugMaps?.falseSupportConfidenceGateMap,
+    index
+  );
+  const falseSupportDensityGate = readOptionalProbeMapValue(
+    payload.debugMaps?.falseSupportDensityGateMap,
+    index
+  );
+  const falseSupportSpreadGate = readOptionalProbeMapValue(
+    payload.debugMaps?.falseSupportSpreadGateMap,
+    index
+  );
+  const falseSupportVeto = readOptionalProbeMapValue(
+    payload.debugMaps?.falseSupportVetoMap,
+    index
+  );
+  const rowBackgroundDensityGate = readOptionalProbeMapValue(
+    payload.debugMaps?.rowBackgroundDensityGateMap,
+    index
+  );
+  const rowBackgroundSpreadGate = readOptionalProbeMapValue(
+    payload.debugMaps?.rowBackgroundSpreadGateMap,
+    index
+  );
+  const rowBackgroundPeakHuGate = readOptionalProbeMapValue(
+    payload.debugMaps?.rowBackgroundPeakHuGateMap,
+    index
+  );
+  const rowBackgroundEdgeGate = readOptionalProbeMapValue(
+    payload.debugMaps?.rowBackgroundEdgeGateMap,
+    index
+  );
+  const rowBackgroundVeto = readOptionalProbeMapValue(
+    payload.debugMaps?.rowBackgroundVetoMap,
+    index
+  );
+  const supportVetoTriggered = readOptionalProbeMapValue(
+    payload.debugMaps?.supportVetoTriggeredMap,
+    index
+  );
   const rawSupportPeakDominance = readOptionalProbeMapValue(
     payload.debugMaps?.rawSupportPeakDominanceMap,
     index
@@ -296,6 +446,26 @@ function readPanoDebugProbeSample(
   );
   const rawSupportPeakAmbiguity = readOptionalProbeMapValue(
     payload.debugMaps?.rawSupportPeakAmbiguityMap,
+    index
+  );
+  const rawSupportScoreGap = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportScoreGapMap,
+    index
+  );
+  const rawSupportDenseFraction = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportDenseFractionMap,
+    index
+  );
+  const rawSupportPeakHuSupportGate = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportPeakHuSupportGateMap,
+    index
+  );
+  const rawSupportDominantPeakOffsetMm = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportDominantPeakOffsetMap,
+    index
+  );
+  const rawSupportSecondaryPeakOffsetMm = readOptionalProbeMapValue(
+    payload.debugMaps?.rawSupportSecondaryPeakOffsetMap,
     index
   );
   const rawSupportLocalJumpMm = readOptionalProbeMapValue(
@@ -326,8 +496,24 @@ function readPanoDebugProbeSample(
     payload.debugMaps?.effectiveTroughHalfWidthMap,
     index
   );
+  const continuityExpandedTroughHalfWidthMm = readOptionalProbeMapValue(
+    payload.debugMaps?.continuityExpandedTroughHalfWidthMap,
+    index
+  );
   const backgroundTroughNarrowGate = readOptionalProbeMapValue(
     payload.debugMaps?.backgroundTroughNarrowGateMap,
+    index
+  );
+  const dominantToothBandGate = readOptionalProbeMapValue(
+    payload.debugMaps?.dominantToothBandGateMap,
+    index
+  );
+  const broadWeakToothBandGate = readOptionalProbeMapValue(
+    payload.debugMaps?.broadWeakToothBandGateMap,
+    index
+  );
+  const toothContinuityAdmissionGate = readOptionalProbeMapValue(
+    payload.debugMaps?.toothContinuityAdmissionGateMap,
     index
   );
   const invalidSupportBlackout = readOptionalProbeMapValue(
@@ -341,12 +527,83 @@ function readPanoDebugProbeSample(
   const lowerPenalty = readOptionalProbeMapValue(payload.debugMaps?.lowerPenaltyMap, index);
   const totalAttenuation = readOptionalProbeMapValue(payload.debugMaps?.totalAttenuationMap, index);
   const toneMappedValue = readOptionalProbeMapValue(payload.debugMaps?.toneResponseMap, index);
+  const admissionAccumulation = readOptionalProbeMapValue(
+    payload.debugMaps?.admissionAccumulationMap,
+    index
+  );
+  const preToneAccumulation = readOptionalProbeMapValue(
+    payload.debugMaps?.preToneAccumulationMap,
+    index
+  );
+  const toneSuppressedAccumulation = readOptionalProbeMapValue(
+    payload.debugMaps?.toneSuppressedAccumulationMap,
+    index
+  );
+  const toneStageSuppression = readOptionalProbeMapValue(
+    payload.debugMaps?.toneStageSuppressionMap,
+    index
+  );
+  const blackClip = readOptionalProbeMapValue(payload.debugMaps?.blackClipMap, index);
+  const admissionOnlyHu = readOptionalProbeMapValue(payload.debugMaps?.admissionOnlyHuMap, index);
+  const toneBypassHu = readOptionalProbeMapValue(payload.debugMaps?.toneBypassHuMap, index);
+  const retainedSampleMask = readOptionalProbeMapValue(
+    payload.debugMaps?.retainedSampleMaskMap,
+    index
+  );
+  const middleBandLeak = readOptionalProbeMapValue(payload.debugMaps?.middleBandLeakMap, index);
   const participatingSampleCount = readOptionalProbeMapValue(
     payload.debugMaps?.participatingSampleCountMap,
     index
   );
   const localTransmittance =
     typeof totalAttenuation === 'number' ? Math.exp(-Math.max(totalAttenuation, 0)) : undefined;
+  const holeMetricBlackClipThreshold = Math.max(
+    0,
+    Math.min(
+      1,
+      Number(payload.probeContext?.holeMetricBlackClipThreshold) ||
+        CPR_TOOTH_BAND_BLACK_CLIP_THRESHOLD
+    )
+  );
+  const holeMetricRetainedWeightMax = Math.max(
+    0,
+    Math.min(
+      1,
+      Number(payload.probeContext?.holeMetricRetainedWeightMax) ||
+        CPR_TOOTH_BAND_HOLE_RETAINED_WEIGHT_MAX
+    )
+  );
+  const holeMetricPreToneThreshold = Math.max(
+    0,
+    Number(payload.probeContext?.holeMetricPreToneThreshold) || 0
+  );
+  const holeMetricLeakMin = Math.max(
+    0,
+    Math.min(1, Number(payload.probeContext?.holeMetricLeakMin) || CPR_TOOTH_BAND_HOLE_LEAK_MIN)
+  );
+  const holeMetricBlackClipped =
+    typeof toneMappedValue === 'number' ? toneMappedValue <= holeMetricBlackClipThreshold : false;
+  const holeMetricLowRetained =
+    typeof retainedSampleMask === 'number' ? retainedSampleMask <= holeMetricRetainedWeightMax : false;
+  const holeMetricLowPreTone =
+    typeof preToneAccumulation === 'number' ? preToneAccumulation <= holeMetricPreToneThreshold : false;
+  const holeMetricLeakMarked =
+    typeof middleBandLeak === 'number' ? middleBandLeak >= holeMetricLeakMin : false;
+  const holeMetricWouldCount =
+    holeMetricBlackClipped && holeMetricLowRetained && (holeMetricLowPreTone || holeMetricLeakMarked);
+  const holeMetricReasons: string[] = [];
+  if (holeMetricBlackClipped) {
+    holeMetricReasons.push('black-clipped');
+  }
+  if (holeMetricLowRetained) {
+    holeMetricReasons.push('low-retained');
+  }
+  if (holeMetricLowPreTone) {
+    holeMetricReasons.push('low-pre-tone');
+  }
+  if (holeMetricLeakMarked) {
+    holeMetricReasons.push('leak-marked');
+  }
 
   return {
     imageId,
@@ -371,6 +628,11 @@ function readPanoDebugProbeSample(
     rawSupportSecondPeakRatio,
     rawSupportPeakSeparationMm,
     rawSupportPeakAmbiguity,
+    rawSupportScoreGap,
+    rawSupportDenseFraction,
+    rawSupportPeakHuSupportGate,
+    rawSupportDominantPeakOffsetMm,
+    rawSupportSecondaryPeakOffsetMm,
     rawSupportLocalJumpMm,
     rawSupportContinuity,
     supportFailureDisplay,
@@ -378,6 +640,25 @@ function readPanoDebugProbeSample(
     supportConfidence,
     supportSpreadMm,
     supportDensity,
+    toothBandPrior,
+    dominantDensePeakGate,
+    toothBandStructureGuard,
+    ambiguousBroadSupportPenaltyGate,
+    protectedAmbiguousBroadSupportPenaltyGate,
+    structuralSupportGate,
+    peakStructureValidity,
+    supportValidity,
+    rowConfidenceGate,
+    falseSupportConfidenceGate,
+    falseSupportDensityGate,
+    falseSupportSpreadGate,
+    falseSupportVeto,
+    rowBackgroundDensityGate,
+    rowBackgroundSpreadGate,
+    rowBackgroundPeakHuGate,
+    rowBackgroundEdgeGate,
+    rowBackgroundVeto,
+    supportVetoTriggered,
     supportLocalJumpMm,
     supportContinuity,
     supportDepthDeltaMm:
@@ -398,7 +679,11 @@ function readPanoDebugProbeSample(
         : undefined,
     nominalTroughHalfWidthMm,
     effectiveTroughHalfWidthMm,
+    continuityExpandedTroughHalfWidthMm,
     backgroundTroughNarrowGate,
+    dominantToothBandGate,
+    broadWeakToothBandGate,
+    toothContinuityAdmissionGate,
     invalidSupportBlackout,
     troughLowerMm:
       typeof supportDepthMm === 'number' && typeof troughHalfWidthMm === 'number'
@@ -411,11 +696,26 @@ function readPanoDebugProbeSample(
     lowerPenalty,
     localTransmittance,
     toneMappedValue,
+    admissionAccumulation,
+    preToneAccumulation,
+    toneSuppressedAccumulation,
+    toneStageSuppression,
+    blackClip,
+    admissionOnlyHu,
+    toneBypassHu,
+    retainedSampleMask,
+    middleBandLeak,
     participatingSampleCount,
     displayedPath: payload.probeContext?.displayedPath ?? null,
     backend: payload.probeContext?.backend ?? null,
     pipelineMode: payload.probeContext?.pipelineMode ?? null,
     reconstructionMode: payload.probeContext?.reconstructionMode ?? null,
+    holeMetricBlackClipped,
+    holeMetricLowRetained,
+    holeMetricLowPreTone,
+    holeMetricLeakMarked,
+    holeMetricWouldCount,
+    holeMetricReasons,
   };
 }
 
@@ -494,6 +794,8 @@ function installPanoDebugProbe(
   panoImageId: string
 ): void {
   clearPanoDebugProbe();
+  activePanoDebugProbeRunId = runId;
+  panoDebugProbeClicksByRun.set(runId, []);
 
   if (typeof window === 'undefined') {
     return;
@@ -554,6 +856,11 @@ function installPanoDebugProbe(
           rawSupportSecondPeakRatio: sample.rawSupportSecondPeakRatio ?? null,
           rawSupportPeakSeparationMm: sample.rawSupportPeakSeparationMm ?? null,
           rawSupportPeakAmbiguity: sample.rawSupportPeakAmbiguity ?? null,
+          rawSupportScoreGap: sample.rawSupportScoreGap ?? null,
+          rawSupportDenseFraction: sample.rawSupportDenseFraction ?? null,
+          rawSupportPeakHuSupportGate: sample.rawSupportPeakHuSupportGate ?? null,
+          rawSupportDominantPeakOffsetMm: sample.rawSupportDominantPeakOffsetMm ?? null,
+          rawSupportSecondaryPeakOffsetMm: sample.rawSupportSecondaryPeakOffsetMm ?? null,
           rawSupportLocalJumpMm: sample.rawSupportLocalJumpMm ?? null,
           rawSupportContinuity: sample.rawSupportContinuity ?? null,
           supportFailureDisplay: sample.supportFailureDisplay ?? null,
@@ -561,6 +868,26 @@ function installPanoDebugProbe(
           supportConfidence: sample.supportConfidence ?? null,
           supportSpreadMm: sample.supportSpreadMm ?? null,
           supportDensity: sample.supportDensity ?? null,
+          toothBandPrior: sample.toothBandPrior ?? null,
+          dominantDensePeakGate: sample.dominantDensePeakGate ?? null,
+          toothBandStructureGuard: sample.toothBandStructureGuard ?? null,
+          ambiguousBroadSupportPenaltyGate: sample.ambiguousBroadSupportPenaltyGate ?? null,
+          protectedAmbiguousBroadSupportPenaltyGate:
+            sample.protectedAmbiguousBroadSupportPenaltyGate ?? null,
+          structuralSupportGate: sample.structuralSupportGate ?? null,
+          peakStructureValidity: sample.peakStructureValidity ?? null,
+          supportValidity: sample.supportValidity ?? null,
+          rowConfidenceGate: sample.rowConfidenceGate ?? null,
+          falseSupportConfidenceGate: sample.falseSupportConfidenceGate ?? null,
+          falseSupportDensityGate: sample.falseSupportDensityGate ?? null,
+          falseSupportSpreadGate: sample.falseSupportSpreadGate ?? null,
+          falseSupportVeto: sample.falseSupportVeto ?? null,
+          rowBackgroundDensityGate: sample.rowBackgroundDensityGate ?? null,
+          rowBackgroundSpreadGate: sample.rowBackgroundSpreadGate ?? null,
+          rowBackgroundPeakHuGate: sample.rowBackgroundPeakHuGate ?? null,
+          rowBackgroundEdgeGate: sample.rowBackgroundEdgeGate ?? null,
+          rowBackgroundVeto: sample.rowBackgroundVeto ?? null,
+          supportVetoTriggered: sample.supportVetoTriggered ?? null,
           supportLocalJumpMm: sample.supportLocalJumpMm ?? null,
           supportContinuity: sample.supportContinuity ?? null,
           supportDepthDeltaMm: sample.supportDepthDeltaMm ?? null,
@@ -569,12 +896,28 @@ function installPanoDebugProbe(
           supportDensityDelta: sample.supportDensityDelta ?? null,
           nominalTroughHalfWidthMm: sample.nominalTroughHalfWidthMm ?? null,
           effectiveTroughHalfWidthMm: sample.effectiveTroughHalfWidthMm ?? null,
+          continuityExpandedTroughHalfWidthMm:
+            sample.continuityExpandedTroughHalfWidthMm ?? null,
           backgroundTroughNarrowGate: sample.backgroundTroughNarrowGate ?? null,
+          dominantToothBandGate: sample.dominantToothBandGate ?? null,
+          broadWeakToothBandGate: sample.broadWeakToothBandGate ?? null,
+          toothContinuityAdmissionGate: sample.toothContinuityAdmissionGate ?? null,
           invalidSupportBlackout: sample.invalidSupportBlackout ?? null,
           troughLowerMm: sample.troughLowerMm ?? null,
           troughUpperMm: sample.troughUpperMm ?? null,
           localTransmittance: sample.localTransmittance ?? null,
           toneMappedValue: sample.toneMappedValue ?? null,
+          preToneAccumulation: sample.preToneAccumulation ?? null,
+          admissionAccumulation: sample.admissionAccumulation ?? null,
+          retainedSampleMask: sample.retainedSampleMask ?? null,
+          middleBandLeak: sample.middleBandLeak ?? null,
+          blackClip: sample.blackClip ?? null,
+          holeMetricBlackClipped: sample.holeMetricBlackClipped ?? null,
+          holeMetricLowRetained: sample.holeMetricLowRetained ?? null,
+          holeMetricLowPreTone: sample.holeMetricLowPreTone ?? null,
+          holeMetricLeakMarked: sample.holeMetricLeakMarked ?? null,
+          holeMetricWouldCount: sample.holeMetricWouldCount ?? null,
+          holeMetricReasons: sample.holeMetricReasons ?? [],
           lowerPenalty: sample.lowerPenalty ?? null,
           participatingSampleCount: sample.participatingSampleCount ?? null,
         })
@@ -608,6 +951,14 @@ function installPanoDebugProbe(
       canvasY: Math.round(location.canvasY * 100) / 100,
       mappingMode: location.mappingMode,
     });
+    const clickSamples = panoDebugProbeClicksByRun.get(runId) ?? [];
+    clickSamples.push({
+      ...sample,
+      canvasX: Math.round(location.canvasX * 100) / 100,
+      canvasY: Math.round(location.canvasY * 100) / 100,
+      mappingMode: location.mappingMode,
+    });
+    panoDebugProbeClicksByRun.set(runId, clickSamples);
   };
 
   element.addEventListener('click', onClick);
@@ -647,6 +998,17 @@ interface FloatBufferDebugSummary {
   toothBandP10: number;
   toothBandP90: number;
   toothBandBrightFraction: number;
+  toothBandHoleFraction?: number;
+  toothBandBlackClipFraction?: number;
+  toothBandHolePreToneThreshold?: number;
+  toothBandRetainedWeightP10?: number;
+  toothBandRetainedWeightP50?: number;
+  toothBandRetainedWeightRowP10?: number;
+  toothBandRetainedWeightRowP50?: number;
+  toothBandRetainedWeightRowP90?: number;
+  toothBandRetainedWeightColumnP10?: number;
+  toothBandRetainedWeightColumnP50?: number;
+  toothBandRetainedWeightColumnP90?: number;
   lowerBandP50: number;
   lowerBandBrightFraction: number;
   detailBandHorizontalEdgeMean: number;
@@ -657,6 +1019,66 @@ interface FloatBufferDebugSummary {
   backgroundToneMax?: number;
   backgroundOutlierFraction05?: number;
   backgroundOutlierFraction10?: number;
+  backgroundBands?: {
+    top: FloatBufferBackgroundBandSummary;
+    middle: FloatBufferBackgroundBandSummary;
+    bottom: FloatBufferBackgroundBandSummary;
+    dominantOutlierBand05: FloatBufferBackgroundBandDominantLabel;
+    dominantOutlierBand10: FloatBufferBackgroundBandDominantLabel;
+  };
+}
+
+interface FloatBufferBackgroundBandSummary {
+  sampleCount: number;
+  backgroundToneP95: number;
+  backgroundToneP99: number;
+  backgroundToneMax: number;
+  backgroundOutlierFraction05: number;
+  backgroundOutlierFraction10: number;
+  backgroundOutlierContribution05: number;
+  backgroundOutlierContribution10: number;
+}
+
+type FloatBufferBackgroundBandName = 'top' | 'middle' | 'bottom';
+type FloatBufferBackgroundBandDominantLabel =
+  | FloatBufferBackgroundBandName
+  | 'mixed'
+  | 'none';
+
+interface ToothBandStageDiagnostics {
+  sampleCount: number;
+  retainedWeightP10: number | null;
+  retainedWeightP50: number | null;
+  retainedWeightRowP10: number | null;
+  retainedWeightRowP50: number | null;
+  retainedWeightRowP90: number | null;
+  retainedWeightColumnP10: number | null;
+  retainedWeightColumnP50: number | null;
+  retainedWeightColumnP90: number | null;
+  admissionAccumulationP10: number | null;
+  admissionAccumulationP50: number | null;
+  admissionAccumulationP90: number | null;
+  toneSuppressedAccumulationP10: number | null;
+  toneSuppressedAccumulationP50: number | null;
+  toneSuppressedAccumulationP90: number | null;
+  toneStageSuppressionP50: number | null;
+  toneStageSuppressionP90: number | null;
+  invalidSupportBlackoutP50: number | null;
+  invalidSupportBlackoutP90: number | null;
+  blackClipFraction: number | null;
+  middleBandLeakP50: number | null;
+  middleBandLeakP90: number | null;
+  admissionOnlyHuP10: number | null;
+  admissionOnlyHuP50: number | null;
+  admissionOnlyHuP90: number | null;
+  toneBypassHuP10: number | null;
+  toneBypassHuP50: number | null;
+  toneBypassHuP90: number | null;
+  finalPostToneHuP10: number | null;
+  finalPostToneHuP50: number | null;
+  finalPostToneHuP90: number | null;
+  stageHint: 'support-admission-collapse' | 'tone-blackout-destruction' | 'normalization-or-mixed';
+  stageEvidence: string[];
 }
 
 interface PanoVoiSettings {
@@ -674,6 +1096,15 @@ interface HostedPanoVoiAuthority {
 }
 
 const CPR_VTK_PANO_STARTUP_VOI_GUARD_MS = 2000;
+const CPR_TOOTH_BAND_BLACK_CLIP_THRESHOLD = 0.02;
+const CPR_TOOTH_BAND_HOLE_RETAINED_WEIGHT_MAX = 0.18;
+const CPR_TOOTH_BAND_HOLE_LEAK_MIN = 0.08;
+const CPR_TOOTH_BAND_SEVERE_HOLE_FRACTION = 0.05;
+const CPR_TOOTH_BAND_SEVERE_BLACK_CLIP_FRACTION = 0.16;
+const CPR_TOOTH_BAND_SEVERE_RETAINED_WEIGHT_P10_MAX = 0.02;
+const CPR_MIDDLE_BAND_DOMINANT_LEAK_CONTRIBUTION05_MIN = 0.68;
+const CPR_MIDDLE_BAND_DOMINANT_LEAK_CONTRIBUTION10_MIN = 0.72;
+const CPR_TARGET_TOOTH_DEBUG_LABEL = 'retry-mean-balanced-medium-root-biased-tight-slab';
 
 function formatReadablePanoValue(value: number | null | undefined, fractionDigits = 1): string {
   if (!Number.isFinite(value)) {
@@ -1196,6 +1627,10 @@ interface Phase4QualityGateMetrics {
   toothBandP10: number | null;
   toothBandP90: number | null;
   toothBandContrastRange: number | null;
+  toothBandHoleFraction: number | null;
+  toothBandBlackClipFraction: number | null;
+  toothBandRetainedWeightP10: number | null;
+  toothBandRetainedWeightP50: number | null;
   detailBandHorizontalEdgeMean: number | null;
   detailBandVerticalEdgeMean: number | null;
   supportDepthClampFraction: number | null;
@@ -1264,6 +1699,13 @@ interface Phase4SupportSurfaceRiskSummary {
     backgroundToneMax: number | null;
     backgroundOutlierFraction05: number | null;
     backgroundOutlierFraction10: number | null;
+    backgroundBands: {
+      top: FloatBufferBackgroundBandSummary;
+      middle: FloatBufferBackgroundBandSummary;
+      bottom: FloatBufferBackgroundBandSummary;
+      dominantOutlierBand05: FloatBufferBackgroundBandDominantLabel;
+      dominantOutlierBand10: FloatBufferBackgroundBandDominantLabel;
+    } | null;
   };
   anatomy: {
     lowerBandBrightFraction: number | null;
@@ -1272,6 +1714,10 @@ interface Phase4SupportSurfaceRiskSummary {
     toothBandP10: number | null;
     toothBandP90: number | null;
     toothBandContrastRange: number | null;
+    toothBandHoleFraction: number | null;
+    toothBandBlackClipFraction: number | null;
+    toothBandRetainedWeightP10: number | null;
+    toothBandRetainedWeightP50: number | null;
     fractionBelowMinus950: number | null;
     fractionAbove3000: number | null;
   };
@@ -1304,6 +1750,8 @@ interface Phase4QualityGateCandidate {
 interface Phase4DegradedPreviewAssessment {
   catastrophic: boolean;
   catastrophicReasons: string[];
+  blockedAsDegradedPreview: boolean;
+  blockedAsDegradedPreviewReasons: string[];
 }
 
 interface Phase4DisplaySelectionBreakdown {
@@ -1317,6 +1765,9 @@ interface Phase4DisplaySelectionBreakdown {
   backgroundLeakagePenalty: number;
   troughAdmissionPenalty: number;
   broadWeakSupportPenalty: number;
+  toothBandDamagePenalty: number;
+  middleBandLeakPenalty: number;
+  balancedMeanRecoveryBonus: number;
   preferredTightRootFamilyBonus: number;
   hardRejectPenalty: number;
   duplicatePenalty: number;
@@ -1330,6 +1781,10 @@ interface Phase4DisplaySelectionBreakdown {
   participatingSamplesP50: number | null;
   participatingSamplesP90: number | null;
   backgroundTroughNarrowGateP90: number | null;
+  toothBandHoleFraction: number | null;
+  toothBandBlackClipFraction: number | null;
+  toothBandRetainedWeightP10: number | null;
+  toothBandRetainedWeightP50: number | null;
   actualVertHalfMm: number;
   verticalCenterOffsetMm: number;
   slabHalfThicknessMm: number;
@@ -1345,6 +1800,121 @@ function clampPhase4DisplaySelectionUnit(value: number): number {
   }
 
   return Math.max(0, Math.min(1, value));
+}
+
+function smoothstepNumber(edge0: number, edge1: number, value: number): number {
+  if (!Number.isFinite(edge0) || !Number.isFinite(edge1) || !Number.isFinite(value)) {
+    return 0;
+  }
+
+  if (edge0 === edge1) {
+    return value >= edge1 ? 1 : 0;
+  }
+
+  const t = clampPhase4DisplaySelectionUnit((value - edge0) / (edge1 - edge0));
+  return t * t * (3 - 2 * t);
+}
+
+function hasPhase4DominantMiddleBandLeakage(
+  summary: FloatBufferDebugSummary | null | undefined
+): boolean {
+  const backgroundBands = summary?.backgroundBands;
+  if (!backgroundBands) {
+    return false;
+  }
+
+  return (
+    (backgroundBands.dominantOutlierBand05 === 'middle' &&
+      (summary?.backgroundOutlierFraction05 ?? 0) > 0.17 &&
+      backgroundBands.middle.backgroundOutlierContribution05 >=
+        CPR_MIDDLE_BAND_DOMINANT_LEAK_CONTRIBUTION05_MIN) ||
+    (backgroundBands.dominantOutlierBand10 === 'middle' &&
+      (summary?.backgroundOutlierFraction10 ?? 0) > 0.07 &&
+      backgroundBands.middle.backgroundOutlierContribution10 >=
+        CPR_MIDDLE_BAND_DOMINANT_LEAK_CONTRIBUTION10_MIN)
+  );
+}
+
+function computePhase4MiddleBandLeakPenalty(
+  summary: FloatBufferDebugSummary | null | undefined
+): number {
+  const backgroundBands = summary?.backgroundBands;
+  if (!backgroundBands) {
+    return 0;
+  }
+
+  const middleContribution05 = backgroundBands.middle.backgroundOutlierContribution05;
+  const middleContribution10 = backgroundBands.middle.backgroundOutlierContribution10;
+
+  return (
+    (backgroundBands.dominantOutlierBand05 === 'middle'
+      ? Math.max(0, middleContribution05 - 0.52) * 34
+      : Math.max(0, middleContribution05 - 0.62) * 10) +
+    (backgroundBands.dominantOutlierBand10 === 'middle'
+      ? Math.max(0, middleContribution10 - 0.45) * 40
+      : Math.max(0, middleContribution10 - 0.58) * 12)
+  );
+}
+
+function computePhase4ToothBandDamagePenalty(params: {
+  toothBandHoleFraction?: number | null;
+  toothBandBlackClipFraction?: number | null;
+  toothBandRetainedWeightP10?: number | null;
+  toothBandRetainedWeightP50?: number | null;
+}): number {
+  const toothBandHoleFraction = params.toothBandHoleFraction;
+  const toothBandBlackClipFraction = params.toothBandBlackClipFraction;
+  const toothBandRetainedWeightP10 = params.toothBandRetainedWeightP10;
+  const toothBandRetainedWeightP50 = params.toothBandRetainedWeightP50;
+
+  return (
+    Math.max(0, (toothBandHoleFraction ?? 0) - 0.018) * 260 +
+    Math.max(0, (toothBandBlackClipFraction ?? 0) - 0.12) * 120 +
+    (toothBandRetainedWeightP10 !== null && toothBandRetainedWeightP10 !== undefined
+      ? Math.max(0, 0.84 - toothBandRetainedWeightP10) * 55
+      : 0) +
+    (toothBandRetainedWeightP50 !== null && toothBandRetainedWeightP50 !== undefined
+      ? Math.max(0, 0.9 - toothBandRetainedWeightP50) * 32
+      : 0)
+  );
+}
+
+function computePhase4BalancedMeanRecoveryBonus(params: {
+  isGpuMeanAttempt: boolean;
+  summary: FloatBufferDebugSummary | null;
+  actualVertHalfMm: number;
+  verticalCenterOffsetMm: number;
+  slabHalfThicknessMm: number;
+}): number {
+  const { isGpuMeanAttempt, summary, actualVertHalfMm, verticalCenterOffsetMm, slabHalfThicknessMm } =
+    params;
+  if (!isGpuMeanAttempt || !summary || hasPhase4DominantMiddleBandLeakage(summary)) {
+    return 0;
+  }
+
+  const verticalGate = 1 - smoothstepNumber(24.2, 25.2, actualVertHalfMm);
+  const slabGate = 1 - smoothstepNumber(1.62, 1.88, slabHalfThicknessMm);
+  const centerGate = 1 - smoothstepNumber(0, 0.75, Math.abs(verticalCenterOffsetMm + 4.4));
+  const retainedGate = smoothstepNumber(0.72, 0.84, summary.toothBandRetainedWeightP10 ?? 0);
+  const holeGate = 1 - smoothstepNumber(0.05, 0.075, summary.toothBandHoleFraction ?? 0);
+  const blackClipGate =
+    1 - smoothstepNumber(0.16, 0.2, summary.toothBandBlackClipFraction ?? 0);
+  const background05Gate =
+    1 - smoothstepNumber(0.19, 0.225, summary.backgroundOutlierFraction05 ?? 0);
+  const background10Gate =
+    1 - smoothstepNumber(0.08, 0.105, summary.backgroundOutlierFraction10 ?? 0);
+
+  return (
+    verticalGate *
+    slabGate *
+    centerGate *
+    retainedGate *
+    holeGate *
+    blackClipGate *
+    background05Gate *
+    background10Gate *
+    10
+  );
 }
 
 function buildPhase4DisplaySelectionBreakdown(params: {
@@ -1373,6 +1943,10 @@ function buildPhase4DisplaySelectionBreakdown(params: {
   const participatingSamplesP50 = params.metrics.participatingSamplesP50;
   const participatingSamplesP90 = params.metrics.participatingSamplesP90;
   const backgroundTroughNarrowGateP90 = params.metrics.backgroundTroughNarrowGateP90;
+  const toothBandHoleFraction = params.metrics.toothBandHoleFraction;
+  const toothBandBlackClipFraction = params.metrics.toothBandBlackClipFraction;
+  const toothBandRetainedWeightP10 = params.metrics.toothBandRetainedWeightP10;
+  const toothBandRetainedWeightP50 = params.metrics.toothBandRetainedWeightP50;
   const isGpuMeanAttempt =
     params.requestedBackend === 'gpu' &&
     params.resolvedBackend === 'gpu' &&
@@ -1409,6 +1983,20 @@ function buildPhase4DisplaySelectionBreakdown(params: {
         Math.max(0, params.actualVertHalfMm - 15.2) * 1.4 +
         Math.max(0, params.verticalCenterOffsetMm + 4.5) * 0.65
       : 0;
+  const toothBandDamagePenalty = computePhase4ToothBandDamagePenalty({
+    toothBandHoleFraction,
+    toothBandBlackClipFraction,
+    toothBandRetainedWeightP10,
+    toothBandRetainedWeightP50,
+  });
+  const middleBandLeakPenalty = computePhase4MiddleBandLeakPenalty(params.summary);
+  const balancedMeanRecoveryBonus = computePhase4BalancedMeanRecoveryBonus({
+    isGpuMeanAttempt,
+    summary: params.summary,
+    actualVertHalfMm: params.actualVertHalfMm,
+    verticalCenterOffsetMm: params.verticalCenterOffsetMm,
+    slabHalfThicknessMm: params.slabHalfThicknessMm,
+  });
   const preferredTightRootFamilyBonus = preferredTightRootFamily
     ? clampPhase4DisplaySelectionUnit((-params.verticalCenterOffsetMm - 4.8) / 2.8) * 2.5 +
       clampPhase4DisplaySelectionUnit((15.2 - params.actualVertHalfMm) / 2.8) * 1.2 +
@@ -1421,10 +2009,13 @@ function buildPhase4DisplaySelectionBreakdown(params: {
     legacyQualityScoreComponent +
     supportConfidenceReward +
     supportPathConfidenceReward +
+    balancedMeanRecoveryBonus +
     preferredTightRootFamilyBonus -
     backgroundLeakagePenalty -
     troughAdmissionPenalty -
     broadWeakSupportPenalty -
+    toothBandDamagePenalty -
+    middleBandLeakPenalty -
     hardRejectPenalty -
     duplicatePenalty;
 
@@ -1439,6 +2030,9 @@ function buildPhase4DisplaySelectionBreakdown(params: {
     backgroundLeakagePenalty,
     troughAdmissionPenalty,
     broadWeakSupportPenalty,
+    toothBandDamagePenalty,
+    middleBandLeakPenalty,
+    balancedMeanRecoveryBonus,
     preferredTightRootFamilyBonus,
     hardRejectPenalty,
     duplicatePenalty,
@@ -1452,6 +2046,10 @@ function buildPhase4DisplaySelectionBreakdown(params: {
     participatingSamplesP50,
     participatingSamplesP90,
     backgroundTroughNarrowGateP90,
+    toothBandHoleFraction,
+    toothBandBlackClipFraction,
+    toothBandRetainedWeightP10,
+    toothBandRetainedWeightP50,
     actualVertHalfMm: params.actualVertHalfMm,
     verticalCenterOffsetMm: params.verticalCenterOffsetMm,
     slabHalfThicknessMm: params.slabHalfThicknessMm,
@@ -1490,12 +2088,30 @@ function isMateriallyCleanerPhase4DisplayCandidate(
     a.participatingSamplesP50 !== null &&
     b.participatingSamplesP50 !== null &&
     a.participatingSamplesP50 <= b.participatingSamplesP50 - 0.25;
+  const toothHoleImproved =
+    a.toothBandHoleFraction !== null &&
+    b.toothBandHoleFraction !== null &&
+    a.toothBandHoleFraction <= b.toothBandHoleFraction - 0.015;
+  const toothBlackClipImproved =
+    a.toothBandBlackClipFraction !== null &&
+    b.toothBandBlackClipFraction !== null &&
+    a.toothBandBlackClipFraction <= b.toothBandBlackClipFraction - 0.06;
+  const toothRetainedP50Improved =
+    a.toothBandRetainedWeightP50 !== null &&
+    b.toothBandRetainedWeightP50 !== null &&
+    a.toothBandRetainedWeightP50 >= b.toothBandRetainedWeightP50 + 0.08;
+  const toothRetainedP10Improved =
+    a.toothBandRetainedWeightP10 !== null &&
+    b.toothBandRetainedWeightP10 !== null &&
+    a.toothBandRetainedWeightP10 >= b.toothBandRetainedWeightP10 + 0.05;
 
   return (
-    supportImproved &&
-    background05Improved &&
-    background10Improved &&
-    (troughImproved || sampleAdmissionImproved)
+    (supportImproved &&
+      background05Improved &&
+      background10Improved &&
+      (troughImproved || sampleAdmissionImproved)) ||
+    (toothHoleImproved &&
+      (toothBlackClipImproved || toothRetainedP50Improved || toothRetainedP10Improved))
   );
 }
 
@@ -1609,6 +2225,31 @@ function compareRankedPanoOutputs(
   if (aRiskRank !== bRiskRank) {
     return aRiskRank - bRiskRank;
   }
+  const aRiskScore = a.supportSurfaceRiskSummary?.riskScore ?? 0;
+  const bRiskScore = b.supportSurfaceRiskSummary?.riskScore ?? 0;
+  if (aRiskScore !== bRiskScore) {
+    return aRiskScore - bRiskScore;
+  }
+  const aToothBandDamagePenalty = computePhase4ToothBandDamagePenalty({
+    toothBandHoleFraction: a.qualityGateMetrics?.toothBandHoleFraction,
+    toothBandBlackClipFraction: a.qualityGateMetrics?.toothBandBlackClipFraction,
+    toothBandRetainedWeightP10: a.qualityGateMetrics?.toothBandRetainedWeightP10,
+    toothBandRetainedWeightP50: a.qualityGateMetrics?.toothBandRetainedWeightP50,
+  });
+  const bToothBandDamagePenalty = computePhase4ToothBandDamagePenalty({
+    toothBandHoleFraction: b.qualityGateMetrics?.toothBandHoleFraction,
+    toothBandBlackClipFraction: b.qualityGateMetrics?.toothBandBlackClipFraction,
+    toothBandRetainedWeightP10: b.qualityGateMetrics?.toothBandRetainedWeightP10,
+    toothBandRetainedWeightP50: b.qualityGateMetrics?.toothBandRetainedWeightP50,
+  });
+  if (Math.abs(aToothBandDamagePenalty - bToothBandDamagePenalty) > 0.35) {
+    return aToothBandDamagePenalty - bToothBandDamagePenalty;
+  }
+  const aMiddleBandLeakPenalty = computePhase4MiddleBandLeakPenalty(a.summary);
+  const bMiddleBandLeakPenalty = computePhase4MiddleBandLeakPenalty(b.summary);
+  if (Math.abs(aMiddleBandLeakPenalty - bMiddleBandLeakPenalty) > 0.5) {
+    return aMiddleBandLeakPenalty - bMiddleBandLeakPenalty;
+  }
   return b.qualityScore - a.qualityScore || b.qualityBase - a.qualityBase;
 }
 
@@ -1675,6 +2316,10 @@ function extractPhase4QualityGateMetrics(
     toothBandP90: summary?.toothBandP90 ?? null,
     toothBandContrastRange:
       summary ? summary.toothBandP90 - summary.toothBandP10 : readPhase4DiagnosticNumber(virtualPanoRender?.toothBandContrastRange),
+    toothBandHoleFraction: summary?.toothBandHoleFraction ?? null,
+    toothBandBlackClipFraction: summary?.toothBandBlackClipFraction ?? null,
+    toothBandRetainedWeightP10: summary?.toothBandRetainedWeightP10 ?? null,
+    toothBandRetainedWeightP50: summary?.toothBandRetainedWeightP50 ?? null,
     detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean ?? null,
     detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean ?? null,
     supportDepthClampFraction:
@@ -1789,6 +2434,26 @@ function buildPhase4QualityGateCandidate(params: {
         ? 'worker-cpu-virtual-pano'
         : 'worker-legacy';
   const isDualArchProjection = isDualArchProjectionRenderMode(metrics.renderSupportMode);
+  const gpuConfidenceStructurallyStable =
+    candidateSource === 'worker-gpu-support-surface' &&
+    (metrics.supportPathConfidenceP50 ?? 0) >= 0.68 &&
+    (metrics.supportUnstableColumnFraction ?? Number.POSITIVE_INFINITY) <= 0.06 &&
+    (metrics.supportLongestUnstableRunColumns ?? Number.POSITIVE_INFINITY) <= 4;
+  const severeGpuToothBandHoles =
+    candidateSource === 'worker-gpu-support-surface' &&
+    metrics.toothBandHoleFraction !== null &&
+    metrics.toothBandHoleFraction > CPR_TOOTH_BAND_SEVERE_HOLE_FRACTION;
+  const severeGpuToothBandBlackClip =
+    candidateSource === 'worker-gpu-support-surface' &&
+    metrics.toothBandBlackClipFraction !== null &&
+    metrics.toothBandBlackClipFraction > CPR_TOOTH_BAND_SEVERE_BLACK_CLIP_FRACTION;
+  const severeGpuToothBandRetentionCollapse =
+    candidateSource === 'worker-gpu-support-surface' &&
+    metrics.toothBandRetainedWeightP10 !== null &&
+    metrics.toothBandRetainedWeightP10 <= CPR_TOOTH_BAND_SEVERE_RETAINED_WEIGHT_P10_MAX;
+  const dominantGpuMiddleBandLeakage =
+    candidateSource === 'worker-gpu-support-surface' &&
+    hasPhase4DominantMiddleBandLeakage(params.summary);
 
   const rejectReasons: string[] = [];
   if (!params.summary || params.summary.sampledCount < 100) {
@@ -1833,7 +2498,8 @@ function buildPhase4QualityGateCandidate(params: {
   }
   if (
     candidateSource === 'worker-gpu-support-surface' &&
-    ((metrics.supportConfidenceP50 !== null && metrics.supportConfidenceP50 < 0.09) ||
+    (((metrics.supportConfidenceP50 !== null && metrics.supportConfidenceP50 < 0.09) &&
+      !gpuConfidenceStructurallyStable) ||
       (metrics.supportPathConfidenceP50 !== null && metrics.supportPathConfidenceP50 < 0.15))
   ) {
     rejectReasons.push('support-confidence-too-low');
@@ -1845,6 +2511,18 @@ function buildPhase4QualityGateCandidate(params: {
         (params.summary?.backgroundOutlierFraction10 ?? 0) > 0.09))
   ) {
     rejectReasons.push('background-outlier-fraction-too-high');
+  }
+  if (severeGpuToothBandHoles) {
+    rejectReasons.push('tooth-band-hole-fraction-too-high');
+  }
+  if (severeGpuToothBandBlackClip) {
+    rejectReasons.push('tooth-band-black-clip-too-high');
+  }
+  if (severeGpuToothBandRetentionCollapse) {
+    rejectReasons.push('tooth-band-retained-weight-collapsed');
+  }
+  if (dominantGpuMiddleBandLeakage) {
+    rejectReasons.push('middle-band-leakage-dominant');
   }
   if (
     candidateSource === 'worker-gpu-support-surface' &&
@@ -1896,6 +2574,10 @@ function buildPhase4QualityGateCandidate(params: {
   const lowerBandOnlyRejects =
     uniqueRejectReasons.length > 0 &&
     uniqueRejectReasons.every(reason => isPhase4LowerBandRejectReason(reason));
+  const severeCpuLowerBandContamination =
+    candidateSource === 'worker-cpu-virtual-pano' &&
+    ((metrics.lowerBandBrightFraction ?? 0) > 0.38 ||
+      (metrics.lowerBandP50 ?? Number.POSITIVE_INFINITY) > -80);
   const ambiguityOnlyRejects =
     uniqueRejectReasons.length > 0 &&
     uniqueRejectReasons.every(reason => reason === 'virtual-support-ambiguity-too-high');
@@ -1915,6 +2597,7 @@ function buildPhase4QualityGateCandidate(params: {
     workerAcceptedByLowerBandTolerance
       ? 'lower-band-tolerated-in-worker'
       : lowerBandOnlyRejects &&
+          !severeCpuLowerBandContamination &&
           (params.qualityScore ?? Number.NEGATIVE_INFINITY) >= 12 &&
           (metrics.toothBandContrastRange ?? 0) >= 150
         ? 'lower-band-only-borderline'
@@ -1996,10 +2679,19 @@ function buildPhase4SupportSurfaceRiskSummary(params: {
   const usesLegacySupportPathRiskModel =
     params.candidateSource !== 'worker-cpu-arch-guided-synthetic';
   const isDualArchProjection = isDualArchProjectionRenderMode(params.metrics.renderSupportMode);
+  const gpuConfidenceStructurallyStable =
+    params.candidateSource === 'worker-gpu-support-surface' &&
+    (params.metrics.supportPathConfidenceP50 ?? 0) >= 0.68 &&
+    (params.metrics.supportUnstableColumnFraction ?? Number.POSITIVE_INFINITY) <= 0.06 &&
+    (params.metrics.supportLongestUnstableRunColumns ?? Number.POSITIVE_INFINITY) <= 4;
   const backgroundOutlierFraction05 = params.summary?.backgroundOutlierFraction05 ?? null;
   const backgroundOutlierFraction10 = params.summary?.backgroundOutlierFraction10 ?? null;
   const detailBandHorizontalEdgeMean = params.summary?.detailBandHorizontalEdgeMean ?? null;
   const detailBandVerticalEdgeMean = params.summary?.detailBandVerticalEdgeMean ?? null;
+  const toothBandHoleFraction = params.metrics.toothBandHoleFraction;
+  const toothBandBlackClipFraction = params.metrics.toothBandBlackClipFraction;
+  const toothBandRetainedWeightP10 = params.metrics.toothBandRetainedWeightP10;
+  const toothBandRetainedWeightP50 = params.metrics.toothBandRetainedWeightP50;
   const addRiskFlag = (flag: string, condition: boolean, weight = 1): void => {
     if (!condition) {
       return;
@@ -2011,6 +2703,7 @@ function buildPhase4SupportSurfaceRiskSummary(params: {
   addRiskFlag(
     'support-confidence-low',
     usesLegacySupportPathRiskModel &&
+      !gpuConfidenceStructurallyStable &&
       ((params.metrics.supportConfidenceP50 !== null && params.metrics.supportConfidenceP50 < 0.12) ||
         (params.metrics.supportConfidenceP10 !== null && params.metrics.supportConfidenceP10 < 0.04)),
     3
@@ -2096,6 +2789,35 @@ function buildPhase4SupportSurfaceRiskSummary(params: {
     1
   );
   addRiskFlag(
+    'tooth-band-holes',
+    toothBandHoleFraction !== null && toothBandHoleFraction > 0.028,
+    4
+  );
+  addRiskFlag(
+    'tooth-band-black-clipped',
+    toothBandBlackClipFraction !== null &&
+      toothBandBlackClipFraction > CPR_TOOTH_BAND_SEVERE_BLACK_CLIP_FRACTION,
+    3
+  );
+  addRiskFlag(
+    'tooth-band-retention-low',
+    (toothBandRetainedWeightP10 !== null &&
+      toothBandRetainedWeightP10 < CPR_TOOTH_BAND_HOLE_RETAINED_WEIGHT_MAX) ||
+      (toothBandRetainedWeightP50 !== null && toothBandRetainedWeightP50 < 0.42),
+    2
+  );
+  addRiskFlag(
+    'tooth-band-retention-collapsed',
+    toothBandRetainedWeightP10 !== null &&
+      toothBandRetainedWeightP10 <= CPR_TOOTH_BAND_SEVERE_RETAINED_WEIGHT_P10_MAX,
+    5
+  );
+  addRiskFlag(
+    'middle-band-leakage-dominant',
+    hasPhase4DominantMiddleBandLeakage(params.summary),
+    3
+  );
+  addRiskFlag(
     'air-suppression-weak',
     params.metrics.fractionBelowMinus950 !== null &&
       params.metrics.fractionBelowMinus950 < (isDualArchProjection ? 0.005 : 0.015),
@@ -2146,9 +2868,23 @@ function buildPhase4SupportSurfaceRiskSummary(params: {
     `blackClip=${formatPhase4FingerprintValue(params.metrics.blackClipFraction, 4)}`,
     `bgOutlier05=${formatPhase4FingerprintValue(params.summary?.backgroundOutlierFraction05, 4)}`,
     `bgOutlier10=${formatPhase4FingerprintValue(params.summary?.backgroundOutlierFraction10, 4)}`,
+    `bgBand05=${params.summary?.backgroundBands?.dominantOutlierBand05 ?? 'none'}`,
+    `bgBand10=${params.summary?.backgroundBands?.dominantOutlierBand10 ?? 'none'}`,
+    `bgMid05=${formatPhase4FingerprintValue(
+      params.summary?.backgroundBands?.middle.backgroundOutlierContribution05,
+      4
+    )}`,
+    `bgMid10=${formatPhase4FingerprintValue(
+      params.summary?.backgroundBands?.middle.backgroundOutlierContribution10,
+      4
+    )}`,
     `lowerBandBright=${formatPhase4FingerprintValue(params.metrics.lowerBandBrightFraction, 4)}`,
     `lowerBandP50=${formatPhase4FingerprintValue(params.metrics.lowerBandP50)}`,
     `toothContrast=${formatPhase4FingerprintValue(params.metrics.toothBandContrastRange)}`,
+    `toothHole=${formatPhase4FingerprintValue(toothBandHoleFraction, 4)}`,
+    `toothBlackClip=${formatPhase4FingerprintValue(toothBandBlackClipFraction, 4)}`,
+    `toothRetainedP10=${formatPhase4FingerprintValue(toothBandRetainedWeightP10, 4)}`,
+    `toothRetainedP50=${formatPhase4FingerprintValue(toothBandRetainedWeightP50, 4)}`,
     `flags=${riskFlags.length ? riskFlags.join(',') : 'none'}`,
   ].join('|');
 
@@ -2181,6 +2917,7 @@ function buildPhase4SupportSurfaceRiskSummary(params: {
       backgroundToneMax: params.summary?.backgroundToneMax ?? null,
       backgroundOutlierFraction05: params.summary?.backgroundOutlierFraction05 ?? null,
       backgroundOutlierFraction10: params.summary?.backgroundOutlierFraction10 ?? null,
+      backgroundBands: params.summary?.backgroundBands ?? null,
     },
     anatomy: {
       lowerBandBrightFraction: params.metrics.lowerBandBrightFraction,
@@ -2189,6 +2926,10 @@ function buildPhase4SupportSurfaceRiskSummary(params: {
       toothBandP10: params.metrics.toothBandP10,
       toothBandP90: params.metrics.toothBandP90,
       toothBandContrastRange: params.metrics.toothBandContrastRange,
+      toothBandHoleFraction,
+      toothBandBlackClipFraction,
+      toothBandRetainedWeightP10,
+      toothBandRetainedWeightP50,
       fractionBelowMinus950: params.metrics.fractionBelowMinus950,
       fractionAbove3000: params.metrics.fractionAbove3000,
     },
@@ -2225,6 +2966,53 @@ function summarizePhase4QualityGateCandidate(candidate: Phase4QualityGateCandida
   };
 }
 
+function collectPhase4DegradedPreviewBlockedReasons(
+  candidate: Phase4QualityGateCandidate | null
+): string[] {
+  if (!candidate) {
+    return ['candidate-missing'];
+  }
+
+  const blockedReasons: string[] = [];
+  for (const rejectReason of candidate.rejectReasons) {
+    if (
+      rejectReason === 'tooth-band-hole-fraction-too-high' ||
+      rejectReason === 'tooth-band-black-clip-too-high' ||
+      rejectReason === 'tooth-band-retained-weight-collapsed' ||
+      rejectReason === 'middle-band-leakage-dominant'
+    ) {
+      blockedReasons.push(rejectReason);
+    }
+  }
+
+  if (
+    candidate.metrics.toothBandHoleFraction !== null &&
+    candidate.metrics.toothBandHoleFraction > CPR_TOOTH_BAND_SEVERE_HOLE_FRACTION
+  ) {
+    blockedReasons.push('tooth-band-hole-fraction-too-high');
+  }
+  if (
+    candidate.metrics.toothBandBlackClipFraction !== null &&
+    candidate.metrics.toothBandBlackClipFraction > CPR_TOOTH_BAND_SEVERE_BLACK_CLIP_FRACTION
+  ) {
+    blockedReasons.push('tooth-band-black-clip-too-high');
+  }
+  if (
+    candidate.metrics.toothBandRetainedWeightP10 !== null &&
+    candidate.metrics.toothBandRetainedWeightP10 <= CPR_TOOTH_BAND_SEVERE_RETAINED_WEIGHT_P10_MAX
+  ) {
+    blockedReasons.push('tooth-band-retained-weight-collapsed');
+  }
+  if (
+    candidate.supportSurfaceRiskSummary.riskFlags.includes('middle-band-leakage-dominant') ||
+    candidate.rejectReasons.includes('middle-band-leakage-dominant')
+  ) {
+    blockedReasons.push('middle-band-leakage-dominant');
+  }
+
+  return Array.from(new Set(blockedReasons));
+}
+
 function assessPhase4DegradedPreviewCandidate(
   candidate: Phase4QualityGateCandidate | null
 ): Phase4DegradedPreviewAssessment {
@@ -2232,10 +3020,13 @@ function assessPhase4DegradedPreviewCandidate(
     return {
       catastrophic: true,
       catastrophicReasons: ['candidate-missing'],
+      blockedAsDegradedPreview: true,
+      blockedAsDegradedPreviewReasons: ['candidate-missing'],
     };
   }
 
   const catastrophicReasons: string[] = [];
+  const blockedAsDegradedPreviewReasons = collectPhase4DegradedPreviewBlockedReasons(candidate);
   const nonLowerBandWorkerRejectReasons = candidate.workerRejectReasons.filter(
     reason => !isPhase4LowerBandRejectReason(reason)
   );
@@ -2288,6 +3079,8 @@ function assessPhase4DegradedPreviewCandidate(
   return {
     catastrophic: catastrophicReasons.length > 0,
     catastrophicReasons: Array.from(new Set(catastrophicReasons)),
+    blockedAsDegradedPreview: blockedAsDegradedPreviewReasons.length > 0,
+    blockedAsDegradedPreviewReasons,
   };
 }
 
@@ -2359,10 +3152,38 @@ function summarizeFloatBufferForDebug(
   const supportConfidenceMap = debugMaps?.supportConfidenceMap;
   const lowerPenaltyMap = debugMaps?.lowerPenaltyMap;
   const participatingSampleCountMap = debugMaps?.participatingSampleCountMap;
+  const preToneAccumulationMap = debugMaps?.preToneAccumulationMap;
+  const retainedSampleMaskMap = debugMaps?.retainedSampleMaskMap;
+  const middleBandLeakMap = debugMaps?.middleBandLeakMap;
   const backgroundToneSamples: number[] = [];
   let backgroundToneOutlierCount05 = 0;
   let backgroundToneOutlierCount10 = 0;
   let backgroundToneMax = 0;
+  const toothBandPreToneAccumulationSamples: number[] = [];
+  const toothBandRetainedWeightSamples: number[] = [];
+  const toothBandToneResponseSamples: number[] = [];
+  const toothBandLeakSamples: number[] = [];
+  let toothBandRetainedWeightRowValues: number[] = [];
+  let toothBandRetainedWeightColumnValues: number[] = [];
+  const toothBandHoleSignals: Array<{
+    preToneAccumulation: number;
+    retainedWeight: number;
+    toneResponse: number;
+    middleBandLeak: number;
+  }> = [];
+  const backgroundBandBuckets: Record<
+    FloatBufferBackgroundBandName,
+    {
+      samples: number[];
+      outlierCount05: number;
+      outlierCount10: number;
+      toneMax: number;
+    }
+  > = {
+    top: { samples: [], outlierCount05: 0, outlierCount10: 0, toneMax: 0 },
+    middle: { samples: [], outlierCount05: 0, outlierCount10: 0, toneMax: 0 },
+    bottom: { samples: [], outlierCount05: 0, outlierCount10: 0, toneMax: 0 },
+  };
 
   for (let i = 0; i < buffer.length; i += step) {
     const value = Number(buffer[i]);
@@ -2415,6 +3236,16 @@ function summarizeFloatBufferForDebug(
     const lowerBandEndRow = Math.max(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
     const detailBandStartRow = Math.max(0, Math.floor(safeHeight * 0.12));
     const detailBandEndRow = Math.min(safeHeight - 1, Math.ceil(safeHeight * 0.72));
+    const toothBandRowRetainedWeightSums = retainedSampleMaskMap ? new Float32Array(safeHeight) : null;
+    const toothBandRowRetainedWeightCounts = retainedSampleMaskMap
+      ? new Float32Array(safeHeight)
+      : null;
+    const toothBandColumnRetainedWeightSums = retainedSampleMaskMap
+      ? new Float32Array(safeWidth)
+      : null;
+    const toothBandColumnRetainedWeightCounts = retainedSampleMaskMap
+      ? new Float32Array(safeWidth)
+      : null;
     const canSampleBackgroundTone = !!toneResponseMap && !!supportConfidenceMap;
     const backgroundSupportConfidenceMax = 0.03;
     const backgroundLowerPenaltyMax = 0.05;
@@ -2445,6 +3276,48 @@ function summarizeFloatBufferForDebug(
           toothBandSum += value;
           if (value > 1200) {
             toothBandBrightCount++;
+          }
+          const toneResponse = readOptionalProbeMapValue(toneResponseMap, index);
+          if (toneResponse !== undefined) {
+            const clampedToneResponse = Math.max(0, Math.min(1, toneResponse));
+            toothBandToneResponseSamples.push(clampedToneResponse);
+            const preToneAccumulation =
+              readOptionalProbeMapValue(preToneAccumulationMap, index) ?? undefined;
+            const retainedWeight = readOptionalProbeMapValue(retainedSampleMaskMap, index) ?? undefined;
+            const middleBandLeak = readOptionalProbeMapValue(middleBandLeakMap, index) ?? undefined;
+            if (preToneAccumulation !== undefined) {
+              toothBandPreToneAccumulationSamples.push(Math.max(0, preToneAccumulation));
+            }
+            if (retainedWeight !== undefined) {
+              const clampedRetainedWeight = Math.max(0, Math.min(1, retainedWeight));
+              toothBandRetainedWeightSamples.push(clampedRetainedWeight);
+              if (
+                toothBandRowRetainedWeightSums &&
+                toothBandRowRetainedWeightCounts &&
+                toothBandColumnRetainedWeightSums &&
+                toothBandColumnRetainedWeightCounts
+              ) {
+                toothBandRowRetainedWeightSums[row] += clampedRetainedWeight;
+                toothBandRowRetainedWeightCounts[row] += 1;
+                toothBandColumnRetainedWeightSums[col] += clampedRetainedWeight;
+                toothBandColumnRetainedWeightCounts[col] += 1;
+              }
+            }
+            if (middleBandLeak !== undefined) {
+              toothBandLeakSamples.push(Math.max(0, Math.min(1, middleBandLeak)));
+            }
+            if (
+              preToneAccumulation !== undefined &&
+              retainedWeight !== undefined &&
+              middleBandLeak !== undefined
+            ) {
+              toothBandHoleSignals.push({
+                preToneAccumulation: Math.max(0, preToneAccumulation),
+                retainedWeight: Math.max(0, Math.min(1, retainedWeight)),
+                toneResponse: clampedToneResponse,
+                middleBandLeak: Math.max(0, Math.min(1, middleBandLeak)),
+              });
+            }
           }
         }
 
@@ -2490,10 +3363,45 @@ function summarizeFloatBufferForDebug(
               if (clampedTone > backgroundToneMax) {
                 backgroundToneMax = clampedTone;
               }
+              const backgroundBandName: FloatBufferBackgroundBandName =
+                row < toothBandStartRow ? 'top' : row > toothBandEndRow ? 'bottom' : 'middle';
+              const backgroundBandBucket = backgroundBandBuckets[backgroundBandName];
+              backgroundBandBucket.samples.push(clampedTone);
+              if (clampedTone > backgroundToneOutlierThreshold05) {
+                backgroundBandBucket.outlierCount05++;
+              }
+              if (clampedTone > backgroundToneOutlierThreshold10) {
+                backgroundBandBucket.outlierCount10++;
+              }
+              if (clampedTone > backgroundBandBucket.toneMax) {
+                backgroundBandBucket.toneMax = clampedTone;
+              }
             }
           }
         }
       }
+    }
+
+    if (
+      toothBandRowRetainedWeightSums &&
+      toothBandRowRetainedWeightCounts &&
+      toothBandColumnRetainedWeightSums &&
+      toothBandColumnRetainedWeightCounts
+    ) {
+      toothBandRetainedWeightRowValues = Array.from(
+        toothBandRowRetainedWeightSums,
+        (sum, row) =>
+          toothBandRowRetainedWeightCounts[row] > 0
+            ? sum / Math.max(toothBandRowRetainedWeightCounts[row], 1)
+            : Number.NaN
+      ).filter(value => Number.isFinite(value));
+      toothBandRetainedWeightColumnValues = Array.from(
+        toothBandColumnRetainedWeightSums,
+        (sum, col) =>
+          toothBandColumnRetainedWeightCounts[col] > 0
+            ? sum / Math.max(toothBandColumnRetainedWeightCounts[col], 1)
+            : Number.NaN
+      ).filter(value => Number.isFinite(value));
     }
   }
 
@@ -2511,7 +3419,107 @@ function summarizeFloatBufferForDebug(
   if (backgroundToneSamples.length) {
     backgroundToneSamples.sort((a, b) => a - b);
   }
+  if (toothBandPreToneAccumulationSamples.length) {
+    toothBandPreToneAccumulationSamples.sort((a, b) => a - b);
+  }
+  if (toothBandRetainedWeightSamples.length) {
+    toothBandRetainedWeightSamples.sort((a, b) => a - b);
+  }
+  if (toothBandToneResponseSamples.length) {
+    toothBandToneResponseSamples.sort((a, b) => a - b);
+  }
+  if (toothBandLeakSamples.length) {
+    toothBandLeakSamples.sort((a, b) => a - b);
+  }
+  if (toothBandRetainedWeightRowValues.length) {
+    toothBandRetainedWeightRowValues.sort((a, b) => a - b);
+  }
+  if (toothBandRetainedWeightColumnValues.length) {
+    toothBandRetainedWeightColumnValues.sort((a, b) => a - b);
+  }
+  const backgroundBandOrder: FloatBufferBackgroundBandName[] = ['top', 'middle', 'bottom'];
+  for (const bandName of backgroundBandOrder) {
+    backgroundBandBuckets[bandName].samples.sort((a, b) => a - b);
+  }
   const sampledCount = samples.length;
+  const buildBackgroundBandSummary = (
+    bandName: FloatBufferBackgroundBandName
+  ): FloatBufferBackgroundBandSummary => {
+    const bandBucket = backgroundBandBuckets[bandName];
+    return {
+      sampleCount: bandBucket.samples.length,
+      backgroundToneP95: bandBucket.samples.length
+        ? percentileFromSorted(bandBucket.samples, 0.95)
+        : 0,
+      backgroundToneP99: bandBucket.samples.length
+        ? percentileFromSorted(bandBucket.samples, 0.99)
+        : 0,
+      backgroundToneMax: bandBucket.toneMax,
+      backgroundOutlierFraction05: bandBucket.samples.length
+        ? bandBucket.outlierCount05 / bandBucket.samples.length
+        : 0,
+      backgroundOutlierFraction10: bandBucket.samples.length
+        ? bandBucket.outlierCount10 / bandBucket.samples.length
+        : 0,
+      backgroundOutlierContribution05:
+        backgroundToneOutlierCount05 > 0
+          ? bandBucket.outlierCount05 / backgroundToneOutlierCount05
+          : 0,
+      backgroundOutlierContribution10:
+        backgroundToneOutlierCount10 > 0
+          ? bandBucket.outlierCount10 / backgroundToneOutlierCount10
+          : 0,
+    };
+  };
+  const determineDominantBackgroundBand = (
+    outlierKey: 'outlierCount05' | 'outlierCount10'
+  ): FloatBufferBackgroundBandDominantLabel => {
+    const rankedBands = backgroundBandOrder
+      .map(bandName => ({
+        bandName,
+        count: backgroundBandBuckets[bandName][outlierKey],
+      }))
+      .sort((a, b) => b.count - a.count);
+    if (!rankedBands.length || rankedBands[0].count <= 0) {
+      return 'none';
+    }
+    if (rankedBands[1]?.count && rankedBands[0].count <= rankedBands[1].count * 1.15) {
+      return 'mixed';
+    }
+    return rankedBands[0].bandName;
+  };
+  const backgroundBands = {
+    top: buildBackgroundBandSummary('top'),
+    middle: buildBackgroundBandSummary('middle'),
+    bottom: buildBackgroundBandSummary('bottom'),
+    dominantOutlierBand05: determineDominantBackgroundBand('outlierCount05'),
+    dominantOutlierBand10: determineDominantBackgroundBand('outlierCount10'),
+  };
+  const toothBandBlackClipFraction = toothBandToneResponseSamples.length
+    ? toothBandToneResponseSamples.filter(
+        toneResponse => toneResponse <= CPR_TOOTH_BAND_BLACK_CLIP_THRESHOLD
+      ).length / toothBandToneResponseSamples.length
+    : undefined;
+  let toothBandHoleFraction: number | undefined;
+  let toothBandHolePreToneThreshold: number | undefined;
+  if (toothBandHoleSignals.length && toothBandPreToneAccumulationSamples.length) {
+    toothBandHolePreToneThreshold = Math.max(
+      0.012,
+      percentileFromSorted(toothBandPreToneAccumulationSamples, 0.15) * 1.2
+    );
+    let toothBandHoleCount = 0;
+    for (const signal of toothBandHoleSignals) {
+      const blackClipped = signal.toneResponse <= CPR_TOOTH_BAND_BLACK_CLIP_THRESHOLD;
+      const lowRetained =
+        signal.retainedWeight <= CPR_TOOTH_BAND_HOLE_RETAINED_WEIGHT_MAX;
+      const lowPreTone = signal.preToneAccumulation <= toothBandHolePreToneThreshold;
+      const leakMarked = signal.middleBandLeak >= CPR_TOOTH_BAND_HOLE_LEAK_MIN;
+      if (blackClipped && lowRetained && (lowPreTone || leakMarked)) {
+        toothBandHoleCount++;
+      }
+    }
+    toothBandHoleFraction = toothBandHoleCount / toothBandHoleSignals.length;
+  }
 
   return {
     sampledCount,
@@ -2527,6 +3535,33 @@ function summarizeFloatBufferForDebug(
     toothBandP10: toothBandSamples.length ? percentileFromSorted(toothBandSamples, 0.1) : 0,
     toothBandP90: toothBandSamples.length ? percentileFromSorted(toothBandSamples, 0.9) : 0,
     toothBandBrightFraction: toothBandCount > 0 ? toothBandBrightCount / toothBandCount : 0,
+    toothBandHoleFraction,
+    toothBandBlackClipFraction,
+    toothBandHolePreToneThreshold,
+    toothBandRetainedWeightP10: toothBandRetainedWeightSamples.length
+      ? percentileFromSorted(toothBandRetainedWeightSamples, 0.1)
+      : undefined,
+    toothBandRetainedWeightP50: toothBandRetainedWeightSamples.length
+      ? percentileFromSorted(toothBandRetainedWeightSamples, 0.5)
+      : undefined,
+    toothBandRetainedWeightRowP10: toothBandRetainedWeightRowValues.length
+      ? percentileFromSorted(toothBandRetainedWeightRowValues, 0.1)
+      : undefined,
+    toothBandRetainedWeightRowP50: toothBandRetainedWeightRowValues.length
+      ? percentileFromSorted(toothBandRetainedWeightRowValues, 0.5)
+      : undefined,
+    toothBandRetainedWeightRowP90: toothBandRetainedWeightRowValues.length
+      ? percentileFromSorted(toothBandRetainedWeightRowValues, 0.9)
+      : undefined,
+    toothBandRetainedWeightColumnP10: toothBandRetainedWeightColumnValues.length
+      ? percentileFromSorted(toothBandRetainedWeightColumnValues, 0.1)
+      : undefined,
+    toothBandRetainedWeightColumnP50: toothBandRetainedWeightColumnValues.length
+      ? percentileFromSorted(toothBandRetainedWeightColumnValues, 0.5)
+      : undefined,
+    toothBandRetainedWeightColumnP90: toothBandRetainedWeightColumnValues.length
+      ? percentileFromSorted(toothBandRetainedWeightColumnValues, 0.9)
+      : undefined,
     lowerBandP50: lowerBandSamples.length ? percentileFromSorted(lowerBandSamples, 0.5) : 0,
     lowerBandBrightFraction: lowerBandCount > 0 ? lowerBandBrightCount / lowerBandCount : 0,
     detailBandHorizontalEdgeMean:
@@ -2551,6 +3586,211 @@ function summarizeFloatBufferForDebug(
     backgroundOutlierFraction10: backgroundToneSamples.length
       ? backgroundToneOutlierCount10 / backgroundToneSamples.length
       : 0,
+    backgroundBands,
+  };
+}
+
+function buildToothBandStageDiagnostics(params: {
+  buffer: Float32Array | Uint16Array;
+  width?: number;
+  height?: number;
+  debugMaps?: PanoImagePayload['debugMaps'];
+  analysisCenterRow?: number;
+  summary?: FloatBufferDebugSummary | null;
+}): ToothBandStageDiagnostics | null {
+  const { buffer, width, height, debugMaps, analysisCenterRow, summary } = params;
+  if (
+    !buffer?.length ||
+    !width ||
+    !height ||
+    width <= 1 ||
+    height <= 1 ||
+    width * height > buffer.length ||
+    !debugMaps
+  ) {
+    return null;
+  }
+
+  const admissionAccumulationMap = debugMaps.admissionAccumulationMap;
+  const toneSuppressedAccumulationMap =
+    debugMaps.toneSuppressedAccumulationMap ?? debugMaps.preToneAccumulationMap;
+  const retainedSampleMaskMap = debugMaps.retainedSampleMaskMap;
+  const toneStageSuppressionMap = debugMaps.toneStageSuppressionMap;
+  const invalidSupportBlackoutMap = debugMaps.invalidSupportBlackoutMap;
+  const blackClipMap = debugMaps.blackClipMap;
+  const middleBandLeakMap = debugMaps.middleBandLeakMap;
+  const admissionOnlyHuMap = debugMaps.admissionOnlyHuMap;
+  const toneBypassHuMap = debugMaps.toneBypassHuMap;
+  if (
+    !admissionAccumulationMap ||
+    !toneSuppressedAccumulationMap ||
+    !retainedSampleMaskMap ||
+    !toneStageSuppressionMap ||
+    !invalidSupportBlackoutMap ||
+    !blackClipMap ||
+    !middleBandLeakMap ||
+    !admissionOnlyHuMap ||
+    !toneBypassHuMap
+  ) {
+    return null;
+  }
+
+  const safeWidth = Number(width);
+  const safeHeight = Number(height);
+  const rowStep = Math.max(1, Math.floor(safeHeight / 140));
+  const colStep = Math.max(1, Math.floor(safeWidth / 180));
+  const panoCenterRow =
+    Number.isFinite(analysisCenterRow) && Number(analysisCenterRow) >= 0
+      ? Math.max(0, Math.min(safeHeight - 1, Number(analysisCenterRow)))
+      : (safeHeight - 1) / 2;
+  const rowFromNormalizedOffset = (yNorm: number): number => {
+    const row = Math.round(panoCenterRow + yNorm * panoCenterRow);
+    return Math.max(0, Math.min(safeHeight - 1, row));
+  };
+  const toothBandStartRow = Math.min(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
+  const toothBandEndRow = Math.max(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
+  const admissionAccumulationSamples: number[] = [];
+  const toneSuppressedAccumulationSamples: number[] = [];
+  const toneStageSuppressionSamples: number[] = [];
+  const invalidSupportBlackoutSamples: number[] = [];
+  const blackClipSamples: number[] = [];
+  const middleBandLeakSamples: number[] = [];
+  const admissionOnlyHuSamples: number[] = [];
+  const toneBypassHuSamples: number[] = [];
+  const finalPostToneHuSamples: number[] = [];
+
+  for (let row = toothBandStartRow; row <= toothBandEndRow; row += rowStep) {
+    for (let col = 0; col < safeWidth; col += colStep) {
+      const index = row * safeWidth + col;
+      const finalValue = Number(buffer[index]);
+      if (Number.isFinite(finalValue)) {
+        finalPostToneHuSamples.push(finalValue);
+      }
+      const admissionAccumulation = readOptionalProbeMapValue(admissionAccumulationMap, index);
+      if (admissionAccumulation !== undefined) {
+        admissionAccumulationSamples.push(Math.max(0, admissionAccumulation));
+      }
+      const toneSuppressedAccumulation = readOptionalProbeMapValue(
+        toneSuppressedAccumulationMap,
+        index
+      );
+      if (toneSuppressedAccumulation !== undefined) {
+        toneSuppressedAccumulationSamples.push(Math.max(0, toneSuppressedAccumulation));
+      }
+      const toneStageSuppression = readOptionalProbeMapValue(toneStageSuppressionMap, index);
+      if (toneStageSuppression !== undefined) {
+        toneStageSuppressionSamples.push(Math.max(0, Math.min(1, toneStageSuppression)));
+      }
+      const invalidSupportBlackout = readOptionalProbeMapValue(invalidSupportBlackoutMap, index);
+      if (invalidSupportBlackout !== undefined) {
+        invalidSupportBlackoutSamples.push(Math.max(0, Math.min(1, invalidSupportBlackout)));
+      }
+      const blackClip = readOptionalProbeMapValue(blackClipMap, index);
+      if (blackClip !== undefined) {
+        blackClipSamples.push(Math.max(0, Math.min(1, blackClip)));
+      }
+      const middleBandLeak = readOptionalProbeMapValue(middleBandLeakMap, index);
+      if (middleBandLeak !== undefined) {
+        middleBandLeakSamples.push(Math.max(0, Math.min(1, middleBandLeak)));
+      }
+      const admissionOnlyHu = readOptionalProbeMapValue(admissionOnlyHuMap, index);
+      if (admissionOnlyHu !== undefined) {
+        admissionOnlyHuSamples.push(admissionOnlyHu);
+      }
+      const toneBypassHu = readOptionalProbeMapValue(toneBypassHuMap, index);
+      if (toneBypassHu !== undefined) {
+        toneBypassHuSamples.push(toneBypassHu);
+      }
+    }
+  }
+
+  const sortNumeric = (values: number[]): number[] => values.sort((a, b) => a - b);
+  const percentileOrNull = (values: number[], percentile: number): number | null =>
+    values.length ? percentileFromSorted(sortNumeric(values.slice()), percentile) : null;
+  const stageEvidence: string[] = [];
+  const retainedWeightP10 = summary?.toothBandRetainedWeightP10 ?? null;
+  const retainedWeightP50 = summary?.toothBandRetainedWeightP50 ?? null;
+  const retainedWeightRowP10 = summary?.toothBandRetainedWeightRowP10 ?? null;
+  const retainedWeightRowP50 = summary?.toothBandRetainedWeightRowP50 ?? null;
+  const retainedWeightRowP90 = summary?.toothBandRetainedWeightRowP90 ?? null;
+  const retainedWeightColumnP10 = summary?.toothBandRetainedWeightColumnP10 ?? null;
+  const retainedWeightColumnP50 = summary?.toothBandRetainedWeightColumnP50 ?? null;
+  const retainedWeightColumnP90 = summary?.toothBandRetainedWeightColumnP90 ?? null;
+  const toneStageSuppressionP50 = percentileOrNull(toneStageSuppressionSamples, 0.5);
+  const toneStageSuppressionP90 = percentileOrNull(toneStageSuppressionSamples, 0.9);
+  const invalidSupportBlackoutP50 = percentileOrNull(invalidSupportBlackoutSamples, 0.5);
+  const invalidSupportBlackoutP90 = percentileOrNull(invalidSupportBlackoutSamples, 0.9);
+  const blackClipFraction = blackClipSamples.length
+    ? blackClipSamples.filter(value => value > 0.5).length / blackClipSamples.length
+    : null;
+  const admissionAccumulationP50 = percentileOrNull(admissionAccumulationSamples, 0.5);
+  const toneSuppressedAccumulationP50 = percentileOrNull(toneSuppressedAccumulationSamples, 0.5);
+  const admissionOnlyHuP50 = percentileOrNull(admissionOnlyHuSamples, 0.5);
+  const toneBypassHuP50 = percentileOrNull(toneBypassHuSamples, 0.5);
+  const finalPostToneHuP50 = percentileOrNull(finalPostToneHuSamples, 0.5);
+  let stageHint: ToothBandStageDiagnostics['stageHint'] = 'normalization-or-mixed';
+
+  if ((retainedWeightP10 ?? 1) <= 0.02 || (retainedWeightRowP10 ?? 1) <= 0.08) {
+    stageHint = 'support-admission-collapse';
+    stageEvidence.push('tooth-band retained weight collapses before tone');
+  }
+  if (
+    (toneStageSuppressionP90 ?? 0) >= 0.4 ||
+    (invalidSupportBlackoutP90 ?? 0) >= 0.4 ||
+    (blackClipFraction ?? 0) >= 0.25
+  ) {
+    stageHint =
+      stageHint === 'support-admission-collapse'
+        ? 'normalization-or-mixed'
+        : 'tone-blackout-destruction';
+    stageEvidence.push('tone/blackout stage still removes a large fraction of admitted tooth-band signal');
+  }
+  if (
+    (admissionOnlyHuP50 ?? Number.NEGATIVE_INFINITY) <=
+      (toneBypassHuP50 ?? Number.POSITIVE_INFINITY) + 80 &&
+    (toneBypassHuP50 ?? Number.NEGATIVE_INFINITY) <=
+      (finalPostToneHuP50 ?? Number.POSITIVE_INFINITY) + 80
+  ) {
+    stageEvidence.push('normalization may still dominate because admission-only and tone-bypass remain similarly collapsed');
+  }
+  if (!stageEvidence.length) {
+    stageEvidence.push('no single stage dominates from static thresholds');
+  }
+
+  return {
+    sampleCount: finalPostToneHuSamples.length,
+    retainedWeightP10,
+    retainedWeightP50,
+    retainedWeightRowP10,
+    retainedWeightRowP50,
+    retainedWeightRowP90,
+    retainedWeightColumnP10,
+    retainedWeightColumnP50,
+    retainedWeightColumnP90,
+    admissionAccumulationP10: percentileOrNull(admissionAccumulationSamples, 0.1),
+    admissionAccumulationP50,
+    admissionAccumulationP90: percentileOrNull(admissionAccumulationSamples, 0.9),
+    toneSuppressedAccumulationP10: percentileOrNull(toneSuppressedAccumulationSamples, 0.1),
+    toneSuppressedAccumulationP50,
+    toneSuppressedAccumulationP90: percentileOrNull(toneSuppressedAccumulationSamples, 0.9),
+    toneStageSuppressionP50,
+    toneStageSuppressionP90,
+    invalidSupportBlackoutP50,
+    invalidSupportBlackoutP90,
+    blackClipFraction,
+    middleBandLeakP50: percentileOrNull(middleBandLeakSamples, 0.5),
+    middleBandLeakP90: percentileOrNull(middleBandLeakSamples, 0.9),
+    admissionOnlyHuP10: percentileOrNull(admissionOnlyHuSamples, 0.1),
+    admissionOnlyHuP50,
+    admissionOnlyHuP90: percentileOrNull(admissionOnlyHuSamples, 0.9),
+    toneBypassHuP10: percentileOrNull(toneBypassHuSamples, 0.1),
+    toneBypassHuP50,
+    toneBypassHuP90: percentileOrNull(toneBypassHuSamples, 0.9),
+    finalPostToneHuP10: percentileOrNull(finalPostToneHuSamples, 0.1),
+    finalPostToneHuP50,
+    finalPostToneHuP90: percentileOrNull(finalPostToneHuSamples, 0.9),
+    stageHint,
+    stageEvidence,
   };
 }
 
@@ -3412,6 +4652,14 @@ interface CPRWorkerErrorMessage {
   type: 'ERROR';
   requestId: string;
   message: string;
+  stage?: string;
+}
+
+interface CPRWorkerLifecycleMessage {
+  type: 'WORKER_LIFECYCLE';
+  scope: 'entry-wrapper' | 'bootstrap' | 'implementation';
+  stage: string;
+  detail?: Record<string, unknown>;
 }
 
 type CPRWorkerResponseMessage =
@@ -3419,9 +4667,13 @@ type CPRWorkerResponseMessage =
   | CPRWorkerInitSuccessMessage
   | CPRWorkerSuccessMessage
   | CPRWorkerDisposeSuccessMessage
-  | CPRWorkerErrorMessage;
+  | CPRWorkerErrorMessage
+  | CPRWorkerLifecycleMessage;
 
-type CPRWorkerExpectedResponseType = Exclude<CPRWorkerResponseMessage['type'], 'ERROR'>;
+type CPRWorkerExpectedResponseType = Exclude<
+  CPRWorkerResponseMessage['type'],
+  'ERROR' | 'WORKER_LIFECYCLE'
+>;
 
 type PendingCPRWorkerRequest = {
   expectedTypes: Set<CPRWorkerExpectedResponseType>;
@@ -3429,30 +4681,105 @@ type PendingCPRWorkerRequest = {
   resolve: (value: CPRWorkerResponseMessage) => void;
   reject: (error: Error) => void;
   timeoutId?: number;
+  retryIntervalId?: number;
 };
 
 interface CPRWorkerSession {
   worker: Worker;
   volumeKey: string;
   sessionKey: string;
+  workerEntryUrl: string;
+  workerRuntimeUrl: string;
+  workerCreationMode: 'prewarm' | 'lazy-init';
   pendingRequests: Map<string, PendingCPRWorkerRequest>;
+  workerEntryReadyPromise: Promise<void>;
+  workerEntryReady: boolean;
+  workerEntryReadyError?: Error;
   bootstrapPromise: Promise<void>;
   bootstrapReady: boolean;
+  bootstrapProbeFailed: boolean;
+  bootstrapProbeError?: Error;
   initPromise?: Promise<void>;
   initCompleted?: boolean;
+  lastTimedOutRequestType?: string;
+  fatalWorkerError?: Error;
+  workerLifecycleEventCount: number;
+  workerLastLifecycleStage?: string;
   isTerminating: boolean;
   terminatePromise?: Promise<void>;
   cleanupListeners: () => void;
+  revokeWorkerRuntimeUrl?: () => void;
   rejectPendingRequests: (
     error: Error,
     predicate?: (requestId: string, request: PendingCPRWorkerRequest) => boolean
   ) => void;
 }
 
+type BufferedCPRWorkerEvent =
+  | {
+      kind: 'message';
+      event: MessageEvent<CPRWorkerResponseMessage>;
+    }
+  | {
+      kind: 'error';
+      event: ErrorEvent;
+    }
+  | {
+      kind: 'messageerror';
+      event: MessageEvent;
+    };
+
 let activeCPRWorkerSession: CPRWorkerSession | null = null;
 let cprWorkerRequestCounter = 0;
+const CPR_WORKER_ENTRY_SPECIFIER = './cprWorker.ts';
+
+function isCPRWorkerInitializationRequestType(requestType: string): boolean {
+  return requestType === 'BOOTSTRAP_CHECK' || requestType === 'INIT_VOLUME';
+}
+
+function buildCPRWorkerRequestError(params: {
+  session: CPRWorkerSession;
+  requestType: string;
+  message: string;
+  stage?: string | null;
+}): Error {
+  const baseMessage = params.message.trim();
+  const fatalMessage = params.session.fatalWorkerError?.message?.trim() ?? null;
+  if (!isCPRWorkerInitializationRequestType(params.requestType)) {
+    return new Error(baseMessage);
+  }
+
+  const initStage =
+    params.requestType === 'BOOTSTRAP_CHECK' ? 'bootstrap' : 'volume initialization';
+  const stageSuffix = params.stage ? ` Stage: ${params.stage}.` : '';
+  const rootCauseSuffix =
+    fatalMessage && fatalMessage !== baseMessage ? ` Root cause: ${fatalMessage}` : '';
+  const lifecycleSuffix =
+    params.session.workerLifecycleEventCount === 0
+      ? ` Worker entry ${params.session.workerEntryUrl} emitted no lifecycle event before failure; this points to worker script load or entry execution failure.`
+      : params.session.workerLastLifecycleStage
+        ? ` Last worker lifecycle stage: ${params.session.workerLastLifecycleStage}.`
+        : '';
+  return new Error(
+    `[CPR] CPR worker failed to initialize during ${initStage}.${stageSuffix} ${baseMessage}${rootCauseSuffix}${lifecycleSuffix}`.trim()
+  );
+}
 
 function computeCPRWorkerInitTimeoutMs(
+  scalarData: ArrayLike<number> & {
+    byteLength?: number;
+    BYTES_PER_ELEMENT?: number;
+  }
+): number {
+  const estimatedByteLength = estimateCPRWorkerPayloadByteLength(scalarData);
+  const megaBytes = estimatedByteLength / (1024 * 1024);
+
+  // Fresh module-worker startup plus transferring a large volume payload is
+  // materially slower than the old voxel-count heuristic implied.
+  return Math.max(CPR_WORKER_INIT_TIMEOUT_MS, Math.min(60000, 10000 + megaBytes * 180));
+}
+
+function estimateCPRWorkerPayloadByteLength(
   scalarData: ArrayLike<number> & {
     byteLength?: number;
     BYTES_PER_ELEMENT?: number;
@@ -3463,20 +4790,58 @@ function computeCPRWorkerInitTimeoutMs(
     Number((scalarData as { length?: number }).length) > 0
       ? Number((scalarData as { length: number }).length)
       : 0;
-  const estimatedByteLength =
-    Number.isFinite((scalarData as { byteLength?: unknown })?.byteLength) &&
+  const safeBytesPerElement =
+    Number.isFinite((scalarData as { BYTES_PER_ELEMENT?: unknown })?.BYTES_PER_ELEMENT) &&
+    Number((scalarData as { BYTES_PER_ELEMENT?: number }).BYTES_PER_ELEMENT) > 0
+      ? Number((scalarData as { BYTES_PER_ELEMENT: number }).BYTES_PER_ELEMENT)
+      : 4;
+  return Number.isFinite((scalarData as { byteLength?: unknown })?.byteLength) &&
     Number((scalarData as { byteLength?: number }).byteLength) > 0
-      ? Number((scalarData as { byteLength: number }).byteLength)
-      : safeLength *
-        (Number.isFinite((scalarData as { BYTES_PER_ELEMENT?: unknown })?.BYTES_PER_ELEMENT) &&
-        Number((scalarData as { BYTES_PER_ELEMENT?: number }).BYTES_PER_ELEMENT) > 0
-          ? Number((scalarData as { BYTES_PER_ELEMENT: number }).BYTES_PER_ELEMENT)
-          : 4);
-  const megaBytes = estimatedByteLength / (1024 * 1024);
+    ? Number((scalarData as { byteLength: number }).byteLength)
+    : safeLength * safeBytesPerElement;
+}
 
-  // Fresh module-worker startup plus transferring a large volume payload is
-  // materially slower than the old voxel-count heuristic implied.
-  return Math.max(CPR_WORKER_INIT_TIMEOUT_MS, Math.min(60000, 10000 + megaBytes * 180));
+function computeCPRWorkerRenderTimeoutMs(params: {
+  scalarData: ArrayLike<number> & {
+    byteLength?: number;
+    BYTES_PER_ELEMENT?: number;
+  };
+  panoWidth: number;
+  panoHeight: number;
+  frameCount: number;
+  slabSamples: number;
+  renderBackend?: 'gpu' | 'cpu';
+  reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  debugRunId?: string;
+}): number {
+  const megaBytes = estimateCPRWorkerPayloadByteLength(params.scalarData) / (1024 * 1024);
+  const pixelCount = Math.max(1, params.panoWidth * params.panoHeight);
+  const megaSampleWork =
+    (pixelCount * Math.max(1, Math.min(64, Math.floor(params.slabSamples)))) / 1_000_000;
+  const normalizedFrameCount = Math.max(1, params.frameCount) / 500;
+  const backendOverheadMs = params.renderBackend === 'gpu' ? 12000 : 6000;
+  const debugOverheadMs = params.debugRunId ? 20000 : 0;
+  const reconstructionOverheadMs =
+    params.reconstructionMode && params.reconstructionMode !== 'legacy' ? 10000 : 0;
+
+  // GPU debug renders spend time inside the worker after the request is posted:
+  // readback, support/tone diagnostics, and debug sidecar packaging all happen
+  // before SUCCESS can be emitted back to the main thread.
+  return Math.max(
+    CPR_WORKER_RENDER_TIMEOUT_MS,
+    Math.min(
+      120000,
+      Math.round(
+        12000 +
+          megaBytes * 120 +
+          megaSampleWork * 2500 +
+          normalizedFrameCount * 2000 +
+          backendOverheadMs +
+          debugOverheadMs +
+          reconstructionOverheadMs
+      )
+    )
+  );
 }
 
 function buildCPRWorkerVolumeKey(params: {
@@ -3509,6 +4874,203 @@ function createCPRWorkerRequestId(): string {
   return `cpr-worker-${Date.now().toString(36)}-${cprWorkerRequestCounter.toString(36)}`;
 }
 
+function resolveBundledCPRWorkerEntryUrl(): string {
+  // Keep the worker specifier inline so webpack's worker transform can rewrite it
+  // to a served bundle URL instead of leaving it as a raw source-file URL.
+  return new URL('./cprWorker.ts', import.meta.url).toString();
+}
+
+function createInstrumentedCPRWorker(params: {
+  mode: 'prewarm' | 'lazy-init';
+  volumeKey: string;
+}): {
+  worker: Worker;
+  workerEntryUrl: string;
+  workerRuntimeUrl: string;
+  revokeWorkerRuntimeUrl: () => void;
+  workerEntryReadyPromise: Promise<void>;
+  handoffBufferedEvents: (handlers: {
+    onMessage: (event: MessageEvent<CPRWorkerResponseMessage>) => void;
+    onError: (event: ErrorEvent) => void;
+    onMessageError: (event: MessageEvent) => void;
+  }) => void;
+} {
+  const workerEntryUrl = resolveBundledCPRWorkerEntryUrl();
+  const workerRuntimeUrl = workerEntryUrl;
+  const revokeWorkerRuntimeUrl = () => {};
+  console.log(
+    '[CPR-WORKER-CONSTRUCTOR-JSON]',
+    JSON.stringify({
+      stage: 'before-create',
+      mode: params.mode,
+      volumeKey: params.volumeKey,
+      workerEntrySpecifier: CPR_WORKER_ENTRY_SPECIFIER,
+      workerEntryUrl,
+      workerRuntimeUrl,
+      baseImportMetaUrl: import.meta.url,
+      workerType: 'module',
+      bundlerStrategy: 'webpack-inline-new-worker-url-direct',
+    })
+  );
+
+  try {
+    const worker = new Worker(new URL('./cprWorker.ts', import.meta.url), {
+      type: 'module',
+    });
+    const bufferedEvents: BufferedCPRWorkerEvent[] = [];
+    let handoffHandlers:
+      | {
+          onMessage: (event: MessageEvent<CPRWorkerResponseMessage>) => void;
+          onError: (event: ErrorEvent) => void;
+          onMessageError: (event: MessageEvent) => void;
+        }
+      | null = null;
+    let workerEntryReadyResolved = false;
+    let workerEntryReadyRejected = false;
+    let resolveWorkerEntryReady!: () => void;
+    let rejectWorkerEntryReady!: (error: Error) => void;
+    const workerEntryReadyPromise = new Promise<void>((resolve, reject) => {
+      resolveWorkerEntryReady = resolve;
+      rejectWorkerEntryReady = reject;
+    });
+    const markWorkerEntryReady = () => {
+      if (workerEntryReadyResolved || workerEntryReadyRejected) {
+        return;
+      }
+      workerEntryReadyResolved = true;
+      resolveWorkerEntryReady();
+    };
+    const markWorkerEntryFailed = (error: Error) => {
+      if (workerEntryReadyResolved || workerEntryReadyRejected) {
+        return;
+      }
+      workerEntryReadyRejected = true;
+      rejectWorkerEntryReady(error);
+    };
+    const bufferOrDispatchMessage = (event: MessageEvent<CPRWorkerResponseMessage>) => {
+      const data = event.data;
+      if (
+        data &&
+        typeof data === 'object' &&
+        data.type === 'WORKER_LIFECYCLE' &&
+        data.scope === 'bootstrap' &&
+        data.stage === 'worker-bootstrap-script-loaded'
+      ) {
+        markWorkerEntryReady();
+      }
+      if (handoffHandlers) {
+        handoffHandlers.onMessage(event);
+        return;
+      }
+      bufferedEvents.push({
+        kind: 'message',
+        event,
+      });
+    };
+    const bufferOrDispatchError = (event: ErrorEvent) => {
+      markWorkerEntryFailed(
+        new Error(
+          [
+            '[cprWorker] Early worker error before session listener attachment.',
+            event.message ? `message=${event.message}` : null,
+            event.filename ? `file=${event.filename}` : null,
+            Number.isFinite(event.lineno) && event.lineno > 0 ? `line=${event.lineno}` : null,
+            Number.isFinite(event.colno) && event.colno > 0 ? `col=${event.colno}` : null,
+          ]
+            .filter(Boolean)
+            .join(' ')
+        )
+      );
+      if (handoffHandlers) {
+        handoffHandlers.onError(event);
+        return;
+      }
+      bufferedEvents.push({
+        kind: 'error',
+        event,
+      });
+    };
+    const bufferOrDispatchMessageError = (event: MessageEvent) => {
+      markWorkerEntryFailed(
+        new Error('[cprWorker] Early worker messageerror before session listener attachment.')
+      );
+      if (handoffHandlers) {
+        handoffHandlers.onMessageError(event);
+        return;
+      }
+      bufferedEvents.push({
+        kind: 'messageerror',
+        event,
+      });
+    };
+    worker.addEventListener('message', bufferOrDispatchMessage as EventListener);
+    worker.addEventListener('error', bufferOrDispatchError as EventListener);
+    worker.addEventListener('messageerror', bufferOrDispatchMessageError as EventListener);
+    const handoffBufferedEvents = (handlers: {
+      onMessage: (event: MessageEvent<CPRWorkerResponseMessage>) => void;
+      onError: (event: ErrorEvent) => void;
+      onMessageError: (event: MessageEvent) => void;
+    }) => {
+      handoffHandlers = handlers;
+      worker.removeEventListener('message', bufferOrDispatchMessage as EventListener);
+      worker.removeEventListener('error', bufferOrDispatchError as EventListener);
+      worker.removeEventListener('messageerror', bufferOrDispatchMessageError as EventListener);
+      for (const bufferedEvent of bufferedEvents.splice(0)) {
+        if (bufferedEvent.kind === 'message') {
+          handlers.onMessage(bufferedEvent.event);
+          continue;
+        }
+        if (bufferedEvent.kind === 'error') {
+          handlers.onError(bufferedEvent.event);
+          continue;
+        }
+        handlers.onMessageError(bufferedEvent.event);
+      }
+    };
+    console.log(
+      '[CPR-WORKER-CONSTRUCTOR-JSON]',
+      JSON.stringify({
+        stage: 'constructor-succeeded',
+        mode: params.mode,
+        volumeKey: params.volumeKey,
+        workerEntrySpecifier: CPR_WORKER_ENTRY_SPECIFIER,
+        workerEntryUrl,
+        workerRuntimeUrl,
+        workerType: 'module',
+        bundlerStrategy: 'webpack-inline-new-worker-url-direct',
+      })
+    );
+    return {
+      worker,
+      workerEntryUrl,
+      workerRuntimeUrl,
+      revokeWorkerRuntimeUrl,
+      workerEntryReadyPromise,
+      handoffBufferedEvents,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    revokeWorkerRuntimeUrl();
+    console.error(
+      '[CPR-WORKER-CONSTRUCTOR-JSON]',
+      JSON.stringify({
+        stage: 'constructor-failed',
+        mode: params.mode,
+        volumeKey: params.volumeKey,
+        workerEntrySpecifier: CPR_WORKER_ENTRY_SPECIFIER,
+        workerEntryUrl,
+        workerRuntimeUrl,
+        workerType: 'module',
+        bundlerStrategy: 'webpack-inline-new-worker-url-direct',
+        message,
+      })
+    );
+    throw new Error(
+      `[CPR] CPR worker failed to initialize. Worker constructor failed for runtime ${workerRuntimeUrl} (entry ${workerEntryUrl}). ${message}`
+    );
+  }
+}
+
 function beginCPRWorkerVolumeInit(params: {
   workerSession: CPRWorkerSession;
   initPayload: Record<string, unknown>;
@@ -3523,21 +5085,46 @@ function beginCPRWorkerVolumeInit(params: {
     return workerSession.initPromise;
   }
 
-  const initPromise = workerSession.bootstrapPromise
-    .then(() =>
-      postMessageToCPRWorker<CPRWorkerInitSuccessMessage>(workerSession, initPayload, {
-        expectedTypes: ['INIT_SUCCESS'],
-        transferList,
-        timeoutMs,
-      })
-    )
+  const initPromise = postMessageToCPRWorker<CPRWorkerInitSuccessMessage>(workerSession, initPayload, {
+    expectedTypes: ['INIT_SUCCESS'],
+    transferList,
+    timeoutMs,
+  })
     .then(() => {
       workerSession.initCompleted = true;
+      console.log('[CPR-WORKER-INIT-ACK-JSON]', {
+        sessionKey: workerSession.sessionKey,
+        volumeKey: workerSession.volumeKey,
+        workerEntryUrl: workerSession.workerEntryUrl,
+        bootstrapReady: workerSession.bootstrapReady,
+        bootstrapProbeFailed: workerSession.bootstrapProbeFailed,
+        workerLifecycleEventCount: workerSession.workerLifecycleEventCount,
+        workerLastLifecycleStage: workerSession.workerLastLifecycleStage ?? null,
+      });
+      if (workerSession.bootstrapProbeFailed) {
+        console.warn('[CPR] Worker bootstrap probe failed, but direct INIT_VOLUME succeeded.', {
+          sessionKey: workerSession.sessionKey,
+          volumeKey: workerSession.volumeKey,
+          error:
+            workerSession.bootstrapProbeError instanceof Error
+              ? workerSession.bootstrapProbeError.message
+              : null,
+        });
+      }
     });
 
   workerSession.initPromise = initPromise
     .catch(error => {
       workerSession.initCompleted = false;
+      console.error('[CPR-WORKER-INIT-FAILED-JSON]', {
+        sessionKey: workerSession.sessionKey,
+        volumeKey: workerSession.volumeKey,
+        workerEntryUrl: workerSession.workerEntryUrl,
+        error: error instanceof Error ? error.message : String(error),
+        fatalWorkerError: workerSession.fatalWorkerError?.message ?? null,
+        workerLifecycleEventCount: workerSession.workerLifecycleEventCount,
+        workerLastLifecycleStage: workerSession.workerLastLifecycleStage ?? null,
+      });
       throw error;
     })
     .finally(() => {
@@ -3550,20 +5137,69 @@ function beginCPRWorkerVolumeInit(params: {
 function createCPRWorkerSession(
   worker: Worker,
   volumeKey: string,
-  sessionKey: string
+  sessionKey: string,
+  workerEntryUrl: string,
+  workerRuntimeUrl: string,
+  workerCreationMode: 'prewarm' | 'lazy-init',
+  workerEntryReadyPromise: Promise<void>,
+  handoffBufferedEvents: (handlers: {
+    onMessage: (event: MessageEvent<CPRWorkerResponseMessage>) => void;
+    onError: (event: ErrorEvent) => void;
+    onMessageError: (event: MessageEvent) => void;
+  }) => void
 ): CPRWorkerSession {
   const session: CPRWorkerSession = {
     worker,
     volumeKey,
     sessionKey,
+    workerEntryUrl,
+    workerRuntimeUrl,
+    workerCreationMode,
     pendingRequests: new Map(),
+    workerEntryReadyPromise,
+    workerEntryReady: false,
+    workerEntryReadyError: undefined,
     bootstrapPromise: Promise.resolve(),
     bootstrapReady: false,
+    bootstrapProbeFailed: false,
+    bootstrapProbeError: undefined,
     initPromise: undefined,
     initCompleted: false,
+    lastTimedOutRequestType: undefined,
+    fatalWorkerError: undefined,
+    workerLifecycleEventCount: 0,
+    workerLastLifecycleStage: undefined,
     isTerminating: false,
     cleanupListeners: () => {},
+    revokeWorkerRuntimeUrl: undefined,
     rejectPendingRequests: () => {},
+  };
+
+  session.workerEntryReadyPromise = session.workerEntryReadyPromise
+    .then(() => {
+      session.workerEntryReady = true;
+      session.workerEntryReadyError = undefined;
+    })
+    .catch(error => {
+      const readyError = error instanceof Error ? error : new Error(String(error));
+      session.workerEntryReady = false;
+      session.workerEntryReadyError = readyError;
+      throw readyError;
+    });
+
+  const recordFatalWorkerError = (error: Error, source: string) => {
+    session.fatalWorkerError = error;
+    if (!session.isTerminating) {
+      console.error('[CPR-WORKER-FATAL-ERROR-JSON]', {
+        source,
+        sessionKey,
+        volumeKey,
+        workerEntryUrl: session.workerEntryUrl,
+        workerRuntimeUrl: session.workerRuntimeUrl,
+        mode: session.workerCreationMode,
+        message: error.message,
+      });
+    }
   };
 
   const rejectPendingRequests = (
@@ -3579,13 +5215,61 @@ function createCPRWorkerSession(
       if (request.timeoutId != null) {
         window.clearTimeout(request.timeoutId);
       }
+      if (request.retryIntervalId != null) {
+        window.clearInterval(request.retryIntervalId);
+      }
       request.reject(error);
     }
   };
 
+  const rejectPendingRequestsForFatalWorkerError = (error: Error, stage: string) => {
+    for (const [requestId, request] of Array.from(session.pendingRequests.entries())) {
+      session.pendingRequests.delete(requestId);
+      if (request.timeoutId != null) {
+        window.clearTimeout(request.timeoutId);
+      }
+      if (request.retryIntervalId != null) {
+        window.clearInterval(request.retryIntervalId);
+      }
+      request.reject(
+        buildCPRWorkerRequestError({
+          session,
+          requestType: request.requestType,
+          message: error.message,
+          stage,
+        })
+      );
+    }
+  };
+
+  void session.workerEntryReadyPromise.catch(error => {
+    const readyError = error instanceof Error ? error : new Error(String(error));
+    recordFatalWorkerError(readyError, 'worker-entry-ready-failed');
+    rejectPendingRequestsForFatalWorkerError(readyError, 'worker-entry-ready-failed');
+  });
+
   const handleMessage = (event: MessageEvent<CPRWorkerResponseMessage>) => {
     const data = event.data;
     if (!data || typeof data !== 'object') {
+      return;
+    }
+
+    if (data.type === 'WORKER_LIFECYCLE') {
+      session.workerLifecycleEventCount += 1;
+      session.workerLastLifecycleStage = `${data.scope}:${data.stage}`;
+      console.log(
+        '[CPR-WORKER-LIFECYCLE-EVENT-JSON]',
+        JSON.stringify({
+          sessionKey,
+          volumeKey,
+          workerEntryUrl: session.workerEntryUrl,
+          workerRuntimeUrl: session.workerRuntimeUrl,
+          mode: session.workerCreationMode,
+          scope: data.scope,
+          stage: data.stage,
+          detail: data.detail ?? null,
+        })
+      );
       return;
     }
 
@@ -3607,9 +5291,33 @@ function createCPRWorkerSession(
     if (pendingRequest.timeoutId != null) {
       window.clearTimeout(pendingRequest.timeoutId);
     }
+    if (pendingRequest.retryIntervalId != null) {
+      window.clearInterval(pendingRequest.retryIntervalId);
+    }
 
     if (data.type === 'ERROR') {
-      pendingRequest.reject(new Error(`[cprWorker] ${data.message}`));
+      console.error(
+        '[CPR-WORKER-ERROR-RESPONSE-JSON]',
+        JSON.stringify({
+          sessionKey,
+          volumeKey,
+          workerEntryUrl: session.workerEntryUrl,
+          workerRuntimeUrl: session.workerRuntimeUrl,
+          mode: session.workerCreationMode,
+          requestType: pendingRequest.requestType,
+          requestId,
+          stage: data.stage ?? null,
+          message: data.message,
+        })
+      );
+      pendingRequest.reject(
+        buildCPRWorkerRequestError({
+          session,
+          requestType: pendingRequest.requestType,
+          message: `[cprWorker] ${data.message}`,
+          stage: data.stage ?? null,
+        })
+      );
       return;
     }
 
@@ -3622,23 +5330,69 @@ function createCPRWorkerSession(
       return;
     }
 
+    session.lastTimedOutRequestType = undefined;
     pendingRequest.resolve(data);
   };
 
   const handleError = (event: ErrorEvent) => {
-    const error = new Error(
-      `[cprWorker] Uncaught worker error: ${event.message || 'unknown worker error'}`
+    console.error(
+      '[CPR-WORKER-ERROR-EVENT-JSON]',
+      JSON.stringify({
+        sessionKey,
+        volumeKey,
+        workerEntryUrl: session.workerEntryUrl,
+        workerRuntimeUrl: session.workerRuntimeUrl,
+        mode: session.workerCreationMode,
+        type: event.type ?? 'error',
+        message: event.message ?? null,
+        filename: event.filename ?? null,
+        lineno: Number.isFinite(event.lineno) ? event.lineno : null,
+        colno: Number.isFinite(event.colno) ? event.colno : null,
+        errorName: event.error instanceof Error ? event.error.name : null,
+        errorMessage: event.error instanceof Error ? event.error.message : null,
+        errorStack: event.error instanceof Error ? event.error.stack ?? null : null,
+      })
     );
-    rejectPendingRequests(error);
+    const messageParts = [
+      event.message || 'unknown worker error',
+      event.filename ? `file=${event.filename}` : null,
+      Number.isFinite(event.lineno) && event.lineno > 0 ? `line=${event.lineno}` : null,
+      Number.isFinite(event.colno) && event.colno > 0 ? `col=${event.colno}` : null,
+    ].filter(Boolean);
+    const error = new Error(
+      `[cprWorker] Uncaught worker error: ${messageParts.join(' ')}`
+    );
+    recordFatalWorkerError(error, 'worker-error-event');
+    rejectPendingRequestsForFatalWorkerError(error, 'worker-error-event');
   };
-  const handleMessageError = () => {
+  const handleMessageError = (event: MessageEvent) => {
+    console.error(
+      '[CPR-WORKER-MESSAGEERROR-EVENT-JSON]',
+      JSON.stringify({
+        sessionKey,
+        volumeKey,
+        workerEntryUrl: session.workerEntryUrl,
+        workerRuntimeUrl: session.workerRuntimeUrl,
+        mode: session.workerCreationMode,
+        type: event.type ?? 'messageerror',
+        origin: event.origin ?? null,
+        lastEventId: event.lastEventId ?? null,
+        dataType: event.data == null ? null : typeof event.data,
+      })
+    );
     const error = new Error('[cprWorker] Worker message deserialization failed.');
-    rejectPendingRequests(error);
+    recordFatalWorkerError(error, 'worker-messageerror-event');
+    rejectPendingRequestsForFatalWorkerError(error, 'worker-messageerror-event');
   };
 
   worker.addEventListener('message', handleMessage as EventListener);
   worker.addEventListener('error', handleError as EventListener);
   worker.addEventListener('messageerror', handleMessageError as EventListener);
+  handoffBufferedEvents({
+    onMessage: handleMessage,
+    onError: handleError,
+    onMessageError: handleMessageError,
+  });
 
   session.cleanupListeners = () => {
     worker.removeEventListener('message', handleMessage as EventListener);
@@ -3654,10 +5408,31 @@ function createCPRWorkerSession(
     {
       expectedTypes: ['BOOTSTRAP_READY'],
       timeoutMs: CPR_WORKER_STARTUP_TIMEOUT_MS,
+      retryIntervalMs: 250,
     }
-  ).then(() => {
-    session.bootstrapReady = true;
-  });
+  )
+    .then(() => {
+      session.bootstrapReady = true;
+      session.bootstrapProbeFailed = false;
+      session.bootstrapProbeError = undefined;
+    })
+    .catch(error => {
+      session.bootstrapReady = false;
+      session.bootstrapProbeFailed = true;
+      session.bootstrapProbeError =
+        error instanceof Error ? error : new Error(String(error));
+      if (!session.isTerminating) {
+        console.warn('[CPR] Worker bootstrap probe failed; continuing with direct INIT_VOLUME.', {
+          sessionKey,
+          volumeKey,
+          workerEntryUrl: session.workerEntryUrl,
+          error: session.bootstrapProbeError.message,
+          fatalWorkerError: session.fatalWorkerError?.message ?? null,
+          workerLifecycleEventCount: session.workerLifecycleEventCount,
+          workerLastLifecycleStage: session.workerLastLifecycleStage ?? null,
+        });
+      }
+    });
 
   return session;
 }
@@ -3679,21 +5454,31 @@ async function terminateCPRWorkerSession(sessionArg?: CPRWorkerSession | null): 
 
   session.isTerminating = true;
   session.terminatePromise = (async () => {
+    const pendingRequestTypes = Array.from(session.pendingRequests.values()).map(
+      request => request.requestType
+    );
+    const shouldAttemptGracefulDispose =
+      pendingRequestTypes.length === 0 &&
+      !session.lastTimedOutRequestType &&
+      (session.bootstrapReady || session.initCompleted === true);
+
     session.rejectPendingRequests(
       new Error('[cprWorker] Worker session terminated during teardown.')
     );
 
     try {
-      await postMessageToCPRWorker<CPRWorkerDisposeSuccessMessage>(
-        session,
-        {
-          type: 'DISPOSE' as const,
-        },
-        {
-          expectedTypes: ['DISPOSE_SUCCESS'],
-          timeoutMs: CPR_WORKER_DISPOSE_TIMEOUT_MS,
-        }
-      );
+      if (shouldAttemptGracefulDispose) {
+        await postMessageToCPRWorker<CPRWorkerDisposeSuccessMessage>(
+          session,
+          {
+            type: 'DISPOSE' as const,
+          },
+          {
+            expectedTypes: ['DISPOSE_SUCCESS'],
+            timeoutMs: CPR_WORKER_DISPOSE_TIMEOUT_MS,
+          }
+        );
+      }
     } catch (disposeError) {
       console.warn('[CPR] Failed to dispose CPR worker before termination.', disposeError);
     } finally {
@@ -3702,6 +5487,7 @@ async function terminateCPRWorkerSession(sessionArg?: CPRWorkerSession | null): 
       );
       session.cleanupListeners();
       session.worker.terminate();
+      session.revokeWorkerRuntimeUrl?.();
     }
   })();
 
@@ -3863,10 +5649,39 @@ async function ensureCPRWorkerVolumeSession(params: {
   }
 
   await terminateCPRWorkerSession();
-  const worker = new Worker(new URL('./cprWorker.ts', import.meta.url), { type: 'module' });
+  const {
+    worker,
+    workerEntryUrl,
+    workerRuntimeUrl,
+    revokeWorkerRuntimeUrl,
+    workerEntryReadyPromise,
+    handoffBufferedEvents,
+  } =
+    createInstrumentedCPRWorker({
+    mode: 'prewarm',
+    volumeKey,
+  });
   const sessionKey = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  const workerSession = createCPRWorkerSession(worker, volumeKey, sessionKey);
+  const workerSession = createCPRWorkerSession(
+    worker,
+    volumeKey,
+    sessionKey,
+    workerEntryUrl,
+    workerRuntimeUrl,
+    'prewarm',
+    workerEntryReadyPromise,
+    handoffBufferedEvents
+  );
+  workerSession.revokeWorkerRuntimeUrl = revokeWorkerRuntimeUrl;
   activeCPRWorkerSession = workerSession;
+  console.log('[CPR-WORKER-SESSION-CREATED-JSON]', {
+    sessionKey,
+    volumeKey,
+    mode: 'prewarm',
+    workerEntry: CPR_WORKER_ENTRY_SPECIFIER,
+    workerEntryUrl,
+    workerRuntimeUrl,
+  });
   const isSharedArrayBuffer = scalarData.buffer instanceof SharedArrayBuffer;
   const initScalarData = isSharedArrayBuffer
     ? scalarData
@@ -3931,6 +5746,7 @@ function postMessageToCPRWorker<T extends CPRWorkerResponseMessage>(
     expectedTypes: T['type'][];
     transferList?: Transferable[];
     timeoutMs?: number;
+    retryIntervalMs?: number;
   }
 ): Promise<T> {
   const requestType =
@@ -3942,6 +5758,16 @@ function postMessageToCPRWorker<T extends CPRWorkerResponseMessage>(
 
   if (session.isTerminating && requestType !== 'DISPOSE') {
     return Promise.reject(new Error('[cprWorker] Worker session is terminating.'));
+  }
+  if (session.fatalWorkerError && requestType !== 'DISPOSE') {
+    return Promise.reject(
+      buildCPRWorkerRequestError({
+        session,
+        requestType,
+        message: session.fatalWorkerError.message,
+        stage: 'worker-fatal-error-before-request',
+      })
+    );
   }
 
   const requestId = createCPRWorkerRequestId();
@@ -3969,17 +5795,83 @@ function postMessageToCPRWorker<T extends CPRWorkerResponseMessage>(
         }
 
         session.pendingRequests.delete(requestId);
+        if (liveRequest.retryIntervalId != null) {
+          window.clearInterval(liveRequest.retryIntervalId);
+        }
+        session.lastTimedOutRequestType = liveRequest.requestType;
+        const timeoutMessage =
+          session.fatalWorkerError?.message ??
+          `[cprWorker] Timed out waiting for ${Array.from(expectedTypes).join('/')} from ${requestType}.`;
         liveRequest.reject(
-          new Error(
-            `[cprWorker] Timed out waiting for ${Array.from(expectedTypes).join('/')} from ${requestType}.`
-          )
+          buildCPRWorkerRequestError({
+            session,
+            requestType: liveRequest.requestType,
+            message: timeoutMessage,
+            stage: session.fatalWorkerError ? 'worker-fatal-error-before-ack' : 'timeout',
+          })
         );
       }, options.timeoutMs);
     }
 
     session.pendingRequests.set(requestId, pendingRequest);
+    if (
+      options.retryIntervalMs &&
+      options.retryIntervalMs > 0 &&
+      (!options.transferList || options.transferList.length === 0)
+    ) {
+      pendingRequest.retryIntervalId = window.setInterval(() => {
+        const liveRequest = session.pendingRequests.get(requestId);
+        if (!liveRequest || session.isTerminating) {
+          if (liveRequest?.retryIntervalId != null) {
+            window.clearInterval(liveRequest.retryIntervalId);
+          }
+          return;
+        }
+
+        try {
+          console.log(
+            '[CPR-WORKER-POSTMESSAGE-JSON]',
+            JSON.stringify({
+              stage: 'retry-post',
+              requestType,
+              requestId,
+              sessionKey: session.sessionKey,
+              volumeKey: session.volumeKey,
+              workerEntryUrl: session.workerEntryUrl,
+              mode: session.workerCreationMode,
+              transferListLength: options.transferList?.length ?? 0,
+            })
+          );
+          session.worker.postMessage(message);
+        } catch (retryError) {
+          session.pendingRequests.delete(requestId);
+          if (liveRequest.timeoutId != null) {
+            window.clearTimeout(liveRequest.timeoutId);
+          }
+          if (liveRequest.retryIntervalId != null) {
+            window.clearInterval(liveRequest.retryIntervalId);
+          }
+          liveRequest.reject(
+            retryError instanceof Error ? retryError : new Error(String(retryError))
+          );
+        }
+      }, options.retryIntervalMs);
+    }
 
     try {
+      console.log(
+        '[CPR-WORKER-POSTMESSAGE-JSON]',
+        JSON.stringify({
+          stage: 'initial-post',
+          requestType,
+          requestId,
+          sessionKey: session.sessionKey,
+          volumeKey: session.volumeKey,
+          workerEntryUrl: session.workerEntryUrl,
+          mode: session.workerCreationMode,
+          transferListLength: options.transferList?.length ?? 0,
+        })
+      );
       if (options.transferList && options.transferList.length > 0) {
         session.worker.postMessage(message, options.transferList);
       } else {
@@ -3990,7 +5882,17 @@ function postMessageToCPRWorker<T extends CPRWorkerResponseMessage>(
       if (pendingRequest.timeoutId != null) {
         window.clearTimeout(pendingRequest.timeoutId);
       }
-      reject(postError instanceof Error ? postError : new Error(String(postError)));
+      if (pendingRequest.retryIntervalId != null) {
+        window.clearInterval(pendingRequest.retryIntervalId);
+      }
+      reject(
+        buildCPRWorkerRequestError({
+          session,
+          requestType,
+          message: postError instanceof Error ? postError.message : String(postError),
+          stage: 'postMessage-failed',
+        })
+      );
     }
   });
 }
@@ -4008,6 +5910,11 @@ function launchCPRWorker(params: {
   forceApplyModalityLut?: boolean;
   modalityLutOverride?: boolean;
   forceDisableStoredValueNormalization?: boolean;
+  debugScalarSamplingMode?:
+    | 'current'
+    | 'lut-only'
+    | 'no-stored-value-normalization'
+    | 'raw-stored-values-debug';
   verticalHalfMm?: number;
   verticalCenterOffsetMm?: number;
   rigidVerticalSliceMode?: boolean;
@@ -4030,6 +5937,7 @@ function launchCPRWorker(params: {
       forceApplyModalityLut,
       modalityLutOverride,
       forceDisableStoredValueNormalization,
+      debugScalarSamplingMode,
       verticalHalfMm,
       verticalCenterOffsetMm,
       rigidVerticalSliceMode = false,
@@ -4199,6 +6107,7 @@ function launchCPRWorker(params: {
         forceApplyModalityLut: !!forceApplyModalityLut,
         modalityLutOverride,
         forceDisableStoredValueNormalization: !!forceDisableStoredValueNormalization,
+        debugScalarSamplingMode: debugScalarSamplingMode ?? 'current',
         heuristicApplyModalityLut,
         applyModalityLut,
         allowStoredValueNormalization,
@@ -4244,10 +6153,39 @@ function launchCPRWorker(params: {
         !activeCPRWorkerSession || activeCPRWorkerSession.volumeKey !== volumeKey;
       if (needsNewWorkerSession) {
         await terminateCPRWorkerSession();
-        const worker = new Worker(new URL('./cprWorker.ts', import.meta.url), { type: 'module' });
+        const {
+          worker,
+          workerEntryUrl,
+          workerRuntimeUrl,
+          revokeWorkerRuntimeUrl,
+          workerEntryReadyPromise,
+          handoffBufferedEvents,
+        } =
+          createInstrumentedCPRWorker({
+          mode: 'lazy-init',
+          volumeKey,
+        });
         const sessionKey = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-        const workerSession = createCPRWorkerSession(worker, volumeKey, sessionKey);
+        const workerSession = createCPRWorkerSession(
+          worker,
+          volumeKey,
+          sessionKey,
+          workerEntryUrl,
+          workerRuntimeUrl,
+          'lazy-init',
+          workerEntryReadyPromise,
+          handoffBufferedEvents
+        );
+        workerSession.revokeWorkerRuntimeUrl = revokeWorkerRuntimeUrl;
         activeCPRWorkerSession = workerSession;
+        console.log('[CPR-WORKER-SESSION-CREATED-JSON]', {
+          sessionKey,
+          volumeKey,
+          mode: 'lazy-init',
+          workerEntry: CPR_WORKER_ENTRY_SPECIFIER,
+          workerEntryUrl,
+          workerRuntimeUrl,
+        });
       }
 
       if (!activeCPRWorkerSession?.initCompleted) {
@@ -4306,6 +6244,31 @@ function launchCPRWorker(params: {
         N_slab: Array.from(f.N_slab) as [number, number, number],
         S: Array.from(f.S) as [number, number, number],
       }));
+      const renderTimeoutMs = computeCPRWorkerRenderTimeoutMs({
+        scalarData,
+        panoWidth,
+        panoHeight,
+        frameCount: serializedFrames.length,
+        slabSamples,
+        renderBackend,
+        reconstructionMode,
+        debugRunId,
+      });
+      if (debugRunId) {
+        console.log(
+          `${logPrefix} [CPR-WORKER-RENDER-TIMEOUT-JSON]`,
+          JSON.stringify({
+            panoWidth,
+            panoHeight,
+            frameCount: serializedFrames.length,
+            slabSamples,
+            renderBackend,
+            reconstructionMode: reconstructionMode ?? 'legacy',
+            scalarBytes: estimateCPRWorkerPayloadByteLength(scalarData),
+            timeoutMs: renderTimeoutMs,
+          })
+        );
+      }
 
       const data = await postMessageToCPRWorker<CPRWorkerSuccessMessage>(
         activeCPRWorkerSession,
@@ -4328,6 +6291,7 @@ function launchCPRWorker(params: {
           allowStoredValueNormalization,
           disableStoredValueNormalization:
             forceDisableStoredValueNormalization === true ? true : undefined,
+          debugScalarSamplingMode,
           debugRunId,
           attemptLabel,
           reconstructionMode,
@@ -4335,7 +6299,7 @@ function launchCPRWorker(params: {
         },
         {
           expectedTypes: ['SUCCESS'],
-          timeoutMs: CPR_WORKER_RENDER_TIMEOUT_MS,
+          timeoutMs: renderTimeoutMs,
         }
       );
 
@@ -7321,11 +9285,6 @@ export function useCPROrchestrator({
         minSpacing
       );
       const baseVerticalHalfMm = CPR_PANO_FIXED_VERTICAL_HALF_MM;
-      const thinnerVerticalHalfMm = CPR_PANO_FIXED_VERTICAL_HALF_MM;
-      const narrowVerticalHalfMm = CPR_PANO_FIXED_VERTICAL_HALF_MM;
-      const toothBandVerticalHalfMm = CPR_PANO_FIXED_VERTICAL_HALF_MM;
-      const mediumVerticalHalfMm = CPR_PANO_FIXED_VERTICAL_HALF_MM;
-      const broadVerticalHalfMm = CPR_PANO_FIXED_VERTICAL_HALF_MM;
       const neutralVerticalCenterOffsetMm = 0;
       const rigidSliceVerticalCenterOffsetMm = 0;
       const rigidVerticalSliceModeEnabled = false;
@@ -7333,6 +9292,7 @@ export function useCPROrchestrator({
       const strongSuperiorCenterOffsetMm = 2.6;
       const superiorMandibularCenterOffsetMm = -2.4;
       const subtleMandibularCenterOffsetMm = -3.8;
+      const balancedMediumCenterOffsetMm = -4.4;
       const mandibularCenterOffsetMm = -5.2;
       const strongMandibularCenterOffsetMm = -6.6;
       const strongerMandibularCenterOffsetMm = -7.2;
@@ -7343,6 +9303,8 @@ export function useCPROrchestrator({
       const fastSlabSamples = 7;
       const balancedMeanSlabHalfThicknessMm = 1.75;
       const balancedMeanSlabSamples = 11;
+      const balancedMediumSlabHalfThicknessMm = 1.6;
+      const balancedMediumSlabSamples = 13;
       const leakageFocusedMeanSlabHalfThicknessMm = 1.45;
       const leakageFocusedMeanSlabSamples = 13;
       const leakageSharpMeanSlabHalfThicknessMm = 1.35;
@@ -7355,7 +9317,54 @@ export function useCPROrchestrator({
       const meanFallbackSlabSamples = 11;
       const sharpMeanSlabHalfThicknessMm = 1.25;
       const sharpMeanSlabSamples = 7;
-      const rootedMediumVerticalHalfMm = CPR_PANO_FIXED_VERTICAL_HALF_MM;
+      const pickReadableWorkerVerticalHalfMm = (
+        presetSelection: ReturnType<typeof selectReadableVtkPanoPreset>,
+        label: VtkPanoPresetCandidate['label'],
+        fallback: number
+      ): number =>
+        presetSelection.candidates.find(candidate => candidate.label === label)?.verticalHalfMm ??
+        presetSelection.selected.verticalHalfMm ??
+        fallback;
+      const focusedMeanWorkerPreset = selectReadableVtkPanoPreset({
+        baseVerticalHalfMm,
+        requestedSlabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+        requestedSlabSamples: focusedMeanSlabSamples,
+        minSpacing,
+        aggregation: 'MEAN',
+      });
+      const balancedMeanWorkerPreset = selectReadableVtkPanoPreset({
+        baseVerticalHalfMm,
+        requestedSlabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+        requestedSlabSamples: balancedMeanSlabSamples,
+        minSpacing,
+        aggregation: 'MEAN',
+      });
+      const broadMeanWorkerPreset = selectReadableVtkPanoPreset({
+        baseVerticalHalfMm,
+        requestedSlabHalfThicknessMm: broadMeanSlabHalfThicknessMm,
+        requestedSlabSamples: broadMeanSlabSamples,
+        minSpacing,
+        aggregation: 'MEAN',
+      });
+      const thinnerVerticalHalfMm = pickReadableWorkerVerticalHalfMm(
+        focusedMeanWorkerPreset,
+        'focused',
+        baseVerticalHalfMm
+      );
+      const narrowVerticalHalfMm = thinnerVerticalHalfMm;
+      const toothBandVerticalHalfMm = thinnerVerticalHalfMm;
+      const mediumVerticalHalfMm = pickReadableWorkerVerticalHalfMm(
+        balancedMeanWorkerPreset,
+        'balanced',
+        baseVerticalHalfMm
+      );
+      const balancedMediumVerticalHalfMm = mediumVerticalHalfMm;
+      const broadVerticalHalfMm = pickReadableWorkerVerticalHalfMm(
+        broadMeanWorkerPreset,
+        'broad',
+        mediumVerticalHalfMm
+      );
+      const rootedMediumVerticalHalfMm = toothBandVerticalHalfMm;
       const minimumPanoHeightPx = clampPanoDimension(
         Math.round((CPR_PANO_FIXED_VERTICAL_HALF_MM * 2) / minSpacing)
       );
@@ -7668,7 +9677,7 @@ export function useCPROrchestrator({
         aggregation,
         renderBackend: CPR_PANO_RECON_BACKEND_DEFAULT as CprPanoReconBackend,
         verticalDir,
-        verticalHalfMm: baseVerticalHalfMm,
+        verticalHalfMm: mediumVerticalHalfMm,
         verticalCenterOffsetMm: rigidSliceVerticalCenterOffsetMm,
         rigidVerticalSliceMode: rigidVerticalSliceModeEnabled,
         debugRunId,
@@ -7714,6 +9723,12 @@ export function useCPROrchestrator({
         aggregation: 'MIP' | 'MEAN';
         slabHalfThicknessMm: number;
         slabSamples: number;
+        debugScalarSamplingMode:
+          | 'current'
+          | 'lut-only'
+          | 'no-stored-value-normalization'
+          | 'raw-stored-values-debug';
+        toothBandStageDiagnostics?: ToothBandStageDiagnostics | null;
         durationMs: number;
         requestOverrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
         requestedBackend: CprPanoReconBackend;
@@ -7759,7 +9774,16 @@ export function useCPROrchestrator({
               ? overrides.verticalCenterOffsetMm ?? rigidSliceVerticalCenterOffsetMm
               : overrides.verticalCenterOffsetMm ?? workerInput.verticalCenterOffsetMm
           ) ?? rigidSliceVerticalCenterOffsetMm;
-        const actualVertHalfMm = CPR_PANO_FIXED_VERTICAL_HALF_MM;
+        const requestedDebugScalarSamplingMode =
+          overrides.debugScalarSamplingMode === 'lut-only' ||
+          overrides.debugScalarSamplingMode === 'no-stored-value-normalization' ||
+          overrides.debugScalarSamplingMode === 'raw-stored-values-debug'
+            ? overrides.debugScalarSamplingMode
+            : 'current';
+        const actualVertHalfMm = toPositiveFinite(
+          overrides.verticalHalfMm,
+          toPositiveFinite(workerInput.verticalHalfMm, baseVerticalHalfMm)
+        );
         const idealPanoHeight = Math.round((actualVertHalfMm * 2) / minSpacing);
         const finalPanoHeight = clampPanoDimension(Math.max(2, idealPanoHeight));
         const rowPixelSpacing = toPositiveFinite(
@@ -7780,6 +9804,7 @@ export function useCPROrchestrator({
             verticalHalfMm: actualVertHalfMm,
             verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
             rigidVerticalSliceMode: requestedRigidVerticalSliceMode,
+            debugScalarSamplingMode: requestedDebugScalarSamplingMode,
           })
         );
         const rawResult = await launchCPRWorker({
@@ -7794,6 +9819,7 @@ export function useCPROrchestrator({
           verticalHalfMm: actualVertHalfMm,
           verticalCenterOffsetMm: requestedVerticalCenterOffsetMm,
           rigidVerticalSliceMode: requestedRigidVerticalSliceMode,
+          debugScalarSamplingMode: requestedDebugScalarSamplingMode,
         });
         const result = rawResult;
         const hasIdentityRescaleMetadata =
@@ -7833,6 +9859,14 @@ export function useCPROrchestrator({
           result.debugMaps,
           summaryAnalysisCenterRow ?? undefined
         );
+        const toothBandStageDiagnostics = buildToothBandStageDiagnostics({
+          buffer: summaryPixelData,
+          width: finalPanoWidth,
+          height: finalPanoHeight,
+          debugMaps: result.debugMaps,
+          analysisCenterRow: summaryAnalysisCenterRow ?? undefined,
+          summary,
+        });
         const supportSurfaceMetrics = extractPhase4QualityGateMetrics(summary, result.workerDebugPayload);
         const renderSupportMode = supportSurfaceMetrics.renderSupportMode;
         const isDualArchProjection = isDualArchProjectionRenderMode(renderSupportMode);
@@ -7895,6 +9929,10 @@ export function useCPROrchestrator({
         const workerGpuRenderDiagnostic =
           workerDiagnostic?.gpuRender && typeof workerDiagnostic.gpuRender === 'object'
             ? (workerDiagnostic.gpuRender as Record<string, unknown>)
+            : null;
+        const workerScalarSamplingDiagnostic =
+          workerDiagnostic?.scalarSampling && typeof workerDiagnostic.scalarSampling === 'object'
+            ? (workerDiagnostic.scalarSampling as Record<string, unknown>)
             : null;
         const routeDiagnostic = resolveWorkerDisplayRouteDiagnostic(result.workerDebugPayload);
         const resolvedReconstructionMode =
@@ -8172,6 +10210,11 @@ export function useCPROrchestrator({
           backgroundToneMax: summary?.backgroundToneMax,
           backgroundOutlierFraction05: summary?.backgroundOutlierFraction05,
           backgroundOutlierFraction10: summary?.backgroundOutlierFraction10,
+          backgroundBands: summary?.backgroundBands,
+          toothBandHoleFraction: summary?.toothBandHoleFraction,
+          toothBandBlackClipFraction: summary?.toothBandBlackClipFraction,
+          toothBandRetainedWeightP10: summary?.toothBandRetainedWeightP10,
+          toothBandRetainedWeightP50: summary?.toothBandRetainedWeightP50,
           supportConfidenceP50: supportSurfaceMetrics.supportConfidenceP50,
           supportDepthStdMm: supportSurfaceMetrics.supportDepthStdMm,
           pathJumpP95Mm: supportSurfaceMetrics.pathJumpP95Mm,
@@ -8253,6 +10296,11 @@ export function useCPROrchestrator({
             actualVerticalCenterOffsetMm,
             slabHalfThicknessMm: requestedSlabHalfThicknessMm,
             slabSamples: requestedSlabSamples,
+            debugScalarSamplingMode: requestedDebugScalarSamplingMode,
+            actualDebugScalarSamplingMode:
+              toNonEmptyString(workerScalarSamplingDiagnostic?.debugScalarSamplingMode) ?? null,
+            normalizationSignature:
+              toNonEmptyString(workerScalarSamplingDiagnostic?.normalizationSignature) ?? null,
             modalityLutApplied: result.modalityLutApplied,
             requestedModalityLutApplied: result.requestedModalityLutApplied,
             storedValueNormalizationApplied: result.storedValueNormalizationApplied,
@@ -8260,6 +10308,24 @@ export function useCPROrchestrator({
             outputSignature,
           })
         );
+        if (
+          toothBandStageDiagnostics &&
+          (label === CPR_TARGET_TOOTH_DEBUG_LABEL || requestedDebugScalarSamplingMode !== 'current')
+        ) {
+          console.debug(
+            '[CPR-TOOTH-STAGE-JSON]',
+            JSON.stringify({
+              runId: debugRunId,
+              label,
+              debugScalarSamplingMode: requestedDebugScalarSamplingMode,
+              modalityLutApplied: result.modalityLutApplied,
+              requestedModalityLutApplied: result.requestedModalityLutApplied,
+              storedValueNormalizationApplied: result.storedValueNormalizationApplied,
+              effectiveIsPreScaled: result.effectiveIsPreScaled,
+              diagnostics: toothBandStageDiagnostics,
+            })
+          );
+        }
         console.debug(
           `[CPR-PANO-ATTEMPT] run=${debugRunId} label=${label} requestedBackend=${requestedRenderBackend} ` +
             `resolvedBackend=${routeDiagnostic.backend} pipelineMode=${routeDiagnostic.pipelineMode} ` +
@@ -8285,7 +10351,13 @@ export function useCPROrchestrator({
               summary ? summary.backgroundOutlierFraction10 * 100 : undefined,
               1
             )} ` +
+            `bgBand05=${summary?.backgroundBands?.dominantOutlierBand05 ?? 'na'} ` +
+            `bgBand10=${summary?.backgroundBands?.dominantOutlierBand10 ?? 'na'} ` +
             `blackClip=${formatReadablePanoValue(supportSurfaceMetrics.blackClipFraction, 3)} ` +
+            `toothHole=${formatReadablePanoValue(summary?.toothBandHoleFraction, 3)} ` +
+            `toothBlackClip=${formatReadablePanoValue(summary?.toothBandBlackClipFraction, 3)} ` +
+            `toothRetainedP10=${formatReadablePanoValue(summary?.toothBandRetainedWeightP10, 3)} ` +
+            `toothRetainedP50=${formatReadablePanoValue(summary?.toothBandRetainedWeightP50, 3)} ` +
             `supportP50=${formatReadablePanoValue(
               supportSurfaceMetrics.supportConfidenceP50,
               3
@@ -8357,6 +10429,10 @@ export function useCPROrchestrator({
             toothBandP10: summary?.toothBandP10 ?? null,
             toothBandP90: summary?.toothBandP90 ?? null,
             toothBandBrightFraction: summary?.toothBandBrightFraction ?? null,
+            toothBandHoleFraction: summary?.toothBandHoleFraction ?? null,
+            toothBandBlackClipFraction: summary?.toothBandBlackClipFraction ?? null,
+            toothBandRetainedWeightP10: summary?.toothBandRetainedWeightP10 ?? null,
+            toothBandRetainedWeightP50: summary?.toothBandRetainedWeightP50 ?? null,
             lowerBandP50: summary?.lowerBandP50 ?? null,
             lowerBandBrightFraction: summary?.lowerBandBrightFraction ?? null,
             backgroundToneSampleCount: summary?.backgroundToneSampleCount ?? null,
@@ -8365,6 +10441,7 @@ export function useCPROrchestrator({
             backgroundToneMax: summary?.backgroundToneMax ?? null,
             backgroundOutlierFraction05: summary?.backgroundOutlierFraction05 ?? null,
             backgroundOutlierFraction10: summary?.backgroundOutlierFraction10 ?? null,
+            backgroundBands: summary?.backgroundBands ?? null,
             detailBandHorizontalEdgeMean: summary?.detailBandHorizontalEdgeMean ?? null,
             detailBandVerticalEdgeMean: summary?.detailBandVerticalEdgeMean ?? null,
             supportConfidenceP50: supportSurfaceMetrics.supportConfidenceP50,
@@ -8423,6 +10500,18 @@ export function useCPROrchestrator({
             anatomy: qualityGateCandidate.supportSurfaceRiskSummary.anatomy,
           })
         );
+        if (summary?.backgroundBands) {
+          console.log(
+            '[CPR-BACKGROUND-LEAK-BANDS-JSON]',
+            JSON.stringify({
+              runId: debugRunId,
+              label,
+              dominantOutlierBand05: summary.backgroundBands.dominantOutlierBand05,
+              dominantOutlierBand10: summary.backgroundBands.dominantOutlierBand10,
+              backgroundBands: summary.backgroundBands,
+            })
+          );
+        }
 
         return {
           label,
@@ -8455,6 +10544,8 @@ export function useCPROrchestrator({
           aggregation: requestedAggregation,
           slabHalfThicknessMm: requestedSlabHalfThicknessMm,
           slabSamples: requestedSlabSamples,
+          debugScalarSamplingMode: requestedDebugScalarSamplingMode,
+          toothBandStageDiagnostics,
           durationMs: attemptDurationMs,
           requestOverrides: { ...overrides },
           requestedBackend: requestedRenderBackend,
@@ -8650,6 +10741,15 @@ export function useCPROrchestrator({
       ): boolean => {
         return compareRankedPanoOutputs(candidate, currentBest) < 0;
       };
+      type EvaluatedPanoAttempt = Awaited<ReturnType<typeof runWorkerAttempt>>;
+      type Phase2BaseSelectionAssessment = {
+        attempt: EvaluatedPanoAttempt;
+        phase0Rejected: boolean;
+        seedEligible: boolean;
+        structuralRejectReasons: string[];
+        score: number;
+        priorityIndex: number;
+      };
       const selectPreferredMeanAttempt = (): Awaited<ReturnType<typeof runWorkerAttempt>> | null => {
         const meanAttempts = attemptResults.filter(attempt => attempt.aggregation === 'MEAN');
         if (!meanAttempts.length) {
@@ -8664,66 +10764,141 @@ export function useCPROrchestrator({
         }
         return selected;
       };
+      const phase2PriorityIndexByLabel = new Map(
+        CPR_PHASE2_VIRTUAL_PANO_BASE_LABELS.map((label, index) => [label, index] as const)
+      );
+      const collectPhase2SeedStructuralRejectReasons = (attempt: EvaluatedPanoAttempt): string[] => {
+        const reasons: string[] = [];
+        if (attempt.hardRejectReason === 'support-surface-instability') {
+          reasons.push('hard-reject:support-surface-instability');
+        } else if (attempt.hardRejectReason) {
+          reasons.push(`hard-reject:${attempt.hardRejectReason}`);
+        }
+        for (const rejectReason of attempt.qualityGateRejectReasons) {
+          if (
+            rejectReason === 'tooth-band-hole-fraction-too-high' ||
+            rejectReason === 'tooth-band-black-clip-too-high' ||
+            rejectReason === 'tooth-band-retained-weight-collapsed' ||
+            rejectReason === 'middle-band-leakage-dominant'
+          ) {
+            reasons.push(rejectReason);
+          }
+        }
+        if ((attempt.summary?.toothBandHoleFraction ?? 0) > CPR_TOOTH_BAND_SEVERE_HOLE_FRACTION) {
+          reasons.push('tooth-band-hole-fraction-too-high');
+        }
+        if (
+          (attempt.summary?.toothBandBlackClipFraction ?? 0) >
+          CPR_TOOTH_BAND_SEVERE_BLACK_CLIP_FRACTION
+        ) {
+          reasons.push('tooth-band-black-clip-too-high');
+        }
+        if (
+          (attempt.summary?.toothBandRetainedWeightP10 ?? 1) <=
+          CPR_TOOTH_BAND_SEVERE_RETAINED_WEIGHT_P10_MAX
+        ) {
+          reasons.push('tooth-band-retained-weight-collapsed');
+        }
+        if (hasPhase4DominantMiddleBandLeakage(attempt.summary)) {
+          reasons.push('middle-band-leakage-dominant');
+        }
+        return Array.from(new Set(reasons));
+      };
+      const assessPhase2BaseAttempt = (attempt: EvaluatedPanoAttempt): Phase2BaseSelectionAssessment => {
+        const summary = attempt.summary;
+        const absVerticalCenterOffsetMm = Math.abs(attempt.verticalCenterOffsetMm);
+        const lowerBandBrightFraction = summary?.lowerBandBrightFraction ?? 0;
+        const lowerBandP50 = summary?.lowerBandP50 ?? -650;
+        const backgroundOutlierFraction05 = summary?.backgroundOutlierFraction05 ?? 0;
+        const backgroundOutlierFraction10 = summary?.backgroundOutlierFraction10 ?? 0;
+        const toothBandContrastRange = summary ? summary.toothBandP90 - summary.toothBandP10 : 0;
+        const toothBandDamagePenalty = computePhase4ToothBandDamagePenalty({
+          toothBandHoleFraction: summary?.toothBandHoleFraction ?? null,
+          toothBandBlackClipFraction: summary?.toothBandBlackClipFraction ?? null,
+          toothBandRetainedWeightP10: summary?.toothBandRetainedWeightP10 ?? null,
+          toothBandRetainedWeightP50: summary?.toothBandRetainedWeightP50 ?? null,
+        });
+        const middleBandLeakPenalty = computePhase4MiddleBandLeakPenalty(summary);
+        const balancedMeanRecoveryBonus = computePhase4BalancedMeanRecoveryBonus({
+          isGpuMeanAttempt:
+            attempt.requestedBackend === 'gpu' &&
+            attempt.resolvedBackend === 'gpu' &&
+            attempt.aggregation === 'MEAN',
+          summary,
+          actualVertHalfMm: attempt.actualVertHalfMm,
+          verticalCenterOffsetMm: attempt.verticalCenterOffsetMm,
+          slabHalfThicknessMm: attempt.slabHalfThicknessMm,
+        });
+        const centerPenalty =
+          absVerticalCenterOffsetMm * 3.2 +
+          Math.max(0, absVerticalCenterOffsetMm - 3.5) * 4.5;
+        const lowerBandPenalty =
+          Math.max(0, lowerBandBrightFraction - 0.03) * 16 +
+          Math.max(0, lowerBandP50 + 420) / 42;
+        const backgroundPenalty =
+          Math.max(0, backgroundOutlierFraction05 - 0.16) * 22 +
+          Math.max(0, backgroundOutlierFraction10 - 0.07) * 28;
+        const slabPenalty = Math.max(0, attempt.slabHalfThicknessMm - 1.6) * 1.8;
+        const contrastReward = Math.max(0, toothBandContrastRange - 560) / 120;
+        const structuralRejectReasons = collectPhase2SeedStructuralRejectReasons(attempt);
+        const phase0Rejected = !attempt.qualityGatePassed || !!attempt.hardRejectReason;
+        const seedEligible = !attempt.hardRejectReason && structuralRejectReasons.length === 0;
+        const phase0RejectPenalty =
+          (attempt.qualityGatePassed ? 0 : 180) +
+          (attempt.hardRejectReason ? 420 : 0) +
+          structuralRejectReasons.length * 180;
+        return {
+          attempt,
+          phase0Rejected,
+          seedEligible,
+          structuralRejectReasons,
+          score:
+            centerPenalty +
+            lowerBandPenalty +
+            backgroundPenalty +
+            slabPenalty +
+            toothBandDamagePenalty +
+            middleBandLeakPenalty +
+            phase0RejectPenalty -
+            contrastReward -
+            balancedMeanRecoveryBonus,
+          priorityIndex:
+            phase2PriorityIndexByLabel.get(
+              attempt.label as (typeof CPR_PHASE2_VIRTUAL_PANO_BASE_LABELS)[number]
+            ) ?? Number.POSITIVE_INFINITY,
+        };
+      };
+      const collectPhase2BaseSelectionAssessments = (): Phase2BaseSelectionAssessment[] =>
+        attemptResults
+          .filter((attempt): attempt is EvaluatedPanoAttempt => attempt.aggregation === 'MEAN')
+          .map(assessPhase2BaseAttempt);
       const selectPreferredMeanAttemptForPhase2 = (): Awaited<
         ReturnType<typeof runWorkerAttempt>
       > | null => {
-        const meanAttempts = attemptResults.filter(attempt => attempt.aggregation === 'MEAN');
-        if (!meanAttempts.length) {
+        const phase2BaseAssessments = collectPhase2BaseSelectionAssessments();
+        if (!phase2BaseAssessments.length) {
           return null;
         }
 
-        const phase2PriorityIndexByLabel = new Map(
-          CPR_PHASE2_VIRTUAL_PANO_BASE_LABELS.map((label, index) => [label, index] as const)
-        );
-        const scorePhase2BaseAttempt = (
-          attempt: Awaited<ReturnType<typeof runWorkerAttempt>>
-        ): number => {
-          const summary = attempt.summary;
-          const absVerticalCenterOffsetMm = Math.abs(attempt.verticalCenterOffsetMm);
-          const lowerBandBrightFraction = summary?.lowerBandBrightFraction ?? 0;
-          const lowerBandP50 = summary?.lowerBandP50 ?? -650;
-          const backgroundOutlierFraction05 = summary?.backgroundOutlierFraction05 ?? 0;
-          const backgroundOutlierFraction10 = summary?.backgroundOutlierFraction10 ?? 0;
-          const toothBandContrastRange = summary ? summary.toothBandP90 - summary.toothBandP10 : 0;
-          const centerPenalty =
-            absVerticalCenterOffsetMm * 3.2 +
-            Math.max(0, absVerticalCenterOffsetMm - 3.5) * 4.5;
-          const lowerBandPenalty =
-            Math.max(0, lowerBandBrightFraction - 0.03) * 16 +
-            Math.max(0, lowerBandP50 + 420) / 42;
-          const backgroundPenalty =
-            Math.max(0, backgroundOutlierFraction05 - 0.16) * 22 +
-            Math.max(0, backgroundOutlierFraction10 - 0.07) * 28;
-          const slabPenalty = Math.max(0, attempt.slabHalfThicknessMm - 1.6) * 1.8;
-          const contrastReward = Math.max(0, toothBandContrastRange - 560) / 120;
-          return centerPenalty + lowerBandPenalty + backgroundPenalty + slabPenalty - contrastReward;
-        };
+        const eligibleAssessments = phase2BaseAssessments.filter(assessment => assessment.seedEligible);
+        if (!eligibleAssessments.length) {
+          return null;
+        }
 
-        let selected = meanAttempts[0];
-        let bestScore = scorePhase2BaseAttempt(selected);
-        for (let index = 1; index < meanAttempts.length; index++) {
-          const candidate = meanAttempts[index];
-          const candidateScore = scorePhase2BaseAttempt(candidate);
-          const selectedPriority =
-            phase2PriorityIndexByLabel.get(
-              selected.label as (typeof CPR_PHASE2_VIRTUAL_PANO_BASE_LABELS)[number]
-            ) ?? Number.POSITIVE_INFINITY;
-          const candidatePriority =
-            phase2PriorityIndexByLabel.get(
-              candidate.label as (typeof CPR_PHASE2_VIRTUAL_PANO_BASE_LABELS)[number]
-            ) ?? Number.POSITIVE_INFINITY;
+        let selected = eligibleAssessments[0];
+        for (let index = 1; index < eligibleAssessments.length; index++) {
+          const candidate = eligibleAssessments[index];
           if (
-            candidateScore < bestScore - 1e-6 ||
-            (Math.abs(candidateScore - bestScore) <= 1e-6 && candidatePriority < selectedPriority)
+            candidate.score < selected.score - 1e-6 ||
+            (Math.abs(candidate.score - selected.score) <= 1e-6 &&
+              candidate.priorityIndex < selected.priorityIndex)
           ) {
             selected = candidate;
-            bestScore = candidateScore;
           }
         }
 
-        return selected;
+        return selected.attempt;
       };
-      type EvaluatedPanoAttempt = Awaited<ReturnType<typeof runWorkerAttempt>>;
       const collectAttemptEscalationReasons = (attempt: EvaluatedPanoAttempt): string[] => {
         const reasons: string[] = [];
         if (attempt.hardRejectReason) {
@@ -8752,11 +10927,34 @@ export function useCPROrchestrator({
             'support-ambiguity-high',
             'support-forced-drift',
             'background-leakage',
+            'middle-band-leakage-dominant',
+            'tooth-band-holes',
+            'tooth-band-black-clipped',
+            'tooth-band-retention-low',
+            'tooth-band-retention-collapsed',
           ]);
           for (const riskFlag of attempt.supportSurfaceRiskFlags) {
             if (blockingRiskFlags.has(riskFlag)) {
               reasons.push(`risk-flag:${riskFlag}`);
             }
+          }
+          if ((attempt.summary?.toothBandHoleFraction ?? 0) > CPR_TOOTH_BAND_SEVERE_HOLE_FRACTION) {
+            reasons.push('tooth-band-hole-fraction-high');
+          }
+          if (
+            (attempt.summary?.toothBandBlackClipFraction ?? 0) >
+            CPR_TOOTH_BAND_SEVERE_BLACK_CLIP_FRACTION
+          ) {
+            reasons.push('tooth-band-black-clip-high');
+          }
+          if (
+            (attempt.summary?.toothBandRetainedWeightP10 ?? 1) <=
+            CPR_TOOTH_BAND_SEVERE_RETAINED_WEIGHT_P10_MAX
+          ) {
+            reasons.push('tooth-band-retained-weight-collapsed');
+          }
+          if (hasPhase4DominantMiddleBandLeakage(attempt.summary)) {
+            reasons.push('middle-band-leakage-dominant');
           }
           if ((attempt.summary?.backgroundOutlierFraction05 ?? 0) > 0.2) {
             reasons.push('background-outlier-fraction05-high');
@@ -9054,10 +11252,10 @@ export function useCPROrchestrator({
           label: 'retry-mean-balanced-medium',
           overrides: {
             modalityLutOverride: true,
-            verticalHalfMm: mediumVerticalHalfMm,
-            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-            slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
-            slabSamples: balancedMeanSlabSamples,
+            verticalHalfMm: balancedMediumVerticalHalfMm,
+            verticalCenterOffsetMm: balancedMediumCenterOffsetMm,
+            slabHalfThicknessMm: balancedMediumSlabHalfThicknessMm,
+            slabSamples: balancedMediumSlabSamples,
             aggregation: 'MEAN',
           },
         });
@@ -9395,16 +11593,57 @@ export function useCPROrchestrator({
       }
 
       const totalAttemptDurationMs = performance.now() - panoAttemptSequenceStartMs;
+      const phase2BaseAssessments = collectPhase2BaseSelectionAssessments();
+      const phase2SeedEligibleBaseAssessments = phase2BaseAssessments.filter(
+        assessment => assessment.seedEligible
+      );
+      const phase2BaseSelectionBlockedReason = !phase2BaseAssessments.length
+        ? 'no-mean-attempt'
+        : !phase2SeedEligibleBaseAssessments.length
+          ? 'no-phase2-seed-eligible-mean-attempt'
+          : null;
+      const phase2NoBaseAttemptSkipReason =
+        phase2BaseSelectionBlockedReason === 'no-phase2-seed-eligible-mean-attempt'
+          ? 'NO_PHASE2_SEED_ELIGIBLE_MEAN_ATTEMPT'
+          : 'NO_MEAN_ATTEMPT';
+      const phase2BaseAssessmentByLabel = new Map(
+        phase2BaseAssessments.map(assessment => [assessment.attempt.label, assessment] as const)
+      );
+      const fastPhase2SeedAssessment =
+        bestAttempt.aggregation === 'MEAN' ? assessPhase2BaseAttempt(bestAttempt) : null;
       const phase2BaseAttempt =
-        shouldUseFastWorkerReconPhase2Seed && bestAttempt.aggregation === 'MEAN'
+        shouldUseFastWorkerReconPhase2Seed &&
+        bestAttempt.aggregation === 'MEAN' &&
+        fastPhase2SeedAssessment?.seedEligible
           ? bestAttempt
           : selectPreferredMeanAttemptForPhase2();
+      const phase2BaseAssessment =
+        phase2BaseAttempt ? phase2BaseAssessmentByLabel.get(phase2BaseAttempt.label) ?? null : null;
       console.log(
         '[CPR-PHASE2-BASE-SELECTION-JSON]',
         JSON.stringify({
           runId: debugRunId,
           selectedLabel: phase2BaseAttempt?.label ?? null,
+          selectedPhase0QualityGatePassed: phase2BaseAttempt?.qualityGatePassed ?? null,
+          selectedPhase0RejectReasons: phase2BaseAttempt?.qualityGateRejectReasons ?? [],
+          selectedStructuralRejectReasons: phase2BaseAssessment?.structuralRejectReasons ?? [],
+          selectedEligibleForPhase2Seed: phase2BaseAssessment?.seedEligible ?? null,
+          selectedPhase2SeedScore: phase2BaseAssessment?.score ?? null,
+          eligibleCandidateCount: phase2SeedEligibleBaseAssessments.length,
+          ineligibleCandidateCount:
+            phase2BaseAssessments.length - phase2SeedEligibleBaseAssessments.length,
+          selectionBlockedReason: phase2BaseSelectionBlockedReason,
           prioritizedLabels: CPR_PHASE2_VIRTUAL_PANO_BASE_LABELS,
+          candidates: phase2BaseAssessments.map(assessment => ({
+            label: assessment.attempt.label,
+            phase0QualityGatePassed: assessment.attempt.qualityGatePassed,
+            phase0RejectReasons: assessment.attempt.qualityGateRejectReasons,
+            hardRejectReason: assessment.attempt.hardRejectReason,
+            structuralRejectReasons: assessment.structuralRejectReasons,
+            seedEligible: assessment.seedEligible,
+            score: assessment.score,
+            priorityIndex: assessment.priorityIndex,
+          })),
           fallbackLabel:
             phase2BaseAttempt && !CPR_PHASE2_VIRTUAL_PANO_BASE_LABELS.includes(
               phase2BaseAttempt.label as (typeof CPR_PHASE2_VIRTUAL_PANO_BASE_LABELS)[number]
@@ -9429,7 +11668,7 @@ export function useCPROrchestrator({
       if (gpuBackendEnabled) {
         phase1VirtualPano.skippedReason = 'GPU_BACKEND_ACTIVE_USE_ATTEMPT_PIPELINE';
       } else if (!phase2BaseAttempt) {
-        phase1VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
+        phase1VirtualPano.skippedReason = phase2NoBaseAttemptSkipReason;
       } else {
         try {
           const phase1Result = await launchCPRWorker({
@@ -9500,6 +11739,15 @@ export function useCPROrchestrator({
         orchestratorGatePassed: boolean | null;
         orchestratorRejectReasons: string[];
         displayDecisionReason: string | null;
+        phase0SeedQualityGatePassed: boolean | null;
+        phase0SeedRejectReasons: string[];
+        phase0SeedStructuralRejectReasons: string[];
+        phase0SeedEligible: boolean | null;
+        revivedRejectedFamily: boolean;
+        revivedRejectedFamilyRulePassed: boolean | null;
+        revivedRejectedFamilyRejectReasons: string[];
+        phase2RenderFamily: string | null;
+        phase2CandidateSource: Phase4QualityGateCandidateSource | null;
       } = {
         executed: false,
         skippedReason: null,
@@ -9514,10 +11762,19 @@ export function useCPROrchestrator({
         orchestratorGatePassed: null,
         orchestratorRejectReasons: [],
         displayDecisionReason: null,
+        phase0SeedQualityGatePassed: phase2BaseAttempt?.qualityGatePassed ?? null,
+        phase0SeedRejectReasons: phase2BaseAttempt?.qualityGateRejectReasons.slice() ?? [],
+        phase0SeedStructuralRejectReasons: phase2BaseAssessment?.structuralRejectReasons ?? [],
+        phase0SeedEligible: phase2BaseAssessment?.seedEligible ?? null,
+        revivedRejectedFamily: false,
+        revivedRejectedFamilyRulePassed: null,
+        revivedRejectedFamilyRejectReasons: [],
+        phase2RenderFamily: null,
+        phase2CandidateSource: null,
       };
       let phase2WorkerResult: CPRWorkerLaunchResult | null = null;
       if (!phase2BaseAttempt) {
-        phase2VirtualPano.skippedReason = 'NO_MEAN_ATTEMPT';
+        phase2VirtualPano.skippedReason = phase2NoBaseAttemptSkipReason;
       } else {
         try {
           const phase2Result = await launchCPRWorker({
@@ -9578,6 +11835,7 @@ export function useCPROrchestrator({
           phase2VirtualPano.diagnostics = phase2RenderDiagnostics;
           phase2VirtualPano.summary = phase2Summary;
           phase2VirtualPano.voi = phase2Voi;
+          phase2VirtualPano.phase2RenderFamily = phase2RenderSupportMode;
           const phase2RejectReasons =
             phase2RenderDiagnostics && Array.isArray(phase2RenderDiagnostics.rejectReasons)
               ? phase2RenderDiagnostics.rejectReasons.filter(reason => typeof reason === 'string')
@@ -9652,16 +11910,87 @@ export function useCPROrchestrator({
               workerDebugPayload: phase2WorkerResult.workerDebugPayload ?? null,
             })
           : null;
+      const phase2RejectedSeedRevivalDecision =
+        phase2BaseAttempt && explicitPhase2QualityGateCandidate
+          ? (() => {
+              const derivedFromPhase0RejectedFamily =
+                !phase2BaseAttempt.qualityGatePassed || !!phase2BaseAttempt.hardRejectReason;
+              const seedStructuralRejectReasons = phase2BaseAssessment?.structuralRejectReasons ?? [];
+              const rejectReasons: string[] = [];
+              if (explicitPhase2QualityGateCandidate.hardRejectReason) {
+                rejectReasons.push(
+                  `phase2-hard-reject:${explicitPhase2QualityGateCandidate.hardRejectReason}`
+                );
+              }
+              if (
+                seedStructuralRejectReasons.includes('tooth-band-hole-fraction-too-high') &&
+                (explicitPhase2QualityGateCandidate.metrics.toothBandHoleFraction ?? 0) >
+                  CPR_TOOTH_BAND_SEVERE_HOLE_FRACTION
+              ) {
+                rejectReasons.push('phase2-tooth-band-holes-not-cleared');
+              }
+              if (
+                seedStructuralRejectReasons.includes('tooth-band-black-clip-too-high') &&
+                (explicitPhase2QualityGateCandidate.metrics.toothBandBlackClipFraction ?? 0) >
+                  CPR_TOOTH_BAND_SEVERE_BLACK_CLIP_FRACTION
+              ) {
+                rejectReasons.push('phase2-tooth-band-black-clip-not-cleared');
+              }
+              if (
+                seedStructuralRejectReasons.includes('tooth-band-retained-weight-collapsed') &&
+                (explicitPhase2QualityGateCandidate.metrics.toothBandRetainedWeightP10 ?? 1) <=
+                  CPR_TOOTH_BAND_SEVERE_RETAINED_WEIGHT_P10_MAX
+              ) {
+                rejectReasons.push('phase2-tooth-band-retention-collapse-not-cleared');
+              }
+              if (
+                seedStructuralRejectReasons.includes('middle-band-leakage-dominant') &&
+                hasPhase4DominantMiddleBandLeakage(phase2VirtualPano.summary)
+              ) {
+                rejectReasons.push('phase2-middle-band-leakage-not-cleared');
+              }
+              if (
+                seedStructuralRejectReasons.includes('hard-reject:support-surface-instability') &&
+                explicitPhase2QualityGateCandidate.hardRejectReason === 'support-surface-instability'
+              ) {
+                rejectReasons.push('phase2-support-surface-instability-not-cleared');
+              }
+              return {
+                derivedFromPhase0RejectedFamily,
+                seedStructuralRejectReasons,
+                pass:
+                  explicitPhase2QualityGateCandidate.pass &&
+                  (!derivedFromPhase0RejectedFamily || rejectReasons.length === 0),
+                rejectReasons,
+              };
+            })()
+          : null;
       if (explicitPhase2QualityGateCandidate) {
         phase2VirtualPano.orchestratorGatePassed = explicitPhase2QualityGateCandidate.pass;
         phase2VirtualPano.orchestratorRejectReasons =
           explicitPhase2QualityGateCandidate.rejectReasons.slice();
+        phase2VirtualPano.phase2CandidateSource = explicitPhase2QualityGateCandidate.candidateSource;
+      }
+      if (phase2RejectedSeedRevivalDecision) {
+        phase2VirtualPano.revivedRejectedFamily =
+          phase2RejectedSeedRevivalDecision.derivedFromPhase0RejectedFamily;
+        phase2VirtualPano.revivedRejectedFamilyRulePassed = phase2RejectedSeedRevivalDecision.pass;
+        phase2VirtualPano.revivedRejectedFamilyRejectReasons =
+          phase2RejectedSeedRevivalDecision.rejectReasons.slice();
       }
       if (phase2VirtualPano.workerAcceptedForOutput && explicitPhase2QualityGateCandidate) {
-        phase2VirtualPano.usedAsDisplayedOutput = explicitPhase2QualityGateCandidate.pass;
-        phase2VirtualPano.displayDecisionReason = explicitPhase2QualityGateCandidate.pass
-          ? 'accepted-by-worker-and-orchestrator'
-          : 'rejected-by-orchestrator-gate';
+        const separateRejectedSeedRulePass =
+          phase2RejectedSeedRevivalDecision?.pass ?? explicitPhase2QualityGateCandidate.pass;
+        phase2VirtualPano.usedAsDisplayedOutput =
+          explicitPhase2QualityGateCandidate.pass && separateRejectedSeedRulePass;
+        phase2VirtualPano.displayDecisionReason =
+          explicitPhase2QualityGateCandidate.pass && separateRejectedSeedRulePass
+            ? phase2RejectedSeedRevivalDecision?.derivedFromPhase0RejectedFamily
+              ? 'accepted-by-worker-and-orchestrator-after-rejected-seed-revival-rule'
+              : 'accepted-by-worker-and-orchestrator'
+            : explicitPhase2QualityGateCandidate.pass
+              ? 'rejected-by-rejected-seed-revival-rule'
+              : 'rejected-by-orchestrator-gate';
       } else if (phase2VirtualPano.workerAcceptedForOutput) {
         phase2VirtualPano.displayDecisionReason = 'accepted-by-worker';
       } else if (phase2VirtualPano.executed) {
@@ -9896,11 +12225,41 @@ export function useCPROrchestrator({
         JSON.stringify({
           runId: debugRunId,
           selectedLabel: phase2BaseAttempt?.label ?? null,
+          selectedPhase0QualityGatePassed: phase2BaseAttempt?.qualityGatePassed ?? null,
+          selectedPhase0RejectReasons: phase2BaseAttempt?.qualityGateRejectReasons ?? [],
+          selectedPhase0StructuralRejectReasons: phase2BaseAssessment?.structuralRejectReasons ?? [],
+          selectedEligibleForPhase2Seed: phase2BaseAssessment?.seedEligible ?? null,
           workerAcceptedForOutput: phase2VirtualPano.workerAcceptedForOutput,
           orchestratorGatePassed: phase2VirtualPano.orchestratorGatePassed,
           orchestratorRejectReasons: phase2VirtualPano.orchestratorRejectReasons,
           displayDecisionReason: phase2VirtualPano.displayDecisionReason,
+          revivedRejectedFamily: phase2VirtualPano.revivedRejectedFamily,
+          revivedRejectedFamilyRulePassed: phase2VirtualPano.revivedRejectedFamilyRulePassed,
+          revivedRejectedFamilyRejectReasons: phase2VirtualPano.revivedRejectedFamilyRejectReasons,
+          phase2RenderFamily: phase2VirtualPano.phase2RenderFamily,
+          phase2CandidateSource: phase2VirtualPano.phase2CandidateSource,
           qualityGateCandidate: explicitPhase2QualityGateCandidate,
+        })
+      );
+      console.log(
+        '[CPR-PHASE2-SEED-PROVENANCE-JSON]',
+        JSON.stringify({
+          runId: debugRunId,
+          seedLabel: phase2BaseAttempt?.label ?? null,
+          seedPhase0QualityGatePassed: phase2BaseAttempt?.qualityGatePassed ?? null,
+          seedPhase0RejectReasons: phase2BaseAttempt?.qualityGateRejectReasons ?? [],
+          seedPhase0StructuralRejectReasons: phase2BaseAssessment?.structuralRejectReasons ?? [],
+          seedEligibleForPhase2: phase2BaseAssessment?.seedEligible ?? null,
+          seedPhase2Score: phase2BaseAssessment?.score ?? null,
+          phase2Executed: phase2VirtualPano.executed,
+          phase2RenderFamily: phase2VirtualPano.phase2RenderFamily,
+          phase2CandidateSource: phase2VirtualPano.phase2CandidateSource,
+          phase2WorkerAccepted: phase2VirtualPano.workerAcceptedForOutput,
+          phase2OrchestratorGatePassed: phase2VirtualPano.orchestratorGatePassed,
+          phase2DisplayDecisionReason: phase2VirtualPano.displayDecisionReason,
+          revivedRejectedFamily: phase2VirtualPano.revivedRejectedFamily,
+          revivedRejectedFamilyRulePassed: phase2VirtualPano.revivedRejectedFamilyRulePassed,
+          revivedRejectedFamilyRejectReasons: phase2VirtualPano.revivedRejectedFamilyRejectReasons,
         })
       );
       console.log(
@@ -9949,6 +12308,14 @@ export function useCPROrchestrator({
             workerDebugPayload: topLegacyAttempt.workerDebugPayload ?? null,
           })
         : null;
+      const forceDisplayGpuCandidateEvenIfRejected =
+        shouldForceDisplayGpuCandidateEvenIfRejected();
+      let forcedDisplayedAttemptForDebug:
+        | Awaited<ReturnType<typeof runWorkerAttempt>>
+        | null = null;
+      let forcedDisplayedQualityGateCandidate: Phase4QualityGateCandidate | null = null;
+      let forcedDisplayedAttemptBlockedReason: string | null = null;
+      let forcedDisplayedAttemptBlockedReasons: string[] = [];
       let selectedQualityGateCandidate =
         phase2VirtualPano.usedAsDisplayedOutput && explicitPhase2QualityGateCandidate
           ? explicitPhase2QualityGateCandidate
@@ -10122,6 +12489,66 @@ export function useCPROrchestrator({
           }
         );
       };
+      const topDisplayRankedGpuAttempt =
+        attemptResults
+          .filter(
+            attempt =>
+              attempt.requestedBackend === 'gpu' && attempt.resolvedBackend === 'gpu'
+          )
+          .slice()
+          .sort(compareDisplayRankedAttempts)[0] ?? topGpuAttempt;
+      const displayRankedGpuQualityGateCandidate = topDisplayRankedGpuAttempt
+        ? buildPhase4QualityGateCandidate({
+            attemptLabel: topDisplayRankedGpuAttempt.label,
+            displayedPath: 'worker-recon',
+            sourceVolumeId,
+            summary: topDisplayRankedGpuAttempt.summary,
+            qualityBase: topDisplayRankedGpuAttempt.qualityBase,
+            qualityScore: topDisplayRankedGpuAttempt.qualityScore,
+            hardRejectReason: topDisplayRankedGpuAttempt.hardRejectReason,
+            workerDebugPayload: topDisplayRankedGpuAttempt.workerDebugPayload ?? null,
+          })
+        : null;
+      if (
+        topGpuAttempt &&
+        topDisplayRankedGpuAttempt &&
+        topGpuAttempt.label !== topDisplayRankedGpuAttempt.label
+      ) {
+        console.debug(
+          '[CPR-GPU-SELECTION-INCONSISTENCY-JSON]',
+          JSON.stringify({
+            runId: debugRunId,
+            qualityRankedGpuLabel: topGpuAttempt.label,
+            displayRankedGpuLabel: topDisplayRankedGpuAttempt.label,
+            qualityRankedGpuQualityScore: topGpuAttempt.qualityScore,
+            displayRankedGpuQualityScore: topDisplayRankedGpuAttempt.qualityScore,
+            qualityRankedGpuDisplayScore:
+              displaySelectionBreakdownByAttemptLabel.get(topGpuAttempt.label)?.displaySelectionScore ??
+              null,
+            displayRankedGpuDisplayScore:
+              displaySelectionBreakdownByAttemptLabel.get(topDisplayRankedGpuAttempt.label)
+                ?.displaySelectionScore ?? null,
+            qualityRankedGpuBlackClip:
+              topGpuAttempt.summary?.toothBandBlackClipFraction ??
+              topGpuAttempt.qualityGateMetrics?.toothBandBlackClipFraction,
+            displayRankedGpuBlackClip:
+              topDisplayRankedGpuAttempt.summary?.toothBandBlackClipFraction ??
+              topDisplayRankedGpuAttempt.qualityGateMetrics?.toothBandBlackClipFraction,
+            qualityRankedGpuHoleFraction:
+              topGpuAttempt.summary?.toothBandHoleFraction ??
+              topGpuAttempt.qualityGateMetrics?.toothBandHoleFraction,
+            displayRankedGpuHoleFraction:
+              topDisplayRankedGpuAttempt.summary?.toothBandHoleFraction ??
+              topDisplayRankedGpuAttempt.qualityGateMetrics?.toothBandHoleFraction,
+            qualityRankedGpuRetainedWeightP50:
+              topGpuAttempt.summary?.toothBandRetainedWeightP50 ??
+              topGpuAttempt.qualityGateMetrics?.toothBandRetainedWeightP50,
+            displayRankedGpuRetainedWeightP50:
+              topDisplayRankedGpuAttempt.summary?.toothBandRetainedWeightP50 ??
+              topDisplayRankedGpuAttempt.qualityGateMetrics?.toothBandRetainedWeightP50,
+          })
+        );
+      }
       const degradedPreviewCandidateOptions = attemptResults
         .filter(
           attempt =>
@@ -10149,7 +12576,10 @@ export function useCPROrchestrator({
           };
         });
       const degradedPreviewDisplayableOptions = degradedPreviewCandidateOptions.filter(
-        option => !option.candidate.pass && !option.degradedPreviewAssessment.catastrophic
+        option =>
+          !option.candidate.pass &&
+          !option.degradedPreviewAssessment.catastrophic &&
+          !option.degradedPreviewAssessment.blockedAsDegradedPreview
       );
       const degradedPreviewDisplayableOptionByCanonicalLabel = new Map<
         string,
@@ -10170,32 +12600,121 @@ export function useCPROrchestrator({
         degradedPreviewUniqueDisplayableOptions
           .slice()
           .sort((a, b) => compareDisplayRankedAttempts(a.attempt, b.attempt));
+      const degradedPreviewOptionByCanonicalLabel = new Map<
+        string,
+        (typeof degradedPreviewCandidateOptions)[number]
+      >();
+      for (const option of degradedPreviewCandidateOptions) {
+        const canonicalLabel =
+          duplicateOfLabelByAttemptLabel.get(option.attempt.label) ?? option.attempt.label;
+        const existing = degradedPreviewOptionByCanonicalLabel.get(canonicalLabel);
+        if (!existing || compareDisplayRankedAttempts(option.attempt, existing.attempt) < 0) {
+          degradedPreviewOptionByCanonicalLabel.set(canonicalLabel, option);
+        }
+      }
+      const degradedPreviewUniqueOptions = Array.from(
+        degradedPreviewOptionByCanonicalLabel.values()
+      );
+      const degradedPreviewRankedOptions = degradedPreviewUniqueOptions
+        .slice()
+        .sort((a, b) => compareDisplayRankedAttempts(a.attempt, b.attempt));
       const degradedPreviewFallbackChoice =
         !selectedQualityGateCandidate.pass
           ? degradedPreviewRankedDisplayableOptions[0] ?? null
           : null;
+      const degradedPreviewEmergencyChoice =
+        !selectedQualityGateCandidate.pass && !degradedPreviewFallbackChoice
+          ? degradedPreviewRankedOptions[0] ?? null
+          : null;
+      const degradedPreviewSelectedChoice =
+        degradedPreviewFallbackChoice ?? degradedPreviewEmergencyChoice;
       const degradedPreviewCatastrophicOptions = degradedPreviewCandidateOptions.filter(
         option => option.degradedPreviewAssessment.catastrophic
+      );
+      const degradedPreviewBlockedOptions = degradedPreviewCandidateOptions.filter(
+        option => option.degradedPreviewAssessment.blockedAsDegradedPreview
       );
       const degradedPreviewCandidateByAttemptLabel = new Map(
         degradedPreviewCandidateOptions.map(option => [
           option.attempt.label,
           {
             candidate: option.candidate,
-            displayable: option.candidate.pass || !option.degradedPreviewAssessment.catastrophic,
+            displayable:
+              option.candidate.pass ||
+              (!option.degradedPreviewAssessment.catastrophic &&
+                !option.degradedPreviewAssessment.blockedAsDegradedPreview),
             catastrophicReasons: option.degradedPreviewAssessment.catastrophicReasons,
+            blockedAsDegradedPreview:
+              option.degradedPreviewAssessment.blockedAsDegradedPreview,
+            blockedAsDegradedPreviewReasons:
+              option.degradedPreviewAssessment.blockedAsDegradedPreviewReasons,
           },
         ])
       );
+      const topDisplayRankedGpuDisplayDiagnostic = topDisplayRankedGpuAttempt
+        ? degradedPreviewCandidateByAttemptLabel.get(topDisplayRankedGpuAttempt.label) ?? null
+        : null;
+      const canForceDisplayTopDisplayRankedGpuCandidate =
+        !!forceDisplayGpuCandidateEvenIfRejected &&
+        !!topDisplayRankedGpuAttempt &&
+        !!displayRankedGpuQualityGateCandidate &&
+        !!topDisplayRankedGpuAttempt.voi &&
+        topDisplayRankedGpuAttempt.result.pixelData.length ===
+          topDisplayRankedGpuAttempt.result.width * topDisplayRankedGpuAttempt.result.height &&
+        (displayRankedGpuQualityGateCandidate.pass ||
+          !!topDisplayRankedGpuDisplayDiagnostic?.displayable);
+      forcedDisplayedAttemptForDebug = canForceDisplayTopDisplayRankedGpuCandidate
+        ? topDisplayRankedGpuAttempt
+        : null;
+      forcedDisplayedQualityGateCandidate =
+        forcedDisplayedAttemptForDebug && displayRankedGpuQualityGateCandidate
+          ? displayRankedGpuQualityGateCandidate
+          : null;
+      if (
+        forceDisplayGpuCandidateEvenIfRejected &&
+        topDisplayRankedGpuAttempt &&
+        displayRankedGpuQualityGateCandidate &&
+        !forcedDisplayedAttemptForDebug
+      ) {
+        forcedDisplayedAttemptBlockedReason = topDisplayRankedGpuDisplayDiagnostic?.catastrophicReasons
+          ?.length
+          ? 'force-display-blocked-catastrophic-gpu-candidate'
+          : topDisplayRankedGpuDisplayDiagnostic?.blockedAsDegradedPreview
+            ? 'force-display-blocked-structurally-rejected-gpu-candidate'
+            : 'force-display-blocked-gpu-candidate-not-displayable';
+        forcedDisplayedAttemptBlockedReasons = Array.from(
+          new Set([
+            ...(topDisplayRankedGpuDisplayDiagnostic?.blockedAsDegradedPreviewReasons ?? []),
+            ...(topDisplayRankedGpuDisplayDiagnostic?.catastrophicReasons ?? []),
+          ])
+        );
+        console.warn(
+          `[CPR][${debugRunId}] Force-display GPU override was requested but the top display-ranked GPU candidate is blocked from direct display.`,
+          {
+            requestedLabel: topDisplayRankedGpuAttempt.label,
+            blockedReason: forcedDisplayedAttemptBlockedReason,
+            blockedReasons: forcedDisplayedAttemptBlockedReasons,
+          }
+        );
+        console.log(
+          '[CPR-FORCED-GPU-DISPLAY-BLOCKED-JSON]',
+          JSON.stringify({
+            runId: debugRunId,
+            requestedLabel: topDisplayRankedGpuAttempt.label,
+            blockedReason: forcedDisplayedAttemptBlockedReason,
+            blockedReasons: forcedDisplayedAttemptBlockedReasons,
+            candidateRejectReasons: displayRankedGpuQualityGateCandidate.rejectReasons,
+          })
+        );
+      }
       const buildDisplayRankingLogRow = (
         attempt: Awaited<ReturnType<typeof runWorkerAttempt>>
       ): Record<string, unknown> => {
         const breakdown = displaySelectionBreakdownByAttemptLabel.get(attempt.label);
-        const displayable =
-          degradedPreviewCandidateByAttemptLabel.get(attempt.label)?.displayable ??
-          attempt.qualityGatePassed;
-        const winnerBreakdown = degradedPreviewFallbackChoice
-          ? displaySelectionBreakdownByAttemptLabel.get(degradedPreviewFallbackChoice.attempt.label) ??
+        const displayDiagnostic = degradedPreviewCandidateByAttemptLabel.get(attempt.label) ?? null;
+        const displayable = displayDiagnostic?.displayable ?? attempt.qualityGatePassed;
+        const winnerBreakdown = degradedPreviewSelectedChoice
+          ? displaySelectionBreakdownByAttemptLabel.get(degradedPreviewSelectedChoice.attempt.label) ??
             null
           : null;
 
@@ -10203,6 +12722,10 @@ export function useCPROrchestrator({
           label: attempt.label,
           displayable,
           rejectReasons: attempt.qualityGateRejectReasons,
+          degradedPreviewBlocked:
+            displayDiagnostic?.blockedAsDegradedPreview ?? false,
+          degradedPreviewBlockedReasons:
+            displayDiagnostic?.blockedAsDegradedPreviewReasons ?? [],
           duplicateOfLabel: duplicateOfLabelByAttemptLabel.get(attempt.label) ?? null,
           legacyQualityScore: attempt.qualityScore,
           legacyQualityBase: attempt.qualityBase,
@@ -10232,6 +12755,7 @@ export function useCPROrchestrator({
                 backgroundLeakagePenalty: breakdown.backgroundLeakagePenalty,
                 troughAdmissionPenalty: breakdown.troughAdmissionPenalty,
                 broadWeakSupportPenalty: breakdown.broadWeakSupportPenalty,
+                balancedMeanRecoveryBonus: breakdown.balancedMeanRecoveryBonus,
                 preferredTightRootFamilyBonus: breakdown.preferredTightRootFamilyBonus,
                 hardRejectPenalty: breakdown.hardRejectPenalty,
                 duplicatePenalty: breakdown.duplicatePenalty,
@@ -10242,7 +12766,8 @@ export function useCPROrchestrator({
               ? {
                   deltaDisplaySelectionScore:
                     breakdown.displaySelectionScore - winnerBreakdown.displaySelectionScore,
-                  deltaLegacyQualityScore: attempt.qualityScore - degradedPreviewFallbackChoice!.attempt.qualityScore,
+                  deltaLegacyQualityScore:
+                    attempt.qualityScore - degradedPreviewSelectedChoice!.attempt.qualityScore,
                   deltaSupportP50:
                     (breakdown.supportConfidenceP50 ?? 0) -
                     (winnerBreakdown.supportConfidenceP50 ?? 0),
@@ -10287,26 +12812,42 @@ export function useCPROrchestrator({
         finalSelectedOutput: summarizePhase4QualityGateCandidate(selectedQualityGateCandidate),
         candidates: {
           gpu: summarizePhase4QualityGateCandidate(gpuQualityGateCandidate),
+          gpuDisplayWinner: summarizePhase4QualityGateCandidate(displayRankedGpuQualityGateCandidate),
           cpu: summarizePhase4QualityGateCandidate(cpuQualityGateCandidate),
           legacy: summarizePhase4QualityGateCandidate(legacyQualityGateCandidate),
         },
         degradedPreview: {
-          available: !!degradedPreviewFallbackChoice,
-          selectedAttemptLabel: degradedPreviewFallbackChoice?.attempt.label ?? null,
+          available: !!degradedPreviewSelectedChoice,
+          displayableAvailable: !!degradedPreviewFallbackChoice,
+          emergencyAvailable: !!degradedPreviewEmergencyChoice,
+          legacyPolicyAllowed: CPR_PANO_ALLOW_DEGRADED_FIRST_RUN_DISPLAY,
+          selectionMode: degradedPreviewFallbackChoice
+            ? 'displayable'
+            : degradedPreviewEmergencyChoice
+              ? 'emergency'
+              : null,
+          selectedAttemptLabel: degradedPreviewSelectedChoice?.attempt.label ?? null,
           selectedCandidate: summarizePhase4QualityGateCandidate(
-            degradedPreviewFallbackChoice?.candidate ?? null
+            degradedPreviewSelectedChoice?.candidate ?? null
           ),
-          selectedRejectReasons: degradedPreviewFallbackChoice?.candidate.rejectReasons ?? [],
+          selectedRejectReasons: degradedPreviewSelectedChoice?.candidate.rejectReasons ?? [],
           displayableCandidateCount: degradedPreviewUniqueDisplayableOptions.length,
+          candidateCount: degradedPreviewUniqueOptions.length,
           duplicateSignatureCollapsedCount:
             degradedPreviewDisplayableOptions.length - degradedPreviewUniqueDisplayableOptions.length,
           selectedDisplaySelectionScore:
-            degradedPreviewFallbackChoice &&
-            displaySelectionBreakdownByAttemptLabel.has(degradedPreviewFallbackChoice.attempt.label)
+            degradedPreviewSelectedChoice &&
+            displaySelectionBreakdownByAttemptLabel.has(degradedPreviewSelectedChoice.attempt.label)
               ? displaySelectionBreakdownByAttemptLabel.get(
-                  degradedPreviewFallbackChoice.attempt.label
+                  degradedPreviewSelectedChoice.attempt.label
                 )?.displaySelectionScore ?? null
               : null,
+          blockedCandidateCount: degradedPreviewBlockedOptions.length,
+          blockedCandidates: degradedPreviewBlockedOptions.slice(0, 8).map(option => ({
+            attemptLabel: option.attempt.label,
+            blockedReasons: option.degradedPreviewAssessment.blockedAsDegradedPreviewReasons,
+            rejectReasons: option.candidate.rejectReasons,
+          })),
           catastrophicCandidateCount: degradedPreviewCatastrophicOptions.length,
           catastrophicCandidates: degradedPreviewCatastrophicOptions.slice(0, 8).map(option => ({
             attemptLabel: option.attempt.label,
@@ -10337,9 +12878,18 @@ export function useCPROrchestrator({
             selectedQualityGateCandidate.supportSurfaceRiskSummary,
           selectedSupportSurfaceBaselineFingerprint:
             selectedQualityGateCandidate.supportSurfaceRiskSummary.baselineFingerprint,
+          qualityRankedGpuLabel: topGpuAttempt?.label ?? null,
+          displayRankedGpuLabel: topDisplayRankedGpuAttempt?.label ?? null,
           finalSelectedOutput: qualityGateFallbackSummary.finalSelectedOutput,
           candidates: qualityGateFallbackSummary.candidates,
           degradedPreview: qualityGateFallbackSummary.degradedPreview,
+          debugOverrides: {
+            forceDisplayGpuCandidateEvenIfRejected,
+            forceDisplayGpuCandidateActive: !!forcedDisplayedAttemptForDebug,
+            forcedDisplayedAttemptLabel: forcedDisplayedAttemptForDebug?.label ?? null,
+            forcedDisplayBlockedReason: forcedDisplayedAttemptBlockedReason,
+            forcedDisplayBlockedReasons: forcedDisplayedAttemptBlockedReasons,
+          },
           temporaryDisplayPin: {
             active: !!temporarilyPinnedDisplayedAttempt,
             requestedLabels: CPR_TEMP_DEBUG_PIN_DISPLAYED_ATTEMPT_LABELS,
@@ -10358,9 +12908,11 @@ export function useCPROrchestrator({
             preservePreviousPanoRequested: shouldPreservePreviousPanoDisplay,
             preservePreviousPanoAvailable: canPreservePreviousPanoDisplay,
             preservedPreviousPanoImageId,
-            degradedPreviewAvailable: !!degradedPreviewFallbackChoice,
-            degradedPreviewAttemptLabel: degradedPreviewFallbackChoice?.attempt.label ?? null,
-            degradedPreviewRejectReasons: degradedPreviewFallbackChoice?.candidate.rejectReasons ?? [],
+            degradedPreviewAvailable: !!degradedPreviewSelectedChoice,
+            degradedPreviewAttemptLabel: degradedPreviewSelectedChoice?.attempt.label ?? null,
+            degradedPreviewRejectReasons:
+              degradedPreviewSelectedChoice?.candidate.rejectReasons ?? [],
+            degradedPreviewBlockedCandidateCount: degradedPreviewBlockedOptions.length,
             degradedPreviewCatastrophicCandidateCount: degradedPreviewCatastrophicOptions.length,
           },
           attemptExecution: {
@@ -10376,9 +12928,9 @@ export function useCPROrchestrator({
         JSON.stringify({
           runId: debugRunId,
           selectionMode: 'degraded-display',
-          winnerLabel: degradedPreviewFallbackChoice?.attempt.label ?? null,
-          winnerDisplaySelectionScore: degradedPreviewFallbackChoice
-            ? displaySelectionBreakdownByAttemptLabel.get(degradedPreviewFallbackChoice.attempt.label)
+          winnerLabel: degradedPreviewSelectedChoice?.attempt.label ?? null,
+          winnerDisplaySelectionScore: degradedPreviewSelectedChoice
+            ? displaySelectionBreakdownByAttemptLabel.get(degradedPreviewSelectedChoice.attempt.label)
                 ?.displaySelectionScore ?? null
             : null,
           duplicateSignatureDisplayableCount:
@@ -10396,6 +12948,8 @@ export function useCPROrchestrator({
           displayedOutputMode: selectedDisplayedOutputMode,
           temporaryDisplayPinned: !!temporarilyPinnedDisplayedAttempt,
           temporaryDisplayedAttemptLabel: temporarilyPinnedDisplayedAttempt?.label ?? null,
+          qualityRankedGpuLabel: topGpuAttempt?.label ?? null,
+          displayRankedGpuLabel: topDisplayRankedGpuAttempt?.label ?? null,
           selectedRequestedBackend: selectedAttempt.requestedBackend,
           selectedResolvedBackend: selectedAttempt.resolvedBackend,
           selectedPipelineMode: selectedAttempt.pipelineMode,
@@ -10444,9 +12998,9 @@ export function useCPROrchestrator({
           qualityGateSelectedOutput: qualityGateFallbackSummary.finalSelectedOutput,
           qualityGateCandidates: qualityGateFallbackSummary.candidates,
           qualityGateDegradedPreview: qualityGateFallbackSummary.degradedPreview,
-          degradedDisplayRankingTopLabel: degradedPreviewFallbackChoice?.attempt.label ?? null,
-          degradedDisplayRankingTopScore: degradedPreviewFallbackChoice
-            ? displaySelectionBreakdownByAttemptLabel.get(degradedPreviewFallbackChoice.attempt.label)
+          degradedDisplayRankingTopLabel: degradedPreviewSelectedChoice?.attempt.label ?? null,
+          degradedDisplayRankingTopScore: degradedPreviewSelectedChoice
+            ? displaySelectionBreakdownByAttemptLabel.get(degradedPreviewSelectedChoice.attempt.label)
                 ?.displaySelectionScore ?? null
             : null,
           selectedSupportSurfaceRiskSummary:
@@ -10462,14 +13016,24 @@ export function useCPROrchestrator({
         '[CPR-ATTEMPT-TABLE-JSON]',
         JSON.stringify({
           runId: debugRunId,
-          rankedAttempts: rankedAttemptAudit.map(attempt => ({
+          rankedAttempts: rankedAttempts.map(attempt => ({
             label: attempt.label,
             checksum: attempt.outputSignature.checksum,
+            phase0QualityGatePassed: attempt.qualityGatePassed,
+            phase0RejectReasons: attempt.qualityGateRejectReasons,
             supportP50: attempt.supportSurfaceRiskSummary.stability.supportConfidenceP50,
-            bgOutlier05: attempt.backgroundOutlierFraction05,
-            bgOutlier10: attempt.backgroundOutlierFraction10,
+            bgOutlier05: attempt.summary?.backgroundOutlierFraction05 ?? null,
+            bgOutlier10: attempt.summary?.backgroundOutlierFraction10 ?? null,
             blackClip: attempt.supportSurfaceRiskSummary.background.blackClipFraction,
-            lowerBandBrightFraction: attempt.lowerBandBrightFraction,
+            toothBandHoleFraction:
+              attempt.supportSurfaceRiskSummary.anatomy.toothBandHoleFraction,
+            toothBandBlackClipFraction:
+              attempt.supportSurfaceRiskSummary.anatomy.toothBandBlackClipFraction,
+            toothBandRetainedWeightP10:
+              attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP10,
+            toothBandRetainedWeightP50:
+              attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP50,
+            lowerBandBrightFraction: attempt.summary?.lowerBandBrightFraction ?? null,
             rejectReasons: attempt.qualityGateRejectReasons,
             displayable:
               degradedPreviewCandidateByAttemptLabel.get(attempt.label)?.displayable ??
@@ -10488,7 +13052,71 @@ export function useCPROrchestrator({
             participatingSamplesP50:
               displaySelectionBreakdownByAttemptLabel.get(attempt.label)?.participatingSamplesP50 ??
               null,
-            duplicateOfLabel: attempt.duplicateOfLabel ?? null,
+            qualityRankedGpuPrimary: attempt.label === topGpuAttempt?.label,
+            displayRankedGpuWinner: attempt.label === topDisplayRankedGpuAttempt?.label,
+            duplicateOfLabel: duplicateOfLabelByAttemptLabel.get(attempt.label) ?? null,
+            phase2SeedSelected: attempt.label === phase2BaseAttempt?.label,
+            phase2SeedEligible: phase2BaseAssessmentByLabel.get(attempt.label)?.seedEligible ?? null,
+            phase2SeedStructuralRejectReasons:
+              phase2BaseAssessmentByLabel.get(attempt.label)?.structuralRejectReasons ?? [],
+            phase2DisplayedDerived: attempt.label === phase2BaseAttempt?.label && phase2VirtualPano.executed,
+            phase2DisplayedUsedAsOutput:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.usedAsDisplayedOutput
+                : null,
+            phase2DisplayedWorkerAccepted:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.workerAcceptedForOutput
+                : null,
+            phase2DisplayedOrchestratorGatePassed:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.orchestratorGatePassed
+                : null,
+            phase2DisplayedDecisionReason:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.displayDecisionReason
+                : null,
+            phase2DisplayedRenderFamily:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.phase2RenderFamily
+                : null,
+            phase2DisplayedCandidateSource:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.phase2CandidateSource
+                : null,
+            phase2DisplayedDerivedFromPhase0RejectedFamily:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.revivedRejectedFamily
+                : null,
+            phase2DisplayedRevivedSeedRulePassed:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.revivedRejectedFamilyRulePassed
+                : null,
+            phase2DisplayedRevivedSeedRejectReasons:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.revivedRejectedFamilyRejectReasons
+                : [],
+            phase2DisplayedBgOutlier05:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.summary?.backgroundOutlierFraction05 ?? null
+                : null,
+            phase2DisplayedBgOutlier10:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.summary?.backgroundOutlierFraction10 ?? null
+                : null,
+            phase2DisplayedBlackClip:
+              attempt.label === phase2BaseAttempt?.label
+                ? explicitPhase2QualityGateCandidate?.supportSurfaceRiskSummary.background.blackClipFraction ??
+                  null
+                : null,
+            phase2DisplayedToothHole:
+              attempt.label === phase2BaseAttempt?.label
+                ? explicitPhase2QualityGateCandidate?.metrics.toothBandHoleFraction ?? null
+                : null,
+            phase2DisplayedToothBlackClip:
+              attempt.label === phase2BaseAttempt?.label
+                ? explicitPhase2QualityGateCandidate?.metrics.toothBandBlackClipFraction ?? null
+                : null,
             catastrophicReasons:
               degradedPreviewCandidateByAttemptLabel.get(attempt.label)?.catastrophicReasons ?? [],
           })),
@@ -10497,7 +13125,85 @@ export function useCPROrchestrator({
 
       if (shouldExportCprAttemptReport()) {
         try {
-          const attemptLookupByLabel = new Map(attemptResults.map(attempt => [attempt.label, attempt]));
+          const targetNormalizationDiagnosticAttempts: Array<{
+            matrixMode:
+              | 'current'
+              | 'lut-only'
+              | 'no-stored-value-normalization'
+              | 'raw-stored-values-debug';
+            attempt: Awaited<ReturnType<typeof runWorkerAttempt>>;
+          }> = [];
+          const targetToothDebugBaseAttempt =
+            attemptResults.find(attempt => attempt.label === CPR_TARGET_TOOTH_DEBUG_LABEL) ?? null;
+          if (
+            targetToothDebugBaseAttempt &&
+            targetToothDebugBaseAttempt.requestedBackend === 'gpu' &&
+            targetToothDebugBaseAttempt.resolvedBackend === 'gpu'
+          ) {
+            targetNormalizationDiagnosticAttempts.push({
+              matrixMode: 'current',
+              attempt: targetToothDebugBaseAttempt,
+            });
+            for (const matrixMode of [
+              'lut-only',
+              'no-stored-value-normalization',
+              'raw-stored-values-debug',
+            ] as const) {
+              const diagnosticAttempt = await runWorkerAttempt(
+                `${CPR_TARGET_TOOTH_DEBUG_LABEL}-diag-${matrixMode}`,
+                {
+                  ...targetToothDebugBaseAttempt.requestOverrides,
+                  modalityLutOverride:
+                    matrixMode === 'raw-stored-values-debug'
+                      ? false
+                      : matrixMode === 'lut-only'
+                        ? true
+                        : targetToothDebugBaseAttempt.requestOverrides.modalityLutOverride,
+                  debugScalarSamplingMode: matrixMode,
+                }
+              );
+              targetNormalizationDiagnosticAttempts.push({
+                matrixMode,
+                attempt: diagnosticAttempt,
+              });
+            }
+            console.debug(
+              '[CPR-TARGET-NORMALIZATION-MATRIX-JSON]',
+              JSON.stringify({
+                runId: debugRunId,
+                targetLabel: CPR_TARGET_TOOTH_DEBUG_LABEL,
+                rows: targetNormalizationDiagnosticAttempts.map(entry => ({
+                  matrixMode: entry.matrixMode,
+                  label:
+                    entry.matrixMode === 'current'
+                      ? `${entry.attempt.label}-diag-current`
+                      : entry.attempt.label,
+                  modalityLutApplied: entry.attempt.result.modalityLutApplied,
+                  requestedModalityLutApplied: entry.attempt.result.requestedModalityLutApplied,
+                  storedValueNormalizationApplied:
+                    entry.attempt.result.storedValueNormalizationApplied,
+                  supportP50:
+                    entry.attempt.supportSurfaceRiskSummary.stability.supportConfidenceP50,
+                  blackClipFraction:
+                    entry.attempt.supportSurfaceRiskSummary.background.blackClipFraction,
+                  toothBandHoleFraction: entry.attempt.summary?.toothBandHoleFraction ?? null,
+                  toothBandBlackClipFraction:
+                    entry.attempt.summary?.toothBandBlackClipFraction ?? null,
+                  toothBandRetainedWeightP10:
+                    entry.attempt.summary?.toothBandRetainedWeightP10 ?? null,
+                  bg05: entry.attempt.summary?.backgroundOutlierFraction05 ?? null,
+                  bg10: entry.attempt.summary?.backgroundOutlierFraction10 ?? null,
+                  stageHint: entry.attempt.toothBandStageDiagnostics?.stageHint ?? null,
+                  stageEvidence: entry.attempt.toothBandStageDiagnostics?.stageEvidence ?? [],
+                })),
+              })
+            );
+          }
+          const attemptLookupByLabel = new Map(
+            [...attemptResults, ...targetNormalizationDiagnosticAttempts.map(entry => entry.attempt)].map(
+              attempt => [attempt.label, attempt] as const
+            )
+          );
           const displayRankedAttemptLabels = degradedPreviewRankedDisplayableOptions
             .slice(0, CPR_DEBUG_EXPORT_TOP_ATTEMPT_COUNT)
             .map(option => option.attempt.label);
@@ -10508,22 +13214,90 @@ export function useCPROrchestrator({
                   attempt => attempt.label
                 ),
                 ...displayRankedAttemptLabels,
+                topDisplayRankedGpuAttempt?.label,
                 'primary-mean-toothband-narrow',
                 'retry-force-lut-mean-narrow-no-normalization',
                 'retry-mean-balanced-medium-strong-bias',
+                ...targetNormalizationDiagnosticAttempts.map(entry => entry.attempt.label),
                 ...CPR_DEBUG_DISPLAY_SELECTION_FOCUS_LABELS,
                 'retry-cpu-virtual-pano-fallback',
               ].filter(label => attemptLookupByLabel.has(label))
             )
           );
-          const reportRows = rankedAttemptAudit.map(attempt => ({
+          const rankedAttemptReportRows = rankedAttempts.map(attempt => ({
             label: attempt.label,
             checksum: attempt.outputSignature.checksum,
+            diagnosticOnly: false,
+            normalizationMatrixMode:
+              attempt.label === CPR_TARGET_TOOTH_DEBUG_LABEL ? 'current' : null,
+            requestedScalarSamplingMode: attempt.debugScalarSamplingMode,
+            modalityLutApplied: attempt.result.modalityLutApplied,
+            requestedModalityLutApplied: attempt.result.requestedModalityLutApplied,
+            storedValueNormalizationApplied: attempt.result.storedValueNormalizationApplied,
+            phase0QualityGatePassed: attempt.qualityGatePassed,
+            phase0RejectReasons: attempt.qualityGateRejectReasons,
             supportP50: attempt.supportSurfaceRiskSummary.stability.supportConfidenceP50,
-            bgOutlier05: attempt.backgroundOutlierFraction05,
-            bgOutlier10: attempt.backgroundOutlierFraction10,
+            bgOutlier05: attempt.summary?.backgroundOutlierFraction05 ?? null,
+            bgOutlier10: attempt.summary?.backgroundOutlierFraction10 ?? null,
+            bgDominantBand05:
+              attempt.supportSurfaceRiskSummary.background.backgroundBands?.dominantOutlierBand05 ??
+              null,
+            bgDominantBand10:
+              attempt.supportSurfaceRiskSummary.background.backgroundBands?.dominantOutlierBand10 ??
+              null,
+            bgTopContribution05:
+              attempt.supportSurfaceRiskSummary.background.backgroundBands?.top
+                .backgroundOutlierContribution05 ?? null,
+            bgMiddleContribution05:
+              attempt.supportSurfaceRiskSummary.background.backgroundBands?.middle
+                .backgroundOutlierContribution05 ?? null,
+            bgBottomContribution05:
+              attempt.supportSurfaceRiskSummary.background.backgroundBands?.bottom
+                .backgroundOutlierContribution05 ?? null,
+            bgTopContribution10:
+              attempt.supportSurfaceRiskSummary.background.backgroundBands?.top
+                .backgroundOutlierContribution10 ?? null,
+            bgMiddleContribution10:
+              attempt.supportSurfaceRiskSummary.background.backgroundBands?.middle
+                .backgroundOutlierContribution10 ?? null,
+            bgBottomContribution10:
+              attempt.supportSurfaceRiskSummary.background.backgroundBands?.bottom
+                .backgroundOutlierContribution10 ?? null,
             blackClip: attempt.supportSurfaceRiskSummary.background.blackClipFraction,
-            lowerBandBrightFraction: attempt.lowerBandBrightFraction,
+            toothBandHoleFraction:
+              attempt.supportSurfaceRiskSummary.anatomy.toothBandHoleFraction,
+            toothBandBlackClipFraction:
+              attempt.supportSurfaceRiskSummary.anatomy.toothBandBlackClipFraction,
+            toothBandRetainedWeightP10:
+              attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP10,
+            toothBandRetainedWeightP50:
+              attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP50,
+            toothBandRetainedWeightRowP10:
+              attempt.summary?.toothBandRetainedWeightRowP10 ?? null,
+            toothBandRetainedWeightRowP50:
+              attempt.summary?.toothBandRetainedWeightRowP50 ?? null,
+            toothBandRetainedWeightRowP90:
+              attempt.summary?.toothBandRetainedWeightRowP90 ?? null,
+            toothBandRetainedWeightColumnP10:
+              attempt.summary?.toothBandRetainedWeightColumnP10 ?? null,
+            toothBandRetainedWeightColumnP50:
+              attempt.summary?.toothBandRetainedWeightColumnP50 ?? null,
+            toothBandRetainedWeightColumnP90:
+              attempt.summary?.toothBandRetainedWeightColumnP90 ?? null,
+            lowerBandBrightFraction: attempt.summary?.lowerBandBrightFraction ?? null,
+            stageHint: attempt.toothBandStageDiagnostics?.stageHint ?? null,
+            stageEvidence: attempt.toothBandStageDiagnostics?.stageEvidence.join('; ') ?? '',
+            admissionAccumulationP50:
+              attempt.toothBandStageDiagnostics?.admissionAccumulationP50 ?? null,
+            toneSuppressedAccumulationP50:
+              attempt.toothBandStageDiagnostics?.toneSuppressedAccumulationP50 ?? null,
+            toneStageSuppressionP90:
+              attempt.toothBandStageDiagnostics?.toneStageSuppressionP90 ?? null,
+            invalidSupportBlackoutP90:
+              attempt.toothBandStageDiagnostics?.invalidSupportBlackoutP90 ?? null,
+            admissionOnlyHuP50: attempt.toothBandStageDiagnostics?.admissionOnlyHuP50 ?? null,
+            toneBypassHuP50: attempt.toothBandStageDiagnostics?.toneBypassHuP50 ?? null,
+            finalPostToneHuP50: attempt.toothBandStageDiagnostics?.finalPostToneHuP50 ?? null,
             rejectReasons: attempt.qualityGateRejectReasons,
             displayable:
               degradedPreviewCandidateByAttemptLabel.get(attempt.label)?.displayable ??
@@ -10542,9 +13316,373 @@ export function useCPROrchestrator({
             participatingSamplesP50:
               displaySelectionBreakdownByAttemptLabel.get(attempt.label)?.participatingSamplesP50 ??
               null,
-            duplicateOfLabel: attempt.duplicateOfLabel ?? null,
+            qualityRankedGpuPrimary: attempt.label === topGpuAttempt?.label,
+            displayRankedGpuWinner: attempt.label === topDisplayRankedGpuAttempt?.label,
+            duplicateOfLabel: duplicateOfLabelByAttemptLabel.get(attempt.label) ?? null,
+            phase2SeedSelected: attempt.label === phase2BaseAttempt?.label,
+            phase2SeedEligible: phase2BaseAssessmentByLabel.get(attempt.label)?.seedEligible ?? null,
+            phase2SeedStructuralRejectReasons:
+              phase2BaseAssessmentByLabel.get(attempt.label)?.structuralRejectReasons.join(', ') ?? '',
+            phase2DisplayedDerived: attempt.label === phase2BaseAttempt?.label && phase2VirtualPano.executed,
+            phase2DisplayedUsedAsOutput:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.usedAsDisplayedOutput
+                : null,
+            phase2DisplayedWorkerAccepted:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.workerAcceptedForOutput
+                : null,
+            phase2DisplayedOrchestratorGatePassed:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.orchestratorGatePassed
+                : null,
+            phase2DisplayedDecisionReason:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.displayDecisionReason
+                : null,
+            phase2DisplayedRenderFamily:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.phase2RenderFamily
+                : null,
+            phase2DisplayedCandidateSource:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.phase2CandidateSource
+                : null,
+            phase2DisplayedDerivedFromPhase0RejectedFamily:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.revivedRejectedFamily
+                : null,
+            phase2DisplayedRevivedSeedRulePassed:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.revivedRejectedFamilyRulePassed
+                : null,
+            phase2DisplayedRevivedSeedRejectReasons:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.revivedRejectedFamilyRejectReasons.join(', ')
+                : '',
+            phase2DisplayedBgOutlier05:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.summary?.backgroundOutlierFraction05 ?? null
+                : null,
+            phase2DisplayedBgOutlier10:
+              attempt.label === phase2BaseAttempt?.label
+                ? phase2VirtualPano.summary?.backgroundOutlierFraction10 ?? null
+                : null,
+            phase2DisplayedBlackClip:
+              attempt.label === phase2BaseAttempt?.label
+                ? explicitPhase2QualityGateCandidate?.supportSurfaceRiskSummary.background.blackClipFraction ??
+                  null
+                : null,
+            phase2DisplayedToothHole:
+              attempt.label === phase2BaseAttempt?.label
+                ? explicitPhase2QualityGateCandidate?.metrics.toothBandHoleFraction ?? null
+                : null,
+            phase2DisplayedToothBlackClip:
+              attempt.label === phase2BaseAttempt?.label
+                ? explicitPhase2QualityGateCandidate?.metrics.toothBandBlackClipFraction ?? null
+                : null,
           }));
+          const normalizationDiagnosticRows = targetNormalizationDiagnosticAttempts.map(entry => ({
+            label:
+              entry.matrixMode === 'current'
+                ? `${entry.attempt.label}-diag-current`
+                : entry.attempt.label,
+            checksum: entry.attempt.outputSignature.checksum,
+            diagnosticOnly: true,
+            normalizationMatrixMode: entry.matrixMode,
+            requestedScalarSamplingMode: entry.attempt.debugScalarSamplingMode,
+            modalityLutApplied: entry.attempt.result.modalityLutApplied,
+            requestedModalityLutApplied: entry.attempt.result.requestedModalityLutApplied,
+            storedValueNormalizationApplied: entry.attempt.result.storedValueNormalizationApplied,
+            phase0QualityGatePassed: entry.attempt.qualityGatePassed,
+            phase0RejectReasons: entry.attempt.qualityGateRejectReasons,
+            supportP50: entry.attempt.supportSurfaceRiskSummary.stability.supportConfidenceP50,
+            bgOutlier05: entry.attempt.summary?.backgroundOutlierFraction05 ?? null,
+            bgOutlier10: entry.attempt.summary?.backgroundOutlierFraction10 ?? null,
+            bgDominantBand05:
+              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands
+                ?.dominantOutlierBand05 ?? null,
+            bgDominantBand10:
+              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands
+                ?.dominantOutlierBand10 ?? null,
+            bgTopContribution05:
+              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.top
+                .backgroundOutlierContribution05 ?? null,
+            bgMiddleContribution05:
+              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.middle
+                .backgroundOutlierContribution05 ?? null,
+            bgBottomContribution05:
+              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.bottom
+                .backgroundOutlierContribution05 ?? null,
+            bgTopContribution10:
+              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.top
+                .backgroundOutlierContribution10 ?? null,
+            bgMiddleContribution10:
+              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.middle
+                .backgroundOutlierContribution10 ?? null,
+            bgBottomContribution10:
+              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.bottom
+                .backgroundOutlierContribution10 ?? null,
+            blackClip: entry.attempt.supportSurfaceRiskSummary.background.blackClipFraction,
+            toothBandHoleFraction:
+              entry.attempt.supportSurfaceRiskSummary.anatomy.toothBandHoleFraction,
+            toothBandBlackClipFraction:
+              entry.attempt.supportSurfaceRiskSummary.anatomy.toothBandBlackClipFraction,
+            toothBandRetainedWeightP10:
+              entry.attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP10,
+            toothBandRetainedWeightP50:
+              entry.attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP50,
+            toothBandRetainedWeightRowP10:
+              entry.attempt.summary?.toothBandRetainedWeightRowP10 ?? null,
+            toothBandRetainedWeightRowP50:
+              entry.attempt.summary?.toothBandRetainedWeightRowP50 ?? null,
+            toothBandRetainedWeightRowP90:
+              entry.attempt.summary?.toothBandRetainedWeightRowP90 ?? null,
+            toothBandRetainedWeightColumnP10:
+              entry.attempt.summary?.toothBandRetainedWeightColumnP10 ?? null,
+            toothBandRetainedWeightColumnP50:
+              entry.attempt.summary?.toothBandRetainedWeightColumnP50 ?? null,
+            toothBandRetainedWeightColumnP90:
+              entry.attempt.summary?.toothBandRetainedWeightColumnP90 ?? null,
+            lowerBandBrightFraction: entry.attempt.summary?.lowerBandBrightFraction ?? null,
+            stageHint: entry.attempt.toothBandStageDiagnostics?.stageHint ?? null,
+            stageEvidence: entry.attempt.toothBandStageDiagnostics?.stageEvidence.join('; ') ?? '',
+            admissionAccumulationP50:
+              entry.attempt.toothBandStageDiagnostics?.admissionAccumulationP50 ?? null,
+            toneSuppressedAccumulationP50:
+              entry.attempt.toothBandStageDiagnostics?.toneSuppressedAccumulationP50 ?? null,
+            toneStageSuppressionP90:
+              entry.attempt.toothBandStageDiagnostics?.toneStageSuppressionP90 ?? null,
+            invalidSupportBlackoutP90:
+              entry.attempt.toothBandStageDiagnostics?.invalidSupportBlackoutP90 ?? null,
+            admissionOnlyHuP50: entry.attempt.toothBandStageDiagnostics?.admissionOnlyHuP50 ?? null,
+            toneBypassHuP50: entry.attempt.toothBandStageDiagnostics?.toneBypassHuP50 ?? null,
+            finalPostToneHuP50: entry.attempt.toothBandStageDiagnostics?.finalPostToneHuP50 ?? null,
+            rejectReasons: entry.attempt.qualityGateRejectReasons,
+            displayable: entry.attempt.qualityGatePassed,
+            legacyQualityScore: entry.attempt.qualityScore,
+            legacyQualityBase: entry.attempt.qualityBase,
+            displaySelectionScore: null,
+            preferredTightRootFamily: false,
+            effectiveTroughHalfWidthP50Mm: null,
+            participatingSamplesP50: null,
+            qualityRankedGpuPrimary: false,
+            displayRankedGpuWinner: false,
+            duplicateOfLabel: null,
+            phase2SeedSelected: false,
+            phase2SeedEligible: null,
+            phase2SeedStructuralRejectReasons: '',
+            phase2DisplayedDerived: false,
+            phase2DisplayedUsedAsOutput: null,
+            phase2DisplayedWorkerAccepted: null,
+            phase2DisplayedOrchestratorGatePassed: null,
+            phase2DisplayedDecisionReason: null,
+            phase2DisplayedRenderFamily: null,
+            phase2DisplayedCandidateSource: null,
+            phase2DisplayedDerivedFromPhase0RejectedFamily: null,
+            phase2DisplayedRevivedSeedRulePassed: null,
+            phase2DisplayedRevivedSeedRejectReasons: '',
+            phase2DisplayedBgOutlier05: null,
+            phase2DisplayedBgOutlier10: null,
+            phase2DisplayedBlackClip: null,
+            phase2DisplayedToothHole: null,
+            phase2DisplayedToothBlackClip: null,
+          }));
+          const reportRows = [...rankedAttemptReportRows, ...normalizationDiagnosticRows];
           const reportImages: Parameters<typeof downloadCprDebugArtifacts>[0]['images'] = [];
+          type SupportFormationSummary = {
+            columnSupportConfidenceP10?: number | null;
+            columnSupportConfidenceP50?: number | null;
+            columnSupportConfidenceP90?: number | null;
+            columnSupportSpreadP10Mm?: number | null;
+            columnSupportSpreadP50Mm?: number | null;
+            columnSupportSpreadP90Mm?: number | null;
+            columnSupportDensityP10?: number | null;
+            columnSupportDensityP50?: number | null;
+            columnSupportDensityP90?: number | null;
+            rowSupportConfidenceP10?: number | null;
+            rowSupportConfidenceP50?: number | null;
+            rowSupportConfidenceP90?: number | null;
+            rowSupportSpreadP10Mm?: number | null;
+            rowSupportSpreadP50Mm?: number | null;
+            rowSupportSpreadP90Mm?: number | null;
+            rowSupportDensityP10?: number | null;
+            rowSupportDensityP50?: number | null;
+            rowSupportDensityP90?: number | null;
+            dominantDensePeakGateP50?: number | null;
+            dominantDensePeakGateP90?: number | null;
+            toothBandStructureGuardP50?: number | null;
+            toothBandStructureGuardP90?: number | null;
+            protectedAmbiguousBroadSupportPenaltyGateP50?: number | null;
+            protectedAmbiguousBroadSupportPenaltyGateP90?: number | null;
+            supportValidityP10?: number | null;
+            supportValidityP50?: number | null;
+            supportValidityP90?: number | null;
+            rawScoreGapP50?: number | null;
+            falseSupportVetoFraction?: number | null;
+            rowBackgroundVetoFraction?: number | null;
+            supportVetoTriggeredFraction?: number | null;
+          };
+          type RawSupportFormationSummary = {
+            rawScoreGapP10?: number | null;
+            rawScoreGapP90?: number | null;
+          };
+          const readAttemptSupportFormationDiagnostics = (
+            workerDebugPayload: CPRWorkerLaunchResult['workerDebugPayload'] | null | undefined
+          ): {
+            supportFormation: SupportFormationSummary | null;
+            rawSupportFormation: RawSupportFormationSummary | null;
+          } => {
+            const diagnostic = readPhase4DiagnosticRecord(workerDebugPayload?.diagnostic);
+            const gpuRender = readPhase4DiagnosticRecord(diagnostic?.gpuRender);
+
+            return {
+              supportFormation:
+                (readPhase4DiagnosticRecord(gpuRender?.supportFormation) ??
+                  readPhase4DiagnosticRecord(diagnostic?.supportFormation)) as SupportFormationSummary | null,
+              rawSupportFormation:
+                (readPhase4DiagnosticRecord(gpuRender?.rawSupportFormation) ??
+                  readPhase4DiagnosticRecord(diagnostic?.rawSupportFormation)) as RawSupportFormationSummary | null,
+            };
+          };
+          const targetPhase2SeedAssessment =
+            phase2BaseAssessmentByLabel.get(CPR_TARGET_TOOTH_DEBUG_LABEL) ?? null;
+          const reportDisplayMode = forcedDisplayedAttemptForDebug
+            ? 'forced-debug-gpu'
+            : phase2VirtualPano.usedAsDisplayedOutput
+              ? 'accepted-phase2'
+              : canPreservePreviousPanoDisplay
+                ? 'preserve-previous-accepted'
+                : selectedQualityGateCandidate.pass
+                  ? 'accepted-ranked-top'
+                  : degradedPreviewFallbackChoice
+                    ? 'degraded-preview'
+                    : degradedPreviewEmergencyChoice
+                      ? 'emergency-debug-preview'
+                      : 'blocked';
+          const reportDisplayedLabel = forcedDisplayedAttemptForDebug
+            ? forcedDisplayedAttemptForDebug.label
+            : phase2VirtualPano.usedAsDisplayedOutput
+              ? phase2BaseAttempt?.label ?? selectedAttempt.label
+              : canPreservePreviousPanoDisplay
+                ? preservedPreviousPanoImageId ?? 'previous-accepted-pano'
+                : degradedPreviewSelectedChoice?.attempt.label ?? selectedAttempt.label;
+          const reportDisplayedAccepted =
+            reportDisplayMode === 'preserve-previous-accepted' ||
+            (phase2VirtualPano.usedAsDisplayedOutput
+              ? explicitPhase2QualityGateCandidate?.pass === true
+              : !forcedDisplayedAttemptForDebug && selectedQualityGateCandidate.pass);
+          const reportDisplayedRejectReasons = forcedDisplayedAttemptForDebug
+            ? forcedDisplayedQualityGateCandidate?.rejectReasons ??
+              displayRankedGpuQualityGateCandidate?.rejectReasons ??
+              []
+            : phase2VirtualPano.usedAsDisplayedOutput
+              ? explicitPhase2QualityGateCandidate?.rejectReasons ?? []
+              : degradedPreviewSelectedChoice
+                ? degradedPreviewSelectedChoice.candidate.rejectReasons
+                : selectedQualityGateCandidate.rejectReasons;
+          const reportSummarySections = [
+            {
+              title: 'Normal Winner',
+              lines: [
+                `acceptedWinnerLabel=${selectedQualityGateCandidate.pass ? selectedAttempt.label : 'none'}`,
+                `rankedTopLabel=${selectedAttempt.label}`,
+                `rankedTopAccepted=${selectedQualityGateCandidate.pass ? 'yes' : 'no'}`,
+                `rankedTopRejectReasons=${
+                  selectedQualityGateCandidate.rejectReasons.join(', ') || 'none'
+                }`,
+                `selectionReason=${qualityGateSelectionReason}`,
+              ],
+            },
+            {
+              title: 'Degraded Preview',
+              lines: [
+                `winnerLabel=${degradedPreviewSelectedChoice?.attempt.label ?? 'none'}`,
+                `selectionMode=${
+                  degradedPreviewFallbackChoice
+                    ? 'displayable'
+                    : degradedPreviewEmergencyChoice
+                      ? 'emergency'
+                      : 'none'
+                }`,
+                `winnerRejectReasons=${
+                  degradedPreviewSelectedChoice?.candidate.rejectReasons.join(', ') || 'none'
+                }`,
+                `winnerBlockedAsDegraded=${
+                  degradedPreviewSelectedChoice?.degradedPreviewAssessment.blockedAsDegradedPreview
+                    ? 'yes'
+                    : 'no'
+                }`,
+                `winnerBlockedReasons=${
+                  degradedPreviewSelectedChoice?.degradedPreviewAssessment.blockedAsDegradedPreviewReasons.join(
+                    ', '
+                  ) || 'none'
+                }`,
+              ],
+            },
+            {
+              title: 'Displayed Result',
+              lines: [
+                `displayMode=${reportDisplayMode}`,
+                `displayedLabel=${reportDisplayedLabel}`,
+                `displayedAccepted=${reportDisplayedAccepted ? 'yes' : 'no'}`,
+                `displayedRejectReasons=${reportDisplayedRejectReasons.join(', ') || 'none'}`,
+                `forceDisplayRequested=${forceDisplayGpuCandidateEvenIfRejected ? 'yes' : 'no'}`,
+                `forceDisplayActive=${forcedDisplayedAttemptForDebug ? 'yes' : 'no'}`,
+                `forceDisplayBlockedReason=${forcedDisplayedAttemptBlockedReason ?? 'none'}`,
+                `forceDisplayBlockedReasons=${
+                  forcedDisplayedAttemptBlockedReasons.join(', ') || 'none'
+                }`,
+              ],
+            },
+            {
+              title: 'Phase-2 Seed',
+              lines: [
+                `selectedSeedLabel=${phase2BaseAttempt?.label ?? 'none'}`,
+                `selectionBlockedReason=${phase2BaseSelectionBlockedReason ?? 'none'}`,
+                `targetSeedLabel=${CPR_TARGET_TOOTH_DEBUG_LABEL}`,
+                `targetSeedEligible=${targetPhase2SeedAssessment?.seedEligible ? 'yes' : 'no'}`,
+                `targetStructuralRejects=${
+                  targetPhase2SeedAssessment?.structuralRejectReasons.join(', ') || 'none'
+                }`,
+              ],
+            },
+          ];
+          const {
+            supportFormation: rankedSupportFormation,
+            rawSupportFormation: rankedRawSupportFormation,
+          } = readAttemptSupportFormationDiagnostics(topGpuAttempt?.workerDebugPayload ?? null);
+          reportSummarySections.push(
+            {
+              title: 'Support Formation',
+              lines: [
+                `rankedTopLabel=${topGpuAttempt?.label ?? 'none'}`,
+                `columnSupportConfidenceP10/P50/P90=${rankedSupportFormation?.columnSupportConfidenceP10 ?? 'na'}/${rankedSupportFormation?.columnSupportConfidenceP50 ?? 'na'}/${rankedSupportFormation?.columnSupportConfidenceP90 ?? 'na'}`,
+                `columnSupportSpreadP10/P50/P90=${rankedSupportFormation?.columnSupportSpreadP10Mm ?? 'na'}/${rankedSupportFormation?.columnSupportSpreadP50Mm ?? 'na'}/${rankedSupportFormation?.columnSupportSpreadP90Mm ?? 'na'}`,
+                `columnSupportDensityP10/P50/P90=${rankedSupportFormation?.columnSupportDensityP10 ?? 'na'}/${rankedSupportFormation?.columnSupportDensityP50 ?? 'na'}/${rankedSupportFormation?.columnSupportDensityP90 ?? 'na'}`,
+                `rowSupportConfidenceP10/P50/P90=${rankedSupportFormation?.rowSupportConfidenceP10 ?? 'na'}/${rankedSupportFormation?.rowSupportConfidenceP50 ?? 'na'}/${rankedSupportFormation?.rowSupportConfidenceP90 ?? 'na'}`,
+                `rowSupportSpreadP10/P50/P90=${rankedSupportFormation?.rowSupportSpreadP10Mm ?? 'na'}/${rankedSupportFormation?.rowSupportSpreadP50Mm ?? 'na'}/${rankedSupportFormation?.rowSupportSpreadP90Mm ?? 'na'}`,
+                `rowSupportDensityP10/P50/P90=${rankedSupportFormation?.rowSupportDensityP10 ?? 'na'}/${rankedSupportFormation?.rowSupportDensityP50 ?? 'na'}/${rankedSupportFormation?.rowSupportDensityP90 ?? 'na'}`,
+              ],
+            },
+            {
+              title: 'Support Gates',
+              lines: [
+                `dominantDensePeakGateP50/P90=${rankedSupportFormation?.dominantDensePeakGateP50 ?? 'na'}/${rankedSupportFormation?.dominantDensePeakGateP90 ?? 'na'}`,
+                `toothBandStructureGuardP50/P90=${rankedSupportFormation?.toothBandStructureGuardP50 ?? 'na'}/${rankedSupportFormation?.toothBandStructureGuardP90 ?? 'na'}`,
+                `protectedAmbiguousPenaltyP50/P90=${rankedSupportFormation?.protectedAmbiguousBroadSupportPenaltyGateP50 ?? 'na'}/${rankedSupportFormation?.protectedAmbiguousBroadSupportPenaltyGateP90 ?? 'na'}`,
+                `supportValidityP10/P50/P90=${rankedSupportFormation?.supportValidityP10 ?? 'na'}/${rankedSupportFormation?.supportValidityP50 ?? 'na'}/${rankedSupportFormation?.supportValidityP90 ?? 'na'}`,
+                `rawScoreGapP10/P50/P90=${rankedRawSupportFormation?.rawScoreGapP10 ?? 'na'}/${rankedSupportFormation?.rawScoreGapP50 ?? 'na'}/${rankedRawSupportFormation?.rawScoreGapP90 ?? 'na'}`,
+                `falseSupportVetoFraction=${rankedSupportFormation?.falseSupportVetoFraction ?? 'na'}`,
+                `rowBackgroundVetoFraction=${rankedSupportFormation?.rowBackgroundVetoFraction ?? 'na'}`,
+                `supportVetoTriggeredFraction=${rankedSupportFormation?.supportVetoTriggeredFraction ?? 'na'}`,
+              ],
+            }
+          );
+          const formatCandidateMetric = (
+            value: number | null | undefined,
+            digits = 3
+          ): string => formatReadablePanoValue(value, digits);
           const appendReportImage = (
             title: string,
             filenameStem: string,
@@ -10571,6 +13709,202 @@ export function useCPROrchestrator({
               upper,
             });
           };
+          const buildCandidateReportCaption = (
+            attempt: Awaited<ReturnType<typeof runWorkerAttempt>> | null,
+            candidate: Phase4QualityGateCandidate | null
+          ): string => {
+            const backgroundBands = candidate?.supportSurfaceRiskSummary.background.backgroundBands;
+            const attemptSupportFormation = readAttemptSupportFormationDiagnostics(
+              attempt?.workerDebugPayload ?? null
+            ).supportFormation;
+            const formatBackgroundBandLine = (
+              thresholdLabel: '05' | '10'
+            ): string => {
+              if (!backgroundBands) {
+                return `bg${thresholdLabel}Bands=na`;
+              }
+              const contributionKey =
+                thresholdLabel === '05'
+                  ? 'backgroundOutlierContribution05'
+                  : 'backgroundOutlierContribution10';
+              const dominantKey =
+                thresholdLabel === '05'
+                  ? backgroundBands.dominantOutlierBand05
+                  : backgroundBands.dominantOutlierBand10;
+              return [
+                `bg${thresholdLabel}Bands`,
+                `top=${formatCandidateMetric(backgroundBands.top[contributionKey] * 100, 1)}%`,
+                `mid=${formatCandidateMetric(backgroundBands.middle[contributionKey] * 100, 1)}%`,
+                `bot=${formatCandidateMetric(backgroundBands.bottom[contributionKey] * 100, 1)}%`,
+                `dom=${dominantKey}`,
+              ].join(' ');
+            };
+            return [
+              `label=${attempt?.label ?? 'none'}`,
+              `pass=${candidate?.pass ? 'yes' : 'no'}`,
+              `backend=${candidate?.backend ?? attempt?.resolvedBackend ?? 'unknown'}`,
+              `requestedBackend=${candidate?.requestedBackend ?? attempt?.requestedBackend ?? 'unknown'}`,
+              `pipelineMode=${candidate?.pipelineMode ?? attempt?.pipelineMode ?? 'unknown'}`,
+              `reconstructionMode=${candidate?.reconstructionMode ?? attempt?.reconstructionMode ?? 'unknown'}`,
+              `fallbackReason=${candidate?.fallbackReason ?? attempt?.fallbackReason ?? 'none'}`,
+              `displayedPath=${candidate?.displayedPath ?? 'worker-recon'}`,
+              `workerUsedAsOutput=${candidate?.workerUsedAsOutput === null ? 'na' : candidate?.workerUsedAsOutput ? 'yes' : 'no'}`,
+              `qualityBase=${formatCandidateMetric(candidate?.qualityBase ?? attempt?.qualityBase, 2)}`,
+              `qualityScore=${formatCandidateMetric(candidate?.qualityScore ?? attempt?.qualityScore, 2)}`,
+              `supportP50=${formatCandidateMetric(candidate?.metrics.supportConfidenceP50, 3)}`,
+              `supportPathP50=${formatCandidateMetric(candidate?.metrics.supportPathConfidenceP50, 3)}`,
+              `supportValidityP50=${formatCandidateMetric(
+                attemptSupportFormation?.supportValidityP50,
+                3
+              )}`,
+              `dominantDensePeakGateP50=${formatCandidateMetric(
+                attemptSupportFormation?.dominantDensePeakGateP50,
+                3
+              )}`,
+              `protectedAmbiguousPenaltyP50=${formatCandidateMetric(
+                attemptSupportFormation?.protectedAmbiguousBroadSupportPenaltyGateP50,
+                3
+              )}`,
+              `rawScoreGapP50=${formatCandidateMetric(
+                attemptSupportFormation?.rawScoreGapP50,
+                3
+              )}`,
+              `bg05=${formatCandidateMetric(attempt?.summary?.backgroundOutlierFraction05, 3)}`,
+              `bg10=${formatCandidateMetric(attempt?.summary?.backgroundOutlierFraction10, 3)}`,
+              formatBackgroundBandLine('05'),
+              formatBackgroundBandLine('10'),
+              `blackClip=${formatCandidateMetric(
+                candidate?.supportSurfaceRiskSummary.background.blackClipFraction,
+                3
+              )}`,
+              `toothHole=${formatCandidateMetric(candidate?.metrics.toothBandHoleFraction, 3)}`,
+              `toothBlackClip=${formatCandidateMetric(
+                candidate?.metrics.toothBandBlackClipFraction,
+                3
+              )}`,
+              `toothRetainedP10=${formatCandidateMetric(
+                candidate?.metrics.toothBandRetainedWeightP10,
+                3
+              )}`,
+              `toothRetainedP50=${formatCandidateMetric(
+                candidate?.metrics.toothBandRetainedWeightP50,
+                3
+              )}`,
+              `scalarMode=${attempt?.debugScalarSamplingMode ?? 'current'}`,
+              `stageHint=${attempt?.toothBandStageDiagnostics?.stageHint ?? 'na'}`,
+              `lowerBandBright=${formatCandidateMetric(candidate?.metrics.lowerBandBrightFraction, 3)}`,
+              `lowerBandP50=${formatCandidateMetric(candidate?.metrics.lowerBandP50, 1)}`,
+              `toothContrast=${formatCandidateMetric(candidate?.metrics.toothBandContrastRange, 1)}`,
+              `borderline=${candidate?.borderlineAcceptedReason ?? 'none'}`,
+              `hardReject=${candidate?.hardRejectReason ?? attempt?.hardRejectReason ?? 'none'}`,
+              `rejects=${candidate?.rejectReasons.join(', ') || 'none'}`,
+              `workerRejects=${candidate?.workerRejectReasons.join(', ') || 'none'}`,
+              `risk=${candidate?.supportSurfaceRiskSummary.riskLevel ?? 'unknown'}`,
+              `riskFlags=${candidate?.supportSurfaceRiskSummary.riskFlags.join(', ') || 'none'}`,
+              `baseline=${candidate?.supportSurfaceRiskSummary.baselineFingerprint ?? 'none'}`,
+            ].join('\n');
+          };
+          const comparisonAttemptSpecs = [
+            {
+              prefix: 'gpu-primary-candidate',
+              title: `GPU Primary Candidate: ${topGpuAttempt?.label ?? 'none'}`,
+              attempt: topGpuAttempt,
+              candidate: gpuQualityGateCandidate,
+            },
+            ...(topDisplayRankedGpuAttempt &&
+            topDisplayRankedGpuAttempt.label !== topGpuAttempt?.label
+              ? [
+                  {
+                    prefix: 'gpu-display-ranked-winner',
+                    title: `Display-ranked GPU Winner: ${topDisplayRankedGpuAttempt.label}`,
+                    attempt: topDisplayRankedGpuAttempt,
+                    candidate: displayRankedGpuQualityGateCandidate,
+                  },
+                ]
+              : []),
+            {
+              prefix: 'cpu-fallback-candidate',
+              title: `CPU Fallback Candidate: ${topCpuVirtualPanoAttempt?.label ?? 'none'}`,
+              attempt: topCpuVirtualPanoAttempt,
+              candidate: cpuQualityGateCandidate,
+            },
+          ];
+          for (const spec of comparisonAttemptSpecs) {
+            if (!spec.attempt) {
+              continue;
+            }
+            appendReportImage(
+              spec.title,
+              `${spec.prefix}-${spec.attempt.label}`,
+              spec.attempt.result.pixelData,
+              spec.attempt.result.width,
+              spec.attempt.result.height,
+              'hu',
+              spec.attempt.voi?.lower ?? spec.attempt.result.minValue,
+              spec.attempt.voi?.upper ?? spec.attempt.result.maxValue,
+              buildCandidateReportCaption(spec.attempt, spec.candidate)
+            );
+          }
+          if (phase2WorkerResult && phase2BaseAttempt && phase2VirtualPano.summary && phase2VirtualPano.voi) {
+            appendReportImage(
+              `Phase-2 Displayed Candidate: ${phase2BaseAttempt.label}`,
+              `phase2-displayed-${phase2BaseAttempt.label}`,
+              phase2WorkerResult.pixelData,
+              phase2WorkerResult.width,
+              phase2WorkerResult.height,
+              'hu',
+              phase2VirtualPano.voi.lower ?? phase2WorkerResult.minValue,
+              phase2VirtualPano.voi.upper ?? phase2WorkerResult.maxValue,
+              [
+                `phase0SeedLabel=${phase2BaseAttempt.label}`,
+                `phase0SeedPass=${phase2BaseAttempt.qualityGatePassed ? 'yes' : 'no'}`,
+                `phase0SeedRejects=${phase2BaseAttempt.qualityGateRejectReasons.join(', ') || 'none'}`,
+                `phase0SeedStructuralRejects=${
+                  phase2BaseAssessment?.structuralRejectReasons.join(', ') || 'none'
+                }`,
+                `phase2WorkerAccepted=${phase2VirtualPano.workerAcceptedForOutput ? 'yes' : 'no'}`,
+                `phase2OrchestratorGate=${
+                  phase2VirtualPano.orchestratorGatePassed === null
+                    ? 'na'
+                    : phase2VirtualPano.orchestratorGatePassed
+                      ? 'pass'
+                      : 'fail'
+                }`,
+                `phase2UsedAsOutput=${phase2VirtualPano.usedAsDisplayedOutput ? 'yes' : 'no'}`,
+                `phase2Decision=${phase2VirtualPano.displayDecisionReason ?? 'none'}`,
+                `phase2RenderFamily=${phase2VirtualPano.phase2RenderFamily ?? 'none'}`,
+                `phase2CandidateSource=${phase2VirtualPano.phase2CandidateSource ?? 'none'}`,
+                `derivedFromPhase0RejectedFamily=${
+                  phase2VirtualPano.revivedRejectedFamily ? 'yes' : 'no'
+                }`,
+                `rejectedSeedRulePassed=${
+                  phase2VirtualPano.revivedRejectedFamilyRulePassed === null
+                    ? 'na'
+                    : phase2VirtualPano.revivedRejectedFamilyRulePassed
+                      ? 'yes'
+                      : 'no'
+                }`,
+                `rejectedSeedRuleRejects=${
+                  phase2VirtualPano.revivedRejectedFamilyRejectReasons.join(', ') || 'none'
+                }`,
+                `bg05=${formatCandidateMetric(phase2VirtualPano.summary.backgroundOutlierFraction05, 3)}`,
+                `bg10=${formatCandidateMetric(phase2VirtualPano.summary.backgroundOutlierFraction10, 3)}`,
+                `blackClip=${formatCandidateMetric(
+                  explicitPhase2QualityGateCandidate?.supportSurfaceRiskSummary.background
+                    .blackClipFraction,
+                  3
+                )}`,
+                `toothHole=${formatCandidateMetric(
+                  explicitPhase2QualityGateCandidate?.metrics.toothBandHoleFraction,
+                  3
+                )}`,
+                `toothBlackClip=${formatCandidateMetric(
+                  explicitPhase2QualityGateCandidate?.metrics.toothBandBlackClipFraction,
+                  3
+                )}`,
+              ].join('\n')
+            );
+          }
           for (const label of reportAttemptLabels) {
             const attempt = attemptLookupByLabel.get(label);
             if (!attempt) {
@@ -10602,6 +13936,24 @@ export function useCPROrchestrator({
                   attempt.supportSurfaceRiskSummary.background.blackClipFraction,
                   3
                 )}`,
+                `toothHole=${formatReadablePanoValue(
+                  attempt.supportSurfaceRiskSummary.anatomy.toothBandHoleFraction,
+                  3
+                )}`,
+                `toothBlackClip=${formatReadablePanoValue(
+                  attempt.supportSurfaceRiskSummary.anatomy.toothBandBlackClipFraction,
+                  3
+                )}`,
+                `toothRetainedP10=${formatReadablePanoValue(
+                  attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP10,
+                  3
+                )}`,
+                `toothRetainedP50=${formatReadablePanoValue(
+                  attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP50,
+                  3
+                )}`,
+                `scalarMode=${attempt.debugScalarSamplingMode}`,
+                `stageHint=${attempt.toothBandStageDiagnostics?.stageHint ?? 'na'}`,
                 `displayable=${
                   degradedPreviewCandidateByAttemptLabel.get(attempt.label)?.displayable
                     ? 'yes'
@@ -10612,6 +13964,10 @@ export function useCPROrchestrator({
                     ? 'yes'
                     : 'no'
                 }`,
+                attempt.label === topGpuAttempt?.label ? 'qualityRankedGpuPrimary=yes' : null,
+                attempt.label === topDisplayRankedGpuAttempt?.label
+                  ? 'displayRankedGpuWinner=yes'
+                  : null,
                 `rejects=${attempt.qualityGateRejectReasons.join(', ') || 'none'}`,
                 attemptLookupByLabel.get(label)?.outputSignature.checksum !== null &&
                 reportRows.find(row => row.label === label)?.duplicateOfLabel
@@ -10624,30 +13980,211 @@ export function useCPROrchestrator({
           }
           const sidecarAttemptSpecs = [
             {
-              prefix: 'selected-gpu',
-              title: `Selected GPU Winner: ${topGpuAttempt?.label ?? 'none'}`,
+              prefix: 'quality-ranked-gpu',
+              title: `Quality-ranked GPU Primary Candidate: ${topGpuAttempt?.label ?? 'none'}`,
               attempt: topGpuAttempt,
+              candidate: gpuQualityGateCandidate,
             },
+            ...(topDisplayRankedGpuAttempt &&
+            topDisplayRankedGpuAttempt.label !== topGpuAttempt?.label
+              ? [
+                  {
+                    prefix: 'display-ranked-gpu',
+                    title: `Display-ranked GPU Winner: ${topDisplayRankedGpuAttempt.label}`,
+                    attempt: topDisplayRankedGpuAttempt,
+                    candidate: displayRankedGpuQualityGateCandidate,
+                  },
+                ]
+              : []),
             {
               prefix: 'cpu-fallback',
               title: `CPU Virtual Pano Fallback: ${topCpuVirtualPanoAttempt?.label ?? 'none'}`,
               attempt: topCpuVirtualPanoAttempt,
+              candidate: cpuQualityGateCandidate,
             },
+            ...targetNormalizationDiagnosticAttempts.map(entry => ({
+              prefix: `target-normalization-${entry.matrixMode}`,
+              title: `Target Family Normalization ${entry.matrixMode}: ${entry.attempt.label}`,
+              attempt: entry.attempt,
+              candidate: buildPhase4QualityGateCandidate({
+                attemptLabel: entry.attempt.label,
+                displayedPath: 'worker-recon',
+                sourceVolumeId,
+                summary: entry.attempt.summary,
+                qualityBase: entry.attempt.qualityBase,
+                qualityScore: entry.attempt.qualityScore,
+                hardRejectReason: entry.attempt.hardRejectReason,
+                workerDebugPayload: entry.attempt.workerDebugPayload ?? null,
+              }),
+            })),
           ];
           const sidecarMapSpecs: Array<{
             key: keyof NonNullable<PanoImagePayload['debugMaps']>;
             mode: 'hu' | 'unit' | 'signed' | 'positive';
             title: string;
           }> = [
+            { key: 'rawSupportPeakDominanceMap', mode: 'unit', title: 'rawSupportPeakDominanceMap' },
+            { key: 'rawSupportPeakValidityMap', mode: 'unit', title: 'rawSupportPeakValidityMap' },
+            { key: 'rawSupportSecondPeakRatioMap', mode: 'unit', title: 'rawSupportSecondPeakRatioMap' },
+            { key: 'rawSupportPeakAmbiguityMap', mode: 'unit', title: 'rawSupportPeakAmbiguityMap' },
+            { key: 'rawSupportScoreGapMap', mode: 'unit', title: 'rawSupportScoreGapMap' },
+            { key: 'rawSupportDenseFractionMap', mode: 'unit', title: 'rawSupportDenseFractionMap' },
+            {
+              key: 'rawSupportPeakHuSupportGateMap',
+              mode: 'unit',
+              title: 'rawSupportPeakHuSupportGateMap',
+            },
+            {
+              key: 'rawSupportDominantPeakOffsetMap',
+              mode: 'signed',
+              title: 'rawSupportDominantPeakOffsetMap',
+            },
+            {
+              key: 'rawSupportSecondaryPeakOffsetMap',
+              mode: 'signed',
+              title: 'rawSupportSecondaryPeakOffsetMap',
+            },
+            { key: 'toothBandPriorMap', mode: 'unit', title: 'toothBandPriorMap' },
+            {
+              key: 'dominantDensePeakGateMap',
+              mode: 'unit',
+              title: 'dominantDensePeakGateMap',
+            },
+            {
+              key: 'toothBandStructureGuardMap',
+              mode: 'unit',
+              title: 'toothBandStructureGuardMap',
+            },
+            {
+              key: 'ambiguousBroadSupportPenaltyGateMap',
+              mode: 'unit',
+              title: 'ambiguousBroadSupportPenaltyGateMap',
+            },
+            {
+              key: 'protectedAmbiguousBroadSupportPenaltyGateMap',
+              mode: 'unit',
+              title: 'protectedAmbiguousBroadSupportPenaltyGateMap',
+            },
+            { key: 'structuralSupportGateMap', mode: 'unit', title: 'structuralSupportGateMap' },
+            { key: 'peakStructureValidityMap', mode: 'unit', title: 'peakStructureValidityMap' },
+            { key: 'supportValidityMap', mode: 'unit', title: 'supportValidityMap' },
+            { key: 'rowConfidenceGateMap', mode: 'unit', title: 'rowConfidenceGateMap' },
+            {
+              key: 'falseSupportConfidenceGateMap',
+              mode: 'unit',
+              title: 'falseSupportConfidenceGateMap',
+            },
+            {
+              key: 'falseSupportDensityGateMap',
+              mode: 'unit',
+              title: 'falseSupportDensityGateMap',
+            },
+            {
+              key: 'falseSupportSpreadGateMap',
+              mode: 'unit',
+              title: 'falseSupportSpreadGateMap',
+            },
+            { key: 'falseSupportVetoMap', mode: 'unit', title: 'falseSupportVetoMap' },
+            {
+              key: 'rowBackgroundDensityGateMap',
+              mode: 'unit',
+              title: 'rowBackgroundDensityGateMap',
+            },
+            {
+              key: 'rowBackgroundSpreadGateMap',
+              mode: 'unit',
+              title: 'rowBackgroundSpreadGateMap',
+            },
+            {
+              key: 'rowBackgroundPeakHuGateMap',
+              mode: 'unit',
+              title: 'rowBackgroundPeakHuGateMap',
+            },
+            {
+              key: 'rowBackgroundEdgeGateMap',
+              mode: 'unit',
+              title: 'rowBackgroundEdgeGateMap',
+            },
+            { key: 'rowBackgroundVetoMap', mode: 'unit', title: 'rowBackgroundVetoMap' },
+            {
+              key: 'supportVetoTriggeredMap',
+              mode: 'unit',
+              title: 'supportVetoTriggeredMap',
+            },
             { key: 'supportConfidenceMap', mode: 'unit', title: 'supportConfidenceMap' },
             { key: 'supportDepthMap', mode: 'signed', title: 'supportDepthMap' },
+            { key: 'supportSpreadMap', mode: 'positive', title: 'supportSpreadMap' },
+            { key: 'supportDensityMap', mode: 'unit', title: 'supportDensityMap' },
+            {
+              key: 'continuityExpandedTroughHalfWidthMap',
+              mode: 'positive',
+              title: 'continuityExpandedTroughHalfWidthMap',
+            },
             {
               key: 'backgroundTroughNarrowGateMap',
               mode: 'unit',
               title: 'backgroundTroughNarrowGateMap',
             },
+            { key: 'dominantToothBandGateMap', mode: 'unit', title: 'dominantToothBandGateMap' },
+            { key: 'broadWeakToothBandGateMap', mode: 'unit', title: 'broadWeakToothBandGateMap' },
+            {
+              key: 'toothContinuityAdmissionGateMap',
+              mode: 'unit',
+              title: 'toothContinuityAdmissionGateMap',
+            },
             { key: 'totalAttenuationMap', mode: 'positive', title: 'totalAttenuationMap' },
+            {
+              key: 'admissionAccumulationMap',
+              mode: 'positive',
+              title: 'admissionAccumulationMap',
+            },
+            {
+              key: 'toneSuppressedAccumulationMap',
+              mode: 'positive',
+              title: 'toneSuppressedAccumulationMap',
+            },
+            {
+              key: 'participatingSampleCountMap',
+              mode: 'positive',
+              title: 'participatingSampleCountMap',
+            },
+            {
+              key: 'preToneAccumulationMap',
+              mode: 'positive',
+              title: 'preToneAccumulationMap-legacy-tone-suppressed',
+            },
             { key: 'toneResponseMap', mode: 'unit', title: 'toneResponseMap' },
+            {
+              key: 'retainedSampleMaskMap',
+              mode: 'unit',
+              title: 'retainedSampleMaskMap',
+            },
+            { key: 'middleBandLeakMap', mode: 'unit', title: 'middleBandLeakMap' },
+            {
+              key: 'admissionMiddleBandLeakMap',
+              mode: 'unit',
+              title: 'admissionMiddleBandLeakMap',
+            },
+            {
+              key: 'toneStageSuppressionMap',
+              mode: 'unit',
+              title: 'toneStageSuppressionMap',
+            },
+            { key: 'blackClipMap', mode: 'unit', title: 'blackClipMap' },
+            { key: 'invalidSupportBlackoutMap', mode: 'unit', title: 'invalidSupportBlackoutMap' },
+            { key: 'admissionOnlyHuMap', mode: 'hu', title: 'admissionOnlyHuMap' },
+            { key: 'toneBypassHuMap', mode: 'hu', title: 'toneBypassHuMap' },
+            { key: 'backgroundLeakToneMap', mode: 'unit', title: 'backgroundLeakToneMap' },
+            {
+              key: 'backgroundLeakOutlier05Map',
+              mode: 'unit',
+              title: 'backgroundLeakOutlier05Map',
+            },
+            {
+              key: 'backgroundLeakOutlier10Map',
+              mode: 'unit',
+              title: 'backgroundLeakOutlier10Map',
+            },
           ];
           for (const spec of sidecarAttemptSpecs) {
             const attempt = spec.attempt;
@@ -10681,16 +14218,72 @@ export function useCPROrchestrator({
                   `checksum=${attempt.outputSignature.checksum ?? 'na'}`,
                   `backend=${attempt.resolvedBackend}`,
                   `reconstructionMode=${attempt.reconstructionMode}`,
+                  `scalarMode=${attempt.debugScalarSamplingMode}`,
+                  `stageHint=${attempt.toothBandStageDiagnostics?.stageHint ?? 'na'}`,
+                  `rejects=${spec.candidate?.rejectReasons.join(', ') || 'none'}`,
+                  `workerRejects=${spec.candidate?.workerRejectReasons.join(', ') || 'none'}`,
                 ].join('\n')
               );
             }
           }
-          downloadCprDebugArtifacts({
-            title: `CPR Attempt Debug Report ${debugRunId}`,
-            runId: debugRunId,
-            rows: reportRows,
-            images: reportImages,
-          });
+          const emitDebugArtifacts = () => {
+            const reportProbeRows = (panoDebugProbeClicksByRun.get(debugRunId) ?? []).map(
+              (sample, index) => ({
+                clickIndex: index + 1,
+                imageId: sample.imageId ?? null,
+                col: sample.col,
+                row: sample.row,
+                mappingMode: sample.mappingMode ?? null,
+                displayedPath: sample.displayedPath ?? null,
+                backend: sample.backend ?? null,
+                pipelineMode: sample.pipelineMode ?? null,
+                reconstructionMode: sample.reconstructionMode ?? null,
+                rawSupportDepthMm: sample.rawSupportDepthMm ?? null,
+                rawSupportPeakDominance: sample.rawSupportPeakDominance ?? null,
+                rawSupportPeakValidity: sample.rawSupportPeakValidity ?? null,
+                rawSupportSecondPeakRatio: sample.rawSupportSecondPeakRatio ?? null,
+                rawSupportPeakAmbiguity: sample.rawSupportPeakAmbiguity ?? null,
+                rawSupportScoreGap: sample.rawSupportScoreGap ?? null,
+                rawSupportDenseFraction: sample.rawSupportDenseFraction ?? null,
+                rawSupportPeakHuSupportGate: sample.rawSupportPeakHuSupportGate ?? null,
+                supportCenterMm: sample.supportDepthMm ?? null,
+                supportSpreadMm: sample.supportSpreadMm ?? null,
+                supportValidity: sample.supportValidity ?? null,
+                supportDensity: sample.supportDensity ?? null,
+                supportConfidence: sample.supportConfidence ?? null,
+                dominantDensePeakGate: sample.dominantDensePeakGate ?? null,
+                toothBandStructureGuard: sample.toothBandStructureGuard ?? null,
+                protectedAmbiguousBroadSupportPenaltyGate:
+                  sample.protectedAmbiguousBroadSupportPenaltyGate ?? null,
+                falseSupportVeto: sample.falseSupportVeto ?? null,
+                rowBackgroundVeto: sample.rowBackgroundVeto ?? null,
+                supportVetoTriggered: sample.supportVetoTriggered ?? null,
+                effectiveTroughHalfWidthMm: sample.effectiveTroughHalfWidthMm ?? null,
+                continuityExpandedTroughHalfWidthMm:
+                  sample.continuityExpandedTroughHalfWidthMm ?? null,
+                dominantToothBandGate: sample.dominantToothBandGate ?? null,
+                broadWeakToothBandGate: sample.broadWeakToothBandGate ?? null,
+                toothContinuityAdmissionGate: sample.toothContinuityAdmissionGate ?? null,
+                admissionAccumulation: sample.admissionAccumulation ?? null,
+                preToneAccumulation: sample.preToneAccumulation ?? null,
+                blackClip: sample.blackClip ?? null,
+                retainedSampleMask: sample.retainedSampleMask ?? null,
+                middleBandLeak: sample.middleBandLeak ?? null,
+                holeMetricWouldCount: sample.holeMetricWouldCount,
+                holeMetricReasons: sample.holeMetricReasons ?? [],
+              })
+            );
+            downloadCprDebugArtifacts({
+              title: `CPR Attempt Debug Report ${debugRunId}`,
+              runId: debugRunId,
+              rows: reportRows,
+              probeRows: reportProbeRows,
+              images: reportImages,
+              summarySections: reportSummarySections,
+            });
+          };
+          panoDebugArtifactExportersByRun.set(debugRunId, emitDebugArtifacts);
+          emitDebugArtifacts();
         } catch (artifactError) {
           console.warn(
             `[CPR][${debugRunId}] Failed to export CPR attempt debug artifacts.`,
@@ -10719,41 +14312,58 @@ export function useCPROrchestrator({
         const selectedAttemptCatastrophicReasons =
           selectedAttemptDisplayDiagnostic?.catastrophicReasons ?? [];
         const degradedPreviewRejectReasons =
-          degradedPreviewFallbackChoice?.candidate.rejectReasons ?? selectedQualityGateCandidate.rejectReasons;
-        const qualityGateFallbackReason = canPreservePreviousPanoDisplay
-          ? 'quality-gate-blocked-keeping-current-accepted-pano'
-          : shouldDisplayPhase2DiagnosticDraft
-            ? 'quality-gate-failed-displaying-primary-diagnostic-draft'
-            : CPR_PANO_ALLOW_DEGRADED_FIRST_RUN_DISPLAY && selectedAttemptDisplayable
-              ? 'quality-gate-failed-displaying-best-available-degraded-pano'
-            : selectedAttemptDisplayable
-              ? 'quality-gate-blocked-ranked-top-not-allowed-by-policy'
-              : 'quality-gate-blocked-ranked-top-not-displayable';
-        const qualityGateFallbackMessage = canPreservePreviousPanoDisplay
-          ? `[CPR] Quality gate rejected the new panoramic output. Keeping the current accepted pano. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+          degradedPreviewSelectedChoice?.candidate.rejectReasons ??
+          selectedQualityGateCandidate.rejectReasons;
+        const usingEmergencyDegradedPreviewFallback = !!degradedPreviewEmergencyChoice;
+        const qualityGateFallbackReason = forcedDisplayedAttemptForDebug
+          ? 'quality-gate-failed-debug-forcing-gpu-candidate'
+          : canPreservePreviousPanoDisplay
+            ? 'quality-gate-blocked-keeping-current-accepted-pano'
+            : shouldDisplayPhase2DiagnosticDraft
+              ? 'quality-gate-failed-displaying-primary-diagnostic-draft'
+              : degradedPreviewSelectedChoice
+                ? usingEmergencyDegradedPreviewFallback
+                  ? 'quality-gate-failed-displaying-emergency-debug-pano'
+                  : 'quality-gate-failed-displaying-ranked-degraded-pano'
+                : selectedAttemptDisplayable
+                  ? 'quality-gate-blocked-ranked-top-not-allowed-by-policy'
+                  : 'quality-gate-blocked-ranked-top-not-displayable';
+        const qualityGateFallbackMessage = forcedDisplayedAttemptForDebug
+          ? `[CPR] Quality gate rejected the normal winner "${selectedAttempt.label}". Debug override is forcing GPU candidate "${forcedDisplayedAttemptForDebug.label}" onto the display. Normal reject reasons: ${formatPhase4RejectReasonsForMessage(
               selectedQualityGateCandidate.rejectReasons
+            )}. GPU reject reasons: ${formatPhase4RejectReasonsForMessage(
+              forcedDisplayedQualityGateCandidate?.rejectReasons ?? []
             )}.`
-          : shouldDisplayPhase2DiagnosticDraft
-            ? `[CPR] Quality gate rejected the panoramic output. Displaying the primary virtual pano draft from "${phase2BaseAttempt?.label ?? selectedAttempt.label}" because no previously accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+          : canPreservePreviousPanoDisplay
+            ? `[CPR] Quality gate rejected the new panoramic output. Keeping the current accepted pano. Reject reasons: ${formatPhase4RejectReasonsForMessage(
                 selectedQualityGateCandidate.rejectReasons
               )}.`
-            : CPR_PANO_ALLOW_DEGRADED_FIRST_RUN_DISPLAY && selectedAttemptDisplayable
-              ? `[CPR] Quality gate rejected the panoramic output. Displaying the best available pano "${selectedAttempt.label}" because no previously accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+            : shouldDisplayPhase2DiagnosticDraft
+              ? `[CPR] Quality gate rejected the panoramic output. Displaying the primary virtual pano draft from "${phase2BaseAttempt?.label ?? selectedAttempt.label}" because no previously accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
                   selectedQualityGateCandidate.rejectReasons
                 )}.`
-            : selectedAttemptDisplayable
-              ? `[CPR] Quality gate rejected the panoramic output. Blocking display of best-ranked pano "${selectedAttempt.label}" because it failed QC and no previously accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
-                  selectedQualityGateCandidate.rejectReasons
-                )}.`
-            : `[CPR] Quality gate rejected the panoramic output and the best-ranked pano "${selectedAttempt.label}" is not displayable. Reject reasons: ${formatPhase4RejectReasonsForMessage(
-                selectedQualityGateCandidate.rejectReasons
-              )}. Catastrophic reasons: ${
-                selectedAttemptCatastrophicReasons.join(', ') || 'none'
-              }.`;
+              : degradedPreviewSelectedChoice
+                ? usingEmergencyDegradedPreviewFallback
+                  ? `[CPR] Quality gate rejected the panoramic output. Displaying emergency debug pano "${degradedPreviewSelectedChoice.attempt.label}" because no accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+                      degradedPreviewRejectReasons
+                    )}.`
+                  : `[CPR] Quality gate rejected the panoramic output. Displaying degraded pano "${degradedPreviewSelectedChoice.attempt.label}" because no accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+                      degradedPreviewRejectReasons
+                    )}.`
+                : selectedAttemptDisplayable
+                  ? `[CPR] Quality gate rejected the panoramic output. Blocking display of best-ranked pano "${selectedAttempt.label}" because it failed QC and no previously accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+                      selectedQualityGateCandidate.rejectReasons
+                    )}.`
+                  : `[CPR] Quality gate rejected the panoramic output and the best-ranked pano "${selectedAttempt.label}" is not displayable. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+                      selectedQualityGateCandidate.rejectReasons
+                    )}. Catastrophic reasons: ${
+                      selectedAttemptCatastrophicReasons.join(', ') || 'none'
+                    }.`;
         const qualityGateCanContinue =
+          !!forcedDisplayedAttemptForDebug ||
           canPreservePreviousPanoDisplay ||
           shouldDisplayPhase2DiagnosticDraft ||
-          (CPR_PANO_ALLOW_DEGRADED_FIRST_RUN_DISPLAY && selectedAttemptDisplayable);
+          !!degradedPreviewSelectedChoice;
 
         if (!qualityGateCanContinue) {
           console.warn(`[CPR][${debugRunId}] ${qualityGateFallbackMessage}`, {
@@ -10828,7 +14438,7 @@ export function useCPROrchestrator({
           displayingPhase2DiagnosticDraft: shouldDisplayPhase2DiagnosticDraft,
           preservePreviousPanoAvailable: canPreservePreviousPanoDisplay,
           preservedPreviousPanoImageId,
-          degradedPreviewAttemptLabel: degradedPreviewFallbackChoice?.attempt.label ?? null,
+          degradedPreviewAttemptLabel: degradedPreviewSelectedChoice?.attempt.label ?? null,
           qualityGateRejectReasons: selectedQualityGateCandidate.rejectReasons,
         });
         console.log(
@@ -10841,7 +14451,7 @@ export function useCPROrchestrator({
             selectedHardRejectReason: selectedAttempt.hardRejectReason,
             selectedAttemptDisplayable,
             selectedAttemptCatastrophicReasons,
-            degradedPreviewAttemptLabel: degradedPreviewFallbackChoice?.attempt.label ?? null,
+            degradedPreviewAttemptLabel: degradedPreviewSelectedChoice?.attempt.label ?? null,
             degradedPreviewRejectReasons,
             selectionReason: qualityGateSelectionReason,
             preservePreviousPanoAvailable: canPreservePreviousPanoDisplay,
@@ -10872,19 +14482,46 @@ export function useCPROrchestrator({
         );
       }
 
-      const displayedAttempt = temporarilyPinnedDisplayedAttempt ?? selectedAttempt;
-      const displayedQualityGateCandidate = selectedQualityGateCandidate;
-      const usingDegradedPreviewFallback = false;
-      const displayingQcFailedRankedTop =
+      const usingForcedGpuDisplayForDebug =
+        !!forcedDisplayedAttemptForDebug && !!forcedDisplayedQualityGateCandidate;
+      const degradedPreviewDisplayChoice =
+        !usingForcedGpuDisplayForDebug &&
         !temporarilyPinnedDisplayedAttempt &&
-        shouldPreservePreviousPanoDisplay &&
         !canPreservePreviousPanoDisplay &&
-        !displayedQualityGateCandidate.pass;
+        !shouldDisplayPhase2DiagnosticDraft &&
+        !selectedQualityGateCandidate.pass
+          ? degradedPreviewSelectedChoice
+          : null;
+      const usingDegradedPreviewFallback = !!degradedPreviewDisplayChoice;
+      const usingEmergencyDegradedPreviewFallback =
+        !!degradedPreviewDisplayChoice &&
+        degradedPreviewDisplayChoice === degradedPreviewEmergencyChoice;
+      const displayedAttempt =
+        forcedDisplayedAttemptForDebug ??
+        temporarilyPinnedDisplayedAttempt ??
+        degradedPreviewDisplayChoice?.attempt ??
+        selectedAttempt;
+      let displayedQualityGateCandidate =
+        forcedDisplayedQualityGateCandidate ??
+        degradedPreviewDisplayChoice?.candidate ??
+        selectedQualityGateCandidate;
+      let qualityGateDisplaySelectionReason = usingForcedGpuDisplayForDebug
+        ? 'debug-force-display-gpu-candidate-even-if-rejected'
+        : usingDegradedPreviewFallback
+          ? usingEmergencyDegradedPreviewFallback
+            ? 'quality-gate-failed-displaying-emergency-debug-pano'
+            : 'quality-gate-failed-displaying-ranked-degraded-pano'
+          : qualityGateSelectionReason;
       let panoWorkerResult = displayedAttempt.result;
       let panoDebugSummary = displayedAttempt.summary;
       let adaptiveVoi = displayedAttempt.voi;
       let displayedOutputMode: 'legacy' | 'workerGpuPhase2' | 'virtualPanoPhase2' =
-        selectedDisplayedOutputMode;
+        usingForcedGpuDisplayForDebug
+          ? resolveDisplayedOutputModeFromWorkerResult({
+              routeDiagnostic: resolveWorkerDisplayRouteDiagnostic(displayedAttempt.workerDebugPayload),
+              workerDebugPayload: displayedAttempt.workerDebugPayload,
+            })
+          : selectedDisplayedOutputMode;
       let displayedSourceLabel = displayedAttempt.label;
       let displayedSourceAggregation = displayedAttempt.aggregation;
       let selectedPanoWidth = displayedAttempt.panoWidth;
@@ -10892,14 +14529,16 @@ export function useCPROrchestrator({
       let selectedActualVertHalfMm = displayedAttempt.actualVertHalfMm;
       let selectedColumnPixelSpacing = displayedAttempt.columnPixelSpacing;
       let selectedRowPixelSpacing = displayedAttempt.rowPixelSpacing;
-      if (
+      const displayUsesPhase2VirtualPano = Boolean(
+        !usingForcedGpuDisplayForDebug &&
         !usingDegradedPreviewFallback &&
         phase2VirtualPano.usedAsDisplayedOutput &&
         phase2WorkerResult &&
         phase2VirtualPano.summary &&
         phase2VirtualPano.voi &&
         phase2BaseAttempt
-      ) {
+      );
+      if (displayUsesPhase2VirtualPano && phase2BaseAttempt) {
         panoWorkerResult = phase2WorkerResult;
         panoDebugSummary = phase2VirtualPano.summary;
         adaptiveVoi = phase2VirtualPano.voi;
@@ -10911,8 +14550,23 @@ export function useCPROrchestrator({
         selectedActualVertHalfMm = phase2BaseAttempt.actualVertHalfMm;
         selectedColumnPixelSpacing = phase2BaseAttempt.columnPixelSpacing;
         selectedRowPixelSpacing = phase2BaseAttempt.rowPixelSpacing;
+        displayedQualityGateCandidate =
+          explicitPhase2QualityGateCandidate ?? selectedQualityGateCandidate;
+        qualityGateDisplaySelectionReason =
+          phase2VirtualPano.displayDecisionReason ===
+          'accepted-by-worker-and-orchestrator-after-rejected-seed-revival-rule'
+            ? 'phase2-virtual-pano-accepted-after-rejected-seed-revival-rule'
+            : 'phase2-virtual-pano-accepted';
       }
-      const displayedWorkerDebugPayload = phase2VirtualPano.usedAsDisplayedOutput
+      const displayingQcFailedRankedTop =
+        !usingForcedGpuDisplayForDebug &&
+        !usingDegradedPreviewFallback &&
+        !temporarilyPinnedDisplayedAttempt &&
+        !displayUsesPhase2VirtualPano &&
+        shouldPreservePreviousPanoDisplay &&
+        !canPreservePreviousPanoDisplay &&
+        !displayedQualityGateCandidate.pass;
+      const displayedWorkerDebugPayload = displayUsesPhase2VirtualPano
         ? phase2WorkerResult?.workerDebugPayload ?? null
         : displayedAttempt.workerDebugPayload ?? null;
       const displayedRouteDiagnostic = resolveWorkerDisplayRouteDiagnostic(
@@ -10933,7 +14587,7 @@ export function useCPROrchestrator({
             .filter(value => Number.isFinite(value))
         : [];
       const crossSectionVerticalCenterOffsetMm =
-        (phase2VirtualPano.usedAsDisplayedOutput
+        (displayUsesPhase2VirtualPano
           ? phase2BaseAttempt?.verticalCenterOffsetMm
           : displayedAttempt.verticalCenterOffsetMm) ?? 0;
       console.log(
@@ -10953,7 +14607,7 @@ export function useCPROrchestrator({
         displayedWorkerDiagnostic?.timingMs &&
         typeof displayedWorkerDiagnostic.timingMs === 'object'
           ? (displayedWorkerDiagnostic.timingMs as Record<string, unknown>)
-          : phase2VirtualPano.usedAsDisplayedOutput
+          : displayUsesPhase2VirtualPano
             ? phase2VirtualPano.timingMs
             : displayedAttempt.workerTimingMs ?? null;
       const displayedOutputSignature = extractCprOutputSignature(displayedWorkerDebugPayload);
@@ -10983,7 +14637,7 @@ export function useCPROrchestrator({
             signatureKey: selectedOutputSignatureKey,
           },
           displayed: {
-            label: phase2VirtualPano.usedAsDisplayedOutput
+            label: displayUsesPhase2VirtualPano
               ? displayedSourceLabel
               : displayedAttempt.label,
             checksum: displayedOutputSignature.checksum,
@@ -11068,7 +14722,7 @@ export function useCPROrchestrator({
             outputSignature: selectedAttempt.outputSignature,
           },
           displayed: {
-            label: phase2VirtualPano.usedAsDisplayedOutput
+            label: displayUsesPhase2VirtualPano
               ? displayedSourceLabel
               : displayedAttempt.label,
             sourceLabel: displayedSourceLabel,
@@ -11081,9 +14735,14 @@ export function useCPROrchestrator({
             reconstructionMode:
               toNonEmptyString(displayedWorkerDiagnostic?.reconstructionMode) ??
               displayedOutputMode,
-            qualityStatus: displayingQcFailedRankedTop ? 'degraded' : 'accepted',
+            qualityStatus:
+              usingForcedGpuDisplayForDebug ||
+              usingDegradedPreviewFallback ||
+              displayingQcFailedRankedTop
+                ? 'degraded'
+                : 'accepted',
             qualityGatePassed: displayedQualityGateCandidate.pass,
-            qualityGateSelectionReason,
+            qualityGateSelectionReason: qualityGateDisplaySelectionReason,
             qualityGateRejectReasons: displayedQualityGateCandidate.rejectReasons,
             workerTimingMs: displayedWorkerTimingMs,
             outputSignature: displayedOutputSignature,
@@ -11091,8 +14750,9 @@ export function useCPROrchestrator({
         })
       );
       console.log(`[CPR][${debugRunId}] selected pano candidate`, {
-        label: phase2VirtualPano.usedAsDisplayedOutput ? displayedSourceLabel : displayedAttempt.label,
+        label: displayUsesPhase2VirtualPano ? displayedSourceLabel : displayedAttempt.label,
         displayedAttemptLabel: displayedAttempt.label,
+        forceDisplayGpuCandidateEvenIfRejected: usingForcedGpuDisplayForDebug,
         temporaryDisplayPinned: !!temporarilyPinnedDisplayedAttempt,
         usingDegradedPreviewFallback,
         displayingQcFailedRankedTop,
@@ -11104,10 +14764,15 @@ export function useCPROrchestrator({
         displayedPipelineMode: displayedRouteDiagnostic.pipelineMode,
         fallbackReason: displayedRouteDiagnostic.fallbackReason,
         phase2GatePassed: displayedRouteDiagnostic.phase2GatePassed,
-        qualityGateSelectionReason,
+        qualityGateSelectionReason: qualityGateDisplaySelectionReason,
         qualityGateRejectReasons: displayedQualityGateCandidate.rejectReasons,
         qualityGatePassed: displayedQualityGateCandidate.pass,
-        qualityStatus: displayingQcFailedRankedTop ? 'degraded' : 'accepted',
+        qualityStatus:
+          usingForcedGpuDisplayForDebug ||
+          usingDegradedPreviewFallback ||
+          displayingQcFailedRankedTop
+            ? 'degraded'
+            : 'accepted',
         preservePreviousPanoRequested: shouldPreservePreviousPanoDisplay,
         preservePreviousPanoAvailable: canPreservePreviousPanoDisplay,
         preservedPreviousPanoImageId,
@@ -11212,18 +14877,34 @@ export function useCPROrchestrator({
             throw new Error('Dimension mismatch');
           }
 
-          const preservedPayloadForDisplay = canPreservePreviousPanoDisplay
+          const preservedPayloadForDisplay =
+            !usingForcedGpuDisplayForDebug && canPreservePreviousPanoDisplay
             ? preservedPreviousPanoPayload
             : null;
-          const displayingDegradedPanoPreview = false;
-          const qualityStatusForDisplay: PanoQualityStatus = displayingQcFailedRankedTop
-            ? 'degraded'
-            : 'accepted';
-          const qualityMessageForDisplay = displayingQcFailedRankedTop
-            ? `[CPR] Displaying best-ranked pano from "${displayedAttempt.label}" because all candidates failed QC and no previously accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+          const displayingDegradedPanoPreview = usingDegradedPreviewFallback;
+          const qualityStatusForDisplay: PanoQualityStatus =
+            usingForcedGpuDisplayForDebug ||
+            displayingDegradedPanoPreview ||
+            displayingQcFailedRankedTop
+              ? 'degraded'
+              : 'accepted';
+          const qualityMessageForDisplay = usingForcedGpuDisplayForDebug
+            ? `[CPR] Debug override is forcing the GPU pano candidate "${displayedAttempt.label}" for inspection. Normal selection chose "${selectedAttempt.label}". GPU reject reasons: ${formatPhase4RejectReasonsForMessage(
                 displayedQualityGateCandidate.rejectReasons
               )}.`
-            : null;
+            : displayingDegradedPanoPreview
+              ? usingEmergencyDegradedPreviewFallback
+                ? `[CPR] Displaying emergency debug pano from "${displayedAttempt.label}" because no accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+                    displayedQualityGateCandidate.rejectReasons
+                  )}.`
+                : `[CPR] Displaying degraded pano from "${displayedAttempt.label}" because no accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+                    displayedQualityGateCandidate.rejectReasons
+                  )}.`
+            : displayingQcFailedRankedTop
+              ? `[CPR] Displaying best-ranked pano from "${displayedAttempt.label}" because all candidates failed QC and no previously accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+                  displayedQualityGateCandidate.rejectReasons
+                )}.`
+              : null;
           const payloadForDisplay = preservedPayloadForDisplay ?? {
             pixelData: panoWorkerResult.pixelData,
             meanMap: panoWorkerResult.meanMap,
@@ -11241,8 +14922,13 @@ export function useCPROrchestrator({
                 displayedOutputMode,
               qualityStatus: qualityStatusForDisplay,
               qualityGateRejectReasons: displayedQualityGateCandidate.rejectReasons,
-              qualityGateSelectionReason: qualityGateSelectionReason,
+              qualityGateSelectionReason: qualityGateDisplaySelectionReason,
               qualityGateMessage: qualityMessageForDisplay,
+              holeMetricBlackClipThreshold: CPR_TOOTH_BAND_BLACK_CLIP_THRESHOLD,
+              holeMetricRetainedWeightMax: CPR_TOOTH_BAND_HOLE_RETAINED_WEIGHT_MAX,
+              holeMetricPreToneThreshold:
+                displayedAttempt.summary?.toothBandHolePreToneThreshold ?? null,
+              holeMetricLeakMin: CPR_TOOTH_BAND_HOLE_LEAK_MIN,
             },
             width: panoWorkerResult.width,
             height: panoWorkerResult.height,
@@ -11251,7 +14937,7 @@ export function useCPROrchestrator({
             qualityGatePassed: displayedQualityGateCandidate.pass,
             qualityStatus: qualityStatusForDisplay,
             qualityGateRejectReasons: displayedQualityGateCandidate.rejectReasons,
-            qualityGateSelectionReason: qualityGateSelectionReason,
+            qualityGateSelectionReason: qualityGateDisplaySelectionReason,
             qualityGateMessage: qualityMessageForDisplay,
             huDomain: displayedAttempt.huDomain,
             intensityDomain: displayedAttempt.intensityDomain,
@@ -11275,7 +14961,7 @@ export function useCPROrchestrator({
             console.warn(
               `[CPR][${debugRunId}] preserving previously displayed pano because the new worker output failed the quality gate`,
               {
-                selectionReason: qualityGateSelectionReason,
+                selectionReason: qualityGateDisplaySelectionReason,
                 selectedAttemptLabel: selectedAttempt.label,
                 selectedHardRejectReason: selectedAttempt.hardRejectReason,
                 preservedPreviousPanoImageId,
@@ -11285,7 +14971,7 @@ export function useCPROrchestrator({
               '[CPR-PRESERVE-PREVIOUS-PANO-JSON]',
               JSON.stringify({
                 runId: debugRunId,
-                selectionReason: qualityGateSelectionReason,
+                selectionReason: qualityGateDisplaySelectionReason,
                 selectedAttemptLabel: selectedAttempt.label,
                 selectedHardRejectReason: selectedAttempt.hardRejectReason,
                 preservedPreviousPanoImageId,
@@ -11293,11 +14979,54 @@ export function useCPROrchestrator({
               })
             );
           }
+          if (usingForcedGpuDisplayForDebug) {
+            console.warn(
+              `[CPR][${debugRunId}] forcing rejected GPU pano candidate onto the display for direct evaluation`,
+              {
+                forcedAttemptLabel: displayedAttempt.label,
+                normalSelectionLabel: selectedAttempt.label,
+                rejectReasons: displayedQualityGateCandidate.rejectReasons,
+              }
+            );
+            console.log(
+              '[CPR-FORCED-GPU-DISPLAY-JSON]',
+              JSON.stringify({
+                runId: debugRunId,
+                forcedAttemptLabel: displayedAttempt.label,
+                normalSelectionLabel: selectedAttempt.label,
+                rejectReasons: displayedQualityGateCandidate.rejectReasons,
+                selectionReason: qualityGateDisplaySelectionReason,
+              })
+            );
+          }
+          if (displayingDegradedPanoPreview) {
+            console.warn(
+              `[CPR][${debugRunId}] displaying degraded pano preview because no accepted pano is available`,
+              {
+                selectionReason: qualityGateDisplaySelectionReason,
+                degradedAttemptLabel: displayedAttempt.label,
+                rejectReasons: displayedQualityGateCandidate.rejectReasons,
+                emergencyPreview: usingEmergencyDegradedPreviewFallback,
+              }
+            );
+            console.log(
+              '[CPR-DISPLAY-DEGRADED-PREVIEW-JSON]',
+              JSON.stringify({
+                runId: debugRunId,
+                selectionReason: qualityGateDisplaySelectionReason,
+                degradedAttemptLabel: displayedAttempt.label,
+                selectedAttemptLabel: selectedAttempt.label,
+                rejectReasons: displayedQualityGateCandidate.rejectReasons,
+                qualityStatus: qualityStatusForDisplay,
+                selectionMode: usingEmergencyDegradedPreviewFallback ? 'emergency' : 'displayable',
+              })
+            );
+          }
           if (displayingQcFailedRankedTop) {
             console.warn(
               `[CPR][${debugRunId}] displaying best-ranked pano despite QC failure because no previously accepted pano is available`,
               {
-                selectionReason: qualityGateSelectionReason,
+                selectionReason: qualityGateDisplaySelectionReason,
                 selectedAttemptLabel: displayedAttempt.label,
                 selectedHardRejectReason: displayedAttempt.hardRejectReason,
                 rejectReasons: displayedQualityGateCandidate.rejectReasons,
@@ -11307,7 +15036,7 @@ export function useCPROrchestrator({
               '[CPR-DISPLAY-QC-FAILED-RANKED-TOP-JSON]',
               JSON.stringify({
                 runId: debugRunId,
-                selectionReason: qualityGateSelectionReason,
+                selectionReason: qualityGateDisplaySelectionReason,
                 selectedAttemptLabel: displayedAttempt.label,
                 selectedHardRejectReason: displayedAttempt.hardRejectReason,
                 selectedDespiteGateFailure: !displayedQualityGateCandidate.pass,
@@ -11344,6 +15073,163 @@ export function useCPROrchestrator({
             columnPixelSpacing: payloadForDisplay.columnPixelSpacing,
             rowPixelSpacing: payloadForDisplay.rowPixelSpacing,
           });
+          console.log(
+            '[CPR-FINAL-DISPLAYED-IMAGE-JSON]',
+            JSON.stringify({
+              runId: debugRunId,
+              displayedLabel: displayUsesPhase2VirtualPano
+                ? displayedSourceLabel
+                : displayedAttempt.label,
+              displayedSourceLabel,
+              displayedSourceAggregation,
+              displayedOutputMode,
+              displayUsesPhase2VirtualPano,
+              usingForcedGpuDisplayForDebug,
+              usingDegradedPreviewFallback,
+              usingEmergencyDegradedPreviewFallback,
+              displayingQcFailedRankedTop,
+              qualityStatus: qualityStatusForDisplay,
+              qualityGatePassed: displayedQualityGateCandidate.pass,
+              qualityGateSelectionReason: qualityGateDisplaySelectionReason,
+              qualityGateRejectReasons: displayedQualityGateCandidate.rejectReasons,
+              phase0AttemptTableCandidate: {
+                label: displayUsesPhase2VirtualPano
+                  ? phase2BaseAttempt?.label ?? null
+                  : displayedAttempt.label,
+                qualityGatePassed: displayUsesPhase2VirtualPano
+                  ? phase2BaseAttempt?.qualityGatePassed ?? null
+                  : displayedAttempt.qualityGatePassed,
+                rejectReasons: displayUsesPhase2VirtualPano
+                  ? phase2BaseAttempt?.qualityGateRejectReasons ?? []
+                  : displayedAttempt.qualityGateRejectReasons,
+                hardRejectReason: displayUsesPhase2VirtualPano
+                  ? phase2BaseAttempt?.hardRejectReason ?? null
+                  : displayedAttempt.hardRejectReason,
+                structuralRejectReasons: displayUsesPhase2VirtualPano
+                  ? phase2BaseAssessment?.structuralRejectReasons ?? []
+                  : phase2BaseAssessmentByLabel.get(displayedAttempt.label)?.structuralRejectReasons ??
+                    [],
+              },
+              phase2DisplayedCandidate: {
+                executed: phase2VirtualPano.executed,
+                skippedReason: phase2VirtualPano.skippedReason,
+                error: phase2VirtualPano.error,
+                seedLabel: phase2BaseAttempt?.label ?? null,
+                seedEligible: phase2VirtualPano.phase0SeedEligible,
+                seedRejectReasons: phase2VirtualPano.phase0SeedRejectReasons,
+                seedStructuralRejectReasons: phase2VirtualPano.phase0SeedStructuralRejectReasons,
+                workerAcceptedForOutput: phase2VirtualPano.workerAcceptedForOutput,
+                orchestratorGatePassed: phase2VirtualPano.orchestratorGatePassed,
+                orchestratorRejectReasons: phase2VirtualPano.orchestratorRejectReasons,
+                displayDecisionReason: phase2VirtualPano.displayDecisionReason,
+                renderFamily: phase2VirtualPano.phase2RenderFamily,
+                candidateSource: phase2VirtualPano.phase2CandidateSource,
+                derivedFromPhase0RejectedFamily: phase2VirtualPano.revivedRejectedFamily,
+                rejectedSeedRulePassed: phase2VirtualPano.revivedRejectedFamilyRulePassed,
+                rejectedSeedRuleRejectReasons: phase2VirtualPano.revivedRejectedFamilyRejectReasons,
+              },
+              finalDisplayedSummary: panoDebugSummary
+                ? {
+                    sampledCount: panoDebugSummary.sampledCount,
+                    backgroundOutlierFraction05:
+                      panoDebugSummary.backgroundOutlierFraction05 ?? null,
+                    backgroundOutlierFraction10:
+                      panoDebugSummary.backgroundOutlierFraction10 ?? null,
+                    lowerBandBrightFraction: panoDebugSummary.lowerBandBrightFraction ?? null,
+                    blackClipFraction:
+                      displayedQualityGateCandidate.supportSurfaceRiskSummary.background
+                        .blackClipFraction,
+                    toothBandHoleFraction:
+                      displayedQualityGateCandidate.metrics.toothBandHoleFraction,
+                    toothBandBlackClipFraction:
+                      displayedQualityGateCandidate.metrics.toothBandBlackClipFraction,
+                    toothBandRetainedWeightP10:
+                      displayedQualityGateCandidate.metrics.toothBandRetainedWeightP10,
+                    toothBandRetainedWeightP50:
+                      displayedQualityGateCandidate.metrics.toothBandRetainedWeightP50,
+                  }
+                : null,
+              displayedImageDerivedFromPhase0RejectedFamily: displayUsesPhase2VirtualPano
+                ? phase2VirtualPano.revivedRejectedFamily
+                : !displayedAttempt.qualityGatePassed || !!displayedAttempt.hardRejectReason,
+            })
+          );
+          console.log(
+            '[CPR-FINAL-WINNER-STATUS-JSON]',
+            JSON.stringify({
+              runId: debugRunId,
+              normalAcceptedWinner: selectedQualityGateCandidate.pass
+                ? {
+                    label: selectedAttempt.label,
+                    qualityGatePassed: true,
+                    rejectReasons: [],
+                    selectionReason: qualityGateSelectionReason,
+                  }
+                : null,
+              normalRejectedTopCandidate: selectedQualityGateCandidate.pass
+                ? null
+                : {
+                    label: selectedAttempt.label,
+                    qualityGatePassed: false,
+                    rejectReasons: selectedQualityGateCandidate.rejectReasons,
+                    selectionReason: qualityGateSelectionReason,
+                  },
+              degradedPreviewWinner: degradedPreviewSelectedChoice
+                ? {
+                    label: degradedPreviewSelectedChoice.attempt.label,
+                    selectionMode: degradedPreviewFallbackChoice
+                      ? 'displayable'
+                      : degradedPreviewEmergencyChoice
+                        ? 'emergency'
+                        : 'unknown',
+                    rejectReasons: degradedPreviewSelectedChoice.candidate.rejectReasons,
+                    blockedAsDegradedPreview:
+                      degradedPreviewSelectedChoice.degradedPreviewAssessment
+                        .blockedAsDegradedPreview,
+                    blockedAsDegradedPreviewReasons:
+                      degradedPreviewSelectedChoice.degradedPreviewAssessment
+                        .blockedAsDegradedPreviewReasons,
+                  }
+                : null,
+              displayedImage: {
+                label: displayUsesPhase2VirtualPano
+                  ? displayedSourceLabel
+                  : displayedAttempt.label,
+                accepted: displayedQualityGateCandidate.pass,
+                mode: usingForcedGpuDisplayForDebug
+                  ? 'forced-debug-gpu'
+                  : usingDegradedPreviewFallback
+                    ? usingEmergencyDegradedPreviewFallback
+                      ? 'emergency-debug-preview'
+                      : 'degraded-preview'
+                    : displayUsesPhase2VirtualPano
+                      ? 'accepted-phase2'
+                      : !!preservedPayloadForDisplay
+                        ? 'preserve-previous-accepted'
+                        : displayingQcFailedRankedTop
+                          ? 'qc-failed-ranked-top'
+                          : 'accepted-ranked-top',
+                rejectReasons: displayedQualityGateCandidate.rejectReasons,
+                qualityStatus: qualityStatusForDisplay,
+              },
+              phase2SeedStatus: {
+                selectedLabel: phase2BaseAttempt?.label ?? null,
+                selectionBlockedReason: phase2BaseSelectionBlockedReason,
+                targetLabel: CPR_TARGET_TOOTH_DEBUG_LABEL,
+                targetSeedEligible:
+                  phase2BaseAssessmentByLabel.get(CPR_TARGET_TOOTH_DEBUG_LABEL)?.seedEligible ?? null,
+                targetStructuralRejectReasons:
+                  phase2BaseAssessmentByLabel.get(CPR_TARGET_TOOTH_DEBUG_LABEL)
+                    ?.structuralRejectReasons ?? [],
+              },
+              forceDisplayOverride: {
+                requested: forceDisplayGpuCandidateEvenIfRejected,
+                active: usingForcedGpuDisplayForDebug,
+                blockedReason: forcedDisplayedAttemptBlockedReason,
+                blockedReasons: forcedDisplayedAttemptBlockedReasons,
+              },
+            })
+          );
           console.log(
             '[CPR-LOADER-METADATA-JSON]',
             JSON.stringify({

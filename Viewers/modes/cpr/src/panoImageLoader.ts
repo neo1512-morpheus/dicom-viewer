@@ -25,6 +25,10 @@ export interface PanoImagePayload {
     qualityGateRejectReasons?: string[];
     qualityGateSelectionReason?: string | null;
     qualityGateMessage?: string | null;
+    holeMetricBlackClipThreshold?: number | null;
+    holeMetricRetainedWeightMax?: number | null;
+    holeMetricPreToneThreshold?: number | null;
+    holeMetricLeakMin?: number | null;
   };
   width: number;
   height: number;

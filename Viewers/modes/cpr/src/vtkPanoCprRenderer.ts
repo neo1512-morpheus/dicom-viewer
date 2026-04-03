@@ -1334,6 +1334,30 @@ export async function attachVtkPanoCpr(args: AttachVtkPanoCprArgs): Promise<Atta
 
     viewportElement.__cprVtkPanoHost = {
       actorUID,
+      updateWindowLevel: (windowWidth: number, windowCenter: number) => {
+        if (disposed) {
+          return;
+        }
+
+        const nextWindowWidth = requirePositiveNumber(windowWidth, 'windowWidth');
+        const nextWindowCenter = requireFiniteNumber(windowCenter, 'windowCenter');
+        currentWindowWidth = nextWindowWidth;
+        currentWindowCenter = nextWindowCenter;
+        const nextAppliedWindowWidth = nextWindowWidth;
+        const nextAppliedWindowCenter = nextWindowCenter;
+        console.log(
+          `DIAG-TRIPWIRE: vtk-live-wl run=${runLabel} rawWindowWidth=${nextWindowWidth} rawWindowCenter=${nextWindowCenter} slope=${sourceRescaleSlope} intercept=${sourceRescaleIntercept} normalizedHuWindowWidth=${nextAppliedWindowWidth} normalizedHuWindowCenter=${nextAppliedWindowCenter}`
+        );
+        const property = imageSlice.getProperty();
+        property.setRGBTransferFunction(0, null);
+        property.setUseLookupTableScalarRange(false);
+        console.log(
+          `DIAG-TRIPWIRE: vtk-property-apply-live run=${runLabel} isPreScaled=${sourceIsPreScaled} normalizedHuSource=true finalWindowWidth=${nextAppliedWindowWidth} finalWindowCenter=${nextAppliedWindowCenter}`
+        );
+        property.setColorWindow(nextAppliedWindowWidth);
+        property.setColorLevel(nextAppliedWindowCenter);
+        resizeHostedRenderWindow(false);
+      },
       getReattachState: () => {
         if (disposed) {
           return null;

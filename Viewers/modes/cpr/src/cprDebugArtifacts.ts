@@ -31,6 +31,56 @@ export interface CprDebugReportImage {
   upper?: number | null;
 }
 
+export interface CprDebugReportSummarySection {
+  title: string;
+  lines: string[];
+}
+
+export interface CprDebugProbeRow {
+  clickIndex: number;
+  imageId: string | null;
+  col: number;
+  row: number;
+  mappingMode?: string | null;
+  displayedPath?: string | null;
+  backend?: string | null;
+  pipelineMode?: string | null;
+  reconstructionMode?: string | null;
+  rawSupportDepthMm?: number | null;
+  rawSupportPeakDominance?: number | null;
+  rawSupportPeakValidity?: number | null;
+  rawSupportSecondPeakRatio?: number | null;
+  rawSupportPeakAmbiguity?: number | null;
+  rawSupportScoreGap?: number | null;
+  rawSupportDenseFraction?: number | null;
+  rawSupportPeakHuSupportGate?: number | null;
+  supportCenterMm?: number | null;
+  supportSpreadMm?: number | null;
+  supportValidity?: number | null;
+  supportDensity?: number | null;
+  supportConfidence?: number | null;
+  dominantDensePeakGate?: number | null;
+  toothBandStructureGuard?: number | null;
+  protectedAmbiguousBroadSupportPenaltyGate?: number | null;
+  falseSupportVeto?: number | null;
+  rowBackgroundVeto?: number | null;
+  supportVetoTriggered?: number | null;
+  effectiveTroughHalfWidthMm?: number | null;
+  continuityExpandedTroughHalfWidthMm?: number | null;
+  dominantToothBandGate?: number | null;
+  broadWeakToothBandGate?: number | null;
+  toothContinuityAdmissionGate?: number | null;
+  admissionAccumulation?: number | null;
+  preToneAccumulation?: number | null;
+  blackClip?: number | null;
+  retainedSampleMask?: number | null;
+  middleBandLeak?: number | null;
+  holeMetricWouldCount?: boolean;
+  holeMetricReasons?: string[];
+}
+
+const downloadedCprDebugArtifactRunIds = new Set<string>();
+
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) {
     return 0;
@@ -228,11 +278,107 @@ function buildAttemptTableCsv(rows: CprDebugReportRow[]): string {
   return [header.join(','), ...body].join('\n');
 }
 
+function buildProbeTableCsv(rows: CprDebugProbeRow[]): string {
+  const header = [
+    'clickIndex',
+    'imageId',
+    'col',
+    'row',
+    'mappingMode',
+    'displayedPath',
+    'backend',
+    'pipelineMode',
+    'reconstructionMode',
+    'rawSupportDepthMm',
+    'rawSupportPeakDominance',
+    'rawSupportPeakValidity',
+    'rawSupportSecondPeakRatio',
+    'rawSupportPeakAmbiguity',
+    'rawSupportScoreGap',
+    'rawSupportDenseFraction',
+    'rawSupportPeakHuSupportGate',
+    'supportCenterMm',
+    'supportSpreadMm',
+    'supportValidity',
+    'supportDensity',
+    'supportConfidence',
+    'dominantDensePeakGate',
+    'toothBandStructureGuard',
+    'protectedAmbiguousBroadSupportPenaltyGate',
+    'falseSupportVeto',
+    'rowBackgroundVeto',
+    'supportVetoTriggered',
+    'effectiveTroughHalfWidthMm',
+    'continuityExpandedTroughHalfWidthMm',
+    'dominantToothBandGate',
+    'broadWeakToothBandGate',
+    'toothContinuityAdmissionGate',
+    'admissionAccumulation',
+    'preToneAccumulation',
+    'blackClip',
+    'retainedSampleMask',
+    'middleBandLeak',
+    'holeMetricWouldCount',
+    'holeMetricReasons',
+  ];
+
+  const body = rows.map(row =>
+    [
+      row.clickIndex,
+      row.imageId ?? '',
+      row.col,
+      row.row,
+      row.mappingMode ?? '',
+      row.displayedPath ?? '',
+      row.backend ?? '',
+      row.pipelineMode ?? '',
+      row.reconstructionMode ?? '',
+      row.rawSupportDepthMm ?? '',
+      row.rawSupportPeakDominance ?? '',
+      row.rawSupportPeakValidity ?? '',
+      row.rawSupportSecondPeakRatio ?? '',
+      row.rawSupportPeakAmbiguity ?? '',
+      row.rawSupportScoreGap ?? '',
+      row.rawSupportDenseFraction ?? '',
+      row.rawSupportPeakHuSupportGate ?? '',
+      row.supportCenterMm ?? '',
+      row.supportSpreadMm ?? '',
+      row.supportValidity ?? '',
+      row.supportDensity ?? '',
+      row.supportConfidence ?? '',
+      row.dominantDensePeakGate ?? '',
+      row.toothBandStructureGuard ?? '',
+      row.protectedAmbiguousBroadSupportPenaltyGate ?? '',
+      row.falseSupportVeto ?? '',
+      row.rowBackgroundVeto ?? '',
+      row.supportVetoTriggered ?? '',
+      row.effectiveTroughHalfWidthMm ?? '',
+      row.continuityExpandedTroughHalfWidthMm ?? '',
+      row.dominantToothBandGate ?? '',
+      row.broadWeakToothBandGate ?? '',
+      row.toothContinuityAdmissionGate ?? '',
+      row.admissionAccumulation ?? '',
+      row.preToneAccumulation ?? '',
+      row.blackClip ?? '',
+      row.retainedSampleMask ?? '',
+      row.middleBandLeak ?? '',
+      row.holeMetricWouldCount === undefined ? '' : row.holeMetricWouldCount ? 'yes' : 'no',
+      row.holeMetricReasons?.join('|') ?? '',
+    ]
+      .map(value => `"${String(value).replace(/"/g, '""')}"`)
+      .join(',')
+  );
+
+  return [header.join(','), ...body].join('\n');
+}
+
 function buildReportHtml(params: {
   title: string;
   runId: string;
   rows: CprDebugReportRow[];
+  probeRows?: CprDebugProbeRow[];
   images: Array<CprDebugReportImage & { dataUrl: string | null }>;
+  summarySections?: CprDebugReportSummarySection[];
 }): string {
   const rowsHtml = params.rows
     .map(
@@ -256,6 +402,45 @@ function buildReportHtml(params: {
 </tr>`
     )
     .join('\n');
+  const probeRowsHtml = (params.probeRows ?? [])
+    .map(
+      row => `<tr>
+  <td>${row.clickIndex}</td>
+  <td>${row.col}</td>
+  <td>${row.row}</td>
+  <td>${escapeHtml(row.mappingMode ?? '')}</td>
+  <td>${escapeHtml(row.displayedPath ?? '')}</td>
+  <td>${escapeHtml(row.backend ?? '')}</td>
+  <td>${escapeHtml(row.pipelineMode ?? '')}</td>
+  <td>${escapeHtml(row.reconstructionMode ?? '')}</td>
+  <td>${row.rawSupportPeakDominance ?? 'na'}</td>
+  <td>${row.rawSupportPeakValidity ?? 'na'}</td>
+  <td>${row.rawSupportSecondPeakRatio ?? 'na'}</td>
+  <td>${row.rawSupportPeakAmbiguity ?? 'na'}</td>
+  <td>${row.rawSupportScoreGap ?? 'na'}</td>
+  <td>${row.rawSupportPeakHuSupportGate ?? 'na'}</td>
+  <td>${row.supportCenterMm ?? 'na'}</td>
+  <td>${row.supportSpreadMm ?? 'na'}</td>
+  <td>${row.supportValidity ?? 'na'}</td>
+  <td>${row.supportDensity ?? 'na'}</td>
+  <td>${row.supportConfidence ?? 'na'}</td>
+  <td>${row.dominantDensePeakGate ?? 'na'}</td>
+  <td>${row.toothBandStructureGuard ?? 'na'}</td>
+  <td>${row.protectedAmbiguousBroadSupportPenaltyGate ?? 'na'}</td>
+  <td>${row.falseSupportVeto ?? 'na'}</td>
+  <td>${row.rowBackgroundVeto ?? 'na'}</td>
+  <td>${row.supportVetoTriggered ?? 'na'}</td>
+  <td>${row.effectiveTroughHalfWidthMm ?? 'na'}</td>
+  <td>${row.admissionAccumulation ?? 'na'}</td>
+  <td>${row.preToneAccumulation ?? 'na'}</td>
+  <td>${row.blackClip ?? 'na'}</td>
+  <td>${row.retainedSampleMask ?? 'na'}</td>
+  <td>${row.middleBandLeak ?? 'na'}</td>
+  <td>${row.holeMetricWouldCount === undefined ? 'na' : row.holeMetricWouldCount ? 'yes' : 'no'}</td>
+  <td>${escapeHtml(row.holeMetricReasons?.join(', ') ?? '')}</td>
+</tr>`
+    )
+    .join('\n');
 
   const imagesHtml = params.images
     .map(image => {
@@ -269,6 +454,14 @@ function buildReportHtml(params: {
   ${caption}
 </section>`;
     })
+    .join('\n');
+  const summaryHtml = (params.summarySections ?? [])
+    .map(
+      section => `<section class="card">
+  <h2>${escapeHtml(section.title)}</h2>
+  <div class="meta">${escapeHtml(section.lines.join('\n'))}</div>
+</section>`
+    )
     .join('\n');
 
   return `<!DOCTYPE html>
@@ -292,6 +485,14 @@ function buildReportHtml(params: {
 <body>
   <h1>${escapeHtml(params.title)}</h1>
   <div class="meta">Run: ${escapeHtml(params.runId)}</div>
+  ${
+    summaryHtml
+      ? `<h2>Summary</h2>
+  <div class="grid">
+    ${summaryHtml}
+  </div>`
+      : ''
+  }
   <h2>Attempt Table</h2>
   <table>
     <thead>
@@ -318,6 +519,53 @@ function buildReportHtml(params: {
       ${rowsHtml}
     </tbody>
   </table>
+  ${
+    probeRowsHtml
+      ? `<h2>Probe Clicks</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>col</th>
+        <th>row</th>
+        <th>mappingMode</th>
+        <th>displayedPath</th>
+        <th>backend</th>
+        <th>pipelineMode</th>
+        <th>reconstructionMode</th>
+        <th>peakDom</th>
+        <th>peakValid</th>
+        <th>secondPeakRatio</th>
+        <th>peakAmbiguity</th>
+        <th>scoreGap</th>
+        <th>peakHuGate</th>
+        <th>supportCenter</th>
+        <th>supportSpread</th>
+        <th>supportValidity</th>
+        <th>supportDensity</th>
+        <th>supportConfidence</th>
+        <th>dominantGate</th>
+        <th>toothGuard</th>
+        <th>protectedAmbig</th>
+        <th>falseVeto</th>
+        <th>rowBgVeto</th>
+        <th>supportVeto</th>
+        <th>troughWidthUsed</th>
+        <th>admission</th>
+        <th>preTone</th>
+        <th>blackClip</th>
+        <th>retained</th>
+        <th>middleLeak</th>
+        <th>holeMetric</th>
+        <th>holeReasons</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${probeRowsHtml}
+    </tbody>
+  </table>`
+      : ''
+  }
   <h2>Images</h2>
   <div class="grid">
     ${imagesHtml}
@@ -330,13 +578,19 @@ export function downloadCprDebugArtifacts(params: {
   title: string;
   runId: string;
   rows: CprDebugReportRow[];
+  probeRows?: CprDebugProbeRow[];
   images: CprDebugReportImage[];
+  summarySections?: CprDebugReportSummarySection[];
 }): void {
   if (typeof document === 'undefined') {
     return;
   }
 
   const safeRunId = sanitizeFilenamePart(params.runId || 'cpr-debug');
+  if (downloadedCprDebugArtifactRunIds.has(safeRunId)) {
+    return;
+  }
+
   const encodedImages = params.images.map(image => ({
     ...image,
     dataUrl: encodeImageDataUrl(image),
@@ -345,10 +599,17 @@ export function downloadCprDebugArtifacts(params: {
     title: params.title,
     runId: params.runId,
     rows: params.rows,
+    probeRows: params.probeRows,
     images: encodedImages,
+    summarySections: params.summarySections,
   });
-  const csv = buildAttemptTableCsv(params.rows);
+  const csvSections = [buildAttemptTableCsv(params.rows)];
+  if (params.probeRows?.length) {
+    csvSections.push('', buildProbeTableCsv(params.probeRows));
+  }
+  const csv = csvSections.join('\n');
 
+  downloadedCprDebugArtifactRunIds.add(safeRunId);
   triggerDownload(`cpr-debug-report-${safeRunId}.html`, html, 'text/html;charset=utf-8');
   triggerDownload(`cpr-attempt-table-${safeRunId}.csv`, csv, 'text/csv;charset=utf-8');
 }

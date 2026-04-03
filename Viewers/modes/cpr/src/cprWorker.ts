@@ -1,9 +1,42 @@
-import { disposeGpuPanoRenderer, renderPanoGpu } from './cprGpuRenderer';
 import type { GpuPanoDebugMaps, GpuPanoDiagnostics } from './cprGpuRenderer';
 import {
   createHuScalarTransform,
   resolveStoredValueNormalizationPolicy,
 } from './cprScalarPolicy';
+
+type GpuRendererModule = typeof import('./cprGpuRenderer');
+
+let gpuRendererModule: GpuRendererModule | null = null;
+let gpuRendererModulePromise: Promise<GpuRendererModule> | null = null;
+
+// Avoid blocking worker bootstrap on the large GPU renderer module.
+async function loadGpuRendererModule(): Promise<GpuRendererModule> {
+  if (gpuRendererModule) {
+    return gpuRendererModule;
+  }
+
+  if (!gpuRendererModulePromise) {
+    gpuRendererModulePromise = import('./cprGpuRenderer')
+      .then(module => {
+        gpuRendererModule = module;
+        return module;
+      })
+      .catch(error => {
+        gpuRendererModulePromise = null;
+        throw error;
+      });
+  }
+
+  return gpuRendererModulePromise;
+}
+
+async function disposeGpuPanoRendererIfLoaded(): Promise<void> {
+  if (!gpuRendererModule) {
+    return;
+  }
+
+  gpuRendererModule.disposeGpuPanoRenderer();
+}
 
 /**
  * cprWorker.ts
@@ -38,6 +71,11 @@ interface CPRWorkerInput {
   applyModalityLut?: boolean;
   allowStoredValueNormalization?: boolean;
   disableStoredValueNormalization?: boolean;
+  debugScalarSamplingMode?:
+    | 'current'
+    | 'lut-only'
+    | 'no-stored-value-normalization'
+    | 'raw-stored-values-debug';
   rescaleSlope?: number;
   rescaleIntercept?: number;
   bitsStored?: number;
@@ -99,6 +137,11 @@ interface CPRWorkerRenderInput {
   applyModalityLut?: boolean;
   allowStoredValueNormalization?: boolean;
   disableStoredValueNormalization?: boolean;
+  debugScalarSamplingMode?:
+    | 'current'
+    | 'lut-only'
+    | 'no-stored-value-normalization'
+    | 'raw-stored-values-debug';
   debugRunId?: string;
   attemptLabel?: string;
   reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
@@ -203,6 +246,14 @@ interface CPRWorkerError {
   type: 'ERROR';
   requestId: string;
   message: string;
+  stage?: string;
+}
+
+interface CPRWorkerLifecycle {
+  type: 'WORKER_LIFECYCLE';
+  scope: 'implementation';
+  stage: string;
+  detail?: Record<string, unknown>;
 }
 
 interface CPRWorkerInitSuccess {
@@ -798,11 +849,13 @@ const CPU_VIRTUAL_PANO_MODEL_PARAMS = {
   archSyntheticAmbiguousDarkenStrength: 0.12,
   archSyntheticOutputHuFloor: -940,
   archSyntheticOutputHuCeiling: 1680,
-  dualArchProjectionWindowHalfWidthMm: 5.0,
+  dualArchProjectionWindowHalfWidthMm: 4.4,
   dualArchProjectionWindowLowReliabilityBoostMm: 0.85,
-  dualArchProjectionOuterWindowScale: 1.15,
+  dualArchProjectionOuterWindowScale: 1.05,
   dualArchProjectionSupportTiltScale: 0.18,
   dualArchProjectionBackgroundHu: -1000,
+  dualArchProjectionQuietBackgroundHu: -820,
+  dualArchProjectionTopBackgroundOnlyRowEnd: 0.34,
   dualArchProjectionOutputHuFloor: -1000,
   dualArchProjectionOutputHuCeiling: 4000,
   dualArchProjectionGateFloorHu: 0,
@@ -813,8 +866,10 @@ const CPU_VIRTUAL_PANO_MODEL_PARAMS = {
   dualArchProjectionBaseDepthPenaltyPerMm: 0.05,
   dualArchProjectionAmbiguityGapThreshold: 0.045,
   dualArchProjectionFocalHalfWidthMm: 2.25,
-  dualArchProjectionOffBandRescueFloorHu: 820,
-  dualArchProjectionLowerBandOffBandRescueBoostHu: 220,
+  dualArchProjectionOffBandRescueFloorHu: 980,
+  dualArchProjectionLowerBandOffBandRescueBoostHu: 120,
+  dualArchProjectionLowerPenaltyDarkenHu: 140,
+  dualArchProjectionLowerPenaltyMaxBlend: 0.42,
   lowerPenaltyRowStart: 0.5,
   lowerPenaltyRowEnd: 0.86,
   lowerPenaltyBase: 0.16,
@@ -889,6 +944,11 @@ function validateGpuReadback(pixelData: Float32Array, panoWidth: number, panoHei
 interface ScalarSamplingPolicy {
   safeSlope: number;
   safeIntercept: number;
+  debugScalarSamplingMode:
+    | 'current'
+    | 'lut-only'
+    | 'no-stored-value-normalization'
+    | 'raw-stored-values-debug';
   requestedModalityLutApplied: boolean;
   shouldApplyModalityLut: boolean;
   shouldNormalizeStoredValues: boolean;
@@ -911,6 +971,7 @@ function resolveScalarSamplingPolicy(input: CPRWorkerInput): ScalarSamplingPolic
     pixelRepresentation,
     isPreScaled,
     applyModalityLut,
+    debugScalarSamplingMode,
   } = input;
   const transform = createHuScalarTransform({
     scalarData,
@@ -928,24 +989,48 @@ function resolveScalarSamplingPolicy(input: CPRWorkerInput): ScalarSamplingPolic
     typeof applyModalityLut === 'boolean'
       ? applyModalityLut
       : Math.abs(transform.safeSlope - 1) > 1e-6 || Math.abs(transform.safeIntercept) > 1e-6;
+  let shouldApplyModalityLut = transform.shouldApplyModalityLut;
+  let shouldNormalizeStoredValues = transform.shouldNormalizeStoredValues;
+  let normalizeStoredSample = transform.normalizeStoredSample;
+  let normalizationSignature = transform.normalizationSignature;
+  const effectiveDebugScalarSamplingMode =
+    debugScalarSamplingMode === 'lut-only' ||
+    debugScalarSamplingMode === 'no-stored-value-normalization' ||
+    debugScalarSamplingMode === 'raw-stored-values-debug'
+      ? debugScalarSamplingMode
+      : 'current';
+
+  if (effectiveDebugScalarSamplingMode === 'lut-only') {
+    shouldApplyModalityLut = true;
+    shouldNormalizeStoredValues = false;
+    normalizeStoredSample = undefined;
+    normalizationSignature = 'debug:lut-only';
+  } else if (effectiveDebugScalarSamplingMode === 'no-stored-value-normalization') {
+    shouldNormalizeStoredValues = false;
+    normalizeStoredSample = undefined;
+    normalizationSignature = 'debug:no-stored-value-normalization';
+  } else if (effectiveDebugScalarSamplingMode === 'raw-stored-values-debug') {
+    shouldApplyModalityLut = false;
+    shouldNormalizeStoredValues = false;
+    normalizeStoredSample = undefined;
+    normalizationSignature = 'debug:raw-stored-values';
+  }
 
   return {
     safeSlope: transform.safeSlope,
     safeIntercept: transform.safeIntercept,
+    debugScalarSamplingMode: effectiveDebugScalarSamplingMode,
     requestedModalityLutApplied,
-    shouldApplyModalityLut: transform.shouldApplyModalityLut,
-    shouldNormalizeStoredValues: transform.shouldNormalizeStoredValues,
+    shouldApplyModalityLut,
+    shouldNormalizeStoredValues,
     unsignedPackedArtifactDetected: transform.unsignedPackedArtifactDetected,
-    normalizeStoredSample: transform.normalizeStoredSample,
-    normalizationSignature: transform.normalizationSignature,
+    normalizeStoredSample,
+    normalizationSignature,
     safeInterpolationOobValue: transform.safeInterpolationOobValue,
   };
 }
 
-function generateGpuPanorama(
-  input: CPRWorkerInput,
-  volumeCacheKey: string
-): {
+interface GeneratedGpuPanorama {
   pixelData: Float32Array;
   meanMap: Float32Array;
   maxMap: Float32Array;
@@ -968,7 +1053,12 @@ function generateGpuPanorama(
     absChecksum: number;
     first16: number[];
   };
-} {
+}
+
+async function generateGpuPanorama(
+  input: CPRWorkerInput,
+  volumeCacheKey: string
+): Promise<GeneratedGpuPanorama> {
   const {
     scalarData,
     dimensions,
@@ -1026,6 +1116,7 @@ function generateGpuPanorama(
         `slabSamples=${requestedSlabSamples}`
     );
   }
+  const { renderPanoGpu } = await loadGpuRendererModule();
   const gpuResult = renderPanoGpu(
     {
       scalarData,
@@ -1241,8 +1332,16 @@ function generateGpuPanorama(
             ? 'support estimation + support smoothing + DRR attenuation + tone mapping'
             : 'gaussian focal-trough weighted accumulation (sigma 1.5 mm)',
       },
+      scalarSampling: {
+        debugScalarSamplingMode: scalarPolicy.debugScalarSamplingMode,
+        normalizationSignature: scalarPolicy.normalizationSignature,
+        requestedModalityLutApplied: scalarPolicy.requestedModalityLutApplied,
+        modalityLutApplied: scalarPolicy.shouldApplyModalityLut,
+        storedValueNormalizationApplied: scalarPolicy.shouldNormalizeStoredValues,
+      },
       gpuRender: {
         enabled: true,
+        debugScalarSamplingMode: scalarPolicy.debugScalarSamplingMode,
         pipelineMode: gpuResult.pipelineMode,
         expectedPipelineMode: gpuResult.diagnostics?.expectedPipelineMode ?? 'multi-pass',
         phase2GatePassed,
@@ -1258,6 +1357,8 @@ function generateGpuPanorama(
         },
         rawSupportPeaks: gpuResult.diagnostics?.rawSupportPeaks ?? null,
         supportSurface: gpuResult.diagnostics?.supportSurface ?? null,
+        rawSupportFormation: gpuResult.diagnostics?.rawSupportFormation ?? null,
+        supportFormation: gpuResult.diagnostics?.supportFormation ?? null,
         drr: gpuResult.diagnostics?.drr ?? null,
         toneMap: gpuResult.diagnostics?.toneMap ?? null,
         sidecarMaps: gpuResult.diagnostics?.sidecarMaps ?? null,
@@ -2202,6 +2303,10 @@ function renderDualArchToothProjectionPano(params: {
       : 0.25;
   const pixelData = new Float32Array(planeSize);
   const backgroundHu = CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionBackgroundHu;
+  const quietBackgroundHu = Math.max(
+    backgroundHu,
+    CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionQuietBackgroundHu
+  );
   const outputHuFloor = CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionOutputHuFloor;
   const outputHuCeiling = CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionOutputHuCeiling;
   pixelData.fill(backgroundHu);
@@ -2509,16 +2614,22 @@ function renderDualArchToothProjectionPano(params: {
         detailSampleFractionSum += retainedWeightFraction;
         detailSampleFractionCount++;
       } else {
+        const upperRowBackgroundOnlyFallback =
+          yNorm <= CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionTopBackgroundOnlyRowEnd;
         const shouldPreferBackgroundFallback =
           lowerBandSuppression > 0.32 ||
           (columnSupportReliability < 0.72 && yNorm > 0.28);
         if (
+          !upperRowBackgroundOnlyFallback &&
           bestToothlikeResponse >= rowToothAdmissionThreshold * 0.72 &&
           bestToothlikeSample > backgroundHu
         ) {
           pixelValue = bestToothlikeSample;
         } else {
-          pixelValue = shouldPreferBackgroundFallback ? backgroundHu : rayMax;
+          pixelValue =
+            shouldPreferBackgroundFallback || upperRowBackgroundOnlyFallback
+              ? quietBackgroundHu
+              : rayMax;
         }
         retainedTopSampleCount = 0;
         fallbackNoEligibleCount++;
@@ -2529,13 +2640,23 @@ function renderDualArchToothProjectionPano(params: {
         (0.14 + (1 - columnSupportReliability) * 0.48) *
         (retainedTopSampleCount <= 1 ? 1.15 : 1);
       lowerPenaltyMap[pixelIndex] = lowerPenalty;
-      if (lowerPenalty > 1e-4 && pixelValue > backgroundHu) {
+      if (lowerPenalty > 1e-4 && pixelValue > quietBackgroundHu) {
         const darkTarget = Math.max(
-          backgroundHu,
-          Math.min(pixelValue - 220 * lowerBandSuppression, columnSoftThreshold - 120)
+          quietBackgroundHu,
+          Math.min(
+            pixelValue -
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionLowerPenaltyDarkenHu *
+                lowerBandSuppression,
+            Math.max(quietBackgroundHu, columnSoftThreshold - 60)
+          )
         );
         pixelValue =
-          pixelValue + (darkTarget - pixelValue) * Math.min(0.82, lowerPenalty);
+          pixelValue +
+          (darkTarget - pixelValue) *
+            Math.min(
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionLowerPenaltyMaxBlend,
+              lowerPenalty
+            );
       }
       pixelValue = clampNumber(pixelValue, outputHuFloor, outputHuCeiling);
       pixelData[pixelIndex] = pixelValue;
@@ -2599,10 +2720,10 @@ function renderDualArchToothProjectionPano(params: {
   if (eligibleSampleFraction < 0.01) {
     rejectReasons.push('eligible-sample-fraction-too-low');
   }
-  if (retainedWeightFractionMean < 0.06) {
+  if (retainedWeightFractionMean < 0.08) {
     rejectReasons.push('retained-weight-fraction-too-low');
   }
-  if (emptyFallbackFraction > 0.35) {
+  if (emptyFallbackFraction > 0.28) {
     rejectReasons.push('empty-fallback-fraction-too-high');
   }
   if (summary.supportDepthClampFraction > 0.36) {
@@ -2617,8 +2738,17 @@ function renderDualArchToothProjectionPano(params: {
   if (summary.toothBandMean > 1420 || summary.toothBandP10 > 320) {
     rejectReasons.push('tooth-band-saturation');
   }
-  if (offTroughEnergyRatio > 3.2) {
+  if (offTroughEnergyRatio > 1.8) {
     rejectReasons.push('off-trough-energy-too-high');
+  }
+  if (summary.lowerBandBrightFraction > 0.46) {
+    rejectReasons.push('lower-band-bright-fraction-too-high');
+  }
+  if (summary.lowerBandMean > 40) {
+    rejectReasons.push('lower-band-mean-too-high');
+  }
+  if (lowerSuppressionRatio > 0.82) {
+    rejectReasons.push('lower-suppression-ratio-too-high');
   }
 
   const acceptedByLowerBandTolerance = false;
@@ -8068,6 +8198,38 @@ function generatePanorama(
         (finalDebugMaps.rawSupportConfidenceMap?.byteLength ?? 0) +
         (finalDebugMaps.rawSupportSpreadMap?.byteLength ?? 0) +
         (finalDebugMaps.rawSupportDensityMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportDenseFractionMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportPeakHuSupportGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportDominantPeakOffsetMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportSecondaryPeakOffsetMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportPeakDominanceMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportPeakValidityMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportPeakConflictMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportSecondPeakRatioMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportPeakSeparationMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportPeakAmbiguityMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportScoreGapMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportLocalJumpMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportContinuityMap?.byteLength ?? 0) +
+        (finalDebugMaps.toothBandPriorMap?.byteLength ?? 0) +
+        (finalDebugMaps.dominantDensePeakGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.toothBandStructureGuardMap?.byteLength ?? 0) +
+        (finalDebugMaps.ambiguousBroadSupportPenaltyGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.protectedAmbiguousBroadSupportPenaltyGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.structuralSupportGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.peakStructureValidityMap?.byteLength ?? 0) +
+        (finalDebugMaps.supportValidityMap?.byteLength ?? 0) +
+        (finalDebugMaps.rowConfidenceGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.falseSupportConfidenceGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.falseSupportDensityGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.falseSupportSpreadGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.falseSupportVetoMap?.byteLength ?? 0) +
+        (finalDebugMaps.rowBackgroundDensityGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.rowBackgroundSpreadGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.rowBackgroundPeakHuGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.rowBackgroundEdgeGateMap?.byteLength ?? 0) +
+        (finalDebugMaps.rowBackgroundVetoMap?.byteLength ?? 0) +
+        (finalDebugMaps.supportVetoTriggeredMap?.byteLength ?? 0) +
         (finalDebugMaps.upperSupportDepthMap?.byteLength ?? 0) +
         (finalDebugMaps.lowerSupportDepthMap?.byteLength ?? 0) +
         (finalDebugMaps.upperSupportConfidenceMap?.byteLength ?? 0) +
@@ -8084,7 +8246,11 @@ function generatePanorama(
         (finalDebugMaps.toneResponseMap?.byteLength ?? 0) +
         (finalDebugMaps.troughHalfWidthMap?.byteLength ?? 0) +
         (finalDebugMaps.effectiveTroughHalfWidthMap?.byteLength ?? 0) +
+        (finalDebugMaps.continuityExpandedTroughHalfWidthMap?.byteLength ?? 0) +
         (finalDebugMaps.backgroundTroughNarrowGateMap?.byteLength ?? 0)
+        + (finalDebugMaps.dominantToothBandGateMap?.byteLength ?? 0)
+        + (finalDebugMaps.broadWeakToothBandGateMap?.byteLength ?? 0)
+        + (finalDebugMaps.toothContinuityAdmissionGateMap?.byteLength ?? 0)
         : 0,
     })
   );
@@ -8158,6 +8324,7 @@ function buildRenderInput(
     applyModalityLut: render.applyModalityLut,
     allowStoredValueNormalization: render.allowStoredValueNormalization,
     disableStoredValueNormalization: render.disableStoredValueNormalization,
+    debugScalarSamplingMode: render.debugScalarSamplingMode,
     debugRunId: render.debugRunId,
     attemptLabel: render.attemptLabel,
     reconstructionMode: render.reconstructionMode,
@@ -8180,36 +8347,130 @@ function postWorkerMessage(
     | CPRWorkerDisposeSuccess
     | CPRWorkerSuccess
     | CPRWorkerError
+    | CPRWorkerLifecycle
 ): void {
   // eslint-disable-next-line no-restricted-globals
   (self as unknown as Worker).postMessage(message);
 }
 
+let workerLifecycleSequence = 0;
+
+function logWorkerLifecycle(stage: string, detail?: Record<string, unknown>): void {
+  console.log(
+    '[CPR-WORKER-LIFECYCLE-JSON]',
+    JSON.stringify({
+      stage,
+      ...(detail ?? {}),
+    })
+  );
+}
+
+function emitWorkerLifecycle(stage: string, detail?: Record<string, unknown>): void {
+  workerLifecycleSequence += 1;
+  const lifecycleDetail = {
+    sequence: workerLifecycleSequence,
+    ...(detail ?? {}),
+  };
+  logWorkerLifecycle(stage, lifecycleDetail);
+  console.log(
+    '[CPR-WORKER-PREPOST-JSON]',
+    JSON.stringify({
+      stage,
+      ...lifecycleDetail,
+    })
+  );
+  postWorkerMessage({
+    type: 'WORKER_LIFECYCLE',
+    scope: 'implementation',
+    stage,
+    detail: lifecycleDetail,
+  });
+}
+
 // eslint-disable-next-line no-restricted-globals
-self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
+self.addEventListener('error', event => {
+  emitWorkerLifecycle('worker-global-error-event', {
+    message: event.message ?? null,
+    filename: event.filename ?? null,
+    lineno: Number.isFinite(event.lineno) ? event.lineno : null,
+    colno: Number.isFinite(event.colno) ? event.colno : null,
+    errorMessage: event.error instanceof Error ? event.error.message : null,
+  });
+});
+
+// eslint-disable-next-line no-restricted-globals
+self.addEventListener('messageerror', event => {
+  emitWorkerLifecycle('worker-messageerror-event', {
+    origin: event.origin ?? null,
+    lastEventId: event.lastEventId ?? null,
+    dataType: event.data == null ? null : typeof event.data,
+  });
+});
+
+// eslint-disable-next-line no-restricted-globals
+self.addEventListener('unhandledrejection', event => {
+  const reason =
+    event.reason instanceof Error
+      ? {
+          name: event.reason.name,
+          message: event.reason.message,
+        }
+      : {
+          message: String(event.reason),
+        };
+  emitWorkerLifecycle('worker-unhandled-rejection-event', reason);
+});
+
+emitWorkerLifecycle('worker-implementation-script-loaded');
+
+// eslint-disable-next-line no-restricted-globals
+self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
+  const input = event.data;
+  const requestId = resolveWorkerRequestId(input);
+  const requestType = typeof input?.type === 'string' ? input.type : 'unknown';
   try {
-    const input = event.data;
-    const requestId = resolveWorkerRequestId(input);
     if (input.type === 'BOOTSTRAP_CHECK') {
+      emitWorkerLifecycle('bootstrap-check-received', {
+        requestId,
+      });
       const readyResponse: CPRWorkerBootstrapReady = {
         type: 'BOOTSTRAP_READY',
         requestId,
       };
       postWorkerMessage(readyResponse);
+      emitWorkerLifecycle('bootstrap-ready-sent', {
+        requestId,
+      });
       return;
     }
     if (input.type === 'DISPOSE') {
-      disposeGpuPanoRenderer();
+      emitWorkerLifecycle('dispose-received', {
+        requestId,
+      });
+      await disposeGpuPanoRendererIfLoaded();
       cachedVolumeState = null;
       const disposeResponse: CPRWorkerDisposeSuccess = {
         type: 'DISPOSE_SUCCESS',
         requestId,
       };
       postWorkerMessage(disposeResponse);
+      emitWorkerLifecycle('dispose-success-sent', {
+        requestId,
+      });
       return;
     }
 
     if (input.type === 'INIT_VOLUME') {
+      emitWorkerLifecycle('init-volume-received', {
+        requestId,
+        sessionKey: input.sessionKey,
+        scalarType:
+          input.scalarData && input.scalarData.constructor
+            ? input.scalarData.constructor.name
+            : 'unknown',
+        scalarLength: input.scalarData?.length ?? 0,
+        isSharedArrayBuffer: input.isSharedArrayBuffer === true,
+      });
       if (!input.scalarData || input.scalarData.length === 0) {
         throw new Error('Received empty or null scalar data during INIT_VOLUME.');
       }
@@ -8268,6 +8529,10 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
         sessionKey: input.sessionKey,
       };
       postWorkerMessage(initResponse);
+      emitWorkerLifecycle('init-success-sent', {
+        requestId,
+        sessionKey: input.sessionKey,
+      });
       return;
     }
 
@@ -8297,7 +8562,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       debugMaps?: GpuPanoDebugMaps;
     };
     let renderResult:
-      | ReturnType<typeof generateGpuPanorama>
+      | GeneratedGpuPanorama
       | (Pick<
         ReturnType<typeof generatePanorama>,
         | 'pixelData'
@@ -8347,7 +8612,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
       let gpuFallbackCause: 'gpu-render-failed' | 'gpu-phase2-gate-failed' | null = null;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          renderResult = generateGpuPanorama(renderInput, input.sessionKey);
+          renderResult = await generateGpuPanorama(renderInput, input.sessionKey);
           lastGpuError = null;
           break;
         } catch (gpuError) {
@@ -8359,7 +8624,7 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
             gpuError
           );
           try {
-            disposeGpuPanoRenderer();
+            await disposeGpuPanoRendererIfLoaded();
           } catch (disposeError) {
             console.warn(
               '[CPR-GPU] Failed to dispose GPU renderer after render failure.',
@@ -8526,12 +8791,38 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
     pushTransferBuffer(debugMaps?.rawSupportConfidenceMap);
     pushTransferBuffer(debugMaps?.rawSupportSpreadMap);
     pushTransferBuffer(debugMaps?.rawSupportDensityMap);
+    pushTransferBuffer(debugMaps?.rawSupportDenseFractionMap);
+    pushTransferBuffer(debugMaps?.rawSupportPeakHuSupportGateMap);
+    pushTransferBuffer(debugMaps?.rawSupportDominantPeakOffsetMap);
+    pushTransferBuffer(debugMaps?.rawSupportSecondaryPeakOffsetMap);
     pushTransferBuffer(debugMaps?.rawSupportPeakDominanceMap);
+    pushTransferBuffer(debugMaps?.rawSupportPeakValidityMap);
+    pushTransferBuffer(debugMaps?.rawSupportPeakConflictMap);
     pushTransferBuffer(debugMaps?.rawSupportSecondPeakRatioMap);
     pushTransferBuffer(debugMaps?.rawSupportPeakSeparationMap);
     pushTransferBuffer(debugMaps?.rawSupportPeakAmbiguityMap);
+    pushTransferBuffer(debugMaps?.rawSupportScoreGapMap);
     pushTransferBuffer(debugMaps?.rawSupportLocalJumpMap);
     pushTransferBuffer(debugMaps?.rawSupportContinuityMap);
+    pushTransferBuffer(debugMaps?.toothBandPriorMap);
+    pushTransferBuffer(debugMaps?.dominantDensePeakGateMap);
+    pushTransferBuffer(debugMaps?.toothBandStructureGuardMap);
+    pushTransferBuffer(debugMaps?.ambiguousBroadSupportPenaltyGateMap);
+    pushTransferBuffer(debugMaps?.protectedAmbiguousBroadSupportPenaltyGateMap);
+    pushTransferBuffer(debugMaps?.structuralSupportGateMap);
+    pushTransferBuffer(debugMaps?.peakStructureValidityMap);
+    pushTransferBuffer(debugMaps?.supportValidityMap);
+    pushTransferBuffer(debugMaps?.rowConfidenceGateMap);
+    pushTransferBuffer(debugMaps?.falseSupportConfidenceGateMap);
+    pushTransferBuffer(debugMaps?.falseSupportDensityGateMap);
+    pushTransferBuffer(debugMaps?.falseSupportSpreadGateMap);
+    pushTransferBuffer(debugMaps?.falseSupportVetoMap);
+    pushTransferBuffer(debugMaps?.rowBackgroundDensityGateMap);
+    pushTransferBuffer(debugMaps?.rowBackgroundSpreadGateMap);
+    pushTransferBuffer(debugMaps?.rowBackgroundPeakHuGateMap);
+    pushTransferBuffer(debugMaps?.rowBackgroundEdgeGateMap);
+    pushTransferBuffer(debugMaps?.rowBackgroundVetoMap);
+    pushTransferBuffer(debugMaps?.supportVetoTriggeredMap);
     pushTransferBuffer(debugMaps?.supportFailureDisplayMap);
     pushTransferBuffer(debugMaps?.upperSupportDepthMap);
     pushTransferBuffer(debugMaps?.lowerSupportDepthMap);
@@ -8545,23 +8836,51 @@ self.onmessage = function (event: MessageEvent<CPRWorkerMessage>) {
     pushTransferBuffer(debugMaps?.supportLocalJumpMap);
     pushTransferBuffer(debugMaps?.supportContinuityMap);
     pushTransferBuffer(debugMaps?.totalAttenuationMap);
+    pushTransferBuffer(debugMaps?.admissionAccumulationMap);
+    pushTransferBuffer(debugMaps?.toneSuppressedAccumulationMap);
     pushTransferBuffer(debugMaps?.fogAttenuationMap);
     pushTransferBuffer(debugMaps?.lowerPenaltyMap);
     pushTransferBuffer(debugMaps?.participatingSampleCountMap);
     pushTransferBuffer(debugMaps?.toneResponseMap);
+    pushTransferBuffer(debugMaps?.preToneAccumulationMap);
+    pushTransferBuffer(debugMaps?.retainedSampleMaskMap);
+    pushTransferBuffer(debugMaps?.middleBandLeakMap);
+    pushTransferBuffer(debugMaps?.admissionMiddleBandLeakMap);
     pushTransferBuffer(debugMaps?.invalidSupportBlackoutMap);
+    pushTransferBuffer(debugMaps?.toneStageSuppressionMap);
+    pushTransferBuffer(debugMaps?.blackClipMap);
+    pushTransferBuffer(debugMaps?.backgroundLeakToneMap);
+    pushTransferBuffer(debugMaps?.backgroundLeakOutlier05Map);
+    pushTransferBuffer(debugMaps?.backgroundLeakOutlier10Map);
+    pushTransferBuffer(debugMaps?.admissionOnlyHuMap);
+    pushTransferBuffer(debugMaps?.toneBypassHuMap);
     pushTransferBuffer(debugMaps?.troughHalfWidthMap);
     pushTransferBuffer(debugMaps?.effectiveTroughHalfWidthMap);
+    pushTransferBuffer(debugMaps?.continuityExpandedTroughHalfWidthMap);
     pushTransferBuffer(debugMaps?.backgroundTroughNarrowGateMap);
+    pushTransferBuffer(debugMaps?.dominantToothBandGateMap);
+    pushTransferBuffer(debugMaps?.broadWeakToothBandGateMap);
+    pushTransferBuffer(debugMaps?.toothContinuityAdmissionGateMap);
 
     // eslint-disable-next-line no-restricted-globals
     (self as unknown as Worker).postMessage(response, transferList);
   } catch (err) {
-    const requestId = resolveWorkerRequestId(event.data);
+    const message = err instanceof Error ? err.message : String(err);
+    emitWorkerLifecycle('worker-caught-request-error', {
+      requestType,
+      requestId,
+      message,
+    });
+    console.error('[CPR-WORKER-ERROR-JSON]', {
+      stage: requestType,
+      requestId,
+      message,
+    });
     const response: CPRWorkerError = {
       type: 'ERROR',
       requestId,
-      message: err instanceof Error ? err.message : String(err),
+      message,
+      stage: requestType,
     };
     postWorkerMessage(response);
   }

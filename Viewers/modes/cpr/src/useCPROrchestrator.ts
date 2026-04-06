@@ -1154,7 +1154,14 @@ interface HostedPanoVoiAuthority {
   suppressPanoViewportEventsUntil: number;
 }
 
+interface HostedPanoVoiDragModel {
+  enabled: boolean;
+  fixedHuPerPixel: number | null;
+  sourceHuPerPixel: number | null;
+}
+
 const CPR_VTK_PANO_STARTUP_VOI_GUARD_MS = 2000;
+const CPR_PANO_BYPASS_FIXED_HU_PER_PIXEL = 8;
 const CPR_TOOTH_BAND_BLACK_CLIP_THRESHOLD = 0.02;
 const CPR_TOOTH_BAND_HOLE_RETAINED_WEIGHT_MAX = 0.18;
 const CPR_TOOTH_BAND_HOLE_LEAK_MIN = 0.08;
@@ -2996,9 +3003,7 @@ function buildPhase4QualityGateCandidate(params: {
     metrics.rendererVariant === 'pano-v2-fusion' &&
     metrics.renderBypass === true;
   const effectiveHardRejectReason =
-    isPanoV2FusionBypassCandidate && params.hardRejectReason === 'tooth-band-saturation'
-      ? null
-      : params.hardRejectReason ?? null;
+    isPanoV2FusionBypassCandidate ? null : params.hardRejectReason ?? null;
 
   const rejectReasons: string[] = [];
   const addRejectReason = (reason: string): void => {
@@ -3008,109 +3013,112 @@ function buildPhase4QualityGateCandidate(params: {
         : reason
     );
   };
-  if (!params.summary || params.summary.sampledCount < 100) {
-    addRejectReason('summary-unavailable');
-  }
-  if (candidateSource === 'worker-gpu-support-surface' && routeDiagnostic.phase2GatePassed === false) {
-    addRejectReason('gpu-phase2-gate-failed');
-  }
-  if (effectiveHardRejectReason) {
-    addRejectReason(`hard-reject:${effectiveHardRejectReason}`);
-  }
-  if (
-    candidateSource === 'worker-legacy' &&
-    requestedReconstructionMode !== 'legacy' &&
-    !CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK
-  ) {
-    addRejectReason('legacy-fallback-not-allowed');
-  }
-  if (
-    candidateSource !== 'worker-cpu-virtual-panoramic-radiograph' &&
-    metrics.lowerBandBrightFraction !== null &&
-    metrics.lowerBandBrightFraction > (isDualArchProjection ? 0.94 : 0.25)
-  ) {
-    addRejectReason('lower-band-bright-fraction-too-high');
-  }
-  if (
-    candidateSource !== 'worker-cpu-virtual-panoramic-radiograph' &&
-    metrics.lowerBandP50 !== null &&
-    metrics.lowerBandP50 > (isDualArchProjection ? 420 : -100)
-  ) {
-    addRejectReason('lower-band-p50-too-high');
-  }
-  if (
-    candidateSource !== 'worker-cpu-virtual-panoramic-radiograph' &&
-    !isPanoV2FusionBypassCandidate &&
-    metrics.toothBandContrastRange !== null &&
-    metrics.toothBandContrastRange < (isDualArchProjection ? 120 : 150)
-  ) {
-    addRejectReason('tooth-band-contrast-too-low');
-  }
-  if (
-    metrics.supportDepthClampFraction !== null &&
-    metrics.supportDepthClampFraction > 0.15
-  ) {
-    addRejectReason('support-depth-clamp-fraction-too-high');
-  }
-  if (metrics.pathJumpP95Mm !== null && metrics.pathJumpP95Mm > 1.2) {
-    addRejectReason('path-jump-p95-too-high');
-  }
-  if (
-    candidateSource === 'worker-gpu-support-surface' &&
-    (((metrics.supportConfidenceP50 !== null && metrics.supportConfidenceP50 < 0.09) &&
-      !gpuConfidenceStructurallyStable) ||
-      (metrics.supportPathConfidenceP50 !== null && metrics.supportPathConfidenceP50 < 0.15))
-  ) {
-    addRejectReason('support-confidence-too-low');
-  }
-  if (
-    candidateSource === 'worker-gpu-support-surface' &&
-    (((params.summary?.backgroundOutlierFraction05 ?? 0) > 0.24) ||
-      ((params.summary?.backgroundOutlierFraction05 ?? 0) > 0.20 &&
-        (params.summary?.backgroundOutlierFraction10 ?? 0) > 0.09))
-  ) {
-    addRejectReason('background-outlier-fraction-too-high');
-  }
-  if (severeGpuToothBandHoles) {
-    addRejectReason('tooth-band-hole-fraction-too-high');
-  }
-  if (severeGpuToothBandBlackClip) {
-    addRejectReason('tooth-band-black-clip-too-high');
-  }
-  if (severeGpuToothBandRetentionCollapse) {
-    addRejectReason('tooth-band-retained-weight-collapsed');
-  }
-  if (dominantGpuMiddleBandLeakage) {
-    addRejectReason('middle-band-leakage-dominant');
-  }
-  if (
-    candidateSource === 'worker-gpu-support-surface' &&
-    (((metrics.supportUnstableColumnFraction ?? 0) > 0.24) ||
-      ((metrics.supportLongestUnstableRunColumns ?? 0) > 30) ||
-      (((metrics.supportAmbiguousColumnFraction ?? 0) > 0.2) &&
-        ((metrics.supportScoreGapP50 ?? 1) < 0.11)))
-  ) {
-    addRejectReason('support-columns-unstable');
-  }
-  if (
-    candidateSource === 'worker-cpu-virtual-pano' &&
-    !isPanoV2FusionBypassCandidate &&
-    !workerAcceptedVirtualPanoStructurallyUsable &&
-    (((metrics.supportUnstableColumnFraction ?? 0) > (isDualArchProjection ? 0.36 : 0.24)) ||
-      ((metrics.supportLongestUnstableRunColumns ?? 0) > (isDualArchProjection ? 28 : 14)) ||
-      ((metrics.supportDepthStdMm ?? 0) > (isDualArchProjection ? 1.8 : 1.3)))
-  ) {
-    addRejectReason('virtual-support-columns-unstable');
-  }
-  if (
-    candidateSource === 'worker-cpu-virtual-pano' &&
-    !workerAcceptedVirtualPanoStructurallyUsable &&
-    (((metrics.supportAmbiguousColumnFraction ?? 0) > (isDualArchProjection ? 0.62 : 0.4) &&
-      (metrics.supportScoreGapP50 ?? 1) < (isDualArchProjection ? 0.05 : 0.08)) ||
-      ((metrics.supportForcedDriftFraction ?? 0) > (isDualArchProjection ? 0.2 : 0.12)) ||
-      ((metrics.supportBestDepthDriftP95Mm ?? 0) > (isDualArchProjection ? 2.6 : 1.8)))
-  ) {
-    addRejectReason('virtual-support-ambiguity-too-high');
+  if (!isPanoV2FusionBypassCandidate) {
+    if (!params.summary || params.summary.sampledCount < 100) {
+      addRejectReason('summary-unavailable');
+    }
+    if (
+      candidateSource === 'worker-gpu-support-surface' &&
+      routeDiagnostic.phase2GatePassed === false
+    ) {
+      addRejectReason('gpu-phase2-gate-failed');
+    }
+    if (effectiveHardRejectReason) {
+      addRejectReason(`hard-reject:${effectiveHardRejectReason}`);
+    }
+    if (
+      candidateSource === 'worker-legacy' &&
+      requestedReconstructionMode !== 'legacy' &&
+      !CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK
+    ) {
+      addRejectReason('legacy-fallback-not-allowed');
+    }
+    if (
+      candidateSource !== 'worker-cpu-virtual-panoramic-radiograph' &&
+      metrics.lowerBandBrightFraction !== null &&
+      metrics.lowerBandBrightFraction > (isDualArchProjection ? 0.94 : 0.25)
+    ) {
+      addRejectReason('lower-band-bright-fraction-too-high');
+    }
+    if (
+      candidateSource !== 'worker-cpu-virtual-panoramic-radiograph' &&
+      metrics.lowerBandP50 !== null &&
+      metrics.lowerBandP50 > (isDualArchProjection ? 420 : -100)
+    ) {
+      addRejectReason('lower-band-p50-too-high');
+    }
+    if (
+      candidateSource !== 'worker-cpu-virtual-panoramic-radiograph' &&
+      metrics.toothBandContrastRange !== null &&
+      metrics.toothBandContrastRange < (isDualArchProjection ? 120 : 150)
+    ) {
+      addRejectReason('tooth-band-contrast-too-low');
+    }
+    if (
+      metrics.supportDepthClampFraction !== null &&
+      metrics.supportDepthClampFraction > 0.15
+    ) {
+      addRejectReason('support-depth-clamp-fraction-too-high');
+    }
+    if (metrics.pathJumpP95Mm !== null && metrics.pathJumpP95Mm > 1.2) {
+      addRejectReason('path-jump-p95-too-high');
+    }
+    if (
+      candidateSource === 'worker-gpu-support-surface' &&
+      (((metrics.supportConfidenceP50 !== null && metrics.supportConfidenceP50 < 0.09) &&
+        !gpuConfidenceStructurallyStable) ||
+        (metrics.supportPathConfidenceP50 !== null && metrics.supportPathConfidenceP50 < 0.15))
+    ) {
+      addRejectReason('support-confidence-too-low');
+    }
+    if (
+      candidateSource === 'worker-gpu-support-surface' &&
+      (((params.summary?.backgroundOutlierFraction05 ?? 0) > 0.24) ||
+        ((params.summary?.backgroundOutlierFraction05 ?? 0) > 0.20 &&
+          (params.summary?.backgroundOutlierFraction10 ?? 0) > 0.09))
+    ) {
+      addRejectReason('background-outlier-fraction-too-high');
+    }
+    if (severeGpuToothBandHoles) {
+      addRejectReason('tooth-band-hole-fraction-too-high');
+    }
+    if (severeGpuToothBandBlackClip) {
+      addRejectReason('tooth-band-black-clip-too-high');
+    }
+    if (severeGpuToothBandRetentionCollapse) {
+      addRejectReason('tooth-band-retained-weight-collapsed');
+    }
+    if (dominantGpuMiddleBandLeakage) {
+      addRejectReason('middle-band-leakage-dominant');
+    }
+    if (
+      candidateSource === 'worker-gpu-support-surface' &&
+      (((metrics.supportUnstableColumnFraction ?? 0) > 0.24) ||
+        ((metrics.supportLongestUnstableRunColumns ?? 0) > 30) ||
+        (((metrics.supportAmbiguousColumnFraction ?? 0) > 0.2) &&
+          ((metrics.supportScoreGapP50 ?? 1) < 0.11)))
+    ) {
+      addRejectReason('support-columns-unstable');
+    }
+    if (
+      candidateSource === 'worker-cpu-virtual-pano' &&
+      !workerAcceptedVirtualPanoStructurallyUsable &&
+      (((metrics.supportUnstableColumnFraction ?? 0) > (isDualArchProjection ? 0.36 : 0.24)) ||
+        ((metrics.supportLongestUnstableRunColumns ?? 0) > (isDualArchProjection ? 28 : 14)) ||
+        ((metrics.supportDepthStdMm ?? 0) > (isDualArchProjection ? 1.8 : 1.3)))
+    ) {
+      addRejectReason('virtual-support-columns-unstable');
+    }
+    if (
+      candidateSource === 'worker-cpu-virtual-pano' &&
+      !workerAcceptedVirtualPanoStructurallyUsable &&
+      (((metrics.supportAmbiguousColumnFraction ?? 0) > (isDualArchProjection ? 0.62 : 0.4) &&
+        (metrics.supportScoreGapP50 ?? 1) < (isDualArchProjection ? 0.05 : 0.08)) ||
+        ((metrics.supportForcedDriftFraction ?? 0) > (isDualArchProjection ? 0.2 : 0.12)) ||
+        ((metrics.supportBestDepthDriftP95Mm ?? 0) > (isDualArchProjection ? 2.6 : 1.8)))
+    ) {
+      addRejectReason('virtual-support-ambiguity-too-high');
+    }
   }
   if (candidateSource === 'worker-cpu-virtual-panoramic-radiograph') {
     if ((metrics.focalSharpnessCenterThirdP50 ?? Number.POSITIVE_INFINITY) < 0.56) {
@@ -7910,6 +7918,91 @@ function createPanoVoiFromWindowLevel(
   });
 }
 
+function createPanoVoiForMipBypassOutput(
+  range:
+    | {
+        min?: number | null;
+        p50?: number | null;
+        p90?: number | null;
+        max?: number | null;
+      }
+    | null
+    | undefined
+): PanoVoiSettings | null {
+  const minValue = toFiniteNumber(range?.min);
+  const p50Value = toFiniteNumber(range?.p50);
+  const p90Value = toFiniteNumber(range?.p90);
+  const maxValue = toFiniteNumber(range?.max);
+
+  if (minValue == null || maxValue == null || maxValue <= minValue) {
+    return null;
+  }
+
+  if (p90Value != null && p90Value > 1800 && (p50Value == null || p50Value < 500)) {
+    const upper = Math.max(0, Math.min(4000, maxValue + 120));
+    const windowWidth = Math.max(
+      900,
+      Math.min(1600, Math.max(upper - p90Value + 850, 950))
+    );
+    const lower = Math.max(0, upper - windowWidth);
+    return createPanoVoiFromRange({
+      lower,
+      upper,
+    });
+  }
+
+  const windowCenter = Math.max(0, Math.min(4000, (minValue + maxValue) / 2));
+  const windowWidth = Math.max(1000, Math.min(8000, maxValue - minValue + 200));
+  return createPanoVoiFromWindowLevel(windowWidth, windowCenter);
+}
+
+function computeWindowLevelToolHuPerPixel(dynamicRange: number | null | undefined): number | null {
+  const safeDynamicRange = toFiniteNumber(dynamicRange);
+  if (safeDynamicRange == null || safeDynamicRange <= 0) {
+    return null;
+  }
+
+  const ratio = safeDynamicRange / 1024;
+  const multiplier = ratio > 1 ? Math.round(ratio) : ratio;
+  return Number.isFinite(multiplier) && multiplier > 0 ? multiplier : null;
+}
+
+function remapHostedPanoVoiForFixedHuPerPixel(params: {
+  nextVoi: PanoVoiSettings;
+  authoritativeVoi: PanoVoiSettings | null;
+  dragModel: HostedPanoVoiDragModel;
+}): PanoVoiSettings {
+  const { nextVoi, authoritativeVoi, dragModel } = params;
+  if (!dragModel.enabled || !authoritativeVoi) {
+    return nextVoi;
+  }
+
+  const fixedHuPerPixel = toFiniteNumber(dragModel.fixedHuPerPixel);
+  const sourceHuPerPixel = toFiniteNumber(dragModel.sourceHuPerPixel);
+  if (
+    fixedHuPerPixel == null ||
+    fixedHuPerPixel <= 0 ||
+    sourceHuPerPixel == null ||
+    sourceHuPerPixel <= 0
+  ) {
+    return nextVoi;
+  }
+
+  const scale = fixedHuPerPixel / sourceHuPerPixel;
+  if (!Number.isFinite(scale) || scale <= 0 || Math.abs(scale - 1) <= 1e-6) {
+    return nextVoi;
+  }
+
+  const remappedWindowWidth = Math.max(
+    1,
+    authoritativeVoi.windowWidth + (nextVoi.windowWidth - authoritativeVoi.windowWidth) * scale
+  );
+  const remappedWindowCenter =
+    authoritativeVoi.windowCenter + (nextVoi.windowCenter - authoritativeVoi.windowCenter) * scale;
+
+  return createPanoVoiFromWindowLevel(remappedWindowWidth, remappedWindowCenter) ?? nextVoi;
+}
+
 function createPanoVoiFromRange(
   range:
     | {
@@ -9480,6 +9573,11 @@ export function useCPROrchestrator({
     authoritativeVoi: null,
     suppressPanoViewportEventsUntil: 0,
   });
+  const hostedPanoVoiDragModelRef = useRef<HostedPanoVoiDragModel>({
+    enabled: false,
+    fixedHuPerPixel: null,
+    sourceHuPerPixel: null,
+  });
   const hostedPanoVoiRepairTimeoutRef = useRef<number | null>(null);
   const pendingAxialRestoreCleanupRef = useRef<(() => void) | null>(null);
   const axialRestoreTokenRef = useRef(0);
@@ -9572,6 +9670,11 @@ export function useCPROrchestrator({
         sourceVolumeId: null,
         authoritativeVoi: null,
         suppressPanoViewportEventsUntil: 0,
+      };
+      hostedPanoVoiDragModelRef.current = {
+        enabled: false,
+        fixedHuPerPixel: null,
+        sourceHuPerPixel: null,
       };
     },
     [clearHostedPanoVoiRepair]
@@ -10653,6 +10756,10 @@ export function useCPROrchestrator({
           `phase1VirtualPano=${gpuBackendEnabled ? 'skip-diagnostic-on-gpu-backend' : 'candidate'} ` +
           `phase2VirtualPano=candidate`
       );
+      const phase2ReconstructionMode = getPanoV2Phase0ReconstructionMode();
+      const phase2MipPathActive =
+        typeof phase2ReconstructionMode === 'string' &&
+        phase2ReconstructionMode.toUpperCase().includes('V2');
       const runWorkerAttempt = async (
         label: string,
         overrides: Partial<Parameters<typeof launchCPRWorker>[0]>
@@ -12258,41 +12365,61 @@ export function useCPROrchestrator({
       };
       const shouldUseFastWorkerReconPhase2Seed =
         CPR_PANO_DISPLAY_PATH_DEFAULT === 'worker-recon' && !CPR_PANO_QUALITY_FIRST_MODE;
+      const shouldUseDirectPhase2MipBypass =
+        shouldUseFastWorkerReconPhase2Seed && phase2MipPathActive;
+      let directPhase2Attempt: EvaluatedPanoAttempt | null = null;
 
       await workerWarmupPromise;
-      const primaryAttemptLabel = shouldUseFastWorkerReconPhase2Seed
-        ? 'retry-mean-balanced-neutral'
-        : 'primary-mean-toothband-narrow';
-      const primaryAttemptOverrides = shouldUseFastWorkerReconPhase2Seed
-        ? {
-            renderBackend: 'cpu' as const,
-            reconstructionMode: 'virtualPano' as const,
-            allowLegacyFallback: false,
-            modalityLutOverride: true,
-            verticalHalfMm: narrowVerticalHalfMm,
-            verticalCenterOffsetMm: neutralVerticalCenterOffsetMm,
-            slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
-            slabSamples: balancedMeanSlabSamples,
-            aggregation: 'MEAN' as const,
-          }
-        : {
-            modalityLutOverride: true,
-            verticalHalfMm: toothBandVerticalHalfMm,
-            verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
-            slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
-            slabSamples: focusedMeanSlabSamples,
-            aggregation: 'MEAN' as const,
-          };
-      let bestAttempt = await runWorkerAttempt(primaryAttemptLabel, primaryAttemptOverrides);
-      recordAttempt(bestAttempt);
-      const primaryAttemptEscalationReasons = collectAttemptEscalationReasons(bestAttempt);
-      logAttemptEscalation('primary-attempt', bestAttempt, primaryAttemptEscalationReasons);
-
-      if (isGoodEnoughPanoAttempt(bestAttempt)) {
-        earlyExitReason = 'primary-good-enough';
-      } else if (shouldUseFastWorkerReconPhase2Seed) {
-        earlyExitReason = 'worker-recon-fast-phase2-seed';
+      let bestAttempt: EvaluatedPanoAttempt | null = null;
+      if (shouldUseDirectPhase2MipBypass) {
+        directPhase2Attempt = await runWorkerAttempt('retry-mean-balanced-neutral', {
+          renderBackend: 'cpu' as const,
+          reconstructionMode: phase2ReconstructionMode,
+          allowLegacyFallback: false,
+          modalityLutOverride: true,
+          verticalHalfMm: 55,
+          verticalCenterOffsetMm: -6,
+          slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+          slabSamples: balancedMeanSlabSamples,
+          aggregation: 'MEAN' as const,
+        });
+        recordAttempt(directPhase2Attempt);
+        bestAttempt = directPhase2Attempt;
+        earlyExitReason = 'direct-phase2-mip-bypass';
       } else {
+        const primaryAttemptLabel = shouldUseFastWorkerReconPhase2Seed
+          ? 'retry-mean-balanced-neutral'
+          : 'primary-mean-toothband-narrow';
+        const primaryAttemptOverrides = shouldUseFastWorkerReconPhase2Seed
+          ? {
+              renderBackend: 'cpu' as const,
+              reconstructionMode: 'virtualPano' as const,
+              allowLegacyFallback: false,
+              modalityLutOverride: true,
+              verticalHalfMm: narrowVerticalHalfMm,
+              verticalCenterOffsetMm: neutralVerticalCenterOffsetMm,
+              slabHalfThicknessMm: balancedMeanSlabHalfThicknessMm,
+              slabSamples: balancedMeanSlabSamples,
+              aggregation: 'MEAN' as const,
+            }
+          : {
+              modalityLutOverride: true,
+              verticalHalfMm: toothBandVerticalHalfMm,
+              verticalCenterOffsetMm: subtleMandibularCenterOffsetMm,
+              slabHalfThicknessMm: focusedMeanSlabHalfThicknessMm,
+              slabSamples: focusedMeanSlabSamples,
+              aggregation: 'MEAN' as const,
+            };
+        bestAttempt = await runWorkerAttempt(primaryAttemptLabel, primaryAttemptOverrides);
+        recordAttempt(bestAttempt);
+        const primaryAttemptEscalationReasons = collectAttemptEscalationReasons(bestAttempt);
+        logAttemptEscalation('primary-attempt', bestAttempt, primaryAttemptEscalationReasons);
+
+        if (isGoodEnoughPanoAttempt(bestAttempt)) {
+          earlyExitReason = 'primary-good-enough';
+        } else if (shouldUseFastWorkerReconPhase2Seed) {
+          earlyExitReason = 'worker-recon-fast-phase2-seed';
+        } else {
         const retryConfigs: Array<{
           label: string;
           overrides: Partial<Parameters<typeof launchCPRWorker>[0]>;
@@ -12616,6 +12743,10 @@ export function useCPROrchestrator({
           }
         }
       }
+      }
+      if (!bestAttempt) {
+        throw new Error('[CPR] Failed to establish a base pano attempt before phase2.');
+      }
 
       const cpuVirtualPanoBaseAttempt = gpuBackendEnabled ? selectPreferredMeanAttempt() : null;
       const cpuVirtualPanoFallbackReasons = cpuVirtualPanoBaseAttempt
@@ -12733,15 +12864,19 @@ export function useCPROrchestrator({
       }
 
       const totalAttemptDurationMs = performance.now() - panoAttemptSequenceStartMs;
-      const phase2BaseAssessments = collectPhase2BaseSelectionAssessments();
+      const phase2BaseAssessments = shouldUseDirectPhase2MipBypass
+        ? []
+        : collectPhase2BaseSelectionAssessments();
       const phase2SeedEligibleBaseAssessments = phase2BaseAssessments.filter(
         assessment => assessment.seedEligible
       );
-      const phase2BaseSelectionBlockedReason = !phase2BaseAssessments.length
-        ? 'no-mean-attempt'
-        : !phase2SeedEligibleBaseAssessments.length
-          ? 'no-phase2-seed-eligible-mean-attempt'
-          : null;
+      const phase2BaseSelectionBlockedReason = shouldUseDirectPhase2MipBypass
+        ? null
+        : !phase2BaseAssessments.length
+          ? 'no-mean-attempt'
+          : !phase2SeedEligibleBaseAssessments.length
+            ? 'no-phase2-seed-eligible-mean-attempt'
+            : null;
       const phase2NoBaseAttemptSkipReason =
         phase2BaseSelectionBlockedReason === 'no-phase2-seed-eligible-mean-attempt'
           ? 'NO_PHASE2_SEED_ELIGIBLE_MEAN_ATTEMPT'
@@ -12750,15 +12885,23 @@ export function useCPROrchestrator({
         phase2BaseAssessments.map(assessment => [assessment.attempt.label, assessment] as const)
       );
       const fastPhase2SeedAssessment =
-        bestAttempt.aggregation === 'MEAN' ? assessPhase2BaseAttempt(bestAttempt) : null;
+        !shouldUseDirectPhase2MipBypass && bestAttempt.aggregation === 'MEAN'
+          ? assessPhase2BaseAttempt(bestAttempt)
+          : null;
       const phase2BaseAttempt =
-        shouldUseFastWorkerReconPhase2Seed &&
-        bestAttempt.aggregation === 'MEAN' &&
-        fastPhase2SeedAssessment?.seedEligible
-          ? bestAttempt
-          : selectPreferredMeanAttemptForPhase2();
+        shouldUseDirectPhase2MipBypass
+          ? directPhase2Attempt
+          : shouldUseFastWorkerReconPhase2Seed &&
+              bestAttempt.aggregation === 'MEAN' &&
+              fastPhase2SeedAssessment?.seedEligible
+            ? bestAttempt
+            : selectPreferredMeanAttemptForPhase2();
       const phase2BaseAssessment =
-        phase2BaseAttempt ? phase2BaseAssessmentByLabel.get(phase2BaseAttempt.label) ?? null : null;
+        shouldUseDirectPhase2MipBypass
+          ? null
+          : phase2BaseAttempt
+            ? phase2BaseAssessmentByLabel.get(phase2BaseAttempt.label) ?? null
+            : null;
       console.log(
         '[CPR-PHASE2-BASE-SELECTION-JSON]',
         JSON.stringify({
@@ -12805,10 +12948,25 @@ export function useCPROrchestrator({
         timingMs: null,
         diagnostics: null,
       };
-      if (gpuBackendEnabled) {
-        phase1VirtualPano.skippedReason = 'GPU_BACKEND_ACTIVE_USE_ATTEMPT_PIPELINE';
-      } else if (!phase2BaseAttempt) {
+      const phase2RequestedVerticalHalfMm =
+        phase2MipPathActive ? 55 : phase2BaseAttempt?.actualVertHalfMm ?? mediumVerticalHalfMm;
+      const phase2RequestedVerticalCenterOffsetMm =
+        phase2MipPathActive
+          ? -6
+          : phase2BaseAttempt?.verticalCenterOffsetMm ?? workerInput.verticalCenterOffsetMm ?? 0;
+      let phase2ActualVertHalfMm = phase2RequestedVerticalHalfMm;
+      let phase2RowPixelSpacing =
+        phase2BaseAttempt && phase2BaseAttempt.panoHeight > 1
+          ? (phase2RequestedVerticalHalfMm * 2) / Math.max(1, phase2BaseAttempt.panoHeight - 1)
+          : phase2BaseAttempt?.rowPixelSpacing ?? 0;
+      if (!phase2BaseAttempt) {
         phase1VirtualPano.skippedReason = phase2NoBaseAttemptSkipReason;
+      } else if (shouldUseDirectPhase2MipBypass) {
+        phase1VirtualPano.skippedReason = 'direct-mip-phase2-path';
+      } else if (phase2MipPathActive) {
+        phase1VirtualPano.skippedReason = 'mip-path-active';
+      } else if (gpuBackendEnabled) {
+        phase1VirtualPano.skippedReason = 'GPU_BACKEND_ACTIVE_USE_ATTEMPT_PIPELINE';
       } else {
         try {
           const phase1Result = await launchCPRWorker({
@@ -12919,6 +13077,68 @@ export function useCPROrchestrator({
       let phase2WorkerResult: CPRWorkerLaunchResult | null = null;
       if (!phase2BaseAttempt) {
         phase2VirtualPano.skippedReason = phase2NoBaseAttemptSkipReason;
+      } else if (shouldUseDirectPhase2MipBypass && directPhase2Attempt) {
+        const phase2Result = directPhase2Attempt.result;
+        const phase2DiagnosticPayload =
+          phase2Result.workerDebugPayload &&
+          typeof phase2Result.workerDebugPayload === 'object' &&
+          phase2Result.workerDebugPayload.diagnostic &&
+          typeof phase2Result.workerDebugPayload.diagnostic === 'object'
+            ? (phase2Result.workerDebugPayload.diagnostic as Record<string, unknown>)
+            : null;
+        const phase2RenderDiagnostics =
+          phase2DiagnosticPayload &&
+          phase2DiagnosticPayload.virtualPanoRender &&
+          typeof phase2DiagnosticPayload.virtualPanoRender === 'object'
+            ? (phase2DiagnosticPayload.virtualPanoRender as Record<string, unknown>)
+            : null;
+        const phase2RejectReasons =
+          phase2RenderDiagnostics && Array.isArray(phase2RenderDiagnostics.rejectReasons)
+            ? phase2RenderDiagnostics.rejectReasons.filter(reason => typeof reason === 'string')
+            : [];
+        phase2ActualVertHalfMm = directPhase2Attempt.actualVertHalfMm;
+        phase2RowPixelSpacing = directPhase2Attempt.rowPixelSpacing;
+        phase2VirtualPano.executed = true;
+        phase2VirtualPano.timingMs =
+          directPhase2Attempt.workerTimingMs ??
+          (phase2DiagnosticPayload &&
+          phase2DiagnosticPayload.timingMs &&
+          typeof phase2DiagnosticPayload.timingMs === 'object'
+            ? (phase2DiagnosticPayload.timingMs as Record<string, unknown>)
+            : null);
+        phase2VirtualPano.diagnostics = phase2RenderDiagnostics;
+        phase2VirtualPano.summary = directPhase2Attempt.summary;
+        phase2VirtualPano.voi = directPhase2Attempt.voi;
+        phase2VirtualPano.intensityDomain = directPhase2Attempt.intensityDomain;
+        phase2VirtualPano.huDomain = directPhase2Attempt.huDomain;
+        phase2VirtualPano.phase0SeedQualityGatePassed = null;
+        phase2VirtualPano.phase0SeedRejectReasons = [];
+        phase2VirtualPano.phase0SeedStructuralRejectReasons = [];
+        phase2VirtualPano.phase0SeedEligible = null;
+        phase2VirtualPano.phase2RenderFamily = toNonEmptyString(
+          phase2RenderDiagnostics?.renderSupportMode
+        );
+        phase2VirtualPano.workerAcceptedForOutput =
+          !!phase2RenderDiagnostics && phase2RenderDiagnostics.usedAsOutput === true;
+        phase2VirtualPano.usedAsDisplayedOutput = phase2VirtualPano.workerAcceptedForOutput;
+        const acceptedByLowerBandTolerance =
+          !!phase2RenderDiagnostics && phase2RenderDiagnostics.acceptedByLowerBandTolerance === true;
+        const acceptedByToothBandTolerance =
+          !!phase2RenderDiagnostics && phase2RenderDiagnostics.acceptedByToothBandTolerance === true;
+        if (phase2VirtualPano.usedAsDisplayedOutput && acceptedByLowerBandTolerance) {
+          phase2VirtualPano.borderlineAcceptedReason = 'lower-band-tolerated-in-worker';
+        } else if (phase2VirtualPano.usedAsDisplayedOutput && acceptedByToothBandTolerance) {
+          phase2VirtualPano.borderlineAcceptedReason = 'tooth-band-tolerated-in-worker';
+        } else if (
+          phase2VirtualPano.usedAsDisplayedOutput &&
+          phase2RejectReasons.length === 1 &&
+          phase2RejectReasons[0] === 'lower-band-bright-fraction-too-high'
+        ) {
+          phase2VirtualPano.borderlineAcceptedReason = 'lower-band-bright-fraction-only-rejected';
+        } else if (phase2RenderDiagnostics && phase2RenderDiagnostics.usedAsOutput !== true) {
+          phase2VirtualPano.borderlineAcceptedReason = 'phase2-rejected-by-worker';
+        }
+        phase2WorkerResult = phase2Result;
       } else {
         try {
           const phase2Result = await launchCPRWorker({
@@ -12926,13 +13146,13 @@ export function useCPROrchestrator({
             ...phase2BaseAttempt.requestOverrides,
             panoWidth: phase2BaseAttempt.panoWidth,
             panoHeight: phase2BaseAttempt.panoHeight,
-            verticalHalfMm: phase2BaseAttempt.actualVertHalfMm,
-            verticalCenterOffsetMm: phase2BaseAttempt.verticalCenterOffsetMm,
+            verticalHalfMm: phase2RequestedVerticalHalfMm,
+            verticalCenterOffsetMm: phase2RequestedVerticalCenterOffsetMm,
             slabHalfThicknessMm: phase2BaseAttempt.slabHalfThicknessMm,
             slabSamples: phase2BaseAttempt.slabSamples,
             aggregation: phase2BaseAttempt.aggregation,
             debugRunId: `${debugRunId}-phase2`,
-            reconstructionMode: getPanoV2Phase0ReconstructionMode(),
+            reconstructionMode: phase2ReconstructionMode,
           });
           const phase2DiagnosticPayload =
             phase2Result.workerDebugPayload &&
@@ -12961,6 +13181,14 @@ export function useCPROrchestrator({
             typeof phase2DiagnosticPayload.virtualPanoRender === 'object'
               ? (phase2DiagnosticPayload.virtualPanoRender as Record<string, unknown>)
               : null;
+          phase2ActualVertHalfMm = toPositiveFinite(
+            readPhase4DiagnosticNumber(phase2DiagnosticPayload?.verticalHalfMm),
+            phase2RequestedVerticalHalfMm
+          );
+          phase2RowPixelSpacing =
+            phase2BaseAttempt.panoHeight > 1
+              ? (phase2ActualVertHalfMm * 2) / Math.max(1, phase2BaseAttempt.panoHeight - 1)
+              : phase2BaseAttempt.rowPixelSpacing;
           const phase2RenderSupportMode = toNonEmptyString(phase2RenderDiagnostics?.renderSupportMode);
           const classifiedPhase2IntensityDomain = classifySyntheticCprIntensityDomain({
             modalityLutApplied: phase2Result.modalityLutApplied,
@@ -12976,12 +13204,25 @@ export function useCPROrchestrator({
           const phase2FusionBypass =
             phase2RenderSupportMode === 'panoV2Fusion' &&
             phase2RenderDiagnostics?.renderBypass === true;
+          const phase2OutputRange = readPhase4DiagnosticRecord(phase2RenderDiagnostics?.outputRange);
+          const phase2BypassVoi = phase2FusionBypass
+            ? createPanoVoiForMipBypassOutput({
+                min:
+                  readPhase4DiagnosticNumber(phase2OutputRange?.min) ?? phase2Result.minValue,
+                p50: readPhase4DiagnosticNumber(phase2OutputRange?.p50),
+                p90: readPhase4DiagnosticNumber(phase2OutputRange?.p90),
+                max:
+                  readPhase4DiagnosticNumber(phase2OutputRange?.max) ?? phase2Result.maxValue,
+              })
+            : null;
           const phase2WorkerVoi =
-            phase2FusionBypass ||
-            (!isDualArchProjectionRenderMode(phase2RenderSupportMode) &&
-            !isNativeDisplayPanoRenderMode(phase2RenderSupportMode))
-              ? createPanoVoiFromWindowLevel(phase2Result.windowWidth, phase2Result.windowCenter)
-              : null;
+            phase2FusionBypass
+              ? phase2BypassVoi ??
+                createPanoVoiFromWindowLevel(phase2Result.windowWidth, phase2Result.windowCenter)
+              : !isDualArchProjectionRenderMode(phase2RenderSupportMode) &&
+                  !isNativeDisplayPanoRenderMode(phase2RenderSupportMode)
+                ? createPanoVoiFromWindowLevel(phase2Result.windowWidth, phase2Result.windowCenter)
+                : null;
           const phase2AdaptiveVoi = computeAdaptivePanoVoi(
             phase2Summary,
             phase2Result.minValue,
@@ -16164,9 +16405,9 @@ export function useCPROrchestrator({
         displayedSourceAggregation = phase2BaseAttempt.aggregation;
         selectedPanoWidth = phase2BaseAttempt.panoWidth;
         selectedPanoHeight = phase2BaseAttempt.panoHeight;
-        selectedActualVertHalfMm = phase2BaseAttempt.actualVertHalfMm;
+        selectedActualVertHalfMm = phase2ActualVertHalfMm;
         selectedColumnPixelSpacing = phase2BaseAttempt.columnPixelSpacing;
-        selectedRowPixelSpacing = phase2BaseAttempt.rowPixelSpacing;
+        selectedRowPixelSpacing = phase2RowPixelSpacing;
         displayedQualityGateCandidate =
           explicitPhase2QualityGateCandidate ?? selectedQualityGateCandidate;
         qualityGateDisplaySelectionReason =
@@ -16215,7 +16456,9 @@ export function useCPROrchestrator({
         : [];
       const crossSectionVerticalCenterOffsetMm =
         (displayUsesPhase2VirtualPano
-          ? phase2BaseAttempt?.verticalCenterOffsetMm
+          ? phase2MipPathActive
+            ? phase2RequestedVerticalCenterOffsetMm
+            : phase2BaseAttempt?.verticalCenterOffsetMm
           : displayedAttempt.verticalCenterOffsetMm) ?? 0;
       console.log(
         '[CPR-CROSSSECTION-GEOMETRY-JSON]',
@@ -16906,6 +17149,24 @@ export function useCPROrchestrator({
 
           await ensureViewportTypeByLogicalId(servicesManager, 'cpr-pano', 'stack', debugRunId);
           const panoViewport = await waitForPanoStackViewport(servicesManager);
+          const displayUsesMipBypass =
+            displayUsesPhase2VirtualPano &&
+            readPhase4DiagnosticBoolean(
+              (phase2VirtualPano.diagnostics as Record<string, unknown> | null)?.renderBypass
+            ) === true;
+          hostedPanoVoiDragModelRef.current = displayUsesMipBypass
+            ? {
+                enabled: true,
+                fixedHuPerPixel: CPR_PANO_BYPASS_FIXED_HU_PER_PIXEL,
+                sourceHuPerPixel: computeWindowLevelToolHuPerPixel(
+                  Number(payloadForDisplay.maxValue) - Number(payloadForDisplay.minValue)
+                ),
+              }
+            : {
+                enabled: false,
+                fixedHuPerPixel: null,
+                sourceHuPerPixel: null,
+              };
           setViewportVisibility(panoViewport, true);
           logPanoViewportSnapshot(debugRunId, 'before-setStack', panoViewport);
           await panoViewport.setStack([panoImageId], 0);
@@ -17325,6 +17586,14 @@ export function useCPROrchestrator({
 
       const authority = hostedPanoVoiAuthorityRef.current;
       const authoritativeVoi = clonePanoVoiSettings(authority.authoritativeVoi);
+      const remappedVoi =
+        logicalViewportId === 'cpr-pano'
+          ? remapHostedPanoVoiForFixedHuPerPixel({
+              nextVoi,
+              authoritativeVoi,
+              dragModel: hostedPanoVoiDragModelRef.current,
+            })
+          : nextVoi;
       if (
         logicalViewportId === 'cpr-pano' &&
         authority.sourceVolumeId &&
@@ -17340,7 +17609,7 @@ export function useCPROrchestrator({
 
       if (logicalViewportId === 'cpr-pano') {
         const evaluation = evaluateHostedPanoViewportVoiUpdate({
-          nextVoi,
+          nextVoi: remappedVoi,
           authoritativeVoi,
           suppressPanoViewportEventsUntil: authority.suppressPanoViewportEventsUntil,
           now: Date.now(),
@@ -17353,7 +17622,7 @@ export function useCPROrchestrator({
             : '';
           console.warn(
             `[CPR-VTK-PANO-VOI-GUARD] run=${authority.runId || 'na'} rejectingPanoEvent reason=${evaluation.reason} ` +
-              `eventWW=${nextVoi.windowWidth.toFixed(2)} eventWC=${nextVoi.windowCenter.toFixed(2)}${authoritySummary}`
+              `eventWW=${remappedVoi.windowWidth.toFixed(2)} eventWC=${remappedVoi.windowCenter.toFixed(2)}${authoritySummary}`
           );
           if (evaluation.shouldRepair) {
             scheduleHostedPanoVoiRepair(evaluation.reason);
@@ -17362,12 +17631,32 @@ export function useCPROrchestrator({
         }
       }
 
-      attachedPano.updateWindowLevel(nextVoi.windowWidth, nextVoi.windowCenter);
+      attachedPano.updateWindowLevel(remappedVoi.windowWidth, remappedVoi.windowCenter);
+      if (logicalViewportId === 'cpr-pano' && !arePanoVoiSettingsClose(remappedVoi, nextVoi)) {
+        const livePanoViewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
+        if (isStackViewportLike(livePanoViewport)) {
+          livePanoViewport.setProperties({
+            isComputedVOI: false,
+            voiRange: {
+              lower: remappedVoi.lower,
+              upper: remappedVoi.upper,
+            },
+            invert: false,
+            colormap: undefined,
+            VOILUTFunction: 'LINEAR_EXACT',
+          } as any);
+          livePanoViewport.render?.();
+        }
+      }
       setHostedPanoVoiAuthority({
         runId: authority.runId || 'na',
         sourceVolumeId: authority.sourceVolumeId || detail?.volumeId || null,
-        voi: nextVoi,
+        voi: remappedVoi,
         source: logicalViewportId,
+        suppressPanoViewportEventsForMs:
+          logicalViewportId === 'cpr-pano' && !arePanoVoiSettingsClose(remappedVoi, nextVoi)
+            ? 80
+            : 0,
       });
     };
 

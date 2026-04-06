@@ -1,10 +1,13 @@
 import type { PanoV2NumericSummary, PanoV2TrackLabel } from './panoV2Geometry';
 import type {
   PanoV2BandLayerRenderResult,
+  PanoV2GapBoundaryAnalysis,
+  PanoV2BypassCompositeImages,
   PanoV2FullPlaneLayerImages,
   PanoV2LayerRenderResult,
   PanoV2RenderedLayer,
 } from './panoV2LayerRenderer';
+import { buildPanoV2GapBoundaryAnalysis } from './panoV2LayerRenderer';
 
 const COLUMN_SCORE_ROW_RADIUS = 18;
 const COLUMN_SWITCH_PENALTY = 92;
@@ -81,6 +84,7 @@ export interface PanoV2FusionDiagnostics {
   };
   outputRange: PanoV2NumericSummary;
   rowCoverageByRow: PanoV2FusionRowCoverage[];
+  gapAnalysis: PanoV2GapAnalysisDiagnostics | null;
   upperArch: PanoV2FusionBandDiagnostics;
   lowerArch: PanoV2FusionBandDiagnostics;
 }
@@ -99,6 +103,38 @@ interface PanoV2BandFusionResult {
 interface PanoV2BandBlendPlan {
   secondaryLayerByCol: Int16Array;
   secondaryWeightByCol: Float32Array;
+}
+
+export interface PanoV2GapRowRangeByColumn {
+  col: number;
+  upperLastDenseRow: number | null;
+  lowerFirstDenseRow: number | null;
+  gapHeightPx: number;
+  gapMedianHu: number | null;
+}
+
+export interface PanoV2GapPatchPoint {
+  col: number;
+  row: number;
+  finalHu: number;
+  upperHu: number | null;
+  lowerHu: number | null;
+  source: 'upper-arch-layer' | 'lower-arch-layer' | 'gap-zone';
+}
+
+export interface PanoV2GapAnalysisDiagnostics {
+  denseHuThreshold: number;
+  sampleStrideColumns: number;
+  gapPixelCount: number;
+  gapRowRangeByColumn: PanoV2GapRowRangeByColumn[];
+  fractionOfGapBelowMinus500: number;
+  fractionOfGapBetweenMinus500AndZero: number;
+  fractionOfGapAboveZero: number;
+  patchSearchRegion: {
+    colStart: number;
+    colEnd: number;
+  };
+  patchPoints: PanoV2GapPatchPoint[];
 }
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -162,6 +198,163 @@ function summarize(values: number[]): PanoV2NumericSummary {
     p90: roundTo(percentile(values, 0.9)),
     max: roundTo(max),
     mean: roundTo(sum / values.length),
+  };
+}
+
+function roundNullable(value: number | null): number | null {
+  return Number.isFinite(value ?? Number.NaN) ? roundTo(Number(value)) : null;
+}
+
+function inferGapPointSource(params: {
+  upperValue: number;
+  lowerValue: number;
+}): 'upper-arch-layer' | 'lower-arch-layer' | 'gap-zone' {
+  const { upperValue, lowerValue } = params;
+  const upperFinite = Number.isFinite(upperValue);
+  const lowerFinite = Number.isFinite(lowerValue);
+  if (!upperFinite && !lowerFinite) {
+    return 'gap-zone';
+  }
+  if (upperFinite && !lowerFinite) {
+    return 'upper-arch-layer';
+  }
+  if (!upperFinite && lowerFinite) {
+    return 'lower-arch-layer';
+  }
+  if (upperValue > lowerValue + 1e-3) {
+    return 'upper-arch-layer';
+  }
+  if (lowerValue > upperValue + 1e-3) {
+    return 'lower-arch-layer';
+  }
+  return 'gap-zone';
+}
+
+function buildPanoV2GapAnalysis(params: {
+  panoWidth: number;
+  panoHeight: number;
+  finalPixelData: Float32Array;
+  upperArchImage: Float32Array;
+  lowerArchImage: Float32Array;
+}): PanoV2GapAnalysisDiagnostics {
+  const { panoWidth, panoHeight, finalPixelData, upperArchImage, lowerArchImage } = params;
+  const boundaryAnalysis: PanoV2GapBoundaryAnalysis = buildPanoV2GapBoundaryAnalysis({
+    upperArchImage,
+    lowerArchImage,
+    panoWidth,
+    panoHeight,
+  });
+  let gapPixelCount = 0;
+  let gapBelowMinus500Count = 0;
+  let gapBetweenMinus500AndZeroCount = 0;
+  let gapAboveZeroCount = 0;
+
+  for (let col = 0; col < panoWidth; col++) {
+    const upperLastDenseRow = Number(boundaryAnalysis.upperLastDenseRowByCol[col]);
+    const lowerFirstDenseRow = Number(boundaryAnalysis.lowerFirstDenseRowByCol[col]);
+    if (upperLastDenseRow < 0 || lowerFirstDenseRow < 0 || lowerFirstDenseRow <= upperLastDenseRow + 1) {
+      continue;
+    }
+    for (let row = upperLastDenseRow + 1; row < lowerFirstDenseRow; row++) {
+      const value = Number(finalPixelData[row * panoWidth + col]);
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      gapPixelCount++;
+      if (value <= -500) {
+        gapBelowMinus500Count++;
+      } else if (value <= 0) {
+        gapBetweenMinus500AndZeroCount++;
+      } else {
+        gapAboveZeroCount++;
+      }
+    }
+  }
+
+  const gapRowRangeByColumn: PanoV2GapRowRangeByColumn[] = boundaryAnalysis.sampledColumns.map(sample => {
+    const gapValues: number[] = [];
+    if (
+      sample.upperLastDenseRow !== null &&
+      sample.lowerFirstDenseRow !== null &&
+      sample.lowerFirstDenseRow > sample.upperLastDenseRow + 1
+    ) {
+      for (let row = sample.upperLastDenseRow + 1; row < sample.lowerFirstDenseRow; row++) {
+        const value = Number(finalPixelData[row * panoWidth + sample.col]);
+        if (Number.isFinite(value)) {
+          gapValues.push(value);
+        }
+      }
+    }
+    return {
+      col: sample.col,
+      upperLastDenseRow: sample.upperLastDenseRow,
+      lowerFirstDenseRow: sample.lowerFirstDenseRow,
+      gapHeightPx: sample.gapHeightPx,
+      gapMedianHu: gapValues.length > 0 ? roundTo(percentile(gapValues, 0.5)) : null,
+    };
+  });
+
+  const patchSearchRegion = {
+    colStart: clampNumber(Math.round((panoWidth - 1) * 0.18), 0, Math.max(0, panoWidth - 1)),
+    colEnd: clampNumber(Math.round((panoWidth - 1) * 0.58), 0, Math.max(0, panoWidth - 1)),
+  };
+  const patchCandidates: PanoV2GapPatchPoint[] = [];
+  for (let col = patchSearchRegion.colStart; col <= patchSearchRegion.colEnd; col++) {
+    const upperLastDenseRow = Number(boundaryAnalysis.upperLastDenseRowByCol[col]);
+    const lowerFirstDenseRow = Number(boundaryAnalysis.lowerFirstDenseRowByCol[col]);
+    if (upperLastDenseRow < 0 || lowerFirstDenseRow < 0 || lowerFirstDenseRow <= upperLastDenseRow + 1) {
+      continue;
+    }
+    let lowestGapHu = Number.POSITIVE_INFINITY;
+    let lowestGapRow = -1;
+    for (let row = upperLastDenseRow + 1; row < lowerFirstDenseRow; row++) {
+      const value = Number(finalPixelData[row * panoWidth + col]);
+      if (!Number.isFinite(value) || value >= lowestGapHu) {
+        continue;
+      }
+      lowestGapHu = value;
+      lowestGapRow = row;
+    }
+    if (!Number.isFinite(lowestGapHu) || lowestGapRow < 0 || lowestGapHu > -500) {
+      continue;
+    }
+    const index = lowestGapRow * panoWidth + col;
+    const upperValue = Number(upperArchImage[index]);
+    const lowerValue = Number(lowerArchImage[index]);
+    patchCandidates.push({
+      col,
+      row: lowestGapRow,
+      finalHu: roundTo(lowestGapHu),
+      upperHu: roundNullable(upperValue),
+      lowerHu: roundNullable(lowerValue),
+      source: inferGapPointSource({
+        upperValue,
+        lowerValue,
+      }),
+    });
+  }
+  patchCandidates.sort((left, right) => {
+    if (left.finalHu !== right.finalHu) {
+      return left.finalHu - right.finalHu;
+    }
+    if (left.col !== right.col) {
+      return left.col - right.col;
+    }
+    return left.row - right.row;
+  });
+
+  return {
+    denseHuThreshold: boundaryAnalysis.denseHuThreshold,
+    sampleStrideColumns: boundaryAnalysis.sampleStrideColumns,
+    gapPixelCount,
+    gapRowRangeByColumn,
+    fractionOfGapBelowMinus500:
+      gapPixelCount > 0 ? roundTo(gapBelowMinus500Count / gapPixelCount, 4) : 0,
+    fractionOfGapBetweenMinus500AndZero:
+      gapPixelCount > 0 ? roundTo(gapBetweenMinus500AndZeroCount / gapPixelCount, 4) : 0,
+    fractionOfGapAboveZero: gapPixelCount > 0 ? roundTo(gapAboveZeroCount / gapPixelCount, 4) : 0,
+    patchSearchRegion,
+    patchPoints: patchCandidates.slice(0, 16),
   };
 }
 
@@ -824,16 +1017,17 @@ export function buildPanoV2FusionResult(params: {
   panoHeight: number;
   layerRender: PanoV2LayerRenderResult;
   fullPlaneLayerImages?: PanoV2FullPlaneLayerImages | null;
+  bypassCompositeImages?: PanoV2BypassCompositeImages | null;
 }): PanoV2FusionResult {
-  const { panoWidth, panoHeight, layerRender, fullPlaneLayerImages } = params;
-  if (layerRender.model === 'thick-slab-mip-render' && fullPlaneLayerImages) {
+  const { panoWidth, panoHeight, layerRender, fullPlaneLayerImages, bypassCompositeImages } = params;
+  if (layerRender.model === 'thick-slab-mip-render' && bypassCompositeImages) {
     const planeSize = Math.max(1, panoWidth * panoHeight);
     const pixelData = new Float32Array(planeSize);
     const finalValues: number[] = [];
-    const sourceImages = [
-      ...fullPlaneLayerImages.upperArch,
-      ...fullPlaneLayerImages.lowerArch,
-    ];
+    const sourceImages = [bypassCompositeImages.upperArch, bypassCompositeImages.lowerArch];
+    const fallbackImages = fullPlaneLayerImages
+      ? [...fullPlaneLayerImages.upperArch, ...fullPlaneLayerImages.lowerArch]
+      : [];
     for (let index = 0; index < planeSize; index++) {
       let selectedValue = Number.NEGATIVE_INFINITY;
       let hasFiniteValue = false;
@@ -845,6 +1039,18 @@ export function buildPanoV2FusionResult(params: {
         if (!hasFiniteValue || value > selectedValue) {
           selectedValue = value;
           hasFiniteValue = true;
+        }
+      }
+      if (!hasFiniteValue && fallbackImages.length > 0) {
+        for (let imageIndex = 0; imageIndex < fallbackImages.length; imageIndex++) {
+          const value = Number(fallbackImages[imageIndex]?.[index]);
+          if (!Number.isFinite(value) || value <= -950) {
+            continue;
+          }
+          if (!hasFiniteValue || value > selectedValue) {
+            selectedValue = value;
+            hasFiniteValue = true;
+          }
         }
       }
       const clampedValue = clampNumber(hasFiniteValue ? selectedValue : -1000, -1000, 3500);
@@ -867,6 +1073,13 @@ export function buildPanoV2FusionResult(params: {
         coveredPixelFraction: 1,
       })
     );
+    const gapAnalysis = buildPanoV2GapAnalysis({
+      panoWidth,
+      panoHeight,
+      finalPixelData: pixelData,
+      upperArchImage: bypassCompositeImages.upperArch,
+      lowerArchImage: bypassCompositeImages.lowerArch,
+    });
 
     return {
       pixelData,
@@ -886,6 +1099,7 @@ export function buildPanoV2FusionResult(params: {
         },
         outputRange: summarize(finalValues),
         rowCoverageByRow,
+        gapAnalysis,
         upperArch: {
           label: layerRender.upperArch.label,
           switchCount: 0,
@@ -1045,6 +1259,7 @@ export function buildPanoV2FusionResult(params: {
       },
       outputRange: summarize(finalValues),
       rowCoverageByRow,
+      gapAnalysis: null,
       upperArch: upperBand.diagnostic,
       lowerArch: lowerBand.diagnostic,
     },

@@ -10,8 +10,9 @@ const REGION_ANTERIOR_MAX = 0.65;
 const REGION_RIGHT_POSTERIOR_MIN = 0.78;
 const TOOTH_ROW_BAND_ROW_RADIUS = 18;
 const PANO_V2_MIP_SLAB_HALF_WIDTH_MM = 10;
-const PANO_V2_MIP_DEPTH_STEP_MM = 0.2;
-const PANO_V2_MIP_DEPTH_STEP_COUNT = 100;
+const PANO_V2_MIP_DEPTH_STEP_MM = 0.3;
+const PANO_V2_GAP_ANALYSIS_DENSE_HU_THRESHOLD = 500;
+const PANO_V2_GAP_ANALYSIS_SAMPLE_STRIDE_COLUMNS = 10;
 
 interface PanoV2LayerProbeRow {
   localRow: number;
@@ -101,6 +102,9 @@ export interface PanoV2LayerRenderResult {
     slabHalfWidthMm: number;
     depthStepMm: number;
     sampledColumnCount: number;
+    mipVoiOverride: true;
+    verticalHalfMmUsed: number;
+    verticalCenterOffsetMm: number;
     slabDirectionColumn: number;
     slabDirectionVector: [number, number, number];
     toothBandMedianHu: number;
@@ -120,6 +124,9 @@ export interface PanoV2LayerRenderDiagnostics {
     slabHalfWidthMm: number;
     depthStepMm: number;
     sampledColumnCount: number;
+    mipVoiOverride: true;
+    verticalHalfMmUsed: number;
+    verticalCenterOffsetMm: number;
     slabDirectionColumn: number;
     slabDirectionVector: [number, number, number];
     toothBandMedianHu: number;
@@ -133,6 +140,26 @@ export interface PanoV2LayerRenderDiagnostics {
 export interface PanoV2FullPlaneLayerImages {
   upperArch: Float32Array[];
   lowerArch: Float32Array[];
+}
+
+export interface PanoV2BypassCompositeImages {
+  upperArch: Float32Array;
+  lowerArch: Float32Array;
+}
+
+export interface PanoV2GapBoundarySample {
+  col: number;
+  upperLastDenseRow: number | null;
+  lowerFirstDenseRow: number | null;
+  gapHeightPx: number;
+}
+
+export interface PanoV2GapBoundaryAnalysis {
+  denseHuThreshold: number;
+  sampleStrideColumns: number;
+  upperLastDenseRowByCol: Int16Array;
+  lowerFirstDenseRowByCol: Int16Array;
+  sampledColumns: PanoV2GapBoundarySample[];
 }
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -232,9 +259,11 @@ function buildMipBandImage(
       const by = py + verticalOffsetMm * vertDirY;
       const bz = pz + verticalOffsetMm * vertDirZ;
       let mipHu = Number.NEGATIVE_INFINITY;
-      for (let depthStepIndex = 0; depthStepIndex <= PANO_V2_MIP_DEPTH_STEP_COUNT; depthStepIndex++) {
-        const localDepthOffsetMm =
-          -PANO_V2_MIP_SLAB_HALF_WIDTH_MM + depthStepIndex * PANO_V2_MIP_DEPTH_STEP_MM;
+      for (
+        let localDepthOffsetMm = -PANO_V2_MIP_SLAB_HALF_WIDTH_MM;
+        localDepthOffsetMm <= PANO_V2_MIP_SLAB_HALF_WIDTH_MM + 1e-6;
+        localDepthOffsetMm += PANO_V2_MIP_DEPTH_STEP_MM
+      ) {
         const localDepthMm = centerDepthMm + targetOffsetMm + localDepthOffsetMm;
         const sample = volume.sampleWorldIntensity(
           bx + localDepthMm * slabDirX,
@@ -262,6 +291,60 @@ function buildMipBandImage(
     toothBandValuesHu,
     renderMs: roundTo(performance.now() - renderStartMs),
   };
+}
+
+function buildFullPlaneMipImage(params: {
+  volume: PanoV2StraightenedVolume;
+  centerDepthMmByCol: Float32Array;
+  targetOffsetMmByCol: Float32Array;
+}): Float32Array {
+  const { volume, centerDepthMmByCol, targetOffsetMmByCol } = params;
+  const width = volume.panoWidth;
+  const height = volume.panoHeight;
+  const image = new Float32Array(Math.max(1, width * height));
+  image.fill(Number.NaN);
+
+  for (let col = 0; col < width; col++) {
+    const frame = volume.frames[col];
+    if (!frame) {
+      continue;
+    }
+    const [px, py, pz] = frame.position;
+    const [slabDirX, slabDirY, slabDirZ] = frame.mipSlabDir ?? frame.slabDir;
+    const [vertDirX, vertDirY, vertDirZ] = frame.verticalDir;
+    const centerDepthMm = Number(centerDepthMmByCol[col] ?? 0);
+    const targetOffsetMm = Number(targetOffsetMmByCol[col] ?? 0);
+    const columnVerticalCenterOffsetMm = Number(frame.columnVerticalCenterOffsetMm ?? 0);
+
+    for (let row = 0; row < height; row++) {
+      const rowOffsetMm = volume.effectiveVerticalHalfMm - row * volume.vertStepMm;
+      const verticalOffsetMm = columnVerticalCenterOffsetMm + rowOffsetMm;
+      const bx = px + verticalOffsetMm * vertDirX;
+      const by = py + verticalOffsetMm * vertDirY;
+      const bz = pz + verticalOffsetMm * vertDirZ;
+      let mipHu = Number.NEGATIVE_INFINITY;
+      for (
+        let localDepthOffsetMm = -PANO_V2_MIP_SLAB_HALF_WIDTH_MM;
+        localDepthOffsetMm <= PANO_V2_MIP_SLAB_HALF_WIDTH_MM + 1e-6;
+        localDepthOffsetMm += PANO_V2_MIP_DEPTH_STEP_MM
+      ) {
+        const localDepthMm = centerDepthMm + targetOffsetMm + localDepthOffsetMm;
+        const sample = volume.sampleWorldIntensity(
+          bx + localDepthMm * slabDirX,
+          by + localDepthMm * slabDirY,
+          bz + localDepthMm * slabDirZ
+        );
+        if (Number.isFinite(sample) && sample > mipHu) {
+          mipHu = sample;
+        }
+      }
+      if (Number.isFinite(mipHu)) {
+        image[row * width + col] = mipHu;
+      }
+    }
+  }
+
+  return image;
 }
 
 function resolveTradeoffLabel(
@@ -456,7 +539,9 @@ function buildBandLayerRenderResult(
         band: band.label,
         targetOffsetMm,
         nearestDepthOffsetMm: targetOffsetMm,
-        nearestDepthIndex: Math.floor(PANO_V2_MIP_DEPTH_STEP_COUNT / 2),
+        nearestDepthIndex: Math.round(
+          PANO_V2_MIP_SLAB_HALF_WIDTH_MM / PANO_V2_MIP_DEPTH_STEP_MM
+        ),
         tradeoffLabel: resolveTradeoffLabel(metrics),
         metrics,
         toothRowBand: buildLayerToothRowBandDiagnostics({
@@ -541,6 +626,13 @@ export function buildPanoV2LayerRenderResult(
   );
   const representativeFrame = volume.frames[slabDirectionColumn];
   const representativeSlabDirection = representativeFrame?.mipSlabDir ?? representativeFrame?.slabDir ?? [0, 0, 0];
+  const verticalCenterOffsetMmUsed =
+    volume.frames.length > 0
+      ? volume.frames.reduce(
+          (sum, frame) => sum + Number(frame.columnVerticalCenterOffsetMm || 0),
+          0
+        ) / volume.frames.length
+      : 0;
   return {
     enabled: true,
     phase: 3,
@@ -550,6 +642,9 @@ export function buildPanoV2LayerRenderResult(
       slabHalfWidthMm: PANO_V2_MIP_SLAB_HALF_WIDTH_MM,
       depthStepMm: PANO_V2_MIP_DEPTH_STEP_MM,
       sampledColumnCount: volume.panoWidth,
+      mipVoiOverride: true,
+      verticalHalfMmUsed: roundTo(volume.effectiveVerticalHalfMm),
+      verticalCenterOffsetMm: roundTo(verticalCenterOffsetMmUsed),
       slabDirectionColumn,
       slabDirectionVector: [
         roundTo(representativeSlabDirection[0]),
@@ -608,6 +703,73 @@ function buildFullPlaneBandLayerImages(params: {
   });
 }
 
+function resolvePreferredBypassLayerIndex(band: PanoV2BandLayerRenderResult): number {
+  const sharpnessLayerId = band.bestByRegion.sharpnessPeak;
+  const sharpnessLayerIndex =
+    typeof sharpnessLayerId === 'string'
+      ? band.layers.findIndex(layer => layer.diagnostic.layerId === sharpnessLayerId)
+      : -1;
+  if (sharpnessLayerIndex >= 0) {
+    return sharpnessLayerIndex;
+  }
+  return clampNumber(Math.floor(band.layers.length * 0.5), 0, Math.max(0, band.layers.length - 1));
+}
+
+function resolveBypassLayerIndexFromId(
+  band: PanoV2BandLayerRenderResult,
+  layerId: string | null | undefined
+): number {
+  if (typeof layerId === 'string') {
+    const index = band.layers.findIndex(layer => layer.diagnostic.layerId === layerId);
+    if (index >= 0) {
+      return index;
+    }
+  }
+  return resolvePreferredBypassLayerIndex(band);
+}
+
+function buildBypassTargetOffsetMmByCol(
+  band: PanoV2BandLayerRenderResult,
+  width: number
+): Float32Array {
+  const fallbackIndex = resolvePreferredBypassLayerIndex(band);
+  const fallbackOffsetMm = Number(band.layers[fallbackIndex]?.diagnostic.targetOffsetMm ?? 0);
+  const leftOffsetMm = Number(
+    band.layers[resolveBypassLayerIndexFromId(band, band.bestByRegion.leftMolar)]?.diagnostic
+      .targetOffsetMm ?? fallbackOffsetMm
+  );
+  const centerOffsetMm = Number(
+    band.layers[resolveBypassLayerIndexFromId(band, band.bestByRegion.incisors)]?.diagnostic
+      .targetOffsetMm ?? fallbackOffsetMm
+  );
+  const rightOffsetMm = Number(
+    band.layers[resolveBypassLayerIndexFromId(band, band.bestByRegion.rightMolar)]?.diagnostic
+      .targetOffsetMm ?? fallbackOffsetMm
+  );
+  const targetOffsetMmByCol = new Float32Array(Math.max(1, width));
+
+  for (let col = 0; col < width; col++) {
+    const normalizedCol = width <= 1 ? 0.5 : col / Math.max(1, width - 1);
+    let targetOffsetMm = centerOffsetMm;
+    if (normalizedCol <= 0.25) {
+      targetOffsetMm = leftOffsetMm;
+    } else if (normalizedCol < 0.4) {
+      const blend = (normalizedCol - 0.25) / 0.15;
+      targetOffsetMm = leftOffsetMm * (1 - blend) + centerOffsetMm * blend;
+    } else if (normalizedCol <= 0.6) {
+      targetOffsetMm = centerOffsetMm;
+    } else if (normalizedCol < 0.75) {
+      const blend = (normalizedCol - 0.6) / 0.15;
+      targetOffsetMm = centerOffsetMm * (1 - blend) + rightOffsetMm * blend;
+    } else {
+      targetOffsetMm = rightOffsetMm;
+    }
+    targetOffsetMmByCol[col] = targetOffsetMm;
+  }
+
+  return targetOffsetMmByCol;
+}
+
 export function buildPanoV2FullPlaneLayerImages(params: {
   result: PanoV2LayerRenderResult;
   panoWidth: number;
@@ -624,5 +786,103 @@ export function buildPanoV2FullPlaneLayerImages(params: {
       panoWidth: params.panoWidth,
       panoHeight: params.panoHeight,
     }),
+  };
+}
+
+export function buildPanoV2BypassCompositeImages(params: {
+  result: PanoV2LayerRenderResult;
+  volume: PanoV2StraightenedVolume;
+}): PanoV2BypassCompositeImages {
+  const upperTargetOffsetMmByCol = buildBypassTargetOffsetMmByCol(
+    params.result.upperArch,
+    params.volume.panoWidth
+  );
+  const lowerTargetOffsetMmByCol = buildBypassTargetOffsetMmByCol(
+    params.result.lowerArch,
+    params.volume.panoWidth
+  );
+
+  return {
+    upperArch: buildFullPlaneMipImage({
+      volume: params.volume,
+      centerDepthMmByCol: params.volume.upperArch.centerDepthMmByCol,
+      targetOffsetMmByCol: upperTargetOffsetMmByCol,
+    }),
+    lowerArch: buildFullPlaneMipImage({
+      volume: params.volume,
+      centerDepthMmByCol: params.volume.lowerArch.centerDepthMmByCol,
+      targetOffsetMmByCol: lowerTargetOffsetMmByCol,
+    }),
+  };
+}
+
+export function buildPanoV2GapBoundaryAnalysis(params: {
+  upperArchImage: Float32Array;
+  lowerArchImage: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  denseHuThreshold?: number;
+  sampleStrideColumns?: number;
+}): PanoV2GapBoundaryAnalysis {
+  const {
+    upperArchImage,
+    lowerArchImage,
+    panoWidth,
+    panoHeight,
+    denseHuThreshold = PANO_V2_GAP_ANALYSIS_DENSE_HU_THRESHOLD,
+    sampleStrideColumns = PANO_V2_GAP_ANALYSIS_SAMPLE_STRIDE_COLUMNS,
+  } = params;
+  const upperLastDenseRowByCol = new Int16Array(Math.max(1, panoWidth));
+  const lowerFirstDenseRowByCol = new Int16Array(Math.max(1, panoWidth));
+  upperLastDenseRowByCol.fill(-1);
+  lowerFirstDenseRowByCol.fill(-1);
+
+  for (let col = 0; col < panoWidth; col++) {
+    let upperLastDenseRow = -1;
+    for (let row = 0; row < panoHeight; row++) {
+      const value = Number(upperArchImage[row * panoWidth + col]);
+      if (Number.isFinite(value) && value > denseHuThreshold) {
+        upperLastDenseRow = row;
+      }
+    }
+    upperLastDenseRowByCol[col] = upperLastDenseRow;
+
+    let lowerFirstDenseRow = -1;
+    for (let row = 0; row < panoHeight; row++) {
+      const value = Number(lowerArchImage[row * panoWidth + col]);
+      if (Number.isFinite(value) && value > denseHuThreshold) {
+        lowerFirstDenseRow = row;
+        break;
+      }
+    }
+    lowerFirstDenseRowByCol[col] = lowerFirstDenseRow;
+  }
+
+  const sampledColumns: PanoV2GapBoundarySample[] = [];
+  for (let col = 0; col < panoWidth; col++) {
+    const shouldSample = col % Math.max(1, sampleStrideColumns) === 0 || col === panoWidth - 1;
+    if (!shouldSample) {
+      continue;
+    }
+    const upperLastDenseRow = Number(upperLastDenseRowByCol[col]);
+    const lowerFirstDenseRow = Number(lowerFirstDenseRowByCol[col]);
+    const hasGap =
+      upperLastDenseRow >= 0 &&
+      lowerFirstDenseRow >= 0 &&
+      lowerFirstDenseRow > upperLastDenseRow + 1;
+    sampledColumns.push({
+      col,
+      upperLastDenseRow: upperLastDenseRow >= 0 ? upperLastDenseRow : null,
+      lowerFirstDenseRow: lowerFirstDenseRow >= 0 ? lowerFirstDenseRow : null,
+      gapHeightPx: hasGap ? lowerFirstDenseRow - upperLastDenseRow - 1 : 0,
+    });
+  }
+
+  return {
+    denseHuThreshold,
+    sampleStrideColumns: Math.max(1, sampleStrideColumns),
+    upperLastDenseRowByCol,
+    lowerFirstDenseRowByCol,
+    sampledColumns,
   };
 }

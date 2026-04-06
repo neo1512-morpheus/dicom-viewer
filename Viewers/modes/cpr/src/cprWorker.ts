@@ -23,6 +23,7 @@ import {
   buildPanoV2StraightenedVolumeDiagnostics,
 } from './panoV2Volume';
 import {
+  buildPanoV2BypassCompositeImages,
   buildPanoV2FullPlaneLayerImages,
   buildPanoV2LayerRenderResult,
   toPanoV2LayerRenderDiagnostics,
@@ -10259,10 +10260,13 @@ function generatePanorama(
   // requested sampling window mostly inside the volume. This should only
   // nudge the requested jaw band, not override it.
   let fittedVerticalCenterOffsetMm = 0;
+  let verticalWindowCannotFullyFitVolume = false;
   const volumeMinProjectionByCol = new Float32Array(panoWidth);
   const volumeMaxProjectionByCol = new Float32Array(panoWidth);
   volumeMinProjectionByCol.fill(Number.NEGATIVE_INFINITY);
   volumeMaxProjectionByCol.fill(Number.POSITIVE_INFINITY);
+  let aggregatedMinRequiredOffsetMm = Number.NEGATIVE_INFINITY;
+  let aggregatedMaxAllowedOffsetMm = Number.POSITIVE_INFINITY;
   if (
     !rigidVerticalSliceMode &&
     nx > 1 &&
@@ -10287,9 +10291,6 @@ function generatePanorama(
     const cornerWorlds = cornerIndices.map(([ci, cj, ck]) =>
       indexToWorld(ci, cj, ck, origin, spacing, direction)
     );
-    let minRequiredOffset = -Infinity;
-    let maxAllowedOffset = Infinity;
-
     for (let idx = 0; idx < frames.length; idx++) {
       const verticalDirForFrame = verticalDirs[idx] || effectiveVerticalDir;
       let minProjection = Infinity;
@@ -10310,19 +10311,27 @@ function generatePanorama(
         const frameProjection = dot3(frames[idx].position, verticalDirForFrame);
         const requiredOffsetForLowerSide = minProjection + vertHalfMm - frameProjection;
         const allowedOffsetForUpperSide = maxProjection - vertHalfMm - frameProjection;
-        if (requiredOffsetForLowerSide > minRequiredOffset) {
-          minRequiredOffset = requiredOffsetForLowerSide;
+        if (requiredOffsetForLowerSide > aggregatedMinRequiredOffsetMm) {
+          aggregatedMinRequiredOffsetMm = requiredOffsetForLowerSide;
         }
-        if (allowedOffsetForUpperSide < maxAllowedOffset) {
-          maxAllowedOffset = allowedOffsetForUpperSide;
+        if (allowedOffsetForUpperSide < aggregatedMaxAllowedOffsetMm) {
+          aggregatedMaxAllowedOffsetMm = allowedOffsetForUpperSide;
         }
       }
     }
-    if (Number.isFinite(minRequiredOffset) && Number.isFinite(maxAllowedOffset)) {
-      if (minRequiredOffset <= maxAllowedOffset) {
-        fittedVerticalCenterOffsetMm = Math.max(minRequiredOffset, Math.min(0, maxAllowedOffset));
+    if (
+      Number.isFinite(aggregatedMinRequiredOffsetMm) &&
+      Number.isFinite(aggregatedMaxAllowedOffsetMm)
+    ) {
+      if (aggregatedMinRequiredOffsetMm <= aggregatedMaxAllowedOffsetMm) {
+        fittedVerticalCenterOffsetMm = Math.max(
+          aggregatedMinRequiredOffsetMm,
+          Math.min(0, aggregatedMaxAllowedOffsetMm)
+        );
       } else {
-        fittedVerticalCenterOffsetMm = (minRequiredOffset + maxAllowedOffset) / 2;
+        verticalWindowCannotFullyFitVolume = true;
+        fittedVerticalCenterOffsetMm =
+          (aggregatedMinRequiredOffsetMm + aggregatedMaxAllowedOffsetMm) / 2;
       }
     }
   }
@@ -10337,15 +10346,43 @@ function generatePanorama(
     : Number.isFinite(requestedVerticalCenterOffsetMm)
       ? Number(requestedVerticalCenterOffsetMm)
       : 0;
+  const hasExplicitRequestedCenterOffset =
+    !rigidVerticalSliceMode && Math.abs(requestedCenterOffsetMm) > 1e-3;
   const clampedRequestedCenterOffsetMm = rigidVerticalSliceMode
     ? 0
     : Math.max(
       -baseCenterOffsetLimitMm,
       Math.min(baseCenterOffsetLimitMm, requestedCenterOffsetMm)
     );
-  const clampedFittedVerticalCenterOffsetMm = rigidVerticalSliceMode
+  let clampedFittedVerticalCenterOffsetMm = rigidVerticalSliceMode
     ? 0
     : clampNumber(fittedVerticalCenterOffsetMm, -fitOffsetLimitMm, fitOffsetLimitMm);
+  if (
+    hasExplicitRequestedCenterOffset &&
+    verticalWindowCannotFullyFitVolume &&
+    Number.isFinite(aggregatedMinRequiredOffsetMm) &&
+    Number.isFinite(aggregatedMaxAllowedOffsetMm)
+  ) {
+    const preferredTotalCenterOffsetMm =
+      clampedRequestedCenterOffsetMm < 0
+        ? Math.min(clampedRequestedCenterOffsetMm, aggregatedMaxAllowedOffsetMm)
+        : clampedRequestedCenterOffsetMm > 0
+          ? Math.max(clampedRequestedCenterOffsetMm, aggregatedMinRequiredOffsetMm)
+          : fittedVerticalCenterOffsetMm;
+    const preferredFittedOffsetMm = preferredTotalCenterOffsetMm - clampedRequestedCenterOffsetMm;
+    clampedFittedVerticalCenterOffsetMm = clampNumber(
+      preferredFittedOffsetMm,
+      -fitOffsetLimitMm,
+      fitOffsetLimitMm
+    );
+  }
+  if (
+    hasExplicitRequestedCenterOffset &&
+    verticalWindowCannotFullyFitVolume &&
+    clampedRequestedCenterOffsetMm * clampedFittedVerticalCenterOffsetMm < 0
+  ) {
+    clampedFittedVerticalCenterOffsetMm = 0;
+  }
   let verticalCenterOffsetMm = clampedRequestedCenterOffsetMm + clampedFittedVerticalCenterOffsetMm;
   verticalCenterOffsetMm = Math.max(
     -baseCenterOffsetLimitMm,
@@ -12440,12 +12477,17 @@ function generatePanorama(
         panoWidth,
         panoHeight,
       });
+      const panoV2BypassCompositeImages = buildPanoV2BypassCompositeImages({
+        result: panoV2LayerRenderResult,
+        volume: panoV2StraightenedVolume,
+      });
       panoV2LayerDiagnostics = toPanoV2LayerRenderDiagnostics(panoV2LayerRenderResult);
       const panoV2FusionResult = buildPanoV2FusionResult({
         panoWidth,
         panoHeight,
         layerRender: panoV2LayerRenderResult,
         fullPlaneLayerImages: panoV2FullPlaneLayerImages,
+        bypassCompositeImages: panoV2BypassCompositeImages,
       });
       panoV2FusionDiagnostics = panoV2FusionResult.diagnostics;
       panoV2FusionPixelData = panoV2FusionResult.pixelData;
@@ -13347,6 +13389,13 @@ function generatePanorama(
         ...panoV2LogContext,
         phase: panoV2LayerDiagnostics.phase,
         model: 'thick-slab-mip-render',
+        verticalCenterOffsetMm: (() => {
+          const value = Number(
+            (virtualPanoPhase12Diagnostics as { verticalCenterOffsetMm?: unknown })
+              ?.verticalCenterOffsetMm ?? 0
+          );
+          return Number.isFinite(value) ? Math.round(value * 1000) / 1000 : 0;
+        })(),
         ...panoV2LayerDiagnostics.mip,
       })
     );
@@ -13370,6 +13419,20 @@ function generatePanorama(
         rowCoverageByRow: panoV2FusionDiagnostics.rowCoverageByRow,
       })
     );
+    if (panoV2FusionDiagnostics.gapAnalysis) {
+      console.log(
+        '[CPR-PANOV2-GAP-ANALYSIS-JSON]',
+        JSON.stringify({
+          ...panoV2LogContext,
+          phase: panoV2FusionDiagnostics.phase,
+          model: panoV2FusionDiagnostics.model,
+          implementationVersion: panoV2FusionDiagnostics.implementationVersion,
+          renderBypass: panoV2FusionDiagnostics.renderBypass,
+          gapCenterRow: panoV2FusionDiagnostics.gapCenterRow,
+          gapAnalysis: panoV2FusionDiagnostics.gapAnalysis,
+        })
+      );
+    }
   }
   console.log(
     '[CPR-DRR-JSON]',

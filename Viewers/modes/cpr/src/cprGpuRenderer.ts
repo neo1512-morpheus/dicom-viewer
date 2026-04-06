@@ -39,6 +39,38 @@ export interface GpuPanoInput {
 }
 
 export interface GpuPanoDebugMaps {
+  renderBranchMap?: Float32Array;
+  panoV2FusionImageMap?: Float32Array;
+  panoV2UpperLayer1Map?: Float32Array;
+  panoV2UpperLayer2Map?: Float32Array;
+  panoV2UpperLayer3Map?: Float32Array;
+  panoV2LowerLayer1Map?: Float32Array;
+  panoV2LowerLayer2Map?: Float32Array;
+  panoV2LowerLayer3Map?: Float32Array;
+  selectedSupportHypothesisMap?: Float32Array;
+  focalTroughSharpnessMap?: Float32Array;
+  outOfTroughSuppressionMap?: Float32Array;
+  rawProjectedAttenuationMap?: Float32Array;
+  upperProjectedAttenuationMap?: Float32Array;
+  lowerProjectedAttenuationMap?: Float32Array;
+  upperBandRawOdMap?: Float32Array;
+  lowerBandRawOdMap?: Float32Array;
+  gapBandRawOdMap?: Float32Array;
+  outsideRowsRawOdMap?: Float32Array;
+  displayBackgroundOdMap?: Float32Array;
+  bandMaskUpperMap?: Float32Array;
+  bandMaskGapMap?: Float32Array;
+  bandMaskLowerMap?: Float32Array;
+  bandMaskOutsideMap?: Float32Array;
+  normalizationEligibleMaskMap?: Float32Array;
+  preNormalizeCompositeOdMap?: Float32Array;
+  postNormalizeDisplayMap?: Float32Array;
+  displayAnatomyMap?: Float32Array;
+  backgroundPresentationMap?: Float32Array;
+  finalCompositeDisplayMap?: Float32Array;
+  contextContributionMap?: Float32Array;
+  backgroundFillContributionMap?: Float32Array;
+  finalDisplayImageMap?: Float32Array;
   rawSupportDepthMap?: Float32Array;
   rawSupportConfidenceMap?: Float32Array;
   rawSupportSpreadMap?: Float32Array;
@@ -409,6 +441,16 @@ const GPU_SUPPORT_MODEL_PARAMS = {
   nonToothDominantDensityPenaltyFloor: 0.82,
   dominantDensePeakSpreadShrinkScale: 0.68,
   ambiguousBroadSpreadShrinkScale: 0.84,
+  toothBoundarySecondPeakRatioLow: 0.74,
+  toothBoundarySecondPeakRatioHigh: 0.94,
+  toothBoundaryDensityLow: 0.08,
+  toothBoundaryDensityHigh: 0.24,
+  toothBoundarySpreadShrinkScale: 0.62,
+  toothBoundaryValidityFloor: 0.30,
+  toothBoundaryMidpointBlendScale: 0.72,
+  toothBoundaryMidpointSpreadScale: 0.58,
+  weakToothDensePeakValidityPenaltyFloor: 0.72,
+  weakToothDensePeakDensityPenaltyFloor: 0.78,
   enamelBandLowHu: 350,
   enamelBandPeakHu: 550,
   enamelBandHighHu: 1850,
@@ -480,6 +522,9 @@ const GPU_DRR_MODEL_PARAMS = {
   toothContinuitySupportWeightFloor: 0.34,
   toothContinuityContributionFloor: 0.58,
   toothBandValidityTroughExpandScale: 1.12,
+  toothBoundarySigmaShrinkScale: 0.66,
+  residualMiddleLeakProtectScale: 0.52,
+  weakValidatedMiddleAccumContributionScale: 0.34,
   toothBandRetentionProtectFloor: 0.28,
   toothBandRetentionParticipationLow: 0.10,
   toothBandRetentionParticipationHigh: 1.35,
@@ -1143,6 +1188,12 @@ void main() {
       1.0,
       toothBandPeakValidityGuard
     );
+  float weakToothDensePeakGate =
+    toothBandPrior *
+    dominantDensePeakGate *
+    smoothstep(0.06, 0.18, rawSupportDensity) *
+    (1.0 - toothBandPeakValidityGuard) *
+    (1.0 - smoothstep(0.18, 0.40, toothBandStructureGuard));
   float ambiguousBroadSupportPenaltyGate =
     broadSupportGate *
     secondPeakComparableGate *
@@ -1209,6 +1260,55 @@ void main() {
   float protectedBroadWeakSupportGate =
     broadWeakSupportGate *
     (1.0 - toothBandStructureGuard * 0.58);
+  float toothBoundaryAmbiguityGate =
+    toothBandStructureGuard *
+    peakHuSupportGate *
+    smoothstep(
+      ${GPU_SUPPORT_MODEL_PARAMS.toothBoundaryDensityLow.toFixed(2)},
+      ${GPU_SUPPORT_MODEL_PARAMS.toothBoundaryDensityHigh.toFixed(2)},
+      rawSupportDensity
+    ) *
+    smoothstep(
+      ${GPU_SUPPORT_MODEL_PARAMS.toothBoundarySecondPeakRatioLow.toFixed(2)},
+      ${GPU_SUPPORT_MODEL_PARAMS.toothBoundarySecondPeakRatioHigh.toFixed(2)},
+      secondPeakRatio
+    ) *
+    broadSupportGate *
+    (1.0 - smoothstep(0.22, 0.48, peakDominance));
+  float toothBoundaryMidpointGate =
+    toothBoundaryAmbiguityGate *
+    smoothstep(
+      max(nativeSlabPitchMm * 1.4, 0.22),
+      max(uSlabHalfMm * 0.26, nativeSlabPitchMm * 2.4),
+      peakSeparationMm
+    );
+  supportCenterMm = mix(
+    supportCenterMm,
+    0.5 * (top1OffsetMm + top2OffsetMm),
+    toothBoundaryMidpointGate *
+      ${GPU_SUPPORT_MODEL_PARAMS.toothBoundaryMidpointBlendScale.toFixed(2)}
+  );
+  supportSpreadMm = mix(
+    supportSpreadMm,
+    max(
+      nativeSlabPitchMm * 0.82,
+      supportSpreadMm *
+        ${GPU_SUPPORT_MODEL_PARAMS.toothBoundarySpreadShrinkScale.toFixed(2)}
+    ),
+    toothBoundaryAmbiguityGate
+  );
+  supportSpreadMm = mix(
+    supportSpreadMm,
+    min(
+      supportSpreadMm,
+      max(
+        nativeSlabPitchMm * 0.78,
+        peakSeparationMm *
+          ${GPU_SUPPORT_MODEL_PARAMS.toothBoundaryMidpointSpreadScale.toFixed(2)}
+      )
+    ),
+    toothBoundaryMidpointGate
+  );
   float peakDominanceValidityGate =
     smoothstep(
       ${GPU_SUPPORT_MODEL_PARAMS.peakDominanceValidityLow.toFixed(2)},
@@ -1258,9 +1358,20 @@ void main() {
     ${GPU_SUPPORT_MODEL_PARAMS.nonToothDominantValidityPenaltyFloor.toFixed(2)},
     nonToothDominantPeakGate
   );
+  supportValidity *= mix(
+    1.0,
+    ${GPU_SUPPORT_MODEL_PARAMS.weakToothDensePeakValidityPenaltyFloor.toFixed(2)},
+    weakToothDensePeakGate
+  );
   supportValidity = max(
     supportValidity,
     toothBandStructureGuard * mix(0.22, 0.34, 1.0 - broadSupportGate)
+  );
+  supportValidity = max(
+    supportValidity,
+    max(toothBoundaryAmbiguityGate, toothBoundaryMidpointGate) *
+      toothBandStructureGuard *
+      ${GPU_SUPPORT_MODEL_PARAMS.toothBoundaryValidityFloor.toFixed(2)}
   );
   float supportDensity =
     rawSupportDensity *
@@ -1277,6 +1388,11 @@ void main() {
     1.0,
     ${GPU_SUPPORT_MODEL_PARAMS.nonToothDominantDensityPenaltyFloor.toFixed(2)},
     nonToothDominantPeakGate
+  );
+  supportDensity *= mix(
+    1.0,
+    ${GPU_SUPPORT_MODEL_PARAMS.weakToothDensePeakDensityPenaltyFloor.toFixed(2)},
+    weakToothDensePeakGate
   );
   supportDensity = max(
     supportDensity,
@@ -2083,6 +2199,24 @@ void main() {
     ),
     broadWeakToothBandGate
   );
+  float toothBoundaryRefineGate =
+    toothBandPrior *
+    smoothstep(0.08, 0.22, supportConfidence) *
+    smoothstep(0.10, 0.24, supportDensity) *
+    (1.0 - smoothstep(0.24, 0.48, supportDensity)) *
+    smoothstep(
+      max(nativeSlabPitchMm * 1.8, 0.38),
+      max(uSlabHalfMm * 0.34, nativeSlabPitchMm * 3.0),
+      supportSpreadMm
+    );
+  supportSigmaMm = mix(
+    supportSigmaMm,
+    max(
+      nativeSlabPitchMm * 0.64,
+      supportSigmaMm * ${GPU_DRR_MODEL_PARAMS.toothBoundarySigmaShrinkScale.toFixed(3)}
+    ),
+    toothBoundaryRefineGate
+  );
   float sigmaSlabFloor = max(
     uSlabHalfMm * 0.18,
     nativeSlabPitchMm * 1.4
@@ -2293,6 +2427,22 @@ void main() {
       smoothstep(0.05, 0.18, supportDensity) *
       smoothstep(0.006, 0.060, supportConfidence) *
       (1.0 - smoothstep(0.42, 0.90, normalizedSupportDistance));
+    float residualToothNearTroughProtect =
+      middleBandCoreGate *
+      smoothstep(0.06, 0.14, supportConfidence) *
+      smoothstep(0.02, 0.08, supportDensity) *
+      (1.0 - smoothstep(0.12, 0.30, supportDensity)) *
+      (1.0 - smoothstep(0.50, 0.92, normalizedSupportDistance));
+    float weakValidatedMiddleAccumGate =
+      middleBandCoreGate *
+      (1.0 - dominantToothBandGate) *
+      (1.0 - toothContinuityAdmissionGate * 0.88) *
+      smoothstep(0.04, 0.14, supportConfidence) *
+      (1.0 - smoothstep(0.12, 0.24, supportConfidence)) *
+      smoothstep(0.04, 0.12, supportDensity) *
+      (1.0 - smoothstep(0.12, 0.24, supportDensity)) *
+      (1.0 - smoothstep(0.42, 0.86, normalizedSupportDistance)) *
+      (1.0 - smoothstep(0.012, 0.050, lowerPenalty));
     float middleBandLeakAdmissionGate =
       middleBandCoreGate *
       toothBandLeakRisk *
@@ -2305,6 +2455,10 @@ void main() {
       ${GPU_DRR_MODEL_PARAMS.focusedBalancedMiddleLeakProtectScale.toFixed(3)};
     middleBandLeakAdmissionGate *=
       1.0 - softTrueToothNearTroughProtect * 0.32;
+    middleBandLeakAdmissionGate *=
+      1.0 -
+      residualToothNearTroughProtect *
+      ${GPU_DRR_MODEL_PARAMS.residualMiddleLeakProtectScale.toFixed(3)};
     float hardOffTroughMiddleLeakGate =
       middleBandLeakAdmissionGate *
       (1.0 - smoothstep(0.18, 0.44, toothStructureSupport)) *
@@ -2317,6 +2471,8 @@ void main() {
       (1.0 - smoothstep(0.010, 0.060, supportConfidence));
     hardOffTroughMiddleLeakGate *=
       1.0 - softTrueToothNearTroughProtect * 0.72;
+    hardOffTroughMiddleLeakGate *=
+      1.0 - residualToothNearTroughProtect * 0.72;
     float toothBandLeakContributionFloor = mix(
       ${GPU_DRR_MODEL_PARAMS.middleBandLeakContributionScale.toFixed(3)},
       0.380,
@@ -2351,6 +2507,11 @@ void main() {
       1.0,
       ${GPU_DRR_MODEL_PARAMS.hardOffTroughLeakExtraScale.toFixed(3)},
       hardOffTroughMiddleLeakGate
+    );
+    preReductionContributionScale *= mix(
+      1.0,
+      ${GPU_DRR_MODEL_PARAMS.weakValidatedMiddleAccumContributionScale.toFixed(3)},
+      weakValidatedMiddleAccumGate
     );
     preReductionContributionScale = mix(
       preReductionContributionScale,
@@ -3397,6 +3558,16 @@ function buildSupportSigmaMap(
         ) *
         (1 - smoothstepNumber(0.10, 0.26, supportDensity)) *
         (1 - smoothstepNumber(0.02, 0.10, supportConfidence));
+      const toothBoundaryRefineGate =
+        toothBandPrior *
+        smoothstepNumber(0.08, 0.22, supportConfidence) *
+        smoothstepNumber(0.10, 0.24, supportDensity) *
+        (1 - smoothstepNumber(0.24, 0.48, supportDensity)) *
+        smoothstepNumber(
+          Math.max(nativePitchMm * 1.8, 0.38),
+          Math.max(slabHalfThicknessMm * 0.34, nativePitchMm * 3.0),
+          supportSpreadMm
+        );
       supportSigmaMm = mixNumber(
         supportSigmaMm,
         Math.max(
@@ -3412,6 +3583,14 @@ function buildSupportSigmaMap(
           supportSigmaMm * GPU_DRR_MODEL_PARAMS.broadWeakSigmaShrinkScale
         ),
         broadWeakToothBandGate
+      );
+      supportSigmaMm = mixNumber(
+        supportSigmaMm,
+        Math.max(
+          nativePitchMm * 0.64,
+          supportSigmaMm * GPU_DRR_MODEL_PARAMS.toothBoundarySigmaShrinkScale
+        ),
+        toothBoundaryRefineGate
       );
       supportSigmaMap[index] = Math.max(
         Math.max(slabHalfThicknessMm * 0.18, nativePitchMm * 1.4),
@@ -3703,14 +3882,43 @@ function buildMiddleBandLeakMap(
     const broadSupportGate = smoothstepNumber(0.30, 0.80, supportSpreadMm);
     const lowPenaltyGate = 1.0 - smoothstepNumber(0.008, 0.040, lowerPenalty);
     const preToneGate = smoothstepNumber(preToneLeakLow, preToneLeakHigh, preToneAccumulation);
-    middleBandLeakMap[i] =
+    const dominantToothBandGate =
+      middleBandGate *
+      smoothstepNumber(0.08, 0.24, supportDensity) *
+      smoothstepNumber(0.02, 0.12, supportConfidence);
+    const toothContinuityApproxGate =
+      middleBandGate *
+      smoothstepNumber(0.06, 0.20, supportDensity) *
+      smoothstepNumber(0.02, 0.10, supportConfidence) *
+      (1 - smoothstepNumber(0.46, 0.92, supportSpreadMm));
+    const residualToothNearTroughProtect =
+      middleBandGate *
+      smoothstepNumber(0.06, 0.14, supportConfidence) *
+      smoothstepNumber(0.02, 0.08, supportDensity) *
+      (1 - smoothstepNumber(0.12, 0.30, supportDensity)) *
+      (1 - smoothstepNumber(0.50, 0.92, supportSpreadMm));
+    const diffuseLeakProxy =
       middleBandGate *
       retainedSampleMask *
       weakSupportGate *
       lowDensityGate *
       broadSupportGate *
       lowPenaltyGate *
-      Math.max(preToneGate, retainedSampleMask * 0.35);
+      Math.max(preToneGate, retainedSampleMask * 0.35) *
+      (1 - residualToothNearTroughProtect * GPU_DRR_MODEL_PARAMS.residualMiddleLeakProtectScale);
+    const weakValidatedMiddleAccumProxy =
+      middleBandGate *
+      retainedSampleMask *
+      (1 - dominantToothBandGate) *
+      (1 - toothContinuityApproxGate * 0.88) *
+      smoothstepNumber(0.04, 0.14, supportConfidence) *
+      (1 - smoothstepNumber(0.12, 0.24, supportConfidence)) *
+      smoothstepNumber(0.04, 0.12, supportDensity) *
+      (1 - smoothstepNumber(0.12, 0.24, supportDensity)) *
+      (1 - smoothstepNumber(0.42, 0.86, supportSpreadMm)) *
+      lowPenaltyGate *
+      Math.max(preToneGate, retainedSampleMask * 0.22);
+    middleBandLeakMap[i] = Math.max(diffuseLeakProxy, weakValidatedMiddleAccumProxy);
   }
 
   return middleBandLeakMap;
@@ -4139,6 +4347,7 @@ function buildSupportFormationDebugMaps(params: {
   rawSupportDensityMap: Float32Array;
   rawSupportPeakDominanceMap: Float32Array;
   rawSupportSecondPeakRatioMap: Float32Array;
+  rawSupportPeakSeparationMap: Float32Array;
   rawSupportPeakAmbiguityMap: Float32Array;
   rawSupportDenseFractionMap: Float32Array;
   rawSupportPeakHuSupportGateMap: Float32Array;
@@ -4154,6 +4363,7 @@ function buildSupportFormationDebugMaps(params: {
     rawSupportDensityMap,
     rawSupportPeakDominanceMap,
     rawSupportSecondPeakRatioMap,
+    rawSupportPeakSeparationMap,
     rawSupportPeakAmbiguityMap,
     rawSupportDenseFractionMap,
     rawSupportPeakHuSupportGateMap,
@@ -4169,6 +4379,7 @@ function buildSupportFormationDebugMaps(params: {
     rawSupportDensityMap.length,
     rawSupportPeakDominanceMap.length,
     rawSupportSecondPeakRatioMap.length,
+    rawSupportPeakSeparationMap.length,
     rawSupportPeakAmbiguityMap.length,
     rawSupportDenseFractionMap.length,
     rawSupportPeakHuSupportGateMap.length,
@@ -4208,6 +4419,7 @@ function buildSupportFormationDebugMaps(params: {
     const supportConfidence = clampNumber(Number(supportConfidenceMap[i]) || 0, 0, 1);
     const peakDominance = clampNumber(Number(rawSupportPeakDominanceMap[i]) || 0, 0, 1);
     const secondPeakRatio = clampNumber(Number(rawSupportSecondPeakRatioMap[i]) || 0, 0, 1);
+    const peakSeparationMm = Math.max(0, Number(rawSupportPeakSeparationMap[i]) || 0);
     const peakAmbiguity = clampNumber(Number(rawSupportPeakAmbiguityMap[i]) || 0, 0, 1);
     const denseSupportFraction = clampNumber(Number(rawSupportDenseFractionMap[i]) || 0, 0, 1);
     const peakHuSupportGate = clampNumber(Number(rawSupportPeakHuSupportGateMap[i]) || 0, 0, 1);
@@ -4294,6 +4506,12 @@ function buildSupportFormationDebugMaps(params: {
         1,
         toothBandPeakValidityGuard
       );
+    const weakToothDensePeakGate =
+      toothBandPrior *
+      dominantDensePeakGate *
+      smoothstepNumber(0.06, 0.18, rawSupportDensity) *
+      (1 - toothBandPeakValidityGuard) *
+      (1 - smoothstepNumber(0.18, 0.40, toothBandStructureGuard));
     dominantDensePeakGateMap[i] = clampNumber(guardedDominantDensePeakGate, 0, 1);
 
     const ambiguousBroadSupportPenaltyGate =
@@ -4374,6 +4592,28 @@ function buildSupportFormationDebugMaps(params: {
     peakStructureValidityMap[i] = clampNumber(peakStructureValidity, 0, 1);
     const nonToothDominantPeakGate =
       dominantDensePeakGate * (1 - toothBandPeakValidityGuard);
+    const toothBoundaryAmbiguityGate =
+      toothBandStructureGuard *
+      peakHuSupportGate *
+      smoothstepNumber(
+        GPU_SUPPORT_MODEL_PARAMS.toothBoundaryDensityLow,
+        GPU_SUPPORT_MODEL_PARAMS.toothBoundaryDensityHigh,
+        rawSupportDensity
+      ) *
+      smoothstepNumber(
+        GPU_SUPPORT_MODEL_PARAMS.toothBoundarySecondPeakRatioLow,
+        GPU_SUPPORT_MODEL_PARAMS.toothBoundarySecondPeakRatioHigh,
+        secondPeakRatio
+      ) *
+      broadSupportGate *
+      (1 - smoothstepNumber(0.22, 0.48, peakDominance));
+    const toothBoundaryMidpointGate =
+      toothBoundaryAmbiguityGate *
+      smoothstepNumber(
+        Math.max(nativePitchMm * 1.4, 0.22),
+        Math.max(slabHalfThicknessMm * 0.26, nativePitchMm * 2.4),
+        peakSeparationMm
+      );
 
     let supportValidity =
       structuralSupportGate *
@@ -4395,9 +4635,20 @@ function buildSupportFormationDebugMaps(params: {
       GPU_SUPPORT_MODEL_PARAMS.nonToothDominantValidityPenaltyFloor,
       nonToothDominantPeakGate
     );
+    supportValidity *= mixNumber(
+      1,
+      GPU_SUPPORT_MODEL_PARAMS.weakToothDensePeakValidityPenaltyFloor,
+      weakToothDensePeakGate
+    );
     supportValidity = Math.max(
       supportValidity,
       toothBandStructureGuard * mixNumber(0.22, 0.34, 1 - broadSupportGate)
+    );
+    supportValidity = Math.max(
+      supportValidity,
+      Math.max(toothBoundaryAmbiguityGate, toothBoundaryMidpointGate) *
+        toothBandStructureGuard *
+        GPU_SUPPORT_MODEL_PARAMS.toothBoundaryValidityFloor
     );
     supportValidityMap[i] = clampNumber(supportValidity, 0, 1);
 
@@ -6031,6 +6282,7 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
       rawSupportDensityMap: rawSupportReadback.channel3,
       rawSupportPeakDominanceMap: rawSupportPeakDebugReadback.channel0,
       rawSupportSecondPeakRatioMap: rawSupportPeakDebugReadback.channel1,
+      rawSupportPeakSeparationMap: rawSupportPeakDebugReadback.channel2,
       rawSupportPeakAmbiguityMap: rawSupportPeakDebugReadback.channel3,
       rawSupportDenseFractionMap: supportModelDiagnosticReadback.channel0,
       rawSupportPeakHuSupportGateMap: supportModelDiagnosticReadback.channel1,
@@ -6046,6 +6298,7 @@ export function renderPanoGpu(input: GpuPanoInput, volumeId?: string): GpuPanoRe
       rawSupportDensityMap: rawSupportReadback.channel3,
       rawSupportPeakDominanceMap: rawSupportPeakDebugReadback.channel0,
       rawSupportSecondPeakRatioMap: rawSupportPeakDebugReadback.channel1,
+      rawSupportPeakSeparationMap: rawSupportPeakDebugReadback.channel2,
       rawSupportPeakAmbiguityMap: rawSupportPeakDebugReadback.channel3,
       rawSupportDenseFractionMap: supportModelDiagnosticReadback.channel0,
       rawSupportPeakHuSupportGateMap: supportModelDiagnosticReadback.channel1,

@@ -27,6 +27,12 @@ import { downloadCprDebugArtifacts } from './cprDebugArtifacts';
 import type { CPRFrame } from './cprMath';
 import { attachVtkPanoCpr } from './vtkPanoCprRenderer';
 import type { AttachedVtkPanoCpr, HostedVtkPanoReattachState } from './vtkPanoCprRenderer';
+import {
+  getPanoV2Phase0ReconstructionMode,
+  isVirtualPanoLikeCandidateMode,
+  resolvePanoDisplayedOutputMode,
+} from './panoV2OrchestratorBridge';
+import type { PanoDisplayedOutputMode, PanoReconstructionMode } from './panoV2Types';
 
 type CprPanoDisplayPath = 'vtk-reference' | 'worker-recon';
 type CprPanoReconBackend = 'gpu' | 'cpu';
@@ -42,10 +48,13 @@ const CPR_DUAL_ARCH_PROJECTION_STANDARD_MIN_WINDOW_WIDTH = 1450;
 const CPR_PANO_DISPLAY_PATH_DEFAULT: CprPanoDisplayPath = 'worker-recon';
 const CPR_PANO_RECON_BACKEND_DEFAULT: CprPanoReconBackend = 'gpu';
 const CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK = false;
-const CPR_PANO_QUALITY_FIRST_MODE = true;
+// For practical worker-recon display, prefer a fast stable pano over a long
+// retry ladder that often ends in the same emergency virtual-pano fallback.
+const CPR_PANO_QUALITY_FIRST_MODE = false;
 const CPR_PANO_ALLOW_DEGRADED_FIRST_RUN_DISPLAY = true;
 const CPR_DEBUG_EXPORT_ATTEMPT_REPORT_DEFAULT = false;
 const CPR_DEBUG_EXPORT_TOP_ATTEMPT_COUNT = 5;
+const CPR_DEBUG_FORCE_REJECTED_PANOV2_DISPLAY_DEFAULT = false;
 const CPR_DEBUG_DISPLAY_SELECTION_FOCUS_LABELS = [
   'retry-mean-broad-neutral',
   'retry-mean-balanced-medium-stronger-bias-tight-slab',
@@ -81,9 +90,8 @@ const CPR_VTK_PANO_PRESET_WINDOW_WIDTH = 3200;
 const CPR_VTK_PANO_PRESET_WINDOW_CENTER = 600;
 const CPR_PANO_GENERATION_DEBOUNCE_MS = 300;
 const CPR_PANO_MAX_DIMENSION = 4096;
-const CPR_PANO_FIXED_VERTICAL_HALF_MM = 25;
+const CPR_PANO_FIXED_VERTICAL_HALF_MM = 35;
 const CPR_WORKER_INIT_TIMEOUT_MS = 8000;
-const CPR_WORKER_STARTUP_TIMEOUT_MS = 30000;
 const CPR_WORKER_RENDER_TIMEOUT_MS = 15000;
 const CPR_WORKER_DISPOSE_TIMEOUT_MS = 3000;
 const CPR_CROSSSECTION_DEFAULT_SLAB_THICKNESS_MM = 1.5;
@@ -177,6 +185,21 @@ function shouldForceDisplayGpuCandidateEvenIfRejected(): boolean {
   );
 }
 
+function shouldForceDisplayRejectedPanoV2FusionForDebug(): boolean {
+  return (
+    readCprDebugBooleanFlag(
+      [
+        'cprForceDisplayRejectedPanoV2FusionForDebug',
+        'forceDisplayRejectedPanoV2FusionForDebug',
+      ],
+      [
+        'cpr.debug.forceDisplayRejectedPanoV2FusionForDebug',
+        'forceDisplayRejectedPanoV2FusionForDebug',
+      ]
+    ) ?? CPR_DEBUG_FORCE_REJECTED_PANOV2_DISPLAY_DEFAULT
+  );
+}
+
 type PanoDebugProbeSample = {
   imageId: string | null;
   col: number;
@@ -257,6 +280,12 @@ type PanoDebugProbeSample = {
   retainedSampleMask?: number;
   middleBandLeak?: number;
   participatingSampleCount?: number;
+  renderBranchCode?: number;
+  selectedSupportHypothesis?: number;
+  focalTroughSharpness?: number;
+  outOfTroughSuppression?: number;
+  rawProjectedAttenuation?: number;
+  finalDisplayImage?: number;
   displayedPath?: string | null;
   backend?: string | null;
   pipelineMode?: string | null;
@@ -555,6 +584,24 @@ function readPanoDebugProbeSample(
     payload.debugMaps?.participatingSampleCountMap,
     index
   );
+  const renderBranchCode = readOptionalProbeMapValue(payload.debugMaps?.renderBranchMap, index);
+  const selectedSupportHypothesis = readOptionalProbeMapValue(
+    payload.debugMaps?.selectedSupportHypothesisMap,
+    index
+  );
+  const focalTroughSharpness = readOptionalProbeMapValue(
+    payload.debugMaps?.focalTroughSharpnessMap,
+    index
+  );
+  const outOfTroughSuppression = readOptionalProbeMapValue(
+    payload.debugMaps?.outOfTroughSuppressionMap,
+    index
+  );
+  const rawProjectedAttenuation = readOptionalProbeMapValue(
+    payload.debugMaps?.rawProjectedAttenuationMap,
+    index
+  );
+  const finalDisplayImage = readOptionalProbeMapValue(payload.debugMaps?.finalDisplayImageMap, index);
   const localTransmittance =
     typeof totalAttenuation === 'number' ? Math.exp(-Math.max(totalAttenuation, 0)) : undefined;
   const holeMetricBlackClipThreshold = Math.max(
@@ -706,6 +753,12 @@ function readPanoDebugProbeSample(
     retainedSampleMask,
     middleBandLeak,
     participatingSampleCount,
+    renderBranchCode,
+    selectedSupportHypothesis,
+    focalTroughSharpness,
+    outOfTroughSuppression,
+    rawProjectedAttenuation,
+    finalDisplayImage,
     displayedPath: payload.probeContext?.displayedPath ?? null,
     backend: payload.probeContext?.backend ?? null,
     pipelineMode: payload.probeContext?.pipelineMode ?? null,
@@ -912,6 +965,12 @@ function installPanoDebugProbe(
           retainedSampleMask: sample.retainedSampleMask ?? null,
           middleBandLeak: sample.middleBandLeak ?? null,
           blackClip: sample.blackClip ?? null,
+          renderBranchCode: sample.renderBranchCode ?? null,
+          selectedSupportHypothesis: sample.selectedSupportHypothesis ?? null,
+          focalTroughSharpness: sample.focalTroughSharpness ?? null,
+          outOfTroughSuppression: sample.outOfTroughSuppression ?? null,
+          rawProjectedAttenuation: sample.rawProjectedAttenuation ?? null,
+          finalDisplayImage: sample.finalDisplayImage ?? null,
           holeMetricBlackClipped: sample.holeMetricBlackClipped ?? null,
           holeMetricLowRetained: sample.holeMetricLowRetained ?? null,
           holeMetricLowPreTone: sample.holeMetricLowPreTone ?? null,
@@ -1210,7 +1269,7 @@ function resolveWorkerDisplayRouteDiagnostic(
 function resolveDisplayedOutputModeFromWorkerResult(params: {
   routeDiagnostic: ReturnType<typeof resolveWorkerDisplayRouteDiagnostic>;
   workerDebugPayload: CPRWorkerLaunchResult['workerDebugPayload'] | null | undefined;
-}): 'legacy' | 'workerGpuPhase2' | 'virtualPanoPhase2' {
+}): PanoDisplayedOutputMode {
   const diagnostic =
     params.workerDebugPayload &&
     typeof params.workerDebugPayload === 'object' &&
@@ -1223,18 +1282,12 @@ function resolveDisplayedOutputModeFromWorkerResult(params: {
     toNonEmptyString(diagnostic?.pipelineMode) ||
     'legacy';
 
-  if (params.routeDiagnostic.backend === 'cpu' && resolvedReconstructionMode === 'virtualPano') {
-    return 'virtualPanoPhase2';
-  }
-
-  if (
-    params.routeDiagnostic.backend === 'gpu' &&
-    params.routeDiagnostic.phase2GatePassed !== false
-  ) {
-    return 'workerGpuPhase2';
-  }
-
-  return 'legacy';
+  return resolvePanoDisplayedOutputMode({
+    backend: params.routeDiagnostic.backend,
+    phase2GatePassed: params.routeDiagnostic.phase2GatePassed,
+    reconstructionMode: resolvedReconstructionMode,
+    pipelineMode: toNonEmptyString(diagnostic?.pipelineMode),
+  });
 }
 
 function logPanoDisplayRoute(params: {
@@ -1295,6 +1348,13 @@ function isHuLikeRange(minValue: number, maxValue: number): boolean {
   );
 }
 
+function resolveSyntheticCprIntensityDomainForRenderMode(
+  intensityDomain: SyntheticCprIntensityDomain,
+  renderSupportMode: string | null | undefined
+): SyntheticCprIntensityDomain {
+  return renderSupportMode === 'panoV2Fusion' ? 'native' : intensityDomain;
+}
+
 function isSeverelyCorruptedPanoOutput(summary: FloatBufferDebugSummary | null): boolean {
   if (!summary || summary.sampledCount < 100) {
     return false;
@@ -1310,6 +1370,14 @@ function isSeverelyCorruptedPanoOutput(summary: FloatBufferDebugSummary | null):
 
 function isDualArchProjectionRenderMode(renderSupportMode: string | null | undefined): boolean {
   return renderSupportMode === 'dualArchProjection' || renderSupportMode === 'archGuidedDualLayer';
+}
+
+function isNativeDisplayPanoRenderMode(renderSupportMode: string | null | undefined): boolean {
+  return renderSupportMode === 'panoV2Fusion';
+}
+
+function isRadiographVirtualPanoRenderMode(renderSupportMode: string | null | undefined): boolean {
+  return renderSupportMode === 'radiographDualHypothesis';
 }
 
 function isLikelyPoorPanoQuality(
@@ -1385,6 +1453,10 @@ function getHardRejectReason(
 
   if (isSeverelyCorruptedPanoOutput(summary)) {
     return 'severely-corrupted';
+  }
+
+  if (isRadiographVirtualPanoRenderMode(renderSupportMode)) {
+    return null;
   }
 
   if (summary.meanAbsDelta > 760) {
@@ -1601,10 +1673,10 @@ function scoreHardRejectedPanoFallback(
     summary.detailBandHorizontalEdgeMean / Math.max(1, summary.detailBandVerticalEdgeMean);
 
   let score = 0;
-  score -= Math.max(0, summary.lowerBandP50 - (isDualArchProjection ? 240 : -160)) / 45;
-  score -= Math.max(0, summary.lowerBandBrightFraction - (isDualArchProjection ? 0.78 : 0.28)) * 30;
+  score -= Math.max(0, summary.lowerBandP50 - (isDualArchProjection ? -340 : -160)) / 40;
+  score -= Math.max(0, summary.lowerBandBrightFraction - (isDualArchProjection ? 0.18 : 0.28)) * 42;
   score -= Math.max(0, summary.toothBandMean - 760) / 80;
-  score -= Math.max(0, summary.toothBandP10 - (isDualArchProjection ? 180 : 80)) / 30;
+  score -= Math.max(0, summary.toothBandP10 - (isDualArchProjection ? 140 : 80)) / 24;
   score -= Math.max(0, summary.toothBandBrightFraction - 0.24) * 26;
   score += Math.max(-6, Math.min(6, (toothBandContrastRange - 320) / 90));
   score -= Math.max(0, detailRatio - 2.8) * 3.2;
@@ -1616,6 +1688,7 @@ function scoreHardRejectedPanoFallback(
 type Phase4QualityGateCandidateSource =
   | 'worker-gpu-support-surface'
   | 'worker-cpu-virtual-pano'
+  | 'worker-cpu-virtual-panoramic-radiograph'
   | 'worker-cpu-arch-guided-synthetic'
   | 'worker-legacy';
 
@@ -1660,6 +1733,14 @@ interface Phase4QualityGateMetrics {
   fractionBelowMinus950: number | null;
   fractionAbove3000: number | null;
   renderSupportMode: string | null;
+  rendererVariant: string | null;
+  pipelineVariant: string | null;
+  renderBypass: boolean | null;
+  workerBranchSelected: boolean | null;
+  workerQcAccepted: boolean | null;
+  workerQcStage: string | null;
+  metricStage: string | null;
+  rejectReasonsStage: string | null;
   contextHuP50: number | null;
   contextBlendMean: number | null;
   contextWeightFractionMean: number | null;
@@ -1668,6 +1749,69 @@ interface Phase4QualityGateMetrics {
   lowerDetailHuP50: number | null;
   detailSampleFractionMean: number | null;
   shadowLiftMean: number | null;
+  focalSharpnessCenterThirdP50: number | null;
+  interToothValleyContrast: number | null;
+  intraToothGradationScore: number | null;
+  crownHighlightSaturationFraction: number | null;
+  occlusalDarkCapFraction: number | null;
+  offTroughEnergyTopRatio: number | null;
+  offTroughEnergyMiddleRatio: number | null;
+  offTroughEnergyBottomRatio: number | null;
+  lowerFieldSpeckleFraction: number | null;
+  lowerFieldVerticalStreakScore: number | null;
+  underRootVerticalSmearScore: number | null;
+  hypothesisSwitchFraction: number | null;
+  finalDisplayLowClipFraction: number | null;
+  finalDisplayHighClipFraction: number | null;
+  finalDisplayHistogramOccupancy: number | null;
+  rawZeroButFinalBrightFraction: number | null;
+  outsideRowsBrightnessP95: number | null;
+  gapRowsBrightnessP95: number | null;
+  bandBoundaryJumpMean: number | null;
+}
+
+type Phase4RadiographMetricStageName = 'rawProjection' | 'postSuppression' | 'finalDisplay';
+
+interface Phase4RadiographLocalizedReadout {
+  centerTeeth: {
+    focalSharpnessP50: number | null;
+    rawProjectedAttenuationP50: number | null;
+    postSuppressionP50: number | null;
+    preNormalizeCompositeP50: number | null;
+    postNormalizeDisplayP50: number | null;
+    finalDisplayP50: number | null;
+    backgroundPresentationP50: number | null;
+    hasSignalFraction: number | null;
+    contextContributionP50: number | null;
+    backgroundFillContributionP50: number | null;
+    hypothesisSwitchFraction: number | null;
+  };
+  upperCloudBand: {
+    outOfTroughSuppressionP50: number | null;
+    rawProjectedAttenuationP50: number | null;
+    postSuppressionP50: number | null;
+    preNormalizeCompositeP50: number | null;
+    postNormalizeDisplayP50: number | null;
+    finalDisplayP50: number | null;
+    backgroundPresentationP50: number | null;
+    hasSignalFraction: number | null;
+    contextContributionP50: number | null;
+    backgroundFillContributionP50: number | null;
+  };
+  lowerGranularField: {
+    outOfTroughSuppressionP50: number | null;
+    rawProjectedAttenuationP50: number | null;
+    postSuppressionP50: number | null;
+    preNormalizeCompositeP50: number | null;
+    postNormalizeDisplayP50: number | null;
+    finalDisplayP50: number | null;
+    backgroundPresentationP50: number | null;
+    hasSignalFraction: number | null;
+    contextContributionP50: number | null;
+    backgroundFillContributionP50: number | null;
+    speckleFraction: number | null;
+    verticalStreakScore: number | null;
+  };
 }
 
 interface Phase4SupportSurfaceRiskSummary {
@@ -1739,11 +1883,18 @@ interface Phase4QualityGateCandidate {
   qualityScore: number | null;
   hardRejectReason: string | null;
   workerRejectReasons: string[];
+  workerBranchSelected: boolean | null;
+  workerQcAccepted: boolean | null;
+  workerQcStage: string | null;
+  metricStage: string | null;
+  rejectReasonsStage: string | null;
   workerUsedAsOutput: boolean | null;
+  orchestratorAccepted: boolean;
   borderlineAcceptedReason: string | null;
   pass: boolean;
   rejectReasons: string[];
   metrics: Phase4QualityGateMetrics;
+  localizedReadout: Phase4RadiographLocalizedReadout | null;
   supportSurfaceRiskSummary: Phase4SupportSurfaceRiskSummary;
 }
 
@@ -1892,7 +2043,7 @@ function computePhase4BalancedMeanRecoveryBonus(params: {
     return 0;
   }
 
-  const verticalGate = 1 - smoothstepNumber(24.2, 25.2, actualVertHalfMm);
+  const verticalGate = 1 - smoothstepNumber(50.2, 52.2, actualVertHalfMm);
   const slabGate = 1 - smoothstepNumber(1.62, 1.88, slabHalfThicknessMm);
   const centerGate = 1 - smoothstepNumber(0, 0.75, Math.abs(verticalCenterOffsetMm + 4.4));
   const retainedGate = smoothstepNumber(0.72, 0.84, summary.toothBandRetainedWeightP10 ?? 0);
@@ -2284,12 +2435,154 @@ function formatPhase4FingerprintValue(value: number | null | undefined, digits =
   return rounded === null ? 'null' : String(rounded);
 }
 
+function normalizePhase4RadiographMetricStageName(
+  value: unknown
+): Phase4RadiographMetricStageName | null {
+  return value === 'rawProjection' || value === 'postSuppression' || value === 'finalDisplay'
+    ? value
+    : null;
+}
+
+function stripPhase4StagePrefix(reason: string): string {
+  const match = /^(rawProjection|postSuppression|finalDisplay):(.*)$/.exec(reason);
+  return match ? match[2] : reason;
+}
+
+function stampPhase4ReasonStage(
+  reason: string,
+  stage: Phase4RadiographMetricStageName | null
+): string {
+  const baseReason = stripPhase4StagePrefix(reason);
+  return stage ? `${stage}:${baseReason}` : baseReason;
+}
+
+function readPhase4RadiographLocalizedReadout(
+  value: unknown
+): Phase4RadiographLocalizedReadout | null {
+  const record = readPhase4DiagnosticRecord(value);
+  const centerTeeth = readPhase4DiagnosticRecord(record?.centerTeeth);
+  const upperCloudBand = readPhase4DiagnosticRecord(record?.upperCloudBand);
+  const lowerGranularField = readPhase4DiagnosticRecord(record?.lowerGranularField);
+  if (!centerTeeth && !upperCloudBand && !lowerGranularField) {
+    return null;
+  }
+
+  return {
+    centerTeeth: {
+      focalSharpnessP50: readPhase4DiagnosticNumber(centerTeeth?.focalSharpnessP50),
+      rawProjectedAttenuationP50: readPhase4DiagnosticNumber(
+        centerTeeth?.rawProjectedAttenuationP50
+      ),
+      postSuppressionP50: readPhase4DiagnosticNumber(centerTeeth?.postSuppressionP50),
+      preNormalizeCompositeP50: readPhase4DiagnosticNumber(
+        centerTeeth?.preNormalizeCompositeP50
+      ),
+      postNormalizeDisplayP50: readPhase4DiagnosticNumber(
+        centerTeeth?.postNormalizeDisplayP50
+      ),
+      finalDisplayP50: readPhase4DiagnosticNumber(centerTeeth?.finalDisplayP50),
+      backgroundPresentationP50: readPhase4DiagnosticNumber(
+        centerTeeth?.backgroundPresentationP50
+      ),
+      hasSignalFraction: readPhase4DiagnosticNumber(centerTeeth?.hasSignalFraction),
+      contextContributionP50: readPhase4DiagnosticNumber(centerTeeth?.contextContributionP50),
+      backgroundFillContributionP50: readPhase4DiagnosticNumber(
+        centerTeeth?.backgroundFillContributionP50
+      ),
+      hypothesisSwitchFraction: readPhase4DiagnosticNumber(centerTeeth?.hypothesisSwitchFraction),
+    },
+    upperCloudBand: {
+      outOfTroughSuppressionP50: readPhase4DiagnosticNumber(
+        upperCloudBand?.outOfTroughSuppressionP50
+      ),
+      rawProjectedAttenuationP50: readPhase4DiagnosticNumber(
+        upperCloudBand?.rawProjectedAttenuationP50
+      ),
+      postSuppressionP50: readPhase4DiagnosticNumber(upperCloudBand?.postSuppressionP50),
+      preNormalizeCompositeP50: readPhase4DiagnosticNumber(
+        upperCloudBand?.preNormalizeCompositeP50
+      ),
+      postNormalizeDisplayP50: readPhase4DiagnosticNumber(
+        upperCloudBand?.postNormalizeDisplayP50
+      ),
+      finalDisplayP50: readPhase4DiagnosticNumber(upperCloudBand?.finalDisplayP50),
+      backgroundPresentationP50: readPhase4DiagnosticNumber(
+        upperCloudBand?.backgroundPresentationP50
+      ),
+      hasSignalFraction: readPhase4DiagnosticNumber(upperCloudBand?.hasSignalFraction),
+      contextContributionP50: readPhase4DiagnosticNumber(upperCloudBand?.contextContributionP50),
+      backgroundFillContributionP50: readPhase4DiagnosticNumber(
+        upperCloudBand?.backgroundFillContributionP50
+      ),
+    },
+    lowerGranularField: {
+      outOfTroughSuppressionP50: readPhase4DiagnosticNumber(
+        lowerGranularField?.outOfTroughSuppressionP50
+      ),
+      rawProjectedAttenuationP50: readPhase4DiagnosticNumber(
+        lowerGranularField?.rawProjectedAttenuationP50
+      ),
+      postSuppressionP50: readPhase4DiagnosticNumber(lowerGranularField?.postSuppressionP50),
+      preNormalizeCompositeP50: readPhase4DiagnosticNumber(
+        lowerGranularField?.preNormalizeCompositeP50
+      ),
+      postNormalizeDisplayP50: readPhase4DiagnosticNumber(
+        lowerGranularField?.postNormalizeDisplayP50
+      ),
+      finalDisplayP50: readPhase4DiagnosticNumber(lowerGranularField?.finalDisplayP50),
+      backgroundPresentationP50: readPhase4DiagnosticNumber(
+        lowerGranularField?.backgroundPresentationP50
+      ),
+      hasSignalFraction: readPhase4DiagnosticNumber(lowerGranularField?.hasSignalFraction),
+      contextContributionP50: readPhase4DiagnosticNumber(
+        lowerGranularField?.contextContributionP50
+      ),
+      backgroundFillContributionP50: readPhase4DiagnosticNumber(
+        lowerGranularField?.backgroundFillContributionP50
+      ),
+      speckleFraction: readPhase4DiagnosticNumber(lowerGranularField?.speckleFraction),
+      verticalStreakScore: readPhase4DiagnosticNumber(lowerGranularField?.verticalStreakScore),
+    },
+  };
+}
+
+function resolvePhase4RadiographMetricStage(params: {
+  workerQcStage: string | null;
+  rawStage: Record<string, unknown> | null;
+  postStage: Record<string, unknown> | null;
+  finalStage: Record<string, unknown> | null;
+}): {
+  name: Phase4RadiographMetricStageName;
+  record: Record<string, unknown> | null;
+} {
+  const requestedStage = normalizePhase4RadiographMetricStageName(params.workerQcStage);
+  const stageByName: Record<Phase4RadiographMetricStageName, Record<string, unknown> | null> = {
+    rawProjection: params.rawStage,
+    postSuppression: params.postStage,
+    finalDisplay: params.finalStage,
+  };
+  if (requestedStage && stageByName[requestedStage]) {
+    return { name: requestedStage, record: stageByName[requestedStage] };
+  }
+  if (params.finalStage) {
+    return { name: 'finalDisplay', record: params.finalStage };
+  }
+  if (params.postStage) {
+    return { name: 'postSuppression', record: params.postStage };
+  }
+  return {
+    name: requestedStage ?? 'rawProjection',
+    record: params.rawStage,
+  };
+}
+
 function isPhase4LowerBandRejectReason(reason: string): boolean {
+  const baseReason = stripPhase4StagePrefix(reason);
   return (
-    reason === 'lower-band-bright-fraction-too-high' ||
-    reason === 'lower-band-p50-too-high' ||
-    reason === 'lower-band-mean-too-high' ||
-    reason === 'lower-suppression-ratio-too-high'
+    baseReason === 'lower-band-bright-fraction-too-high' ||
+    baseReason === 'lower-band-p50-too-high' ||
+    baseReason === 'lower-band-mean-too-high' ||
+    baseReason === 'lower-suppression-ratio-too-high'
   );
 }
 
@@ -2305,17 +2598,88 @@ function extractPhase4QualityGateMetrics(
   const virtualPanoPhase12 = readPhase4DiagnosticRecord(diagnostic?.virtualPanoPhase12);
   const cpuSupportSurface = readPhase4DiagnosticRecord(virtualPanoPhase12?.supportSurface);
   const virtualPanoRender = readPhase4DiagnosticRecord(diagnostic?.virtualPanoRender);
+  const outputSelection = readPhase4DiagnosticRecord(diagnostic?.outputSelection);
+  const virtualPanoRenderRawStage = readPhase4DiagnosticRecord(virtualPanoRender?.rawProjectionStage);
+  const virtualPanoRenderPostStage = readPhase4DiagnosticRecord(
+    virtualPanoRender?.postSuppressionStage
+  );
+  const virtualPanoRenderFinalStage = readPhase4DiagnosticRecord(virtualPanoRender?.finalDisplayStage);
   const supportSurface = gpuSupportSurface ?? cpuSupportSurface;
+  const renderSupportMode = toNonEmptyString(virtualPanoRender?.renderSupportMode);
+  const rendererVariant =
+    toNonEmptyString(virtualPanoRender?.rendererVariant) ??
+    toNonEmptyString(virtualPanoRender?.rendererFamilyName);
+  const pipelineVariant = toNonEmptyString(virtualPanoRender?.pipelineVariant);
+  const renderBypass = readPhase4DiagnosticBoolean(virtualPanoRender?.renderBypass);
+  const workerQcStage =
+    toNonEmptyString(outputSelection?.workerQcStage) ??
+    toNonEmptyString(virtualPanoRender?.workerQcStage);
+  const isRadiographRenderer =
+    rendererVariant === 'virtual-panoramic-radiograph' ||
+    pipelineVariant === 'virtualPanoramicRadiograph' ||
+    isRadiographVirtualPanoRenderMode(renderSupportMode);
+  const selectedRadiographStage = isRadiographRenderer
+    ? resolvePhase4RadiographMetricStage({
+        workerQcStage,
+        rawStage: virtualPanoRenderRawStage,
+        postStage: virtualPanoRenderPostStage,
+        finalStage: virtualPanoRenderFinalStage,
+      })
+    : null;
+  const selectedRadiographStageRecord = selectedRadiographStage?.record ?? null;
+  const metricStage = isRadiographRenderer ? selectedRadiographStage?.name ?? workerQcStage : null;
+  const readSelectedRadiographMetric = (key: string): number | null =>
+    readPhase4DiagnosticNumber(selectedRadiographStageRecord?.[key]);
+  const lowerBandBrightFraction = isRadiographRenderer
+    ? readSelectedRadiographMetric('lowerBandBrightFraction') ?? summary?.lowerBandBrightFraction ?? null
+    : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.lowerBandBrightFraction) ??
+      readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.lowerBandBrightFraction) ??
+      summary?.lowerBandBrightFraction ??
+      null;
+  const lowerBandP50 = isRadiographRenderer
+    ? readSelectedRadiographMetric('lowerBandP50') ?? summary?.lowerBandP50 ?? null
+    : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.lowerBandP50) ??
+      readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.lowerBandP50) ??
+      summary?.lowerBandP50 ??
+      null;
+  const toothBandMean = isRadiographRenderer
+    ? readSelectedRadiographMetric('toothBandMean') ?? summary?.toothBandMean ?? null
+    : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.toothBandMean) ??
+      readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.toothBandMean) ??
+      summary?.toothBandMean ??
+      null;
+  const toothBandP10 = isRadiographRenderer
+    ? readSelectedRadiographMetric('toothBandP10') ?? summary?.toothBandP10 ?? null
+    : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.toothBandP10) ??
+      readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.toothBandP10) ??
+      summary?.toothBandP10 ??
+      null;
+  const toothBandP90 = isRadiographRenderer
+    ? readSelectedRadiographMetric('toothBandP90') ?? summary?.toothBandP90 ?? null
+    : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.toothBandP90) ??
+      readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.toothBandP90) ??
+      summary?.toothBandP90 ??
+      null;
+  const toothBandContrastRange = isRadiographRenderer
+    ? readSelectedRadiographMetric('toothBandContrastRange') ??
+      (summary ? summary.toothBandP90 - summary.toothBandP10 : null)
+    : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.toothBandContrastRange) ??
+      readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.toothBandContrastRange) ??
+      (summary ? summary.toothBandP90 - summary.toothBandP10 : null);
+  const blackClipFraction = isRadiographRenderer
+    ? readSelectedRadiographMetric('finalDisplayLowClipFraction') ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.blackClipFraction)
+    : readPhase4DiagnosticNumber(gpuToneMap?.blackClipFraction) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.blackClipFraction);
 
   return {
     sampledCount: summary?.sampledCount ?? null,
-    lowerBandBrightFraction: summary?.lowerBandBrightFraction ?? null,
-    lowerBandP50: summary?.lowerBandP50 ?? null,
-    toothBandMean: summary?.toothBandMean ?? null,
-    toothBandP10: summary?.toothBandP10 ?? null,
-    toothBandP90: summary?.toothBandP90 ?? null,
-    toothBandContrastRange:
-      summary ? summary.toothBandP90 - summary.toothBandP10 : readPhase4DiagnosticNumber(virtualPanoRender?.toothBandContrastRange),
+    lowerBandBrightFraction,
+    lowerBandP50,
+    toothBandMean,
+    toothBandP10,
+    toothBandP90,
+    toothBandContrastRange,
     toothBandHoleFraction: summary?.toothBandHoleFraction ?? null,
     toothBandBlackClipFraction: summary?.toothBandBlackClipFraction ?? null,
     toothBandRetainedWeightP10: summary?.toothBandRetainedWeightP10 ?? null,
@@ -2328,18 +2692,33 @@ function extractPhase4QualityGateMetrics(
       readPhase4DiagnosticNumber(virtualPanoRender?.supportDepthClampFraction),
     supportDepthStdMm: readPhase4DiagnosticNumber(supportSurface?.depthStdMm),
     pathJumpP95Mm: readPhase4DiagnosticNumber(supportSurface?.pathJumpP95Mm),
-    supportConfidenceP10: readPhase4DiagnosticNumber(supportSurface?.confidenceP10),
-    supportConfidenceP50: readPhase4DiagnosticNumber(supportSurface?.confidenceP50),
-    supportConfidenceP90: readPhase4DiagnosticNumber(supportSurface?.confidenceP90),
+    supportConfidenceP10:
+      readPhase4DiagnosticNumber(supportSurface?.confidenceP10) ??
+      readPhase4DiagnosticNumber(supportSurface?.supportConfidenceP10) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.supportConfidenceP10),
+    supportConfidenceP50:
+      readPhase4DiagnosticNumber(supportSurface?.confidenceP50) ??
+      readPhase4DiagnosticNumber(supportSurface?.supportConfidenceP50) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.supportConfidenceP50),
+    supportConfidenceP90:
+      readPhase4DiagnosticNumber(supportSurface?.confidenceP90) ??
+      readPhase4DiagnosticNumber(supportSurface?.supportConfidenceP90) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.supportConfidenceP90),
     supportPathConfidenceP10:
       readPhase4DiagnosticNumber(supportSurface?.pathConfidenceP10) ??
-      readPhase4DiagnosticNumber(supportSurface?.selectedReliabilityP10),
+      readPhase4DiagnosticNumber(supportSurface?.selectedReliabilityP10) ??
+      readPhase4DiagnosticNumber(supportSurface?.supportPathConfidenceP10) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.supportPathConfidenceP10),
     supportPathConfidenceP50:
       readPhase4DiagnosticNumber(supportSurface?.pathConfidenceP50) ??
-      readPhase4DiagnosticNumber(supportSurface?.selectedReliabilityP50),
+      readPhase4DiagnosticNumber(supportSurface?.selectedReliabilityP50) ??
+      readPhase4DiagnosticNumber(supportSurface?.supportPathConfidenceP50) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.supportPathConfidenceP50),
     supportPathConfidenceP90:
       readPhase4DiagnosticNumber(supportSurface?.pathConfidenceP90) ??
-      readPhase4DiagnosticNumber(supportSurface?.selectedReliabilityP90),
+      readPhase4DiagnosticNumber(supportSurface?.selectedReliabilityP90) ??
+      readPhase4DiagnosticNumber(supportSurface?.supportPathConfidenceP90) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.supportPathConfidenceP90),
     supportUnstableColumnFraction:
       readPhase4DiagnosticNumber(supportSurface?.unstableColumnFraction) ??
       readPhase4DiagnosticNumber(supportSurface?.unreliableColumnFraction),
@@ -2350,20 +2729,44 @@ function extractPhase4QualityGateMetrics(
     supportForcedDriftFraction: readPhase4DiagnosticNumber(supportSurface?.forcedDriftFraction),
     supportBestDepthDriftP95Mm: readPhase4DiagnosticNumber(supportSurface?.bestDepthDriftP95Mm),
     supportScoreGapP50: readPhase4DiagnosticNumber(supportSurface?.scoreGapP50),
-    troughSigmaP50Mm: readPhase4DiagnosticNumber(gpuDrr?.troughSigmaP50Mm),
-    approxTroughHalfWidthP50Mm: readPhase4DiagnosticNumber(gpuDrr?.approxTroughHalfWidthP50Mm),
+    troughSigmaP50Mm:
+      readPhase4DiagnosticNumber(gpuDrr?.troughSigmaP50Mm) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.troughSigmaMm),
+    approxTroughHalfWidthP50Mm:
+      readPhase4DiagnosticNumber(gpuDrr?.approxTroughHalfWidthP50Mm) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.approxTroughHalfWidthMm),
     effectiveTroughHalfWidthP50Mm: readPhase4DiagnosticNumber(gpuDrr?.effectiveTroughHalfWidthP50Mm),
     effectiveTroughHalfWidthP90Mm: readPhase4DiagnosticNumber(gpuDrr?.effectiveTroughHalfWidthP90Mm),
-    participatingSamplesP50: readPhase4DiagnosticNumber(gpuDrr?.participatingSamplesP50),
-    participatingSamplesP90: readPhase4DiagnosticNumber(gpuDrr?.participatingSamplesP90),
-    backgroundTroughNarrowGateP50: readPhase4DiagnosticNumber(gpuDrr?.backgroundTroughNarrowGateP50),
-    backgroundTroughNarrowGateP90: readPhase4DiagnosticNumber(gpuDrr?.backgroundTroughNarrowGateP90),
-    blackClipFraction:
-      readPhase4DiagnosticNumber(gpuToneMap?.blackClipFraction) ??
-      readPhase4DiagnosticNumber(virtualPanoRender?.blackClipFraction),
+    participatingSamplesP50:
+      readPhase4DiagnosticNumber(gpuDrr?.participatingSamplesP50) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.participatingSamplesP50),
+    participatingSamplesP90:
+      readPhase4DiagnosticNumber(gpuDrr?.participatingSamplesP90) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.participatingSamplesP90),
+    backgroundTroughNarrowGateP50:
+      readPhase4DiagnosticNumber(gpuDrr?.backgroundTroughNarrowGateP50) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.backgroundTroughNarrowGateP50),
+    backgroundTroughNarrowGateP90:
+      readPhase4DiagnosticNumber(gpuDrr?.backgroundTroughNarrowGateP90) ??
+      readPhase4DiagnosticNumber(virtualPanoRender?.backgroundTroughNarrowGateP90),
+    blackClipFraction,
     fractionBelowMinus950: summary?.fractionBelowMinus950 ?? null,
     fractionAbove3000: summary?.fractionAbove3000 ?? null,
-    renderSupportMode: toNonEmptyString(virtualPanoRender?.renderSupportMode),
+    renderSupportMode,
+    rendererVariant,
+    pipelineVariant,
+    renderBypass,
+    workerBranchSelected:
+      readPhase4DiagnosticBoolean(outputSelection?.workerBranchSelected) ??
+      readPhase4DiagnosticBoolean(outputSelection?.virtualPanoSelectedForOutput),
+    workerQcAccepted:
+      readPhase4DiagnosticBoolean(outputSelection?.workerQcAccepted) ??
+      readPhase4DiagnosticBoolean(outputSelection?.virtualPanoAccepted) ??
+      readPhase4DiagnosticBoolean(virtualPanoRender?.workerQcAccepted),
+    workerQcStage,
+    metricStage,
+    rejectReasonsStage:
+      toNonEmptyString(virtualPanoRender?.rejectReasonsStage) ?? metricStage,
     contextHuP50: readPhase4DiagnosticNumber(virtualPanoRender?.contextHuP50),
     contextBlendMean: readPhase4DiagnosticNumber(virtualPanoRender?.contextBlendMean),
     contextWeightFractionMean: readPhase4DiagnosticNumber(virtualPanoRender?.contextWeightFractionMean),
@@ -2374,6 +2777,82 @@ function extractPhase4QualityGateMetrics(
     lowerDetailHuP50: readPhase4DiagnosticNumber(virtualPanoRender?.lowerDetailHuP50),
     detailSampleFractionMean: readPhase4DiagnosticNumber(virtualPanoRender?.detailSampleFractionMean),
     shadowLiftMean: readPhase4DiagnosticNumber(virtualPanoRender?.shadowLiftMean),
+    focalSharpnessCenterThirdP50: isRadiographRenderer
+      ? readSelectedRadiographMetric('focalSharpnessCenterThirdP50')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.focalSharpnessCenterThirdP50) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.focalSharpnessCenterThirdP50) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderRawStage?.focalSharpnessCenterThirdP50),
+    interToothValleyContrast: isRadiographRenderer
+      ? readSelectedRadiographMetric('interToothValleyContrast')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.interToothValleyContrast) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.interToothValleyContrast),
+    intraToothGradationScore: isRadiographRenderer
+      ? readSelectedRadiographMetric('intraToothGradationScore')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.intraToothGradationScore) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.intraToothGradationScore),
+    crownHighlightSaturationFraction: isRadiographRenderer
+      ? readSelectedRadiographMetric('crownHighlightSaturationFraction')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.crownHighlightSaturationFraction) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.crownHighlightSaturationFraction),
+    occlusalDarkCapFraction: isRadiographRenderer
+      ? readSelectedRadiographMetric('occlusalDarkCapFraction')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.occlusalDarkCapFraction) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.occlusalDarkCapFraction),
+    offTroughEnergyTopRatio: isRadiographRenderer
+      ? readSelectedRadiographMetric('offTroughEnergyTopRatio')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.offTroughEnergyTopRatio) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.offTroughEnergyTopRatio) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderRawStage?.offTroughEnergyTopRatio),
+    offTroughEnergyMiddleRatio: isRadiographRenderer
+      ? readSelectedRadiographMetric('offTroughEnergyMiddleRatio')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.offTroughEnergyMiddleRatio) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.offTroughEnergyMiddleRatio) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderRawStage?.offTroughEnergyMiddleRatio),
+    offTroughEnergyBottomRatio: isRadiographRenderer
+      ? readSelectedRadiographMetric('offTroughEnergyBottomRatio')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.offTroughEnergyBottomRatio) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.offTroughEnergyBottomRatio) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderRawStage?.offTroughEnergyBottomRatio),
+    lowerFieldSpeckleFraction: isRadiographRenderer
+      ? readSelectedRadiographMetric('lowerFieldSpeckleFraction')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.lowerFieldSpeckleFraction) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.lowerFieldSpeckleFraction),
+    lowerFieldVerticalStreakScore: isRadiographRenderer
+      ? readSelectedRadiographMetric('lowerFieldVerticalStreakScore')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.lowerFieldVerticalStreakScore) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.lowerFieldVerticalStreakScore),
+    underRootVerticalSmearScore: isRadiographRenderer
+      ? readSelectedRadiographMetric('underRootVerticalSmearScore')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.underRootVerticalSmearScore) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.underRootVerticalSmearScore),
+    hypothesisSwitchFraction: isRadiographRenderer
+      ? readSelectedRadiographMetric('hypothesisSwitchFraction')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.hypothesisSwitchFraction) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.hypothesisSwitchFraction),
+    finalDisplayLowClipFraction: isRadiographRenderer
+      ? readSelectedRadiographMetric('finalDisplayLowClipFraction')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.finalDisplayLowClipFraction) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.finalDisplayLowClipFraction),
+    finalDisplayHighClipFraction: isRadiographRenderer
+      ? readSelectedRadiographMetric('finalDisplayHighClipFraction')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.finalDisplayHighClipFraction) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.finalDisplayHighClipFraction),
+    finalDisplayHistogramOccupancy: isRadiographRenderer
+      ? readSelectedRadiographMetric('finalDisplayHistogramOccupancy')
+      : readPhase4DiagnosticNumber(virtualPanoRenderFinalStage?.finalDisplayHistogramOccupancy) ??
+        readPhase4DiagnosticNumber(virtualPanoRenderPostStage?.finalDisplayHistogramOccupancy),
+    rawZeroButFinalBrightFraction: isRadiographRenderer
+      ? readSelectedRadiographMetric('rawZeroButFinalBrightFraction')
+      : null,
+    outsideRowsBrightnessP95: isRadiographRenderer
+      ? readSelectedRadiographMetric('outsideRowsBrightnessP95')
+      : null,
+    gapRowsBrightnessP95: isRadiographRenderer
+      ? readSelectedRadiographMetric('gapRowsBrightnessP95')
+      : null,
+    bandBoundaryJumpMean: isRadiographRenderer
+      ? readSelectedRadiographMetric('bandBoundaryJumpMean')
+      : null,
   };
 }
 
@@ -2396,6 +2875,11 @@ function buildPhase4QualityGateCandidate(params: {
   const routeDiagnostic = resolveWorkerDisplayRouteDiagnostic(params.workerDebugPayload);
   const outputSelection = readPhase4DiagnosticRecord(diagnostic?.outputSelection);
   const virtualPanoRender = readPhase4DiagnosticRecord(diagnostic?.virtualPanoRender);
+  const virtualPanoRenderRawStage = readPhase4DiagnosticRecord(virtualPanoRender?.rawProjectionStage);
+  const virtualPanoRenderPostStage = readPhase4DiagnosticRecord(
+    virtualPanoRender?.postSuppressionStage
+  );
+  const virtualPanoRenderFinalStage = readPhase4DiagnosticRecord(virtualPanoRender?.finalDisplayStage);
   const requestedReconstructionMode =
     toNonEmptyString(diagnostic?.requestedReconstructionMode) ??
     toNonEmptyString(outputSelection?.requestedReconstructionMode) ??
@@ -2417,22 +2901,62 @@ function buildPhase4QualityGateCandidate(params: {
     outputSelectionRejectReasons.length > 0
       ? outputSelectionRejectReasons
       : virtualPanoRenderRejectReasons;
-  const workerUsedAsOutput =
+  const workerBranchSelected =
+    readPhase4DiagnosticBoolean(outputSelection?.workerBranchSelected) ??
+    readPhase4DiagnosticBoolean(outputSelection?.virtualPanoSelectedForOutput);
+  const workerQcAccepted =
+    readPhase4DiagnosticBoolean(outputSelection?.workerQcAccepted) ??
     readPhase4DiagnosticBoolean(outputSelection?.virtualPanoAccepted) ??
+    readPhase4DiagnosticBoolean(virtualPanoRender?.workerQcAccepted) ??
     readPhase4DiagnosticBoolean(virtualPanoRender?.usedAsOutput);
+  const workerQcStage =
+    toNonEmptyString(outputSelection?.workerQcStage) ??
+    toNonEmptyString(virtualPanoRender?.workerQcStage) ??
+    null;
+  const workerUsedAsOutput = workerQcAccepted;
   const workerAcceptedByLowerBandTolerance =
     readPhase4DiagnosticBoolean(outputSelection?.acceptedByLowerBandTolerance) === true ||
     readPhase4DiagnosticBoolean(virtualPanoRender?.acceptedByLowerBandTolerance) === true;
+  const workerAcceptedByToothBandTolerance =
+    readPhase4DiagnosticBoolean(outputSelection?.acceptedByToothBandTolerance) === true ||
+    readPhase4DiagnosticBoolean(virtualPanoRender?.acceptedByToothBandTolerance) === true;
   const metrics = extractPhase4QualityGateMetrics(params.summary, params.workerDebugPayload);
   const candidateSource: Phase4QualityGateCandidateSource =
     backend === 'gpu'
       ? 'worker-gpu-support-surface'
-      : reconstructionMode === 'virtualPano' &&
+      : isVirtualPanoLikeCandidateMode(reconstructionMode) &&
+          (metrics.rendererVariant === 'virtual-panoramic-radiograph' ||
+            metrics.pipelineVariant === 'virtualPanoramicRadiograph' ||
+            isRadiographVirtualPanoRenderMode(metrics.renderSupportMode))
+        ? 'worker-cpu-virtual-panoramic-radiograph'
+      : isVirtualPanoLikeCandidateMode(reconstructionMode) &&
           metrics.renderSupportMode === 'archGuidedDualLayer'
         ? 'worker-cpu-arch-guided-synthetic'
-        : reconstructionMode === 'virtualPano'
+        : isVirtualPanoLikeCandidateMode(reconstructionMode)
         ? 'worker-cpu-virtual-pano'
         : 'worker-legacy';
+  const radiographMetricStage = normalizePhase4RadiographMetricStageName(
+    metrics.rejectReasonsStage ?? metrics.metricStage ?? workerQcStage
+  );
+  const selectedRadiographStageRecord =
+    candidateSource === 'worker-cpu-virtual-panoramic-radiograph'
+      ? resolvePhase4RadiographMetricStage({
+          workerQcStage: radiographMetricStage,
+          rawStage: virtualPanoRenderRawStage,
+          postStage: virtualPanoRenderPostStage,
+          finalStage: virtualPanoRenderFinalStage,
+        }).record
+      : null;
+  const localizedReadout =
+    candidateSource === 'worker-cpu-virtual-panoramic-radiograph'
+      ? readPhase4RadiographLocalizedReadout(
+          selectedRadiographStageRecord?.localizedReadout ?? virtualPanoRender?.localizedReadout
+        )
+      : null;
+  const stagedWorkerRejectReasons =
+    candidateSource === 'worker-cpu-virtual-panoramic-radiograph'
+      ? workerRejectReasons.map(reason => stampPhase4ReasonStage(reason, radiographMetricStage))
+      : workerRejectReasons;
   const isDualArchProjection = isDualArchProjectionRenderMode(metrics.renderSupportMode);
   const gpuConfidenceStructurallyStable =
     candidateSource === 'worker-gpu-support-surface' &&
@@ -2454,47 +2978,82 @@ function buildPhase4QualityGateCandidate(params: {
   const dominantGpuMiddleBandLeakage =
     candidateSource === 'worker-gpu-support-surface' &&
     hasPhase4DominantMiddleBandLeakage(params.summary);
+  const workerAcceptedVirtualPanoStructurallyUsable =
+    candidateSource === 'worker-cpu-virtual-pano' &&
+    workerQcAccepted === true &&
+    (workerAcceptedByLowerBandTolerance ||
+      workerAcceptedByToothBandTolerance ||
+      (((metrics.lowerBandBrightFraction ?? Number.POSITIVE_INFINITY) <= 0.14) &&
+        ((metrics.lowerBandP50 ?? Number.POSITIVE_INFINITY) <= -300) &&
+        ((metrics.toothBandContrastRange ?? 0) >= 500) &&
+        ((metrics.toothBandBlackClipFraction ?? Number.POSITIVE_INFINITY) <= 0.12) &&
+        ((metrics.supportUnstableColumnFraction ?? Number.POSITIVE_INFINITY) <= 0.28) &&
+        ((metrics.supportAmbiguousColumnFraction ?? Number.POSITIVE_INFINITY) <= 0.68) &&
+        ((metrics.supportScoreGapP50 ?? 0) >= 0.03) &&
+        ((metrics.supportBestDepthDriftP95Mm ?? Number.POSITIVE_INFINITY) <= 1.3)));
+  const isPanoV2FusionBypassCandidate =
+    candidateSource === 'worker-cpu-virtual-pano' &&
+    metrics.rendererVariant === 'pano-v2-fusion' &&
+    metrics.renderBypass === true;
+  const effectiveHardRejectReason =
+    isPanoV2FusionBypassCandidate && params.hardRejectReason === 'tooth-band-saturation'
+      ? null
+      : params.hardRejectReason ?? null;
 
   const rejectReasons: string[] = [];
+  const addRejectReason = (reason: string): void => {
+    rejectReasons.push(
+      candidateSource === 'worker-cpu-virtual-panoramic-radiograph'
+        ? stampPhase4ReasonStage(reason, radiographMetricStage)
+        : reason
+    );
+  };
   if (!params.summary || params.summary.sampledCount < 100) {
-    rejectReasons.push('summary-unavailable');
+    addRejectReason('summary-unavailable');
   }
   if (candidateSource === 'worker-gpu-support-surface' && routeDiagnostic.phase2GatePassed === false) {
-    rejectReasons.push('gpu-phase2-gate-failed');
+    addRejectReason('gpu-phase2-gate-failed');
   }
-  if (params.hardRejectReason) {
-    rejectReasons.push(`hard-reject:${params.hardRejectReason}`);
+  if (effectiveHardRejectReason) {
+    addRejectReason(`hard-reject:${effectiveHardRejectReason}`);
   }
   if (
     candidateSource === 'worker-legacy' &&
     requestedReconstructionMode !== 'legacy' &&
     !CPR_PANO_ALLOW_REFERENCE_OR_LEGACY_FALLBACK
   ) {
-    rejectReasons.push('legacy-fallback-not-allowed');
+    addRejectReason('legacy-fallback-not-allowed');
   }
   if (
+    candidateSource !== 'worker-cpu-virtual-panoramic-radiograph' &&
     metrics.lowerBandBrightFraction !== null &&
     metrics.lowerBandBrightFraction > (isDualArchProjection ? 0.94 : 0.25)
   ) {
-    rejectReasons.push('lower-band-bright-fraction-too-high');
-  }
-  if (metrics.lowerBandP50 !== null && metrics.lowerBandP50 > (isDualArchProjection ? 420 : -100)) {
-    rejectReasons.push('lower-band-p50-too-high');
+    addRejectReason('lower-band-bright-fraction-too-high');
   }
   if (
+    candidateSource !== 'worker-cpu-virtual-panoramic-radiograph' &&
+    metrics.lowerBandP50 !== null &&
+    metrics.lowerBandP50 > (isDualArchProjection ? 420 : -100)
+  ) {
+    addRejectReason('lower-band-p50-too-high');
+  }
+  if (
+    candidateSource !== 'worker-cpu-virtual-panoramic-radiograph' &&
+    !isPanoV2FusionBypassCandidate &&
     metrics.toothBandContrastRange !== null &&
     metrics.toothBandContrastRange < (isDualArchProjection ? 120 : 150)
   ) {
-    rejectReasons.push('tooth-band-contrast-too-low');
+    addRejectReason('tooth-band-contrast-too-low');
   }
   if (
     metrics.supportDepthClampFraction !== null &&
     metrics.supportDepthClampFraction > 0.15
   ) {
-    rejectReasons.push('support-depth-clamp-fraction-too-high');
+    addRejectReason('support-depth-clamp-fraction-too-high');
   }
   if (metrics.pathJumpP95Mm !== null && metrics.pathJumpP95Mm > 1.2) {
-    rejectReasons.push('path-jump-p95-too-high');
+    addRejectReason('path-jump-p95-too-high');
   }
   if (
     candidateSource === 'worker-gpu-support-surface' &&
@@ -2502,7 +3061,7 @@ function buildPhase4QualityGateCandidate(params: {
       !gpuConfidenceStructurallyStable) ||
       (metrics.supportPathConfidenceP50 !== null && metrics.supportPathConfidenceP50 < 0.15))
   ) {
-    rejectReasons.push('support-confidence-too-low');
+    addRejectReason('support-confidence-too-low');
   }
   if (
     candidateSource === 'worker-gpu-support-surface' &&
@@ -2510,19 +3069,19 @@ function buildPhase4QualityGateCandidate(params: {
       ((params.summary?.backgroundOutlierFraction05 ?? 0) > 0.20 &&
         (params.summary?.backgroundOutlierFraction10 ?? 0) > 0.09))
   ) {
-    rejectReasons.push('background-outlier-fraction-too-high');
+    addRejectReason('background-outlier-fraction-too-high');
   }
   if (severeGpuToothBandHoles) {
-    rejectReasons.push('tooth-band-hole-fraction-too-high');
+    addRejectReason('tooth-band-hole-fraction-too-high');
   }
   if (severeGpuToothBandBlackClip) {
-    rejectReasons.push('tooth-band-black-clip-too-high');
+    addRejectReason('tooth-band-black-clip-too-high');
   }
   if (severeGpuToothBandRetentionCollapse) {
-    rejectReasons.push('tooth-band-retained-weight-collapsed');
+    addRejectReason('tooth-band-retained-weight-collapsed');
   }
   if (dominantGpuMiddleBandLeakage) {
-    rejectReasons.push('middle-band-leakage-dominant');
+    addRejectReason('middle-band-leakage-dominant');
   }
   if (
     candidateSource === 'worker-gpu-support-surface' &&
@@ -2531,24 +3090,85 @@ function buildPhase4QualityGateCandidate(params: {
       (((metrics.supportAmbiguousColumnFraction ?? 0) > 0.2) &&
         ((metrics.supportScoreGapP50 ?? 1) < 0.11)))
   ) {
-    rejectReasons.push('support-columns-unstable');
+    addRejectReason('support-columns-unstable');
   }
   if (
     candidateSource === 'worker-cpu-virtual-pano' &&
+    !isPanoV2FusionBypassCandidate &&
+    !workerAcceptedVirtualPanoStructurallyUsable &&
     (((metrics.supportUnstableColumnFraction ?? 0) > (isDualArchProjection ? 0.36 : 0.24)) ||
       ((metrics.supportLongestUnstableRunColumns ?? 0) > (isDualArchProjection ? 28 : 14)) ||
       ((metrics.supportDepthStdMm ?? 0) > (isDualArchProjection ? 1.8 : 1.3)))
   ) {
-    rejectReasons.push('virtual-support-columns-unstable');
+    addRejectReason('virtual-support-columns-unstable');
   }
   if (
     candidateSource === 'worker-cpu-virtual-pano' &&
+    !workerAcceptedVirtualPanoStructurallyUsable &&
     (((metrics.supportAmbiguousColumnFraction ?? 0) > (isDualArchProjection ? 0.62 : 0.4) &&
       (metrics.supportScoreGapP50 ?? 1) < (isDualArchProjection ? 0.05 : 0.08)) ||
       ((metrics.supportForcedDriftFraction ?? 0) > (isDualArchProjection ? 0.2 : 0.12)) ||
       ((metrics.supportBestDepthDriftP95Mm ?? 0) > (isDualArchProjection ? 2.6 : 1.8)))
   ) {
-    rejectReasons.push('virtual-support-ambiguity-too-high');
+    addRejectReason('virtual-support-ambiguity-too-high');
+  }
+  if (candidateSource === 'worker-cpu-virtual-panoramic-radiograph') {
+    if ((metrics.focalSharpnessCenterThirdP50 ?? Number.POSITIVE_INFINITY) < 0.56) {
+      addRejectReason('radiograph-focal-trough-sharpness-too-low');
+    }
+    if ((metrics.interToothValleyContrast ?? Number.POSITIVE_INFINITY) < 70) {
+      addRejectReason('radiograph-tooth-separation-too-low');
+    }
+    if ((metrics.intraToothGradationScore ?? Number.POSITIVE_INFINITY) < 52) {
+      addRejectReason('radiograph-internal-gradation-too-low');
+    }
+    if ((metrics.crownHighlightSaturationFraction ?? 0) > 0.18) {
+      addRejectReason('radiograph-crown-highlight-saturation-too-high');
+    }
+    if ((metrics.occlusalDarkCapFraction ?? 0) > 0.19) {
+      addRejectReason('radiograph-occlusal-dark-cap-too-high');
+    }
+    if ((metrics.offTroughEnergyTopRatio ?? 0) > 0.52) {
+      addRejectReason('radiograph-off-trough-top-energy-too-high');
+    }
+    if ((metrics.offTroughEnergyMiddleRatio ?? 0) > 0.38) {
+      addRejectReason('radiograph-off-trough-middle-energy-too-high');
+    }
+    if ((metrics.offTroughEnergyBottomRatio ?? 0) > 0.34) {
+      addRejectReason('radiograph-off-trough-bottom-energy-too-high');
+    }
+    if (
+      (metrics.lowerBandBrightFraction ?? 0) > 0.18 ||
+      (metrics.rawZeroButFinalBrightFraction ?? 0) > 0.04 ||
+      (metrics.outsideRowsBrightnessP95 ?? 0) > 0.15 ||
+      (metrics.gapRowsBrightnessP95 ?? 0) > 0.15
+    ) {
+      addRejectReason('radiograph-lower-field-bright-fill-too-high');
+    }
+    if ((metrics.bandBoundaryJumpMean ?? 0) > 0.14) {
+      addRejectReason('radiograph-band-boundary-jump-too-high');
+    }
+    if ((metrics.lowerFieldSpeckleFraction ?? 0) > 0.11) {
+      addRejectReason('radiograph-lower-field-speckle-too-high');
+    }
+    if ((metrics.lowerFieldVerticalStreakScore ?? 0) > 2.15) {
+      addRejectReason('radiograph-lower-field-vertical-streak-too-high');
+    }
+    if ((metrics.underRootVerticalSmearScore ?? 0) > 2.5) {
+      addRejectReason('radiograph-under-root-vertical-smear-too-high');
+    }
+    if ((metrics.hypothesisSwitchFraction ?? 0) > 0.18) {
+      addRejectReason('radiograph-hypothesis-switch-too-high');
+    }
+    if ((metrics.finalDisplayLowClipFraction ?? 0) > 0.11) {
+      addRejectReason('radiograph-final-display-low-clipping-too-high');
+    }
+    if ((metrics.finalDisplayHighClipFraction ?? 0) > 0.095) {
+      addRejectReason('radiograph-final-display-high-clipping-too-high');
+    }
+    if ((metrics.finalDisplayHistogramOccupancy ?? Number.POSITIVE_INFINITY) < 0.16) {
+      addRejectReason('radiograph-final-display-histogram-occupancy-too-low');
+    }
   }
   if (
     candidateSource === 'worker-cpu-arch-guided-synthetic' &&
@@ -2556,7 +3176,7 @@ function buildPhase4QualityGateCandidate(params: {
       ((metrics.detailSampleFractionMean ?? 0) < 0.028) ||
       ((metrics.columnSupportReliabilityP50 ?? 0) < 0.2))
   ) {
-    rejectReasons.push('arch-guided-context-coverage-too-low');
+    addRejectReason('arch-guided-context-coverage-too-low');
   }
   if (
     candidateSource === 'worker-cpu-arch-guided-synthetic' &&
@@ -2564,16 +3184,18 @@ function buildPhase4QualityGateCandidate(params: {
       ((metrics.contextHuP50 ?? -1000) < -720) ||
       ((metrics.upperDetailHuP50 ?? -1000) < 40 && (metrics.lowerDetailHuP50 ?? -1000) < 40))
   ) {
-    rejectReasons.push('arch-guided-anatomy-contrast-too-low');
+    addRejectReason('arch-guided-anatomy-contrast-too-low');
   }
-  if (!workerAcceptedByLowerBandTolerance && workerUsedAsOutput === false) {
-    rejectReasons.push(...workerRejectReasons);
+  if (!workerAcceptedByLowerBandTolerance && workerQcAccepted === false) {
+    rejectReasons.push(...stagedWorkerRejectReasons);
   }
 
   const uniqueRejectReasons = Array.from(new Set(rejectReasons));
   const lowerBandOnlyRejects =
     uniqueRejectReasons.length > 0 &&
     uniqueRejectReasons.every(reason => isPhase4LowerBandRejectReason(reason));
+  const isPanoV2FusionCandidate =
+    candidateSource === 'worker-cpu-virtual-pano' && metrics.renderSupportMode === 'panoV2Fusion';
   const severeCpuLowerBandContamination =
     candidateSource === 'worker-cpu-virtual-pano' &&
     ((metrics.lowerBandBrightFraction ?? 0) > 0.38 ||
@@ -2584,6 +3206,7 @@ function buildPhase4QualityGateCandidate(params: {
   const ambiguityOnlyBorderlineAccepted =
     candidateSource === 'worker-cpu-virtual-pano' &&
     isDualArchProjection &&
+    !isPanoV2FusionCandidate &&
     ambiguityOnlyRejects &&
     workerUsedAsOutput !== false &&
     (params.qualityScore ?? Number.NEGATIVE_INFINITY) >= 24 &&
@@ -2594,9 +3217,10 @@ function buildPhase4QualityGateCandidate(params: {
     (metrics.lowerBandBrightFraction ?? Number.POSITIVE_INFINITY) <= 0.7 &&
     (metrics.lowerBandP50 ?? Number.POSITIVE_INFINITY) <= 140;
   const borderlineAcceptedReason =
-    workerAcceptedByLowerBandTolerance
+    workerAcceptedByLowerBandTolerance && !isPanoV2FusionCandidate
       ? 'lower-band-tolerated-in-worker'
       : lowerBandOnlyRejects &&
+          !isPanoV2FusionCandidate &&
           !severeCpuLowerBandContamination &&
           (params.qualityScore ?? Number.NEGATIVE_INFINITY) >= 12 &&
           (metrics.toothBandContrastRange ?? 0) >= 150
@@ -2623,7 +3247,7 @@ function buildPhase4QualityGateCandidate(params: {
         ? params.qualityBase
         : null,
     pass,
-    hardRejectReason: params.hardRejectReason ?? null,
+    hardRejectReason: effectiveHardRejectReason,
     metrics,
     summary: params.summary,
     borderlineAcceptedReason,
@@ -2649,13 +3273,20 @@ function buildPhase4QualityGateCandidate(params: {
       typeof params.qualityScore === 'number' && Number.isFinite(params.qualityScore)
         ? params.qualityScore
         : null,
-    hardRejectReason: params.hardRejectReason ?? null,
-    workerRejectReasons,
+    hardRejectReason: effectiveHardRejectReason,
+    workerRejectReasons: stagedWorkerRejectReasons,
+    workerBranchSelected,
+    workerQcAccepted,
+    workerQcStage,
+    metricStage: metrics.metricStage,
+    rejectReasonsStage: metrics.rejectReasonsStage,
     workerUsedAsOutput,
+    orchestratorAccepted: pass,
     borderlineAcceptedReason,
     pass,
     rejectReasons: uniqueRejectReasons,
     metrics,
+    localizedReadout,
     supportSurfaceRiskSummary,
   };
 }
@@ -2676,8 +3307,13 @@ function buildPhase4SupportSurfaceRiskSummary(params: {
 }): Phase4SupportSurfaceRiskSummary {
   const riskFlags: string[] = [];
   let riskScore = 0;
+  const isRadiographCandidate =
+    params.candidateSource === 'worker-cpu-virtual-panoramic-radiograph';
+  const radiographStage = normalizePhase4RadiographMetricStageName(
+    params.metrics.rejectReasonsStage ?? params.metrics.metricStage ?? params.metrics.workerQcStage
+  );
   const usesLegacySupportPathRiskModel =
-    params.candidateSource !== 'worker-cpu-arch-guided-synthetic';
+    !isRadiographCandidate && params.candidateSource !== 'worker-cpu-arch-guided-synthetic';
   const isDualArchProjection = isDualArchProjectionRenderMode(params.metrics.renderSupportMode);
   const gpuConfidenceStructurallyStable =
     params.candidateSource === 'worker-gpu-support-surface' &&
@@ -2699,6 +3335,8 @@ function buildPhase4SupportSurfaceRiskSummary(params: {
     riskFlags.push(flag);
     riskScore += weight;
   };
+  const stageRiskFlag = (flag: string): string =>
+    isRadiographCandidate ? stampPhase4ReasonStage(flag, radiographStage) : flag;
 
   addRiskFlag(
     'support-confidence-low',
@@ -2758,135 +3396,302 @@ function buildPhase4SupportSurfaceRiskSummary(params: {
     2
   );
   addRiskFlag(
-    'background-clipped',
-    params.metrics.blackClipFraction !== null && params.metrics.blackClipFraction > 0.42,
+    stageRiskFlag('background-clipped'),
+    !isRadiographCandidate &&
+      params.metrics.blackClipFraction !== null &&
+      params.metrics.blackClipFraction > 0.42,
     2
   );
   addRiskFlag(
-    'background-leakage',
-    (backgroundOutlierFraction05 !== null && backgroundOutlierFraction05 > 0.18) ||
-      (backgroundOutlierFraction10 !== null && backgroundOutlierFraction10 > 0.08),
+    stageRiskFlag('background-leakage'),
+    !isRadiographCandidate &&
+      ((backgroundOutlierFraction05 !== null && backgroundOutlierFraction05 > 0.18) ||
+        (backgroundOutlierFraction10 !== null && backgroundOutlierFraction10 > 0.08)),
     2
   );
   addRiskFlag(
-    'lower-band-filled',
-    (params.metrics.lowerBandBrightFraction !== null &&
-      params.metrics.lowerBandBrightFraction > (isDualArchProjection ? 0.9 : 0.25)) ||
-      (params.metrics.lowerBandP50 !== null &&
-        params.metrics.lowerBandP50 > (isDualArchProjection ? 360 : -100)),
+    stageRiskFlag('lower-band-filled'),
+    !isRadiographCandidate &&
+      (((params.metrics.lowerBandBrightFraction !== null &&
+        params.metrics.lowerBandBrightFraction > (isDualArchProjection ? 0.9 : 0.25)) ||
+        (params.metrics.lowerBandP50 !== null &&
+          params.metrics.lowerBandP50 > (isDualArchProjection ? 360 : -100)))),
     2
   );
   addRiskFlag(
-    'tooth-band-contrast-low',
-    params.metrics.toothBandContrastRange !== null &&
+    stageRiskFlag('tooth-band-contrast-low'),
+    !isRadiographCandidate &&
+      params.metrics.toothBandContrastRange !== null &&
       params.metrics.toothBandContrastRange > 0 &&
       params.metrics.toothBandContrastRange < (isDualArchProjection ? 120 : 150),
     2
   );
   addRiskFlag(
-    'tooth-band-saturated',
-    params.metrics.toothBandMean !== null && params.metrics.toothBandMean > 760,
+    stageRiskFlag('tooth-band-saturated'),
+    !isRadiographCandidate &&
+      params.metrics.toothBandMean !== null &&
+      params.metrics.toothBandMean > 760,
     1
   );
   addRiskFlag(
-    'tooth-band-holes',
-    toothBandHoleFraction !== null && toothBandHoleFraction > 0.028,
+    stageRiskFlag('tooth-band-holes'),
+    !isRadiographCandidate && toothBandHoleFraction !== null && toothBandHoleFraction > 0.028,
     4
   );
   addRiskFlag(
-    'tooth-band-black-clipped',
-    toothBandBlackClipFraction !== null &&
+    stageRiskFlag('tooth-band-black-clipped'),
+    !isRadiographCandidate &&
+      toothBandBlackClipFraction !== null &&
       toothBandBlackClipFraction > CPR_TOOTH_BAND_SEVERE_BLACK_CLIP_FRACTION,
     3
   );
   addRiskFlag(
-    'tooth-band-retention-low',
-    (toothBandRetainedWeightP10 !== null &&
-      toothBandRetainedWeightP10 < CPR_TOOTH_BAND_HOLE_RETAINED_WEIGHT_MAX) ||
-      (toothBandRetainedWeightP50 !== null && toothBandRetainedWeightP50 < 0.42),
+    stageRiskFlag('tooth-band-retention-low'),
+    !isRadiographCandidate &&
+      ((toothBandRetainedWeightP10 !== null &&
+        toothBandRetainedWeightP10 < CPR_TOOTH_BAND_HOLE_RETAINED_WEIGHT_MAX) ||
+        (toothBandRetainedWeightP50 !== null && toothBandRetainedWeightP50 < 0.42)),
     2
   );
   addRiskFlag(
-    'tooth-band-retention-collapsed',
-    toothBandRetainedWeightP10 !== null &&
+    stageRiskFlag('tooth-band-retention-collapsed'),
+    !isRadiographCandidate &&
+      toothBandRetainedWeightP10 !== null &&
       toothBandRetainedWeightP10 <= CPR_TOOTH_BAND_SEVERE_RETAINED_WEIGHT_P10_MAX,
     5
   );
   addRiskFlag(
-    'middle-band-leakage-dominant',
-    hasPhase4DominantMiddleBandLeakage(params.summary),
+    stageRiskFlag('middle-band-leakage-dominant'),
+    !isRadiographCandidate && hasPhase4DominantMiddleBandLeakage(params.summary),
     3
   );
   addRiskFlag(
-    'air-suppression-weak',
-    params.metrics.fractionBelowMinus950 !== null &&
+    stageRiskFlag('air-suppression-weak'),
+    !isRadiographCandidate &&
+      params.metrics.fractionBelowMinus950 !== null &&
       params.metrics.fractionBelowMinus950 < (isDualArchProjection ? 0.005 : 0.015),
     1
   );
   addRiskFlag(
-    'upper-lower-balance-poor',
-    detailBandVerticalEdgeMean !== null &&
+    stageRiskFlag('upper-lower-balance-poor'),
+    !isRadiographCandidate &&
+      detailBandVerticalEdgeMean !== null &&
       detailBandVerticalEdgeMean > 0 &&
       detailBandHorizontalEdgeMean !== null &&
       detailBandHorizontalEdgeMean / Math.max(1, detailBandVerticalEdgeMean) > 2.8,
     1
   );
-  addRiskFlag('candidate-hard-reject', !!params.hardRejectReason, 4);
-  addRiskFlag('quality-gate-failed', !params.pass, 2);
   addRiskFlag(
-    'borderline-accepted',
+    stageRiskFlag('radiograph-focal-trough-sharpness-soft'),
+    isRadiographCandidate &&
+      (params.metrics.focalSharpnessCenterThirdP50 ?? Number.POSITIVE_INFINITY) < 0.6,
+    3
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-tooth-separation-soft'),
+    isRadiographCandidate &&
+      (params.metrics.interToothValleyContrast ?? Number.POSITIVE_INFINITY) < 78,
+    3
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-internal-gradation-soft'),
+    isRadiographCandidate &&
+      (params.metrics.intraToothGradationScore ?? Number.POSITIVE_INFINITY) < 60,
+    3
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-crown-highlights-hot'),
+    isRadiographCandidate &&
+      (params.metrics.crownHighlightSaturationFraction ?? 0) > 0.14,
+    2
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-dark-roof-over-crowns'),
+    isRadiographCandidate &&
+      (params.metrics.occlusalDarkCapFraction ?? 0) > 0.14,
+    3
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-off-trough-top-energy-high'),
+    isRadiographCandidate &&
+      (params.metrics.offTroughEnergyTopRatio ?? 0) > 0.44,
+    2
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-off-trough-middle-energy-high'),
+    isRadiographCandidate &&
+      (params.metrics.offTroughEnergyMiddleRatio ?? 0) > 0.32,
+    2
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-off-trough-bottom-energy-high'),
+    isRadiographCandidate &&
+      (params.metrics.offTroughEnergyBottomRatio ?? 0) > 0.28,
+    2
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-lower-field-grainy'),
+    isRadiographCandidate &&
+      (((params.metrics.lowerFieldSpeckleFraction ?? 0) > 0.09) ||
+        ((params.metrics.lowerFieldVerticalStreakScore ?? 0) > 1.8)),
+    3
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-under-root-smear'),
+    isRadiographCandidate &&
+      (params.metrics.underRootVerticalSmearScore ?? 0) > 2.0,
+    3
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-hypothesis-switching'),
+    isRadiographCandidate &&
+      (params.metrics.hypothesisSwitchFraction ?? 0) > 0.12,
+    2
+  );
+  addRiskFlag(
+    stageRiskFlag('radiograph-final-display-clipped'),
+    isRadiographCandidate &&
+      (((params.metrics.finalDisplayLowClipFraction ?? 0) > 0.09) ||
+        ((params.metrics.finalDisplayHighClipFraction ?? 0) > 0.08) ||
+        ((params.metrics.finalDisplayHistogramOccupancy ?? Number.POSITIVE_INFINITY) < 0.2)),
+    3
+  );
+  addRiskFlag(stageRiskFlag('candidate-hard-reject'), !!params.hardRejectReason, 4);
+  addRiskFlag(stageRiskFlag('quality-gate-failed'), !params.pass, 2);
+  addRiskFlag(
+    stageRiskFlag('borderline-accepted'),
     params.borderlineAcceptedReason !== null && !params.pass,
     1
   );
 
   const riskLevel =
     riskScore >= 9 ? 'high' : riskScore >= 6 ? 'elevated' : riskScore >= 3 ? 'moderate' : 'low';
-  const baselineFingerprint = [
-    `backend=${params.backend}`,
-    `requestedBackend=${params.requestedBackend ?? 'null'}`,
-    `reconstructionMode=${params.reconstructionMode}`,
-    `pipelineMode=${params.pipelineMode}`,
-    `candidateSource=${params.candidateSource}`,
-    `qualityBase=${formatPhase4FingerprintValue(params.qualityBase, 2)}`,
-    `qualityScore=${formatPhase4FingerprintValue(params.qualityScore, 2)}`,
-    `pass=${params.pass ? 1 : 0}`,
-    `hardReject=${params.hardRejectReason ?? 'none'}`,
-    `borderline=${params.borderlineAcceptedReason ?? 'none'}`,
-    `supportP10=${formatPhase4FingerprintValue(params.metrics.supportConfidenceP10)}`,
-    `supportP50=${formatPhase4FingerprintValue(params.metrics.supportConfidenceP50)}`,
-    `supportP90=${formatPhase4FingerprintValue(params.metrics.supportConfidenceP90)}`,
-    `supportClamp=${formatPhase4FingerprintValue(params.metrics.supportDepthClampFraction)}`,
-    `supportStd=${formatPhase4FingerprintValue(params.metrics.supportDepthStdMm)}`,
-    `pathJumpP95=${formatPhase4FingerprintValue(params.metrics.pathJumpP95Mm)}`,
-    `pathConfP50=${formatPhase4FingerprintValue(params.metrics.supportPathConfidenceP50, 4)}`,
-    `unstableCols=${formatPhase4FingerprintValue(params.metrics.supportUnstableColumnFraction, 4)}`,
-    `unstableRun=${formatPhase4FingerprintValue(params.metrics.supportLongestUnstableRunColumns, 0)}`,
-    `ambiguousCols=${formatPhase4FingerprintValue(params.metrics.supportAmbiguousColumnFraction, 4)}`,
-    `forcedDrift=${formatPhase4FingerprintValue(params.metrics.supportForcedDriftFraction, 4)}`,
-    `driftP95=${formatPhase4FingerprintValue(params.metrics.supportBestDepthDriftP95Mm)}`,
-    `scoreGapP50=${formatPhase4FingerprintValue(params.metrics.supportScoreGapP50, 4)}`,
-    `blackClip=${formatPhase4FingerprintValue(params.metrics.blackClipFraction, 4)}`,
-    `bgOutlier05=${formatPhase4FingerprintValue(params.summary?.backgroundOutlierFraction05, 4)}`,
-    `bgOutlier10=${formatPhase4FingerprintValue(params.summary?.backgroundOutlierFraction10, 4)}`,
-    `bgBand05=${params.summary?.backgroundBands?.dominantOutlierBand05 ?? 'none'}`,
-    `bgBand10=${params.summary?.backgroundBands?.dominantOutlierBand10 ?? 'none'}`,
-    `bgMid05=${formatPhase4FingerprintValue(
-      params.summary?.backgroundBands?.middle.backgroundOutlierContribution05,
-      4
-    )}`,
-    `bgMid10=${formatPhase4FingerprintValue(
-      params.summary?.backgroundBands?.middle.backgroundOutlierContribution10,
-      4
-    )}`,
-    `lowerBandBright=${formatPhase4FingerprintValue(params.metrics.lowerBandBrightFraction, 4)}`,
-    `lowerBandP50=${formatPhase4FingerprintValue(params.metrics.lowerBandP50)}`,
-    `toothContrast=${formatPhase4FingerprintValue(params.metrics.toothBandContrastRange)}`,
-    `toothHole=${formatPhase4FingerprintValue(toothBandHoleFraction, 4)}`,
-    `toothBlackClip=${formatPhase4FingerprintValue(toothBandBlackClipFraction, 4)}`,
-    `toothRetainedP10=${formatPhase4FingerprintValue(toothBandRetainedWeightP10, 4)}`,
-    `toothRetainedP50=${formatPhase4FingerprintValue(toothBandRetainedWeightP50, 4)}`,
-    `flags=${riskFlags.length ? riskFlags.join(',') : 'none'}`,
-  ].join('|');
+  const baselineFingerprint = isRadiographCandidate
+    ? [
+        `backend=${params.backend}`,
+        `requestedBackend=${params.requestedBackend ?? 'null'}`,
+        `reconstructionMode=${params.reconstructionMode}`,
+        `pipelineMode=${params.pipelineMode}`,
+        `candidateSource=${params.candidateSource}`,
+        `workerBranchSelected=${params.metrics.workerBranchSelected === null ? 'null' : params.metrics.workerBranchSelected ? 1 : 0}`,
+        `workerQcAccepted=${params.metrics.workerQcAccepted === null ? 'null' : params.metrics.workerQcAccepted ? 1 : 0}`,
+        `workerQcStage=${params.metrics.workerQcStage ?? 'null'}`,
+        `metricStage=${params.metrics.metricStage ?? 'null'}`,
+        `rejectStage=${params.metrics.rejectReasonsStage ?? 'null'}`,
+        `qualityBase=${formatPhase4FingerprintValue(params.qualityBase, 2)}`,
+        `qualityScore=${formatPhase4FingerprintValue(params.qualityScore, 2)}`,
+        `pass=${params.pass ? 1 : 0}`,
+        `hardReject=${params.hardRejectReason ?? 'none'}`,
+        `borderline=${params.borderlineAcceptedReason ?? 'none'}`,
+        `focalSharpness=${formatPhase4FingerprintValue(
+          params.metrics.focalSharpnessCenterThirdP50,
+          4
+        )}`,
+        `toothSeparation=${formatPhase4FingerprintValue(
+          params.metrics.interToothValleyContrast,
+          2
+        )}`,
+        `internalGradation=${formatPhase4FingerprintValue(
+          params.metrics.intraToothGradationScore,
+          2
+        )}`,
+        `crownHot=${formatPhase4FingerprintValue(
+          params.metrics.crownHighlightSaturationFraction,
+          4
+        )}`,
+        `darkRoof=${formatPhase4FingerprintValue(params.metrics.occlusalDarkCapFraction, 4)}`,
+        `offTroughTop=${formatPhase4FingerprintValue(params.metrics.offTroughEnergyTopRatio, 4)}`,
+        `offTroughMid=${formatPhase4FingerprintValue(
+          params.metrics.offTroughEnergyMiddleRatio,
+          4
+        )}`,
+        `offTroughBottom=${formatPhase4FingerprintValue(
+          params.metrics.offTroughEnergyBottomRatio,
+          4
+        )}`,
+        `lowerSpeckle=${formatPhase4FingerprintValue(
+          params.metrics.lowerFieldSpeckleFraction,
+          4
+        )}`,
+        `lowerStreak=${formatPhase4FingerprintValue(
+          params.metrics.lowerFieldVerticalStreakScore,
+          3
+        )}`,
+        `underRootSmear=${formatPhase4FingerprintValue(
+          params.metrics.underRootVerticalSmearScore,
+          3
+        )}`,
+        `hypothesisSwitch=${formatPhase4FingerprintValue(
+          params.metrics.hypothesisSwitchFraction,
+          4
+        )}`,
+        `lowClip=${formatPhase4FingerprintValue(
+          params.metrics.finalDisplayLowClipFraction,
+          4
+        )}`,
+        `highClip=${formatPhase4FingerprintValue(
+          params.metrics.finalDisplayHighClipFraction,
+          4
+        )}`,
+        `histOcc=${formatPhase4FingerprintValue(
+          params.metrics.finalDisplayHistogramOccupancy,
+          4
+        )}`,
+        `lowerBandBright=${formatPhase4FingerprintValue(params.metrics.lowerBandBrightFraction, 4)}`,
+        `lowerBandP50=${formatPhase4FingerprintValue(params.metrics.lowerBandP50)}`,
+        `toothContrast=${formatPhase4FingerprintValue(params.metrics.toothBandContrastRange)}`,
+        `detailP50Upper=${formatPhase4FingerprintValue(params.metrics.upperDetailHuP50)}`,
+        `detailP50Lower=${formatPhase4FingerprintValue(params.metrics.lowerDetailHuP50)}`,
+        `detailFraction=${formatPhase4FingerprintValue(params.metrics.detailSampleFractionMean, 4)}`,
+        `shadowLift=${formatPhase4FingerprintValue(params.metrics.shadowLiftMean, 4)}`,
+        `flags=${riskFlags.length ? riskFlags.join(',') : 'none'}`,
+      ].join('|')
+    : [
+        `backend=${params.backend}`,
+        `requestedBackend=${params.requestedBackend ?? 'null'}`,
+        `reconstructionMode=${params.reconstructionMode}`,
+        `pipelineMode=${params.pipelineMode}`,
+        `candidateSource=${params.candidateSource}`,
+        `qualityBase=${formatPhase4FingerprintValue(params.qualityBase, 2)}`,
+        `qualityScore=${formatPhase4FingerprintValue(params.qualityScore, 2)}`,
+        `pass=${params.pass ? 1 : 0}`,
+        `hardReject=${params.hardRejectReason ?? 'none'}`,
+        `borderline=${params.borderlineAcceptedReason ?? 'none'}`,
+        `supportP10=${formatPhase4FingerprintValue(params.metrics.supportConfidenceP10)}`,
+        `supportP50=${formatPhase4FingerprintValue(params.metrics.supportConfidenceP50)}`,
+        `supportP90=${formatPhase4FingerprintValue(params.metrics.supportConfidenceP90)}`,
+        `supportClamp=${formatPhase4FingerprintValue(params.metrics.supportDepthClampFraction)}`,
+        `supportStd=${formatPhase4FingerprintValue(params.metrics.supportDepthStdMm)}`,
+        `pathJumpP95=${formatPhase4FingerprintValue(params.metrics.pathJumpP95Mm)}`,
+        `pathConfP50=${formatPhase4FingerprintValue(params.metrics.supportPathConfidenceP50, 4)}`,
+        `unstableCols=${formatPhase4FingerprintValue(params.metrics.supportUnstableColumnFraction, 4)}`,
+        `unstableRun=${formatPhase4FingerprintValue(params.metrics.supportLongestUnstableRunColumns, 0)}`,
+        `ambiguousCols=${formatPhase4FingerprintValue(params.metrics.supportAmbiguousColumnFraction, 4)}`,
+        `forcedDrift=${formatPhase4FingerprintValue(params.metrics.supportForcedDriftFraction, 4)}`,
+        `driftP95=${formatPhase4FingerprintValue(params.metrics.supportBestDepthDriftP95Mm)}`,
+        `scoreGapP50=${formatPhase4FingerprintValue(params.metrics.supportScoreGapP50, 4)}`,
+        `blackClip=${formatPhase4FingerprintValue(params.metrics.blackClipFraction, 4)}`,
+        `bgOutlier05=${formatPhase4FingerprintValue(params.summary?.backgroundOutlierFraction05, 4)}`,
+        `bgOutlier10=${formatPhase4FingerprintValue(params.summary?.backgroundOutlierFraction10, 4)}`,
+        `bgBand05=${params.summary?.backgroundBands?.dominantOutlierBand05 ?? 'none'}`,
+        `bgBand10=${params.summary?.backgroundBands?.dominantOutlierBand10 ?? 'none'}`,
+        `bgMid05=${formatPhase4FingerprintValue(
+          params.summary?.backgroundBands?.middle.backgroundOutlierContribution05,
+          4
+        )}`,
+        `bgMid10=${formatPhase4FingerprintValue(
+          params.summary?.backgroundBands?.middle.backgroundOutlierContribution10,
+          4
+        )}`,
+        `lowerBandBright=${formatPhase4FingerprintValue(params.metrics.lowerBandBrightFraction, 4)}`,
+        `lowerBandP50=${formatPhase4FingerprintValue(params.metrics.lowerBandP50)}`,
+        `toothContrast=${formatPhase4FingerprintValue(params.metrics.toothBandContrastRange)}`,
+        `toothHole=${formatPhase4FingerprintValue(toothBandHoleFraction, 4)}`,
+        `toothBlackClip=${formatPhase4FingerprintValue(toothBandBlackClipFraction, 4)}`,
+        `toothRetainedP10=${formatPhase4FingerprintValue(toothBandRetainedWeightP10, 4)}`,
+        `toothRetainedP50=${formatPhase4FingerprintValue(toothBandRetainedWeightP50, 4)}`,
+        `flags=${riskFlags.length ? riskFlags.join(',') : 'none'}`,
+      ].join('|');
 
   return {
     riskLevel,
@@ -2957,11 +3762,18 @@ function summarizePhase4QualityGateCandidate(candidate: Phase4QualityGateCandida
     qualityScore: candidate.qualityScore,
     hardRejectReason: candidate.hardRejectReason,
     workerRejectReasons: candidate.workerRejectReasons,
+    workerBranchSelected: candidate.workerBranchSelected,
+    workerQcAccepted: candidate.workerQcAccepted,
+    workerQcStage: candidate.workerQcStage,
+    metricStage: candidate.metricStage,
+    rejectReasonsStage: candidate.rejectReasonsStage,
     workerUsedAsOutput: candidate.workerUsedAsOutput,
+    orchestratorAccepted: candidate.orchestratorAccepted,
     borderlineAcceptedReason: candidate.borderlineAcceptedReason,
     pass: candidate.pass,
     rejectReasons: candidate.rejectReasons,
     metrics: candidate.metrics,
+    localizedReadout: candidate.localizedReadout,
     supportSurfaceRiskSummary: candidate.supportSurfaceRiskSummary,
   };
 }
@@ -3031,14 +3843,23 @@ function assessPhase4DegradedPreviewCandidate(
     reason => !isPhase4LowerBandRejectReason(reason)
   );
   const isDualArchProjection = isDualArchProjectionRenderMode(candidate.metrics.renderSupportMode);
+  const allowVirtualPanoSupportInstabilityPreview =
+    candidate.hardRejectReason === 'virtual-pano-support-instability' &&
+    isVirtualPanoLikeCandidateMode(candidate.reconstructionMode) &&
+    candidate.backend === 'cpu' &&
+    (candidate.metrics.lowerBandBrightFraction ?? Number.POSITIVE_INFINITY) <= 0.18 &&
+    (candidate.metrics.lowerBandP50 ?? Number.POSITIVE_INFINITY) <= -320 &&
+    (candidate.metrics.toothBandContrastRange ?? 0) >= 500 &&
+    (candidate.metrics.toothBandP10 ?? Number.POSITIVE_INFINITY) <= 150 &&
+    (candidate.metrics.toothBandBlackClipFraction ?? Number.POSITIVE_INFINITY) <= 0.065;
 
   if ((candidate.metrics.sampledCount ?? 0) < 100) {
     catastrophicReasons.push('summary-unavailable');
   }
-  if (candidate.hardRejectReason) {
+  if (candidate.hardRejectReason && !allowVirtualPanoSupportInstabilityPreview) {
     catastrophicReasons.push(`hard-reject:${candidate.hardRejectReason}`);
   }
-  if (candidate.workerUsedAsOutput === false && nonLowerBandWorkerRejectReasons.length > 0) {
+  if (candidate.workerQcAccepted === false && nonLowerBandWorkerRejectReasons.length > 0) {
     catastrophicReasons.push(
       ...nonLowerBandWorkerRejectReasons.map(reason => `worker-reject:${reason}`)
     );
@@ -3155,6 +3976,8 @@ function summarizeFloatBufferForDebug(
   const preToneAccumulationMap = debugMaps?.preToneAccumulationMap;
   const retainedSampleMaskMap = debugMaps?.retainedSampleMaskMap;
   const middleBandLeakMap = debugMaps?.middleBandLeakMap;
+  const selectedSupportHypothesisMap = debugMaps?.selectedSupportHypothesisMap;
+  const rawProjectedAttenuationMap = debugMaps?.rawProjectedAttenuationMap;
   const backgroundToneSamples: number[] = [];
   let backgroundToneOutlierCount05 = 0;
   let backgroundToneOutlierCount10 = 0;
@@ -3220,22 +4043,110 @@ function summarizeFloatBufferForDebug(
       Number.isFinite(analysisCenterRow) && Number(analysisCenterRow) >= 0
         ? Math.max(0, Math.min(safeHeight - 1, Number(analysisCenterRow)))
         : (safeHeight - 1) / 2;
+    const isRadiographDisplayDomain =
+      (!!rawProjectedAttenuationMap || !!selectedSupportHypothesisMap) && max >= 512;
     const rowFromNormalizedOffset = (yNorm: number): number => {
       const row = Math.round(panoCenterRow + yNorm * panoCenterRow);
       return Math.max(0, Math.min(safeHeight - 1, row));
     };
-    const toothBandStartRow = Math.min(
-      rowFromNormalizedOffset(-0.35),
-      rowFromNormalizedOffset(0.55)
-    );
-    const toothBandEndRow = Math.max(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
-    const lowerBandStartRow = Math.min(
-      rowFromNormalizedOffset(0.65),
-      rowFromNormalizedOffset(1.15)
-    );
-    const lowerBandEndRow = Math.max(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
+    const deriveRadiographBandRows = ():
+      | {
+          upperRows: [number, number];
+          gapRows: [number, number];
+          lowerRows: [number, number];
+          bgTopRows: [number, number];
+          bgGapRows: [number, number];
+          bgBottomRows: [number, number];
+        }
+      | null => {
+      if (
+        !selectedSupportHypothesisMap ||
+        selectedSupportHypothesisMap.length < safeWidth * safeHeight
+      ) {
+        return null;
+      }
+      const upperCounts = new Float32Array(safeHeight);
+      const lowerCounts = new Float32Array(safeHeight);
+      for (let row = 0; row < safeHeight; row += rowStep) {
+        for (let col = 0; col < safeWidth; col += colStep) {
+          const code = Math.round(Number(selectedSupportHypothesisMap[row * safeWidth + col]) || 0);
+          if (code === 1) {
+            upperCounts[row] += 1;
+          } else if (code === 2) {
+            lowerCounts[row] += 1;
+          }
+        }
+      }
+      let upperAnchorRow = -1;
+      let lowerAnchorRow = -1;
+      let upperAnchorCount = 0;
+      let lowerAnchorCount = 0;
+      for (let row = 0; row < safeHeight; row++) {
+        if (upperCounts[row] > upperAnchorCount) {
+          upperAnchorCount = upperCounts[row];
+          upperAnchorRow = row;
+        }
+        if (lowerCounts[row] > lowerAnchorCount) {
+          lowerAnchorCount = lowerCounts[row];
+          lowerAnchorRow = row;
+        }
+      }
+      if (
+        upperAnchorRow < 0 ||
+        lowerAnchorRow < 0 ||
+        upperAnchorCount <= 0 ||
+        lowerAnchorCount <= 0 ||
+        lowerAnchorRow <= upperAnchorRow
+      ) {
+        return null;
+      }
+      const midRow = Math.round(0.5 * (upperAnchorRow + lowerAnchorRow));
+      const toothHalf = Math.max(
+        16,
+        Math.min(24, Math.round(0.35 * (lowerAnchorRow - upperAnchorRow)))
+      );
+      const gapHalf = 5;
+      return {
+        upperRows: [
+          Math.max(0, upperAnchorRow - toothHalf),
+          Math.max(0, Math.min(safeHeight - 1, midRow - gapHalf - 1)),
+        ],
+        gapRows: [
+          Math.max(0, Math.min(safeHeight - 1, midRow - gapHalf)),
+          Math.max(0, Math.min(safeHeight - 1, midRow + gapHalf)),
+        ],
+        lowerRows: [
+          Math.max(0, Math.min(safeHeight - 1, midRow + gapHalf + 1)),
+          Math.max(0, Math.min(safeHeight - 1, lowerAnchorRow + toothHalf)),
+        ],
+        bgTopRows: [0, Math.max(0, upperAnchorRow - toothHalf - 8)],
+        bgGapRows: [
+          Math.max(0, Math.min(safeHeight - 1, midRow - gapHalf + 2)),
+          Math.max(0, Math.min(safeHeight - 1, midRow + gapHalf - 2)),
+        ],
+        bgBottomRows: [
+          Math.max(0, Math.min(safeHeight - 1, lowerAnchorRow + toothHalf + 8)),
+          Math.max(0, safeHeight - 1),
+        ],
+      };
+    };
+    const radiographBandRows = isRadiographDisplayDomain ? deriveRadiographBandRows() : null;
+    const toothBandStartRow = radiographBandRows
+      ? Math.min(radiographBandRows.upperRows[0], radiographBandRows.lowerRows[0])
+      : Math.min(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
+    const toothBandEndRow = radiographBandRows
+      ? Math.max(radiographBandRows.upperRows[1], radiographBandRows.lowerRows[1])
+      : Math.max(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
+    const lowerBandStartRow = radiographBandRows
+      ? radiographBandRows.bgBottomRows[0]
+      : Math.min(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
+    const lowerBandEndRow = radiographBandRows
+      ? radiographBandRows.bgBottomRows[1]
+      : Math.max(rowFromNormalizedOffset(0.65), rowFromNormalizedOffset(1.15));
     const detailBandStartRow = Math.max(0, Math.floor(safeHeight * 0.12));
     const detailBandEndRow = Math.min(safeHeight - 1, Math.ceil(safeHeight * 0.72));
+    const toothBandBrightThreshold = isRadiographDisplayDomain ? min + (max - min) * 0.82 : 1200;
+    const lowerBandBrightThreshold = isRadiographDisplayDomain ? min + (max - min) * 0.18 : -180;
     const toothBandRowRetainedWeightSums = retainedSampleMaskMap ? new Float32Array(safeHeight) : null;
     const toothBandRowRetainedWeightCounts = retainedSampleMaskMap
       ? new Float32Array(safeHeight)
@@ -3250,7 +4161,7 @@ function summarizeFloatBufferForDebug(
     const backgroundSupportConfidenceMax = 0.03;
     const backgroundLowerPenaltyMax = 0.05;
     const backgroundParticipatingSampleCountMin = 0.5;
-    const backgroundHuMax = -300;
+    const backgroundHuMax = isRadiographDisplayDomain ? Number.POSITIVE_INFINITY : -300;
     const backgroundToneOutlierThreshold05 = 0.05;
     const backgroundToneOutlierThreshold10 = 0.1;
 
@@ -3265,7 +4176,7 @@ function summarizeFloatBufferForDebug(
         if (row >= lowerBandStartRow && row <= lowerBandEndRow) {
           lowerBandSamples.push(value);
           lowerBandCount++;
-          if (value > -180) {
+          if (value > lowerBandBrightThreshold) {
             lowerBandBrightCount++;
           }
         }
@@ -3274,7 +4185,7 @@ function summarizeFloatBufferForDebug(
           toothBandSamples.push(value);
           toothBandCount++;
           toothBandSum += value;
-          if (value > 1200) {
+          if (value > toothBandBrightThreshold) {
             toothBandBrightCount++;
           }
           const toneResponse = readOptionalProbeMapValue(toneResponseMap, index);
@@ -3340,7 +4251,42 @@ function summarizeFloatBufferForDebug(
           }
         }
 
-        if (canSampleBackgroundTone && value <= backgroundHuMax) {
+        const radiographBackgroundBandName: FloatBufferBackgroundBandName | null = radiographBandRows
+          ? row >= radiographBandRows.bgTopRows[0] && row <= radiographBandRows.bgTopRows[1]
+            ? 'top'
+            : row >= radiographBandRows.bgBottomRows[0] && row <= radiographBandRows.bgBottomRows[1]
+            ? 'bottom'
+            : row >= radiographBandRows.bgGapRows[0] && row <= radiographBandRows.bgGapRows[1]
+            ? 'middle'
+            : null
+          : null;
+        if (isRadiographDisplayDomain && toneResponseMap && radiographBackgroundBandName) {
+          const toneResponse = readOptionalProbeMapValue(toneResponseMap, index);
+          if (toneResponse !== undefined) {
+            const clampedTone = Math.max(0, Math.min(1, toneResponse));
+            backgroundToneSamples.push(clampedTone);
+            if (clampedTone > backgroundToneOutlierThreshold05) {
+              backgroundToneOutlierCount05++;
+            }
+            if (clampedTone > backgroundToneOutlierThreshold10) {
+              backgroundToneOutlierCount10++;
+            }
+            if (clampedTone > backgroundToneMax) {
+              backgroundToneMax = clampedTone;
+            }
+            const backgroundBandBucket = backgroundBandBuckets[radiographBackgroundBandName];
+            backgroundBandBucket.samples.push(clampedTone);
+            if (clampedTone > backgroundToneOutlierThreshold05) {
+              backgroundBandBucket.outlierCount05++;
+            }
+            if (clampedTone > backgroundToneOutlierThreshold10) {
+              backgroundBandBucket.outlierCount10++;
+            }
+            if (clampedTone > backgroundBandBucket.toneMax) {
+              backgroundBandBucket.toneMax = clampedTone;
+            }
+          }
+        } else if (canSampleBackgroundTone && value <= backgroundHuMax) {
           const toneResponse = readOptionalProbeMapValue(toneResponseMap, index);
           const supportConfidence = readOptionalProbeMapValue(supportConfidenceMap, index);
           if (toneResponse !== undefined && supportConfidence !== undefined) {
@@ -3863,7 +4809,8 @@ function computeAdaptivePanoVoi(
 
   const windowWidth = Math.max(1, adaptiveUpper - adaptiveLower);
   const windowCenter = adaptiveLower + windowWidth / 2;
-  const looksLikeHU = isHuLikeRange(lower, upper);
+  const looksLikeHU =
+    !isNativeDisplayPanoRenderMode(renderSupportMode) && isHuLikeRange(lower, upper);
 
   if (isDualArchProjection) {
     const dataRangeWidth =
@@ -4811,7 +5758,7 @@ function computeCPRWorkerRenderTimeoutMs(params: {
   frameCount: number;
   slabSamples: number;
   renderBackend?: 'gpu' | 'cpu';
-  reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  reconstructionMode?: PanoReconstructionMode;
   debugRunId?: string;
 }): number {
   const megaBytes = estimateCPRWorkerPayloadByteLength(params.scalarData) / (1024 * 1024);
@@ -5092,6 +6039,9 @@ function beginCPRWorkerVolumeInit(params: {
   })
     .then(() => {
       workerSession.initCompleted = true;
+      workerSession.bootstrapReady = true;
+      workerSession.bootstrapProbeFailed = false;
+      workerSession.bootstrapProbeError = undefined;
       console.log('[CPR-WORKER-INIT-ACK-JSON]', {
         sessionKey: workerSession.sessionKey,
         volumeKey: workerSession.volumeKey,
@@ -5400,39 +6350,7 @@ function createCPRWorkerSession(
     worker.removeEventListener('messageerror', handleMessageError as EventListener);
   };
   session.rejectPendingRequests = rejectPendingRequests;
-  session.bootstrapPromise = postMessageToCPRWorker<CPRWorkerBootstrapReadyMessage>(
-    session,
-    {
-      type: 'BOOTSTRAP_CHECK' as const,
-    },
-    {
-      expectedTypes: ['BOOTSTRAP_READY'],
-      timeoutMs: CPR_WORKER_STARTUP_TIMEOUT_MS,
-      retryIntervalMs: 250,
-    }
-  )
-    .then(() => {
-      session.bootstrapReady = true;
-      session.bootstrapProbeFailed = false;
-      session.bootstrapProbeError = undefined;
-    })
-    .catch(error => {
-      session.bootstrapReady = false;
-      session.bootstrapProbeFailed = true;
-      session.bootstrapProbeError =
-        error instanceof Error ? error : new Error(String(error));
-      if (!session.isTerminating) {
-        console.warn('[CPR] Worker bootstrap probe failed; continuing with direct INIT_VOLUME.', {
-          sessionKey,
-          volumeKey,
-          workerEntryUrl: session.workerEntryUrl,
-          error: session.bootstrapProbeError.message,
-          fatalWorkerError: session.fatalWorkerError?.message ?? null,
-          workerLifecycleEventCount: session.workerLifecycleEventCount,
-          workerLastLifecycleStage: session.workerLastLifecycleStage ?? null,
-        });
-      }
-    });
+  session.bootstrapPromise = Promise.resolve();
 
   return session;
 }
@@ -5920,7 +6838,7 @@ function launchCPRWorker(params: {
   rigidVerticalSliceMode?: boolean;
   debugRunId?: string;
   attemptLabel?: string;
-  reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  reconstructionMode?: PanoReconstructionMode;
   allowLegacyFallback?: boolean;
 }): Promise<CPRWorkerLaunchResult> {
   return new Promise(async (resolve, reject) => {
@@ -6123,6 +7041,51 @@ function launchCPRWorker(params: {
         voiWindowWidth: CPR_PANO_DEFAULT_WINDOW_WIDTH,
         voiWindowCenter: CPR_PANO_DEFAULT_WINDOW_CENTER,
       });
+      console.log(
+        '[CPR-NORMALIZATION-AUDIT-JSON]',
+        JSON.stringify({
+          stage: 'orchestrator-launch',
+          runId: debugRunId ?? null,
+          attemptLabel: attemptLabel ?? null,
+          sourceVolumeId: sourceVolumeId ?? null,
+          transferredBuffer: {
+            materializedNormalizedBufferBeforeWorker: false,
+            transferPayloadKind: 'raw-source-scalars',
+            scalarType,
+            rawScalarRange: {
+              min: scalarMin,
+              max: scalarMax,
+            },
+            normalizedScalarRangeBeforeWorker: null,
+            note:
+              'The main thread transfers raw source scalarData to the worker. No standalone normalized scalar buffer is materialized before worker init.',
+          },
+          normalizationPath: {
+            effectiveIsPreScaled,
+            rawIsPreScaled,
+            allowStoredValueNormalization,
+            hasUnsignedPackedArtifact,
+            hasBitDepthRangeMismatch,
+            applyModalityLut,
+            rescaleSlope,
+            rescaleIntercept,
+            bitsStored,
+            bitsAllocated,
+            highBit,
+            pixelRepresentation,
+            scalarMaxExceedsNominalBitsStoredRange:
+              scalarMax > nominalStoredMax,
+            nominalStoredMax,
+            nominalSignedMin,
+            unsignedPackedArtifactBranchCondition:
+              '!effectiveIsPreScaled && scalarData instanceof Int16Array && nominalBitsStored < 16 && pixelRepresentation === 0 && (scalarMin < -1 || scalarMax > nominalStoredMax + 8)',
+            overflowHandlingPath:
+              'useCPROrchestrator heuristics only flag and forward raw data; packed-value correction happens later inside cprScalarPolicy.resolveStoredValueNormalizationPolicy in the worker.',
+            modalityLutApplicationOrder:
+              'No modality LUT is applied on the main thread before worker transfer.',
+          },
+        })
+      );
 
       if (
         !effectiveIsPreScaled &&
@@ -7499,7 +8462,7 @@ function selectReadableVtkPanoPreset(params: {
   selected: VtkPanoPresetCandidate;
   candidates: VtkPanoPresetCandidate[];
 } {
-  const desiredVerticalHalfMm = Math.max(15, Math.min(22, params.baseVerticalHalfMm));
+  const desiredVerticalHalfMm = Math.max(15, Math.min(35, params.baseVerticalHalfMm));
   const averageProjection = params.aggregation === 'MEAN';
   const baseDesiredSlabHalfMm =
     params.minSpacing <= 0.2
@@ -7522,14 +8485,14 @@ function selectReadableVtkPanoPreset(params: {
   const rawCandidates = [
     {
       label: 'focused',
-      verticalHalfMm: Math.max(14, Math.min(20, roundToStep(desiredVerticalHalfMm - 1.5, 0.5))),
+      verticalHalfMm: Math.max(14, Math.min(33, roundToStep(desiredVerticalHalfMm - 1.5, 0.5))),
       slabHalfThicknessMm: Math.max(
         averageProjection ? 1.5 : 0.35,
         Math.min(
-          averageProjection ? 1.7 : 0.9,
+          averageProjection ? 15 : 0.9,
           roundToStep(
             averageProjection
-              ? Math.max(Math.min(baseSlabHalfMm, 1.7), Math.min(desiredSlabHalfMm, 1.7), 1.5)
+              ? Math.max(Math.min(baseSlabHalfMm, 15), Math.min(desiredSlabHalfMm, 15), 1.5)
               : Math.min(baseSlabHalfMm, desiredSlabHalfMm),
             averageProjection ? 0.1 : 0.05
           )
@@ -7537,22 +8500,22 @@ function selectReadableVtkPanoPreset(params: {
       ),
       slabSamples: toOddSampleCount(
         averageProjection
-          ? Math.max(Math.min(baseSamples, 9), Math.min(desiredSamples, 9), 9)
+          ? Math.max(Math.min(baseSamples, 41), Math.min(desiredSamples, 41), 9)
           : Math.min(baseSamples, desiredSamples),
         averageProjection ? 9 : 3,
-        averageProjection ? 9 : 11
+        averageProjection ? 41 : 11
       ),
     },
     {
       label: 'balanced',
-      verticalHalfMm: Math.max(15, Math.min(22, roundToStep(desiredVerticalHalfMm, 0.5))),
+      verticalHalfMm: Math.max(15, Math.min(35, roundToStep(desiredVerticalHalfMm, 0.5))),
       slabHalfThicknessMm: Math.max(
         averageProjection ? 1.75 : 0.5,
         Math.min(
-          averageProjection ? 2.0 : 1.4,
+          averageProjection ? 15 : 1.4,
           roundToStep(
             averageProjection
-              ? Math.max(Math.min(baseSlabHalfMm, 2.0), Math.min(desiredSlabHalfMm, 2.0), 1.75)
+              ? Math.max(Math.min(baseSlabHalfMm, 15), Math.min(desiredSlabHalfMm, 15), 1.75)
               : Math.max(desiredSlabHalfMm, Math.min(baseSlabHalfMm, 1.4)),
             averageProjection ? 0.1 : 0.05
           )
@@ -7560,26 +8523,26 @@ function selectReadableVtkPanoPreset(params: {
       ),
       slabSamples: toOddSampleCount(
         averageProjection
-          ? Math.max(Math.min(baseSamples, 11), Math.min(desiredSamples, 11), 11)
+          ? Math.max(Math.min(baseSamples, 41), Math.min(desiredSamples, 41), 11)
           : Math.max(baseSamples, desiredSamples),
         averageProjection ? 11 : 5,
-        averageProjection ? 11 : 15
+        averageProjection ? 41 : 15
       ),
     },
     {
       label: 'broad',
-      verticalHalfMm: Math.max(16, Math.min(24, roundToStep(desiredVerticalHalfMm + 2, 0.5))),
+      verticalHalfMm: Math.max(16, Math.min(37, roundToStep(desiredVerticalHalfMm + 2, 0.5))),
       slabHalfThicknessMm: Math.max(
         averageProjection ? 1.9 : 0.9,
         Math.min(
-          averageProjection ? 2.0 : 2.2,
+          averageProjection ? 15 : 2.2,
           roundToStep(
             Math.max(
               averageProjection
-                ? Math.min(baseSlabHalfMm, 2.0)
+                ? Math.min(baseSlabHalfMm, 15)
                 : baseSlabHalfMm,
               averageProjection
-                ? Math.min(desiredSlabHalfMm + 0.15, 2.0)
+                ? Math.min(desiredSlabHalfMm + 0.15, 15)
                 : desiredSlabHalfMm + 0.35
             ),
             averageProjection ? 0.1 : 0.05
@@ -7588,10 +8551,10 @@ function selectReadableVtkPanoPreset(params: {
       ),
       slabSamples: toOddSampleCount(
         averageProjection
-          ? Math.max(Math.min(baseSamples, 11), Math.min(desiredSamples + 2, 11), 11)
+          ? Math.max(Math.min(baseSamples, 41), Math.min(desiredSamples + 2, 41), 11)
           : Math.max(baseSamples, desiredSamples + 2),
         averageProjection ? 11 : 7,
-        averageProjection ? 11 : 19
+        averageProjection ? 41 : 19
       ),
     },
   ];
@@ -8491,7 +9454,7 @@ export function useCPROrchestrator({
   commandsManager,
   sourceViewportId,
   panoWidth: requestedPanoWidth = 800,
-  panoHeight: requestedPanoHeight = 400,
+  panoHeight: requestedPanoHeight = 800,
   slabHalfThicknessMm = CPR_GPU_PANO_DEFAULT_SLAB_HALF_THICKNESS_MM,
   slabSamples = CPR_GPU_PANO_DEFAULT_SLAB_SAMPLES,
   aggregation = 'MIP',
@@ -9785,7 +10748,15 @@ export function useCPROrchestrator({
           toPositiveFinite(workerInput.verticalHalfMm, baseVerticalHalfMm)
         );
         const idealPanoHeight = Math.round((actualVertHalfMm * 2) / minSpacing);
-        const finalPanoHeight = clampPanoDimension(Math.max(2, idealPanoHeight));
+        const autoDerivedPanoHeight = clampPanoDimension(Math.max(2, idealPanoHeight));
+        const finalPanoHeight = clampPanoDimension(
+          Math.max(
+            2,
+            Number.isFinite(Number(overrides.panoHeight))
+              ? Number(overrides.panoHeight)
+              : requestedPanoHeightPx
+          )
+        );
         const rowPixelSpacing = toPositiveFinite(
           (actualVertHalfMm * 2) / Math.max(1, finalPanoHeight - 1),
           minSpacing
@@ -9799,6 +10770,7 @@ export function useCPROrchestrator({
             aggregation: requestedAggregation,
             panoWidth: finalPanoWidth,
             panoHeight: finalPanoHeight,
+            autoDerivedPanoHeight,
             slabHalfThicknessMm: requestedSlabHalfThicknessMm,
             slabSamples: requestedSlabSamples,
             verticalHalfMm: actualVertHalfMm,
@@ -9807,6 +10779,19 @@ export function useCPROrchestrator({
             debugScalarSamplingMode: requestedDebugScalarSamplingMode,
           })
         );
+        if (finalPanoHeight !== autoDerivedPanoHeight) {
+          console.debug(
+            '[CPR-PANO-HEIGHT-FIX-JSON]',
+            JSON.stringify({
+              runId: debugRunId,
+              label,
+              requestedPanoHeight: requestedPanoHeightPx,
+              autoDerivedPanoHeight,
+              finalPanoHeight,
+              source: 'runWorkerAttempt-finalPanoHeight-override',
+            })
+          );
+        }
         const rawResult = await launchCPRWorker({
           ...workerInput,
           ...overrides,
@@ -9824,15 +10809,12 @@ export function useCPROrchestrator({
         const result = rawResult;
         const hasIdentityRescaleMetadata =
           Math.abs(result.rescaleSlope - 1) <= 1e-6 && Math.abs(result.rescaleIntercept) <= 1e-6;
-        const intensityDomain = classifySyntheticCprIntensityDomain({
+        const classifiedIntensityDomain = classifySyntheticCprIntensityDomain({
           modalityLutApplied: result.modalityLutApplied,
           effectiveIsPreScaled: result.effectiveIsPreScaled,
           minValue: result.minValue,
           maxValue: result.maxValue,
         });
-        const huDomain = isSyntheticCprHuDomain(intensityDomain);
-        const convertedToHu = false;
-        const rescaleSkippedAsUnsafe = intensityDomain === 'unknown';
         const summaryPixelData = reconstructPanoFloatBuffer(
           result.pixelData,
           result.slope,
@@ -9869,8 +10851,16 @@ export function useCPROrchestrator({
         });
         const supportSurfaceMetrics = extractPhase4QualityGateMetrics(summary, result.workerDebugPayload);
         const renderSupportMode = supportSurfaceMetrics.renderSupportMode;
+        const intensityDomain = resolveSyntheticCprIntensityDomainForRenderMode(
+          classifiedIntensityDomain,
+          renderSupportMode
+        );
+        const huDomain = isSyntheticCprHuDomain(intensityDomain);
+        const convertedToHu = false;
+        const rescaleSkippedAsUnsafe = intensityDomain === 'unknown';
         const isDualArchProjection = isDualArchProjectionRenderMode(renderSupportMode);
-        const workerVoi = isDualArchProjection
+        const workerVoi =
+          isDualArchProjection || isNativeDisplayPanoRenderMode(renderSupportMode)
           ? null
           : createPanoVoiFromWindowLevel(result.windowWidth, result.windowCenter);
         const adaptiveVoi = computeAdaptivePanoVoi(
@@ -9935,10 +10925,22 @@ export function useCPROrchestrator({
             ? (workerDiagnostic.scalarSampling as Record<string, unknown>)
             : null;
         const routeDiagnostic = resolveWorkerDisplayRouteDiagnostic(result.workerDebugPayload);
+        const workerOutputSelection =
+          workerDiagnostic?.outputSelection && typeof workerDiagnostic.outputSelection === 'object'
+            ? (workerDiagnostic.outputSelection as Record<string, unknown>)
+            : null;
         const resolvedReconstructionMode =
           toNonEmptyString(workerDiagnostic?.reconstructionMode) ||
           toNonEmptyString(workerDiagnostic?.pipelineMode) ||
           routeDiagnostic.pipelineMode;
+        const workerVirtualPanoAccepted =
+          readPhase4DiagnosticBoolean(workerOutputSelection?.virtualPanoAccepted) === true;
+        const workerVirtualPanoRejected =
+          readPhase4DiagnosticBoolean(workerOutputSelection?.virtualPanoRejected) === true;
+        const workerVirtualPanoAcceptedByLowerBandTolerance =
+          readPhase4DiagnosticBoolean(workerOutputSelection?.acceptedByLowerBandTolerance) === true;
+        const workerVirtualPanoAcceptedByToothBandTolerance =
+          readPhase4DiagnosticBoolean(workerOutputSelection?.acceptedByToothBandTolerance) === true;
         const phase2GatePassed =
           typeof workerGpuRenderDiagnostic?.phase2GatePassed === 'boolean'
             ? Boolean(workerGpuRenderDiagnostic.phase2GatePassed)
@@ -9976,10 +10978,10 @@ export function useCPROrchestrator({
           : 0;
         const specklePenalty = summary ? Math.max(0, summary.meanAbsDelta - 460) / 60 : 0;
         const focalTroughPenalty =
-          Math.max(0, actualVertHalfMm - 45) / 2.0 +
+          Math.max(0, actualVertHalfMm - 40) / 2.0 +
           Math.max(
             0,
-            requestedSlabHalfThicknessMm - (requestedAggregation === 'MIP' ? 0.8 : 1.8)
+            requestedSlabHalfThicknessMm - (requestedAggregation === 'MIP' ? 0.8 : 15.5)
           ) * (requestedAggregation === 'MIP' ? 5 : 1.4);
         const lowerBandFillPenalty = summary
           ? isDualArchProjection
@@ -10011,7 +11013,7 @@ export function useCPROrchestrator({
             Math.max(0, summary.detailBandHorizontalEdgeMean - 240) / 28
           : 0;
         const tallFillPenalty = summary
-          ? Math.max(0, actualVertHalfMm - 42) *
+          ? Math.max(0, actualVertHalfMm - 38) *
             Math.max(0, summary.lowerBandBrightFraction - (isDualArchProjection ? 0.82 : 0.45)) *
             (isDualArchProjection ? 10 : 28)
           : 0;
@@ -10066,6 +11068,13 @@ export function useCPROrchestrator({
             ? 30
             : 0;
         const baseHardRejectReason = getHardRejectReason(summary, renderSupportMode);
+        const isRadiographVirtualPano =
+          isVirtualPanoLikeCandidateMode(resolvedReconstructionMode) &&
+          (toNonEmptyString(supportSurfaceMetrics.rendererVariant) ===
+            'virtual-panoramic-radiograph' ||
+            toNonEmptyString(supportSurfaceMetrics.pipelineVariant) ===
+              'virtualPanoramicRadiograph' ||
+            isRadiographVirtualPanoRenderMode(renderSupportMode));
         const excessiveCenterDrift =
           actualCenterDriftMm > Math.max(4, actualVertHalfMm * 0.2) ||
           baseCenterDriftMm > Math.max(3.5, actualVertHalfMm * 0.16);
@@ -10086,7 +11095,7 @@ export function useCPROrchestrator({
               (supportSurfaceMetrics.supportAmbiguousColumnFraction !== null &&
                 supportSurfaceMetrics.supportAmbiguousColumnFraction > 0.18)));
         const unstableVirtualPanoSupportSurface =
-          resolvedReconstructionMode === 'virtualPano' &&
+          isVirtualPanoLikeCandidateMode(resolvedReconstructionMode) &&
           routeDiagnostic.backend === 'cpu' &&
           ((supportSurfaceMetrics.supportDepthStdMm !== null &&
             supportSurfaceMetrics.supportDepthStdMm > 1.3) ||
@@ -10104,6 +11113,21 @@ export function useCPROrchestrator({
               supportSurfaceMetrics.supportForcedDriftFraction > 0.12) ||
             (supportSurfaceMetrics.supportBestDepthDriftP95Mm !== null &&
               supportSurfaceMetrics.supportBestDepthDriftP95Mm > 1.8));
+        const workerAcceptedVirtualPanoStructurallyUsable =
+          isVirtualPanoLikeCandidateMode(resolvedReconstructionMode) &&
+          routeDiagnostic.backend === 'cpu' &&
+          workerVirtualPanoAccepted &&
+          !workerVirtualPanoRejected &&
+          (workerVirtualPanoAcceptedByLowerBandTolerance ||
+            workerVirtualPanoAcceptedByToothBandTolerance ||
+            ((summary?.lowerBandBrightFraction ?? Number.POSITIVE_INFINITY) <= 0.14 &&
+              (summary?.lowerBandP50 ?? Number.POSITIVE_INFINITY) <= -300 &&
+              toothBandContrastRange >= 500 &&
+              (summary?.toothBandBlackClipFraction ?? Number.POSITIVE_INFINITY) <= 0.12 &&
+              (supportSurfaceMetrics.supportUnstableColumnFraction ?? Number.POSITIVE_INFINITY) <= 0.28 &&
+              (supportSurfaceMetrics.supportAmbiguousColumnFraction ?? Number.POSITIVE_INFINITY) <= 0.68 &&
+              (supportSurfaceMetrics.supportScoreGapP50 ?? 0) >= 0.03 &&
+              (supportSurfaceMetrics.supportBestDepthDriftP95Mm ?? Number.POSITIVE_INFINITY) <= 1.3));
         const hardRejectReason =
           requestedRenderBackend === 'gpu' &&
           routeDiagnostic.backend === 'gpu' &&
@@ -10111,14 +11135,17 @@ export function useCPROrchestrator({
             ? 'gpu-phase2-gate-failed'
             : !baseHardRejectReason && unstableSupportSurface
               ? 'support-surface-instability'
-            : !baseHardRejectReason && unstableVirtualPanoSupportSurface
+            : !baseHardRejectReason &&
+                !isRadiographVirtualPano &&
+                unstableVirtualPanoSupportSurface &&
+                !workerAcceptedVirtualPanoStructurallyUsable
               ? 'virtual-pano-support-instability'
             : !baseHardRejectReason && excessiveCenterDrift
               ? 'vertical-center-drift'
               : !baseHardRejectReason &&
                   !!summary &&
                   requestedAggregation === 'MEAN' &&
-                  actualVertHalfMm > 45 &&
+                  actualVertHalfMm > 40 &&
                   summary.lowerBandBrightFraction > 0.64
                 ? 'tall-lower-band-fill'
                 : baseHardRejectReason;
@@ -10742,6 +11769,100 @@ export function useCPROrchestrator({
         return compareRankedPanoOutputs(candidate, currentBest) < 0;
       };
       type EvaluatedPanoAttempt = Awaited<ReturnType<typeof runWorkerAttempt>>;
+      const getFiniteAttemptMetric = (
+        value: number | null | undefined,
+        fallback: number
+      ): number => (Number.isFinite(value) ? Number(value) : fallback);
+      const shouldAbortVirtualPanoRetryLadder = (): {
+        reason: string;
+        clusteredLabels: string[];
+      } | null => {
+        const recentAttempts = attemptResults.slice(-3) as EvaluatedPanoAttempt[];
+        if (recentAttempts.length < 3) {
+          return null;
+        }
+
+        const isVirtualPanoInstabilityAttempt = (attempt: EvaluatedPanoAttempt): boolean =>
+          attempt.resolvedBackend === 'cpu' &&
+          isVirtualPanoLikeCandidateMode(attempt.reconstructionMode) &&
+          attempt.hardRejectReason === 'virtual-pano-support-instability' &&
+          !attempt.qualityGatePassed;
+
+        if (!recentAttempts.every(isVirtualPanoInstabilityAttempt)) {
+          return null;
+        }
+
+        const hasSameRejectShape = recentAttempts.every(
+          attempt =>
+            attempt.qualityGateRejectReasons.includes('off-trough-energy-too-high') &&
+            attempt.qualityGateRejectReasons.includes('lower-band-bright-fraction-too-high') &&
+            attempt.qualityGateRejectReasons.includes('lower-band-mean-too-high') &&
+            attempt.qualityGateRejectReasons.includes('lower-suppression-ratio-too-high')
+        );
+        if (!hasSameRejectShape) {
+          return null;
+        }
+
+        const metricRange = (values: number[]): number =>
+          values.length > 0 ? Math.max(...values) - Math.min(...values) : 0;
+
+        const ambiguousFractions = recentAttempts.map(attempt =>
+          getFiniteAttemptMetric(attempt.qualityGateMetrics.supportAmbiguousColumnFraction, 1)
+        );
+        const scoreGaps = recentAttempts.map(attempt =>
+          getFiniteAttemptMetric(attempt.qualityGateMetrics.supportScoreGapP50, 0)
+        );
+        const depthStdValues = recentAttempts.map(attempt =>
+          getFiniteAttemptMetric(attempt.qualityGateMetrics.supportDepthStdMm, 0)
+        );
+        const unstableFractions = recentAttempts.map(attempt =>
+          getFiniteAttemptMetric(attempt.qualityGateMetrics.supportUnstableColumnFraction, 0)
+        );
+        const lowerBandBrightFractions = recentAttempts.map(attempt =>
+          getFiniteAttemptMetric(attempt.summary?.lowerBandBrightFraction, 0)
+        );
+        const qualityScores = recentAttempts.map(attempt => attempt.qualityScore);
+
+        if (
+          Math.min(...ambiguousFractions) < 0.5 ||
+          Math.max(...scoreGaps) > 0.035 ||
+          Math.min(...depthStdValues) < 0.75
+        ) {
+          return null;
+        }
+
+        const hasFlatSupportSurfaceFailure =
+          Math.min(...ambiguousFractions) >= 0.9 &&
+          Math.max(...scoreGaps) <= 0.015 &&
+          Math.min(...depthStdValues) >= 1.0 &&
+          Math.min(...unstableFractions) >= 0.24 &&
+          metricRange(scoreGaps) <= 0.004 &&
+          metricRange(depthStdValues) <= 0.5 &&
+          metricRange(unstableFractions) <= 0.14 &&
+          metricRange(qualityScores) <= 3.5;
+
+        if (hasFlatSupportSurfaceFailure) {
+          return {
+            reason: 'retry-virtual-pano-flat-support-surface',
+            clusteredLabels: recentAttempts.map(attempt => attempt.label),
+          };
+        }
+
+        if (
+          metricRange(ambiguousFractions) > 0.08 ||
+          metricRange(scoreGaps) > 0.01 ||
+          metricRange(depthStdValues) > 0.25 ||
+          metricRange(lowerBandBrightFractions) > 0.08 ||
+          metricRange(qualityScores) > 1.25
+        ) {
+          return null;
+        }
+
+        return {
+          reason: 'retry-virtual-pano-support-instability-cluster',
+          clusteredLabels: recentAttempts.map(attempt => attempt.label),
+        };
+      };
       type Phase2BaseSelectionAssessment = {
         attempt: EvaluatedPanoAttempt;
         phase0Rejected: boolean;
@@ -11144,6 +12265,9 @@ export function useCPROrchestrator({
         : 'primary-mean-toothband-narrow';
       const primaryAttemptOverrides = shouldUseFastWorkerReconPhase2Seed
         ? {
+            renderBackend: 'cpu' as const,
+            reconstructionMode: 'virtualPano' as const,
+            allowLegacyFallback: false,
             modalityLutOverride: true,
             verticalHalfMm: narrowVerticalHalfMm,
             verticalCenterOffsetMm: neutralVerticalCenterOffsetMm,
@@ -11439,6 +12563,22 @@ export function useCPROrchestrator({
           if (shouldPromoteAttempt(attempt, bestAttempt)) {
             bestAttempt = attempt;
           }
+          const virtualPanoRetryAbort = shouldAbortVirtualPanoRetryLadder();
+          if (virtualPanoRetryAbort) {
+            earlyExitReason = `${virtualPanoRetryAbort.reason}:${virtualPanoRetryAbort.clusteredLabels.join(',')}`;
+            console.debug(
+              '[CPR-VIRTUAL-PANO-RETRY-EARLY-EXIT-JSON]',
+              JSON.stringify({
+                runId: debugRunId,
+                reason: virtualPanoRetryAbort.reason,
+                clusteredLabels: virtualPanoRetryAbort.clusteredLabels,
+                bestAttemptLabel: bestAttempt.label,
+                bestAttemptQualityScore: bestAttempt.qualityScore,
+                bestAttemptHardRejectReason: bestAttempt.hardRejectReason,
+              })
+            );
+            break;
+          }
           if (isGoodEnoughPanoAttempt(bestAttempt)) {
             earlyExitReason = `retry-good-enough:${bestAttempt.label}`;
             break;
@@ -11733,6 +12873,8 @@ export function useCPROrchestrator({
         diagnostics: Record<string, unknown> | null;
         summary: FloatBufferDebugSummary | null;
         voi: PanoVoiSettings | null;
+        intensityDomain: SyntheticCprIntensityDomain;
+        huDomain: boolean;
         usedAsDisplayedOutput: boolean;
         borderlineAcceptedReason: string | null;
         workerAcceptedForOutput: boolean;
@@ -11756,6 +12898,8 @@ export function useCPROrchestrator({
         diagnostics: null,
         summary: null,
         voi: null,
+        intensityDomain: 'unknown',
+        huDomain: false,
         usedAsDisplayedOutput: false,
         borderlineAcceptedReason: null,
         workerAcceptedForOutput: false,
@@ -11788,7 +12932,7 @@ export function useCPROrchestrator({
             slabSamples: phase2BaseAttempt.slabSamples,
             aggregation: phase2BaseAttempt.aggregation,
             debugRunId: `${debugRunId}-phase2`,
-            reconstructionMode: 'virtualPano',
+            reconstructionMode: getPanoV2Phase0ReconstructionMode(),
           });
           const phase2DiagnosticPayload =
             phase2Result.workerDebugPayload &&
@@ -11818,12 +12962,33 @@ export function useCPROrchestrator({
               ? (phase2DiagnosticPayload.virtualPanoRender as Record<string, unknown>)
               : null;
           const phase2RenderSupportMode = toNonEmptyString(phase2RenderDiagnostics?.renderSupportMode);
-          const phase2Voi = computeAdaptivePanoVoi(
+          const classifiedPhase2IntensityDomain = classifySyntheticCprIntensityDomain({
+            modalityLutApplied: phase2Result.modalityLutApplied,
+            effectiveIsPreScaled: phase2Result.effectiveIsPreScaled,
+            minValue: phase2Result.minValue,
+            maxValue: phase2Result.maxValue,
+          });
+          const phase2IntensityDomain = resolveSyntheticCprIntensityDomainForRenderMode(
+            classifiedPhase2IntensityDomain,
+            phase2RenderSupportMode
+          );
+          const phase2HuDomain = isSyntheticCprHuDomain(phase2IntensityDomain);
+          const phase2FusionBypass =
+            phase2RenderSupportMode === 'panoV2Fusion' &&
+            phase2RenderDiagnostics?.renderBypass === true;
+          const phase2WorkerVoi =
+            phase2FusionBypass ||
+            (!isDualArchProjectionRenderMode(phase2RenderSupportMode) &&
+            !isNativeDisplayPanoRenderMode(phase2RenderSupportMode))
+              ? createPanoVoiFromWindowLevel(phase2Result.windowWidth, phase2Result.windowCenter)
+              : null;
+          const phase2AdaptiveVoi = computeAdaptivePanoVoi(
             phase2Summary,
             phase2Result.minValue,
             phase2Result.maxValue,
             phase2RenderSupportMode
           );
+          const phase2Voi = phase2WorkerVoi ?? phase2AdaptiveVoi;
 
           phase2VirtualPano.executed = true;
           phase2VirtualPano.timingMs =
@@ -11835,6 +13000,8 @@ export function useCPROrchestrator({
           phase2VirtualPano.diagnostics = phase2RenderDiagnostics;
           phase2VirtualPano.summary = phase2Summary;
           phase2VirtualPano.voi = phase2Voi;
+          phase2VirtualPano.intensityDomain = phase2IntensityDomain;
+          phase2VirtualPano.huDomain = phase2HuDomain;
           phase2VirtualPano.phase2RenderFamily = phase2RenderSupportMode;
           const phase2RejectReasons =
             phase2RenderDiagnostics && Array.isArray(phase2RenderDiagnostics.rejectReasons)
@@ -12117,7 +13284,16 @@ export function useCPROrchestrator({
       let selectedAttemptRouteDiagnostic = resolveWorkerDisplayRouteDiagnostic(
         selectedAttempt.workerDebugPayload
       );
-      let selectedDisplayedOutputMode: 'legacy' | 'workerGpuPhase2' | 'virtualPanoPhase2' =
+      const phase2DisplayedOutputMode: PanoDisplayedOutputMode =
+        phase2WorkerResult
+          ? resolveDisplayedOutputModeFromWorkerResult({
+              routeDiagnostic: resolveWorkerDisplayRouteDiagnostic(
+                phase2WorkerResult.workerDebugPayload
+              ),
+              workerDebugPayload: phase2WorkerResult.workerDebugPayload,
+            })
+          : 'virtualPanoPhase2';
+      let selectedDisplayedOutputMode: PanoDisplayedOutputMode =
         resolveDisplayedOutputModeFromWorkerResult({
           routeDiagnostic: selectedAttemptRouteDiagnostic,
           workerDebugPayload: selectedAttempt.workerDebugPayload,
@@ -12136,7 +13312,8 @@ export function useCPROrchestrator({
         attemptResults
           .filter(
             attempt =>
-              attempt.resolvedBackend === 'cpu' && attempt.reconstructionMode === 'virtualPano'
+              attempt.resolvedBackend === 'cpu' &&
+              isVirtualPanoLikeCandidateMode(attempt.reconstructionMode)
           )
           .slice()
           .sort(compareRankedPanoOutputs)[0] ?? null;
@@ -12177,7 +13354,7 @@ export function useCPROrchestrator({
         selectedAttempt.workerDebugPayload
       );
       selectedDisplayedOutputMode = phase2VirtualPano.usedAsDisplayedOutput
-        ? 'virtualPanoPhase2'
+        ? phase2DisplayedOutputMode
         : resolveDisplayedOutputModeFromWorkerResult({
             routeDiagnostic: selectedAttemptRouteDiagnostic,
             workerDebugPayload: selectedAttempt.workerDebugPayload,
@@ -12334,6 +13511,8 @@ export function useCPROrchestrator({
           ? 'gpu-candidate-passed'
           : selectedQualityGateCandidate.candidateSource === 'worker-cpu-virtual-pano' ||
               selectedQualityGateCandidate.candidateSource ===
+                'worker-cpu-virtual-panoramic-radiograph' ||
+              selectedQualityGateCandidate.candidateSource ===
                 'worker-cpu-arch-guided-synthetic'
             ? gpuQualityGateCandidate && !gpuQualityGateCandidate.pass
               ? 'gpu-rejected-cpu-selected'
@@ -12396,31 +13575,36 @@ export function useCPROrchestrator({
             supportSurfaceRiskSummary: selectedQualityGateCandidate.supportSurfaceRiskSummary,
           }
         ) < 0;
-      const shouldDisplayPhase2DiagnosticDraft = false;
+      const shouldDisplayPhase2DiagnosticDraft =
+        shouldForceDisplayRejectedPanoV2FusionForDebug() &&
+        !!phase2WorkerResult &&
+        phase2VirtualPano.executed &&
+        !phase2VirtualPano.usedAsDisplayedOutput &&
+        phase2VirtualPano.phase2RenderFamily === 'panoV2Fusion';
       if (
         shouldDisplayPhase2DiagnosticDraft &&
         explicitPhase2QualityGateCandidate &&
         phase2BaseAttempt
       ) {
         const phase2DraftDisplayReason = phase2VirtualPano.workerAcceptedForOutput
-          ? 'draft-displayed-after-orchestrator-gate-reject'
-          : 'draft-displayed-after-worker-reject';
+          ? 'debug-force-display-rejected-pano-v2-fusion-after-orchestrator-reject'
+          : 'debug-force-display-rejected-pano-v2-fusion-after-worker-reject';
         selectedAttempt = phase2BaseAttempt;
         selectedAttemptOverrideReason = phase2VirtualPano.workerAcceptedForOutput
-          ? 'phase2-quality-gate-rejected-display-primary-diagnostic-draft'
-          : 'phase2-worker-rejected-display-primary-diagnostic-draft';
+          ? 'phase2-quality-gate-rejected-display-pano-v2-fusion-debug-draft'
+          : 'phase2-worker-rejected-display-pano-v2-fusion-debug-draft';
         selectedAttemptRouteDiagnostic = resolveWorkerDisplayRouteDiagnostic(
           selectedAttempt.workerDebugPayload
         );
         phase2VirtualPano.usedAsDisplayedOutput = true;
         phase2VirtualPano.displayDecisionReason = phase2DraftDisplayReason;
-        selectedDisplayedOutputMode = 'virtualPanoPhase2';
+        selectedDisplayedOutputMode = phase2DisplayedOutputMode;
         selectedDisplayedSourceLabel = phase2BaseAttempt.label;
         selectedDisplayedSourceAggregation = phase2BaseAttempt.aggregation;
         selectedQualityGateCandidate = explicitPhase2QualityGateCandidate;
         qualityGateSelectionReason = phase2VirtualPano.workerAcceptedForOutput
-          ? 'phase2-diagnostic-draft-displayed-after-gate-reject'
-          : 'phase2-diagnostic-draft-displayed-after-worker-reject';
+          ? 'phase2-pano-v2-fusion-debug-draft-displayed-after-gate-reject'
+          : 'phase2-pano-v2-fusion-debug-draft-displayed-after-worker-reject';
         console.debug(
           '[CPR-PHASE2-DRAFT-DISPLAY-JSON]',
           JSON.stringify({
@@ -12460,6 +13644,66 @@ export function useCPROrchestrator({
           }),
         ] as const)
       );
+      const phase2DegradedPreviewAttempt =
+        explicitPhase2QualityGateCandidate &&
+        phase2WorkerResult &&
+        phase2VirtualPano.summary &&
+        phase2VirtualPano.voi &&
+        phase2BaseAttempt
+          ? {
+              ...phase2BaseAttempt,
+              result: phase2WorkerResult,
+              workerDebugPayload: phase2WorkerResult.workerDebugPayload ?? null,
+              summary: phase2VirtualPano.summary,
+              voi: phase2VirtualPano.voi,
+              qualityBase: explicitPhase2QualityGateCandidate.qualityBase,
+              qualityScore: explicitPhase2QualityGateCandidate.qualityScore,
+              hardRejectReason: explicitPhase2QualityGateCandidate.hardRejectReason,
+              qualityGatePassed: explicitPhase2QualityGateCandidate.pass,
+              qualityGateRejectReasons:
+                explicitPhase2QualityGateCandidate.rejectReasons.slice(),
+              qualityGateMetrics: explicitPhase2QualityGateCandidate.metrics,
+              supportSurfaceRiskSummary:
+                explicitPhase2QualityGateCandidate.supportSurfaceRiskSummary,
+              supportSurfaceBaselineFingerprint:
+                explicitPhase2QualityGateCandidate.supportSurfaceRiskSummary
+                  .baselineFingerprint,
+              supportSurfaceRiskLevel:
+                explicitPhase2QualityGateCandidate.supportSurfaceRiskSummary.riskLevel,
+              supportSurfaceRiskFlags:
+                explicitPhase2QualityGateCandidate.supportSurfaceRiskSummary.riskFlags.slice(),
+              requestedBackend:
+                explicitPhase2QualityGateCandidate.requestedBackend ??
+                phase2BaseAttempt.requestedBackend,
+              resolvedBackend:
+                explicitPhase2QualityGateCandidate.backend === 'gpu' ? 'gpu' : 'cpu',
+              pipelineMode: explicitPhase2QualityGateCandidate.pipelineMode,
+              fallbackReason: explicitPhase2QualityGateCandidate.fallbackReason,
+              reconstructionMode: explicitPhase2QualityGateCandidate.reconstructionMode,
+            }
+          : null;
+      if (phase2DegradedPreviewAttempt) {
+        displaySelectionBreakdownByAttemptLabel.set(
+          phase2DegradedPreviewAttempt.label,
+          buildPhase4DisplaySelectionBreakdown({
+            qualityGatePassed: phase2DegradedPreviewAttempt.qualityGatePassed,
+            qualityBase: phase2DegradedPreviewAttempt.qualityBase,
+            qualityScore: phase2DegradedPreviewAttempt.qualityScore,
+            detailReward: phase2DegradedPreviewAttempt.detailReward,
+            hardRejectReason: phase2DegradedPreviewAttempt.hardRejectReason,
+            summary: phase2DegradedPreviewAttempt.summary,
+            metrics: phase2DegradedPreviewAttempt.qualityGateMetrics,
+            requestedBackend: phase2DegradedPreviewAttempt.requestedBackend,
+            resolvedBackend: phase2DegradedPreviewAttempt.resolvedBackend,
+            aggregation: phase2DegradedPreviewAttempt.aggregation,
+            actualVertHalfMm: phase2DegradedPreviewAttempt.actualVertHalfMm,
+            verticalCenterOffsetMm: phase2DegradedPreviewAttempt.verticalCenterOffsetMm,
+            slabHalfThicknessMm: phase2DegradedPreviewAttempt.slabHalfThicknessMm,
+            slabSamples: phase2DegradedPreviewAttempt.slabSamples,
+            duplicateOfLabel: duplicateOfLabelByAttemptLabel.get(phase2DegradedPreviewAttempt.label) ?? null,
+          })
+        );
+      }
       const compareDisplayRankedAttempts = (
         a: Awaited<ReturnType<typeof runWorkerAttempt>>,
         b: Awaited<ReturnType<typeof runWorkerAttempt>>
@@ -12549,7 +13793,10 @@ export function useCPROrchestrator({
           })
         );
       }
-      const degradedPreviewCandidateOptions = attemptResults
+      const degradedPreviewAttempts = phase2DegradedPreviewAttempt
+        ? [...attemptResults, phase2DegradedPreviewAttempt]
+        : attemptResults;
+      const degradedPreviewCandidateOptions = degradedPreviewAttempts
         .filter(
           attempt =>
             !!attempt.result &&
@@ -12866,7 +14113,7 @@ export function useCPROrchestrator({
           sourceVolumeId,
           selectionRule: {
             primary: 'worker-gpu-support-surface',
-            secondary: 'worker-cpu-virtual-pano-or-arch-guided-synthetic',
+            secondary: 'worker-cpu-virtual-pano-or-radiograph-or-arch-guided-synthetic',
             tertiary: 'reference-or-legacy-only-if-flag-enabled',
           },
           referencePathAvailable: true,
@@ -13224,270 +14471,237 @@ export function useCPROrchestrator({
               ].filter(label => attemptLookupByLabel.has(label))
             )
           );
-          const rankedAttemptReportRows = rankedAttempts.map(attempt => ({
-            label: attempt.label,
-            checksum: attempt.outputSignature.checksum,
-            diagnosticOnly: false,
-            normalizationMatrixMode:
-              attempt.label === CPR_TARGET_TOOTH_DEBUG_LABEL ? 'current' : null,
-            requestedScalarSamplingMode: attempt.debugScalarSamplingMode,
-            modalityLutApplied: attempt.result.modalityLutApplied,
-            requestedModalityLutApplied: attempt.result.requestedModalityLutApplied,
-            storedValueNormalizationApplied: attempt.result.storedValueNormalizationApplied,
-            phase0QualityGatePassed: attempt.qualityGatePassed,
-            phase0RejectReasons: attempt.qualityGateRejectReasons,
-            supportP50: attempt.supportSurfaceRiskSummary.stability.supportConfidenceP50,
-            bgOutlier05: attempt.summary?.backgroundOutlierFraction05 ?? null,
-            bgOutlier10: attempt.summary?.backgroundOutlierFraction10 ?? null,
-            bgDominantBand05:
-              attempt.supportSurfaceRiskSummary.background.backgroundBands?.dominantOutlierBand05 ??
-              null,
-            bgDominantBand10:
-              attempt.supportSurfaceRiskSummary.background.backgroundBands?.dominantOutlierBand10 ??
-              null,
-            bgTopContribution05:
-              attempt.supportSurfaceRiskSummary.background.backgroundBands?.top
-                .backgroundOutlierContribution05 ?? null,
-            bgMiddleContribution05:
-              attempt.supportSurfaceRiskSummary.background.backgroundBands?.middle
-                .backgroundOutlierContribution05 ?? null,
-            bgBottomContribution05:
-              attempt.supportSurfaceRiskSummary.background.backgroundBands?.bottom
-                .backgroundOutlierContribution05 ?? null,
-            bgTopContribution10:
-              attempt.supportSurfaceRiskSummary.background.backgroundBands?.top
-                .backgroundOutlierContribution10 ?? null,
-            bgMiddleContribution10:
-              attempt.supportSurfaceRiskSummary.background.backgroundBands?.middle
-                .backgroundOutlierContribution10 ?? null,
-            bgBottomContribution10:
-              attempt.supportSurfaceRiskSummary.background.backgroundBands?.bottom
-                .backgroundOutlierContribution10 ?? null,
-            blackClip: attempt.supportSurfaceRiskSummary.background.blackClipFraction,
-            toothBandHoleFraction:
-              attempt.supportSurfaceRiskSummary.anatomy.toothBandHoleFraction,
-            toothBandBlackClipFraction:
-              attempt.supportSurfaceRiskSummary.anatomy.toothBandBlackClipFraction,
-            toothBandRetainedWeightP10:
-              attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP10,
-            toothBandRetainedWeightP50:
-              attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP50,
-            toothBandRetainedWeightRowP10:
-              attempt.summary?.toothBandRetainedWeightRowP10 ?? null,
-            toothBandRetainedWeightRowP50:
-              attempt.summary?.toothBandRetainedWeightRowP50 ?? null,
-            toothBandRetainedWeightRowP90:
-              attempt.summary?.toothBandRetainedWeightRowP90 ?? null,
-            toothBandRetainedWeightColumnP10:
-              attempt.summary?.toothBandRetainedWeightColumnP10 ?? null,
-            toothBandRetainedWeightColumnP50:
-              attempt.summary?.toothBandRetainedWeightColumnP50 ?? null,
-            toothBandRetainedWeightColumnP90:
-              attempt.summary?.toothBandRetainedWeightColumnP90 ?? null,
-            lowerBandBrightFraction: attempt.summary?.lowerBandBrightFraction ?? null,
-            stageHint: attempt.toothBandStageDiagnostics?.stageHint ?? null,
-            stageEvidence: attempt.toothBandStageDiagnostics?.stageEvidence.join('; ') ?? '',
-            admissionAccumulationP50:
-              attempt.toothBandStageDiagnostics?.admissionAccumulationP50 ?? null,
-            toneSuppressedAccumulationP50:
-              attempt.toothBandStageDiagnostics?.toneSuppressedAccumulationP50 ?? null,
-            toneStageSuppressionP90:
-              attempt.toothBandStageDiagnostics?.toneStageSuppressionP90 ?? null,
-            invalidSupportBlackoutP90:
-              attempt.toothBandStageDiagnostics?.invalidSupportBlackoutP90 ?? null,
-            admissionOnlyHuP50: attempt.toothBandStageDiagnostics?.admissionOnlyHuP50 ?? null,
-            toneBypassHuP50: attempt.toothBandStageDiagnostics?.toneBypassHuP50 ?? null,
-            finalPostToneHuP50: attempt.toothBandStageDiagnostics?.finalPostToneHuP50 ?? null,
-            rejectReasons: attempt.qualityGateRejectReasons,
-            displayable:
-              degradedPreviewCandidateByAttemptLabel.get(attempt.label)?.displayable ??
-              attempt.qualityGatePassed,
-            legacyQualityScore: attempt.qualityScore,
-            legacyQualityBase: attempt.qualityBase,
-            displaySelectionScore:
-              displaySelectionBreakdownByAttemptLabel.get(attempt.label)?.displaySelectionScore ??
-              null,
-            preferredTightRootFamily:
-              displaySelectionBreakdownByAttemptLabel.get(attempt.label)?.preferredTightRootFamily ??
-              false,
-            effectiveTroughHalfWidthP50Mm:
-              displaySelectionBreakdownByAttemptLabel.get(attempt.label)
-                ?.effectiveTroughHalfWidthP50Mm ?? null,
-            participatingSamplesP50:
-              displaySelectionBreakdownByAttemptLabel.get(attempt.label)?.participatingSamplesP50 ??
-              null,
-            qualityRankedGpuPrimary: attempt.label === topGpuAttempt?.label,
-            displayRankedGpuWinner: attempt.label === topDisplayRankedGpuAttempt?.label,
-            duplicateOfLabel: duplicateOfLabelByAttemptLabel.get(attempt.label) ?? null,
-            phase2SeedSelected: attempt.label === phase2BaseAttempt?.label,
-            phase2SeedEligible: phase2BaseAssessmentByLabel.get(attempt.label)?.seedEligible ?? null,
-            phase2SeedStructuralRejectReasons:
-              phase2BaseAssessmentByLabel.get(attempt.label)?.structuralRejectReasons.join(', ') ?? '',
-            phase2DisplayedDerived: attempt.label === phase2BaseAttempt?.label && phase2VirtualPano.executed,
-            phase2DisplayedUsedAsOutput:
-              attempt.label === phase2BaseAttempt?.label
+          const reportDisplayMode = forcedDisplayedAttemptForDebug
+            ? 'forced-debug-gpu'
+            : phase2VirtualPano.usedAsDisplayedOutput
+              ? 'accepted-phase2'
+              : canPreservePreviousPanoDisplay
+                ? 'preserve-previous-accepted'
+                : selectedQualityGateCandidate.pass
+                  ? 'accepted-ranked-top'
+                  : degradedPreviewFallbackChoice
+                    ? 'degraded-preview'
+                    : degradedPreviewEmergencyChoice
+                      ? 'emergency-debug-preview'
+                      : 'blocked';
+          const reportDisplayedLabel = forcedDisplayedAttemptForDebug
+            ? forcedDisplayedAttemptForDebug.label
+            : phase2VirtualPano.usedAsDisplayedOutput
+              ? phase2BaseAttempt?.label ?? selectedAttempt.label
+              : canPreservePreviousPanoDisplay
+                ? preservedPreviousPanoImageId ?? 'previous-accepted-pano'
+                : degradedPreviewSelectedChoice?.attempt.label ?? selectedAttempt.label;
+          const reportDisplayedAccepted =
+            reportDisplayMode === 'preserve-previous-accepted' ||
+            (phase2VirtualPano.usedAsDisplayedOutput
+              ? explicitPhase2QualityGateCandidate?.pass === true
+              : !forcedDisplayedAttemptForDebug && selectedQualityGateCandidate.pass);
+          const reportDisplayedRejectReasons = forcedDisplayedAttemptForDebug
+            ? forcedDisplayedQualityGateCandidate?.rejectReasons ??
+              displayRankedGpuQualityGateCandidate?.rejectReasons ??
+              []
+            : phase2VirtualPano.usedAsDisplayedOutput
+              ? explicitPhase2QualityGateCandidate?.rejectReasons ?? []
+              : degradedPreviewSelectedChoice
+                ? degradedPreviewSelectedChoice.candidate.rejectReasons
+                : selectedQualityGateCandidate.rejectReasons;
+          const buildAttemptReportRow = (
+            attempt: any,
+            options: {
+              diagnosticOnly: boolean;
+              normalizationMatrixMode: string | null;
+              emergencyDebugPreviewDisplayed: boolean;
+              labelOverride?: string;
+            }
+          ) => {
+            const reportCandidate = buildPhase4QualityGateCandidate({
+              attemptLabel: attempt?.label,
+              displayedPath: 'worker-recon',
+              sourceVolumeId,
+              summary: attempt?.summary,
+              qualityBase: attempt?.qualityBase,
+              qualityScore: attempt?.qualityScore,
+              hardRejectReason: attempt?.hardRejectReason,
+              workerDebugPayload: attempt?.workerDebugPayload ?? null,
+            });
+            const stageDiagnostics = attempt?.toothBandStageDiagnostics ?? null;
+            const stageEvidence = Array.isArray(stageDiagnostics?.stageEvidence)
+              ? stageDiagnostics.stageEvidence.join('; ')
+              : '';
+            const backgroundBands =
+              reportCandidate.supportSurfaceRiskSummary.background.backgroundBands ?? null;
+            const anatomyRisk = reportCandidate.supportSurfaceRiskSummary.anatomy;
+            const displaySelectionBreakdown = options.diagnosticOnly
+              ? null
+              : displaySelectionBreakdownByAttemptLabel.get(attempt?.label);
+            const degradedPreviewCandidate = options.diagnosticOnly
+              ? null
+              : degradedPreviewCandidateByAttemptLabel.get(attempt?.label);
+            const phase2Assessment = options.diagnosticOnly
+              ? null
+              : phase2BaseAssessmentByLabel.get(attempt?.label);
+            const isPhase2Seed = !options.diagnosticOnly && attempt?.label === phase2BaseAttempt?.label;
+
+            return {
+              label: options.labelOverride ?? attempt?.label ?? '',
+              checksum: attempt?.outputSignature?.checksum ?? null,
+              diagnosticOnly: options.diagnosticOnly,
+              normalizationMatrixMode: options.normalizationMatrixMode,
+              requestedScalarSamplingMode: attempt?.debugScalarSamplingMode ?? null,
+              modalityLutApplied: attempt?.result?.modalityLutApplied ?? null,
+              requestedModalityLutApplied: attempt?.result?.requestedModalityLutApplied ?? null,
+              storedValueNormalizationApplied:
+                attempt?.result?.storedValueNormalizationApplied ?? null,
+              candidateSource: reportCandidate.candidateSource,
+              rendererVariant: reportCandidate.metrics.rendererVariant,
+              renderSupportMode: reportCandidate.metrics.renderSupportMode,
+              metricStage: reportCandidate.metricStage,
+              workerBranchSelected: reportCandidate.workerBranchSelected,
+              workerQcAccepted: reportCandidate.workerQcAccepted,
+              workerQcStage: reportCandidate.workerQcStage,
+              rejectReasonsStage: reportCandidate.rejectReasonsStage,
+              orchestratorAccepted: reportCandidate.orchestratorAccepted,
+              emergencyDebugPreviewDisplayed: options.emergencyDebugPreviewDisplayed,
+              phase0QualityGatePassed: attempt?.qualityGatePassed ?? null,
+              phase0RejectReasons: attempt?.qualityGateRejectReasons ?? [],
+              supportP50: reportCandidate.supportSurfaceRiskSummary.stability.supportConfidenceP50,
+              bgOutlier05: attempt?.summary?.backgroundOutlierFraction05 ?? null,
+              bgOutlier10: attempt?.summary?.backgroundOutlierFraction10 ?? null,
+              bgDominantBand05: backgroundBands?.dominantOutlierBand05 ?? null,
+              bgDominantBand10: backgroundBands?.dominantOutlierBand10 ?? null,
+              bgTopContribution05: backgroundBands?.top?.backgroundOutlierContribution05 ?? null,
+              bgMiddleContribution05:
+                backgroundBands?.middle?.backgroundOutlierContribution05 ?? null,
+              bgBottomContribution05:
+                backgroundBands?.bottom?.backgroundOutlierContribution05 ?? null,
+              bgTopContribution10: backgroundBands?.top?.backgroundOutlierContribution10 ?? null,
+              bgMiddleContribution10:
+                backgroundBands?.middle?.backgroundOutlierContribution10 ?? null,
+              bgBottomContribution10:
+                backgroundBands?.bottom?.backgroundOutlierContribution10 ?? null,
+              blackClip: reportCandidate.supportSurfaceRiskSummary.background.blackClipFraction,
+              toothBandHoleFraction: anatomyRisk.toothBandHoleFraction,
+              toothBandBlackClipFraction: anatomyRisk.toothBandBlackClipFraction,
+              toothBandRetainedWeightP10: anatomyRisk.toothBandRetainedWeightP10,
+              toothBandRetainedWeightP50: anatomyRisk.toothBandRetainedWeightP50,
+              toothBandRetainedWeightRowP10: attempt?.summary?.toothBandRetainedWeightRowP10 ?? null,
+              toothBandRetainedWeightRowP50: attempt?.summary?.toothBandRetainedWeightRowP50 ?? null,
+              toothBandRetainedWeightRowP90: attempt?.summary?.toothBandRetainedWeightRowP90 ?? null,
+              toothBandRetainedWeightColumnP10:
+                attempt?.summary?.toothBandRetainedWeightColumnP10 ?? null,
+              toothBandRetainedWeightColumnP50:
+                attempt?.summary?.toothBandRetainedWeightColumnP50 ?? null,
+              toothBandRetainedWeightColumnP90:
+                attempt?.summary?.toothBandRetainedWeightColumnP90 ?? null,
+              lowerBandBrightFraction: reportCandidate.metrics.lowerBandBrightFraction,
+              stageHint: stageDiagnostics?.stageHint ?? null,
+              stageEvidence,
+              admissionAccumulationP50: stageDiagnostics?.admissionAccumulationP50 ?? null,
+              toneSuppressedAccumulationP50:
+                stageDiagnostics?.toneSuppressedAccumulationP50 ?? null,
+              toneStageSuppressionP90: stageDiagnostics?.toneStageSuppressionP90 ?? null,
+              invalidSupportBlackoutP90: stageDiagnostics?.invalidSupportBlackoutP90 ?? null,
+              admissionOnlyHuP50: stageDiagnostics?.admissionOnlyHuP50 ?? null,
+              toneBypassHuP50: stageDiagnostics?.toneBypassHuP50 ?? null,
+              finalPostToneHuP50: stageDiagnostics?.finalPostToneHuP50 ?? null,
+              rejectReasons: reportCandidate.rejectReasons,
+              displayable: options.diagnosticOnly
+                ? reportCandidate.pass
+                : degradedPreviewCandidate?.displayable ?? reportCandidate.pass,
+              legacyQualityScore: attempt?.qualityScore ?? null,
+              legacyQualityBase: attempt?.qualityBase ?? null,
+              displaySelectionScore: options.diagnosticOnly
+                ? null
+                : displaySelectionBreakdown?.displaySelectionScore ?? null,
+              preferredTightRootFamily: options.diagnosticOnly
+                ? false
+                : displaySelectionBreakdown?.preferredTightRootFamily ?? false,
+              effectiveTroughHalfWidthP50Mm: options.diagnosticOnly
+                ? null
+                : displaySelectionBreakdown?.effectiveTroughHalfWidthP50Mm ?? null,
+              participatingSamplesP50: options.diagnosticOnly
+                ? null
+                : displaySelectionBreakdown?.participatingSamplesP50 ?? null,
+              qualityRankedGpuPrimary: !options.diagnosticOnly && attempt?.label === topGpuAttempt?.label,
+              displayRankedGpuWinner:
+                !options.diagnosticOnly && attempt?.label === topDisplayRankedGpuAttempt?.label,
+              duplicateOfLabel: options.diagnosticOnly
+                ? null
+                : duplicateOfLabelByAttemptLabel.get(attempt?.label) ?? null,
+              phase2SeedSelected: isPhase2Seed,
+              phase2SeedEligible: options.diagnosticOnly ? null : phase2Assessment?.seedEligible ?? null,
+              phase2SeedStructuralRejectReasons: options.diagnosticOnly
+                ? ''
+                : Array.isArray(phase2Assessment?.structuralRejectReasons)
+                ? phase2Assessment.structuralRejectReasons.join(', ')
+                : '',
+              phase2DisplayedDerived: isPhase2Seed && phase2VirtualPano.executed,
+              phase2DisplayedUsedAsOutput: isPhase2Seed
                 ? phase2VirtualPano.usedAsDisplayedOutput
                 : null,
-            phase2DisplayedWorkerAccepted:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedWorkerAccepted: isPhase2Seed
                 ? phase2VirtualPano.workerAcceptedForOutput
                 : null,
-            phase2DisplayedOrchestratorGatePassed:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedOrchestratorGatePassed: isPhase2Seed
                 ? phase2VirtualPano.orchestratorGatePassed
                 : null,
-            phase2DisplayedDecisionReason:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedDecisionReason: isPhase2Seed
                 ? phase2VirtualPano.displayDecisionReason
                 : null,
-            phase2DisplayedRenderFamily:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedRenderFamily: isPhase2Seed
                 ? phase2VirtualPano.phase2RenderFamily
                 : null,
-            phase2DisplayedCandidateSource:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedCandidateSource: isPhase2Seed
                 ? phase2VirtualPano.phase2CandidateSource
                 : null,
-            phase2DisplayedDerivedFromPhase0RejectedFamily:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedDerivedFromPhase0RejectedFamily: isPhase2Seed
                 ? phase2VirtualPano.revivedRejectedFamily
                 : null,
-            phase2DisplayedRevivedSeedRulePassed:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedRevivedSeedRulePassed: isPhase2Seed
                 ? phase2VirtualPano.revivedRejectedFamilyRulePassed
                 : null,
-            phase2DisplayedRevivedSeedRejectReasons:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedRevivedSeedRejectReasons: isPhase2Seed
                 ? phase2VirtualPano.revivedRejectedFamilyRejectReasons.join(', ')
                 : '',
-            phase2DisplayedBgOutlier05:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedBgOutlier05: isPhase2Seed
                 ? phase2VirtualPano.summary?.backgroundOutlierFraction05 ?? null
                 : null,
-            phase2DisplayedBgOutlier10:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedBgOutlier10: isPhase2Seed
                 ? phase2VirtualPano.summary?.backgroundOutlierFraction10 ?? null
                 : null,
-            phase2DisplayedBlackClip:
-              attempt.label === phase2BaseAttempt?.label
-                ? explicitPhase2QualityGateCandidate?.supportSurfaceRiskSummary.background.blackClipFraction ??
-                  null
+              phase2DisplayedBlackClip: isPhase2Seed
+                ? explicitPhase2QualityGateCandidate?.supportSurfaceRiskSummary.background
+                    .blackClipFraction ?? null
                 : null,
-            phase2DisplayedToothHole:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedToothHole: isPhase2Seed
                 ? explicitPhase2QualityGateCandidate?.metrics.toothBandHoleFraction ?? null
                 : null,
-            phase2DisplayedToothBlackClip:
-              attempt.label === phase2BaseAttempt?.label
+              phase2DisplayedToothBlackClip: isPhase2Seed
                 ? explicitPhase2QualityGateCandidate?.metrics.toothBandBlackClipFraction ?? null
                 : null,
-          }));
-          const normalizationDiagnosticRows = targetNormalizationDiagnosticAttempts.map(entry => ({
-            label:
-              entry.matrixMode === 'current'
-                ? `${entry.attempt.label}-diag-current`
-                : entry.attempt.label,
-            checksum: entry.attempt.outputSignature.checksum,
-            diagnosticOnly: true,
-            normalizationMatrixMode: entry.matrixMode,
-            requestedScalarSamplingMode: entry.attempt.debugScalarSamplingMode,
-            modalityLutApplied: entry.attempt.result.modalityLutApplied,
-            requestedModalityLutApplied: entry.attempt.result.requestedModalityLutApplied,
-            storedValueNormalizationApplied: entry.attempt.result.storedValueNormalizationApplied,
-            phase0QualityGatePassed: entry.attempt.qualityGatePassed,
-            phase0RejectReasons: entry.attempt.qualityGateRejectReasons,
-            supportP50: entry.attempt.supportSurfaceRiskSummary.stability.supportConfidenceP50,
-            bgOutlier05: entry.attempt.summary?.backgroundOutlierFraction05 ?? null,
-            bgOutlier10: entry.attempt.summary?.backgroundOutlierFraction10 ?? null,
-            bgDominantBand05:
-              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands
-                ?.dominantOutlierBand05 ?? null,
-            bgDominantBand10:
-              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands
-                ?.dominantOutlierBand10 ?? null,
-            bgTopContribution05:
-              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.top
-                .backgroundOutlierContribution05 ?? null,
-            bgMiddleContribution05:
-              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.middle
-                .backgroundOutlierContribution05 ?? null,
-            bgBottomContribution05:
-              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.bottom
-                .backgroundOutlierContribution05 ?? null,
-            bgTopContribution10:
-              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.top
-                .backgroundOutlierContribution10 ?? null,
-            bgMiddleContribution10:
-              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.middle
-                .backgroundOutlierContribution10 ?? null,
-            bgBottomContribution10:
-              entry.attempt.supportSurfaceRiskSummary.background.backgroundBands?.bottom
-                .backgroundOutlierContribution10 ?? null,
-            blackClip: entry.attempt.supportSurfaceRiskSummary.background.blackClipFraction,
-            toothBandHoleFraction:
-              entry.attempt.supportSurfaceRiskSummary.anatomy.toothBandHoleFraction,
-            toothBandBlackClipFraction:
-              entry.attempt.supportSurfaceRiskSummary.anatomy.toothBandBlackClipFraction,
-            toothBandRetainedWeightP10:
-              entry.attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP10,
-            toothBandRetainedWeightP50:
-              entry.attempt.supportSurfaceRiskSummary.anatomy.toothBandRetainedWeightP50,
-            toothBandRetainedWeightRowP10:
-              entry.attempt.summary?.toothBandRetainedWeightRowP10 ?? null,
-            toothBandRetainedWeightRowP50:
-              entry.attempt.summary?.toothBandRetainedWeightRowP50 ?? null,
-            toothBandRetainedWeightRowP90:
-              entry.attempt.summary?.toothBandRetainedWeightRowP90 ?? null,
-            toothBandRetainedWeightColumnP10:
-              entry.attempt.summary?.toothBandRetainedWeightColumnP10 ?? null,
-            toothBandRetainedWeightColumnP50:
-              entry.attempt.summary?.toothBandRetainedWeightColumnP50 ?? null,
-            toothBandRetainedWeightColumnP90:
-              entry.attempt.summary?.toothBandRetainedWeightColumnP90 ?? null,
-            lowerBandBrightFraction: entry.attempt.summary?.lowerBandBrightFraction ?? null,
-            stageHint: entry.attempt.toothBandStageDiagnostics?.stageHint ?? null,
-            stageEvidence: entry.attempt.toothBandStageDiagnostics?.stageEvidence.join('; ') ?? '',
-            admissionAccumulationP50:
-              entry.attempt.toothBandStageDiagnostics?.admissionAccumulationP50 ?? null,
-            toneSuppressedAccumulationP50:
-              entry.attempt.toothBandStageDiagnostics?.toneSuppressedAccumulationP50 ?? null,
-            toneStageSuppressionP90:
-              entry.attempt.toothBandStageDiagnostics?.toneStageSuppressionP90 ?? null,
-            invalidSupportBlackoutP90:
-              entry.attempt.toothBandStageDiagnostics?.invalidSupportBlackoutP90 ?? null,
-            admissionOnlyHuP50: entry.attempt.toothBandStageDiagnostics?.admissionOnlyHuP50 ?? null,
-            toneBypassHuP50: entry.attempt.toothBandStageDiagnostics?.toneBypassHuP50 ?? null,
-            finalPostToneHuP50: entry.attempt.toothBandStageDiagnostics?.finalPostToneHuP50 ?? null,
-            rejectReasons: entry.attempt.qualityGateRejectReasons,
-            displayable: entry.attempt.qualityGatePassed,
-            legacyQualityScore: entry.attempt.qualityScore,
-            legacyQualityBase: entry.attempt.qualityBase,
-            displaySelectionScore: null,
-            preferredTightRootFamily: false,
-            effectiveTroughHalfWidthP50Mm: null,
-            participatingSamplesP50: null,
-            qualityRankedGpuPrimary: false,
-            displayRankedGpuWinner: false,
-            duplicateOfLabel: null,
-            phase2SeedSelected: false,
-            phase2SeedEligible: null,
-            phase2SeedStructuralRejectReasons: '',
-            phase2DisplayedDerived: false,
-            phase2DisplayedUsedAsOutput: null,
-            phase2DisplayedWorkerAccepted: null,
-            phase2DisplayedOrchestratorGatePassed: null,
-            phase2DisplayedDecisionReason: null,
-            phase2DisplayedRenderFamily: null,
-            phase2DisplayedCandidateSource: null,
-            phase2DisplayedDerivedFromPhase0RejectedFamily: null,
-            phase2DisplayedRevivedSeedRulePassed: null,
-            phase2DisplayedRevivedSeedRejectReasons: '',
-            phase2DisplayedBgOutlier05: null,
-            phase2DisplayedBgOutlier10: null,
-            phase2DisplayedBlackClip: null,
-            phase2DisplayedToothHole: null,
-            phase2DisplayedToothBlackClip: null,
-          }));
+            };
+          };
+          const rankedAttemptReportRows = rankedAttempts.map(attempt =>
+            buildAttemptReportRow(attempt, {
+              diagnosticOnly: false,
+              normalizationMatrixMode:
+                attempt.label === CPR_TARGET_TOOTH_DEBUG_LABEL ? 'current' : null,
+              emergencyDebugPreviewDisplayed:
+                reportDisplayMode === 'emergency-debug-preview' &&
+                reportDisplayedLabel === attempt.label,
+            })
+          );
+          const normalizationDiagnosticRows = targetNormalizationDiagnosticAttempts.map(entry =>
+            buildAttemptReportRow(entry.attempt, {
+              diagnosticOnly: true,
+              normalizationMatrixMode: entry.matrixMode,
+              emergencyDebugPreviewDisplayed: false,
+              labelOverride:
+                entry.matrixMode === 'current'
+                  ? `${entry.attempt.label}-diag-current`
+                  : entry.attempt.label,
+            })
+          );
           const reportRows = [...rankedAttemptReportRows, ...normalizationDiagnosticRows];
           const reportImages: Parameters<typeof downloadCprDebugArtifacts>[0]['images'] = [];
           type SupportFormationSummary = {
@@ -13547,40 +14761,6 @@ export function useCPROrchestrator({
           };
           const targetPhase2SeedAssessment =
             phase2BaseAssessmentByLabel.get(CPR_TARGET_TOOTH_DEBUG_LABEL) ?? null;
-          const reportDisplayMode = forcedDisplayedAttemptForDebug
-            ? 'forced-debug-gpu'
-            : phase2VirtualPano.usedAsDisplayedOutput
-              ? 'accepted-phase2'
-              : canPreservePreviousPanoDisplay
-                ? 'preserve-previous-accepted'
-                : selectedQualityGateCandidate.pass
-                  ? 'accepted-ranked-top'
-                  : degradedPreviewFallbackChoice
-                    ? 'degraded-preview'
-                    : degradedPreviewEmergencyChoice
-                      ? 'emergency-debug-preview'
-                      : 'blocked';
-          const reportDisplayedLabel = forcedDisplayedAttemptForDebug
-            ? forcedDisplayedAttemptForDebug.label
-            : phase2VirtualPano.usedAsDisplayedOutput
-              ? phase2BaseAttempt?.label ?? selectedAttempt.label
-              : canPreservePreviousPanoDisplay
-                ? preservedPreviousPanoImageId ?? 'previous-accepted-pano'
-                : degradedPreviewSelectedChoice?.attempt.label ?? selectedAttempt.label;
-          const reportDisplayedAccepted =
-            reportDisplayMode === 'preserve-previous-accepted' ||
-            (phase2VirtualPano.usedAsDisplayedOutput
-              ? explicitPhase2QualityGateCandidate?.pass === true
-              : !forcedDisplayedAttemptForDebug && selectedQualityGateCandidate.pass);
-          const reportDisplayedRejectReasons = forcedDisplayedAttemptForDebug
-            ? forcedDisplayedQualityGateCandidate?.rejectReasons ??
-              displayRankedGpuQualityGateCandidate?.rejectReasons ??
-              []
-            : phase2VirtualPano.usedAsDisplayedOutput
-              ? explicitPhase2QualityGateCandidate?.rejectReasons ?? []
-              : degradedPreviewSelectedChoice
-                ? degradedPreviewSelectedChoice.candidate.rejectReasons
-                : selectedQualityGateCandidate.rejectReasons;
           const reportSummarySections = [
             {
               title: 'Normal Winner',
@@ -13709,6 +14889,79 @@ export function useCPROrchestrator({
               upper,
             });
           };
+          const buildRowMeanPlotImage = (
+            pixels: Float32Array | Uint16Array,
+            width: number,
+            height: number
+          ): { pixels: Float32Array; width: number; height: number } | null => {
+            if (!pixels?.length || width <= 0 || height <= 0) {
+              return null;
+            }
+            const rowMeans = new Float32Array(height);
+            let minMean = Number.POSITIVE_INFINITY;
+            let maxMean = Number.NEGATIVE_INFINITY;
+            for (let row = 0; row < height; row++) {
+              let rowSum = 0;
+              let rowCount = 0;
+              for (let col = 0; col < width; col++) {
+                const value = Number(pixels[row * width + col]);
+                if (!Number.isFinite(value)) {
+                  continue;
+                }
+                rowSum += value;
+                rowCount++;
+              }
+              const rowMean = rowCount > 0 ? rowSum / rowCount : 0;
+              rowMeans[row] = rowMean;
+              minMean = Math.min(minMean, rowMean);
+              maxMean = Math.max(maxMean, rowMean);
+            }
+            const plotHeight = 96;
+            const plotWidth = Math.max(height, 8);
+            const plotPixels = new Float32Array(plotWidth * plotHeight);
+            const span = Math.max(1e-6, maxMean - minMean);
+            let previousY = plotHeight - 1;
+            for (let row = 0; row < height; row++) {
+              const x = Math.min(plotWidth - 1, row);
+              const normalized = Math.max(
+                0,
+                Math.min(1, (rowMeans[row] - minMean) / span)
+              );
+              const y = Math.max(
+                0,
+                Math.min(plotHeight - 1, plotHeight - 1 - Math.round(normalized * (plotHeight - 1)))
+              );
+              const startY = Math.min(previousY, y);
+              const endY = Math.max(previousY, y);
+              for (let lineY = startY; lineY <= endY; lineY++) {
+                plotPixels[lineY * plotWidth + x] = 1;
+              }
+              plotPixels[(plotHeight - 1) * plotWidth + x] = Math.max(
+                plotPixels[(plotHeight - 1) * plotWidth + x],
+                0.18
+              );
+              previousY = y;
+            }
+            return {
+              pixels: plotPixels,
+              width: plotWidth,
+              height: plotHeight,
+            };
+          };
+          const appendRowMeanPlotImage = (
+            title: string,
+            filenameStem: string,
+            pixels: Float32Array | Uint16Array,
+            width: number,
+            height: number,
+            caption?: string | null
+          ) => {
+            const plot = buildRowMeanPlotImage(pixels, width, height);
+            if (!plot) {
+              return;
+            }
+            appendReportImage(title, filenameStem, plot.pixels, plot.width, plot.height, 'unit', 0, 1, caption);
+          };
           const buildCandidateReportCaption = (
             attempt: Awaited<ReturnType<typeof runWorkerAttempt>> | null,
             candidate: Phase4QualityGateCandidate | null
@@ -13717,6 +14970,7 @@ export function useCPROrchestrator({
             const attemptSupportFormation = readAttemptSupportFormationDiagnostics(
               attempt?.workerDebugPayload ?? null
             ).supportFormation;
+            const localizedReadout = candidate?.localizedReadout;
             const formatBackgroundBandLine = (
               thresholdLabel: '05' | '10'
             ): string => {
@@ -13742,17 +14996,42 @@ export function useCPROrchestrator({
             return [
               `label=${attempt?.label ?? 'none'}`,
               `pass=${candidate?.pass ? 'yes' : 'no'}`,
+              `candidateSource=${candidate?.candidateSource ?? 'unknown'}`,
               `backend=${candidate?.backend ?? attempt?.resolvedBackend ?? 'unknown'}`,
               `requestedBackend=${candidate?.requestedBackend ?? attempt?.requestedBackend ?? 'unknown'}`,
               `pipelineMode=${candidate?.pipelineMode ?? attempt?.pipelineMode ?? 'unknown'}`,
               `reconstructionMode=${candidate?.reconstructionMode ?? attempt?.reconstructionMode ?? 'unknown'}`,
+              `rendererVariant=${candidate?.metrics.rendererVariant ?? 'unknown'}`,
+              `renderSupportMode=${candidate?.metrics.renderSupportMode ?? 'unknown'}`,
               `fallbackReason=${candidate?.fallbackReason ?? attempt?.fallbackReason ?? 'none'}`,
               `displayedPath=${candidate?.displayedPath ?? 'worker-recon'}`,
-              `workerUsedAsOutput=${candidate?.workerUsedAsOutput === null ? 'na' : candidate?.workerUsedAsOutput ? 'yes' : 'no'}`,
+              `workerBranchSelected=${candidate?.workerBranchSelected === null ? 'na' : candidate?.workerBranchSelected ? 'yes' : 'no'}`,
+              `workerQcAccepted=${candidate?.workerQcAccepted === null ? 'na' : candidate?.workerQcAccepted ? 'yes' : 'no'}`,
+              `workerQcStage=${candidate?.workerQcStage ?? 'na'}`,
+              `metricStage=${candidate?.metricStage ?? 'na'}`,
+              `rejectStage=${candidate?.rejectReasonsStage ?? 'na'}`,
+              `orchestratorAccepted=${candidate?.orchestratorAccepted ? 'yes' : 'no'}`,
               `qualityBase=${formatCandidateMetric(candidate?.qualityBase ?? attempt?.qualityBase, 2)}`,
               `qualityScore=${formatCandidateMetric(candidate?.qualityScore ?? attempt?.qualityScore, 2)}`,
               `supportP50=${formatCandidateMetric(candidate?.metrics.supportConfidenceP50, 3)}`,
               `supportPathP50=${formatCandidateMetric(candidate?.metrics.supportPathConfidenceP50, 3)}`,
+              `supportAmbiguousFrac=${formatCandidateMetric(
+                candidate?.metrics.supportAmbiguousColumnFraction,
+                3
+              )}`,
+              `supportScoreGapP50=${formatCandidateMetric(
+                candidate?.metrics.supportScoreGapP50,
+                3
+              )}`,
+              `detailHuUpperP50=${formatCandidateMetric(candidate?.metrics.upperDetailHuP50, 1)}`,
+              `detailHuLowerP50=${formatCandidateMetric(candidate?.metrics.lowerDetailHuP50, 1)}`,
+              `detailSampleFraction=${formatCandidateMetric(candidate?.metrics.detailSampleFractionMean, 3)}`,
+              `contextBlendMean=${formatCandidateMetric(candidate?.metrics.contextBlendMean, 3)}`,
+              `contextWeightFractionMean=${formatCandidateMetric(
+                candidate?.metrics.contextWeightFractionMean,
+                3
+              )}`,
+              `shadowLift=${formatCandidateMetric(candidate?.metrics.shadowLiftMean, 3)}`,
               `supportValidityP50=${formatCandidateMetric(
                 attemptSupportFormation?.supportValidityP50,
                 3
@@ -13791,10 +15070,164 @@ export function useCPROrchestrator({
                 3
               )}`,
               `scalarMode=${attempt?.debugScalarSamplingMode ?? 'current'}`,
-              `stageHint=${attempt?.toothBandStageDiagnostics?.stageHint ?? 'na'}`,
+              `stageHint=${
+                candidate?.candidateSource === 'worker-cpu-virtual-panoramic-radiograph'
+                  ? candidate?.metricStage ?? 'na'
+                  : attempt?.toothBandStageDiagnostics?.stageHint ?? 'na'
+              }`,
               `lowerBandBright=${formatCandidateMetric(candidate?.metrics.lowerBandBrightFraction, 3)}`,
               `lowerBandP50=${formatCandidateMetric(candidate?.metrics.lowerBandP50, 1)}`,
               `toothContrast=${formatCandidateMetric(candidate?.metrics.toothBandContrastRange, 1)}`,
+              `focalSharpnessCenterThirdP50=${formatCandidateMetric(
+                candidate?.metrics.focalSharpnessCenterThirdP50,
+                3
+              )}`,
+              `interToothValleyContrast=${formatCandidateMetric(
+                candidate?.metrics.interToothValleyContrast,
+                1
+              )}`,
+              `intraToothGradation=${formatCandidateMetric(
+                candidate?.metrics.intraToothGradationScore,
+                1
+              )}`,
+              `crownHighlightSaturation=${formatCandidateMetric(
+                candidate?.metrics.crownHighlightSaturationFraction,
+                3
+              )}`,
+              `occlusalDarkCap=${formatCandidateMetric(
+                candidate?.metrics.occlusalDarkCapFraction,
+                3
+              )}`,
+              `offTroughEnergy[top,mid,bot]=${[
+                formatCandidateMetric(candidate?.metrics.offTroughEnergyTopRatio, 3),
+                formatCandidateMetric(candidate?.metrics.offTroughEnergyMiddleRatio, 3),
+                formatCandidateMetric(candidate?.metrics.offTroughEnergyBottomRatio, 3),
+              ].join(',')}`,
+              `lowerField[spec,streak]=${[
+                formatCandidateMetric(candidate?.metrics.lowerFieldSpeckleFraction, 3),
+                formatCandidateMetric(candidate?.metrics.lowerFieldVerticalStreakScore, 3),
+              ].join(',')}`,
+              `underRootSmear=${formatCandidateMetric(candidate?.metrics.underRootVerticalSmearScore, 3)}`,
+              `hypothesisSwitch=${formatCandidateMetric(candidate?.metrics.hypothesisSwitchFraction, 3)}`,
+              `finalDisplayClipping[low,high,hist]=${[
+                formatCandidateMetric(candidate?.metrics.finalDisplayLowClipFraction, 3),
+                formatCandidateMetric(candidate?.metrics.finalDisplayHighClipFraction, 3),
+                formatCandidateMetric(candidate?.metrics.finalDisplayHistogramOccupancy, 3),
+              ].join(',')}`,
+              `panelLeak[rawZeroBright,outsideP95,gapP95,boundaryJump]=${[
+                formatCandidateMetric(candidate?.metrics.rawZeroButFinalBrightFraction, 3),
+                formatCandidateMetric(candidate?.metrics.outsideRowsBrightnessP95, 3),
+                formatCandidateMetric(candidate?.metrics.gapRowsBrightnessP95, 3),
+                formatCandidateMetric(candidate?.metrics.bandBoundaryJumpMean, 3),
+              ].join(',')}`,
+              localizedReadout
+                ? `mapReadout.centerTeeth sharp=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.focalSharpnessP50,
+                    3
+                  )} raw=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.rawProjectedAttenuationP50,
+                    3
+                  )} post=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.postSuppressionP50,
+                    3
+                  )} preNorm=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.preNormalizeCompositeP50,
+                    3
+                  )} postNorm=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.postNormalizeDisplayP50,
+                    3
+                  )} final=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.finalDisplayP50,
+                    1
+                  )} bgPresent=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.backgroundPresentationP50,
+                    3
+                  )} signal=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.hasSignalFraction,
+                    3
+                  )} context=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.contextContributionP50,
+                    3
+                  )} fill=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.backgroundFillContributionP50,
+                    3
+                  )} switch=${formatCandidateMetric(
+                    localizedReadout.centerTeeth.hypothesisSwitchFraction,
+                    3
+                  )}`
+                : null,
+              localizedReadout
+                ? `mapReadout.upperCloudBand suppress=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.outOfTroughSuppressionP50,
+                    3
+                  )} raw=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.rawProjectedAttenuationP50,
+                    3
+                  )} post=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.postSuppressionP50,
+                    3
+                  )} preNorm=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.preNormalizeCompositeP50,
+                    3
+                  )} postNorm=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.postNormalizeDisplayP50,
+                    3
+                  )} final=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.finalDisplayP50,
+                    1
+                  )} bgPresent=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.backgroundPresentationP50,
+                    3
+                  )} signal=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.hasSignalFraction,
+                    3
+                  )} context=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.contextContributionP50,
+                    3
+                  )} fill=${formatCandidateMetric(
+                    localizedReadout.upperCloudBand.backgroundFillContributionP50,
+                    3
+                  )}`
+                : null,
+              localizedReadout
+                ? `mapReadout.lowerGranularField suppress=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.outOfTroughSuppressionP50,
+                    3
+                  )} raw=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.rawProjectedAttenuationP50,
+                    3
+                  )} post=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.postSuppressionP50,
+                    3
+                  )} preNorm=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.preNormalizeCompositeP50,
+                    3
+                  )} postNorm=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.postNormalizeDisplayP50,
+                    3
+                  )} final=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.finalDisplayP50,
+                    1
+                  )} bgPresent=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.backgroundPresentationP50,
+                    3
+                  )} signal=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.hasSignalFraction,
+                    3
+                  )} context=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.contextContributionP50,
+                    3
+                  )} fill=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.backgroundFillContributionP50,
+                    3
+                  )} speckle=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.speckleFraction,
+                    3
+                  )} streak=${formatCandidateMetric(
+                    localizedReadout.lowerGranularField.verticalStreakScore,
+                    3
+                  )}`
+                : null,
               `borderline=${candidate?.borderlineAcceptedReason ?? 'none'}`,
               `hardReject=${candidate?.hardRejectReason ?? attempt?.hardRejectReason ?? 'none'}`,
               `rejects=${candidate?.rejectReasons.join(', ') || 'none'}`,
@@ -13802,7 +15235,9 @@ export function useCPROrchestrator({
               `risk=${candidate?.supportSurfaceRiskSummary.riskLevel ?? 'unknown'}`,
               `riskFlags=${candidate?.supportSurfaceRiskSummary.riskFlags.join(', ') || 'none'}`,
               `baseline=${candidate?.supportSurfaceRiskSummary.baselineFingerprint ?? 'none'}`,
-            ].join('\n');
+            ]
+              .filter((line): line is string => !!line)
+              .join('\n');
           };
           const comparisonAttemptSpecs = [
             {
@@ -13953,7 +15388,11 @@ export function useCPROrchestrator({
                   3
                 )}`,
                 `scalarMode=${attempt.debugScalarSamplingMode}`,
-                `stageHint=${attempt.toothBandStageDiagnostics?.stageHint ?? 'na'}`,
+                `stageHint=${
+                  reportRows.find(row => row.label === label)?.metricStage ??
+                  attempt.toothBandStageDiagnostics?.stageHint ??
+                  'na'
+                }`,
                 `displayable=${
                   degradedPreviewCandidateByAttemptLabel.get(attempt.label)?.displayable
                     ? 'yes'
@@ -14023,6 +15462,94 @@ export function useCPROrchestrator({
             mode: 'hu' | 'unit' | 'signed' | 'positive';
             title: string;
           }> = [
+            { key: 'renderBranchMap', mode: 'positive', title: 'renderBranchMap' },
+            {
+              key: 'selectedSupportHypothesisMap',
+              mode: 'positive',
+              title: 'selectedSupportHypothesisMap',
+            },
+            { key: 'focalTroughSharpnessMap', mode: 'unit', title: 'focalTroughSharpnessMap' },
+            {
+              key: 'outOfTroughSuppressionMap',
+              mode: 'unit',
+              title: 'outOfTroughSuppressionMap',
+            },
+            {
+              key: 'rawProjectedAttenuationMap',
+              mode: 'positive',
+              title: 'rawProjectedAttenuationMap',
+            },
+            {
+              key: 'upperProjectedAttenuationMap',
+              mode: 'positive',
+              title: 'upperProjectedAttenuationMap.png',
+            },
+            {
+              key: 'lowerProjectedAttenuationMap',
+              mode: 'positive',
+              title: 'lowerProjectedAttenuationMap.png',
+            },
+            { key: 'upperBandRawOdMap', mode: 'positive', title: 'upperBandRawOD.png' },
+            { key: 'lowerBandRawOdMap', mode: 'positive', title: 'lowerBandRawOD.png' },
+            { key: 'gapBandRawOdMap', mode: 'positive', title: 'gapBandRawOD.png' },
+            { key: 'outsideRowsRawOdMap', mode: 'positive', title: 'outsideRowsRawOD.png' },
+            {
+              key: 'displayBackgroundOdMap',
+              mode: 'positive',
+              title: 'displayBackgroundOD.png',
+            },
+            { key: 'bandMaskUpperMap', mode: 'unit', title: 'bandMaskUpper.png' },
+            { key: 'bandMaskGapMap', mode: 'unit', title: 'bandMaskGap.png' },
+            { key: 'bandMaskLowerMap', mode: 'unit', title: 'bandMaskLower.png' },
+            { key: 'bandMaskOutsideMap', mode: 'unit', title: 'bandMaskOutside.png' },
+            {
+              key: 'normalizationEligibleMaskMap',
+              mode: 'unit',
+              title: 'normalizationEligibleMask.png',
+            },
+            {
+              key: 'preNormalizeCompositeOdMap',
+              mode: 'positive',
+              title: 'preToneCompositeOD.png',
+            },
+            {
+              key: 'postNormalizeDisplayMap',
+              mode: 'unit',
+              title: 'postNormalizeDisplay.png',
+            },
+            {
+              key: 'displayAnatomyMap',
+              mode: 'unit',
+              title: 'displayAnatomy.png',
+            },
+            {
+              key: 'backgroundPresentationMap',
+              mode: 'unit',
+              title: 'backgroundPresentation.png',
+            },
+            {
+              key: 'finalCompositeDisplayMap',
+              mode: 'unit',
+              title: 'finalDisplay.png',
+            },
+            {
+              key: 'contextContributionMap',
+              mode: 'positive',
+              title: 'contextContributionMap',
+            },
+            {
+              key: 'backgroundFillContributionMap',
+              mode: 'positive',
+              title: 'backgroundFillContributionMap',
+            },
+            { key: 'finalDisplayImageMap', mode: 'hu', title: 'finalDisplayImageMap' },
+            { key: 'panoV2FusionImageMap', mode: 'hu', title: 'panoV2FusionImageMap' },
+            { key: 'panoV2UpperLayer1Map', mode: 'hu', title: 'panoV2UpperLayer1Map' },
+            { key: 'panoV2UpperLayer2Map', mode: 'hu', title: 'panoV2UpperLayer2Map' },
+            { key: 'panoV2UpperLayer3Map', mode: 'hu', title: 'panoV2UpperLayer3Map' },
+            { key: 'panoV2LowerLayer1Map', mode: 'hu', title: 'panoV2LowerLayer1Map' },
+            { key: 'panoV2LowerLayer2Map', mode: 'hu', title: 'panoV2LowerLayer2Map' },
+            { key: 'panoV2LowerLayer3Map', mode: 'hu', title: 'panoV2LowerLayer3Map' },
             { key: 'rawSupportPeakDominanceMap', mode: 'unit', title: 'rawSupportPeakDominanceMap' },
             { key: 'rawSupportPeakValidityMap', mode: 'unit', title: 'rawSupportPeakValidityMap' },
             { key: 'rawSupportSecondPeakRatioMap', mode: 'unit', title: 'rawSupportSecondPeakRatioMap' },
@@ -14219,9 +15746,83 @@ export function useCPROrchestrator({
                   `backend=${attempt.resolvedBackend}`,
                   `reconstructionMode=${attempt.reconstructionMode}`,
                   `scalarMode=${attempt.debugScalarSamplingMode}`,
-                  `stageHint=${attempt.toothBandStageDiagnostics?.stageHint ?? 'na'}`,
+                  `stageHint=${
+                    spec.candidate?.metricStage ?? attempt.toothBandStageDiagnostics?.stageHint ?? 'na'
+                  }`,
                   `rejects=${spec.candidate?.rejectReasons.join(', ') || 'none'}`,
                   `workerRejects=${spec.candidate?.workerRejectReasons.join(', ') || 'none'}`,
+                ].join('\n')
+              );
+            }
+            const rowMeanPlotSpecs: Array<{
+              key: keyof NonNullable<PanoImagePayload['debugMaps']>;
+              title: string;
+              filenameStem: string;
+            }> = [
+              {
+                key: 'upperBandRawOdMap',
+                title: 'rowMeanRawUpper.png',
+                filenameStem: 'row-mean-raw-upper',
+              },
+              {
+                key: 'lowerBandRawOdMap',
+                title: 'rowMeanRawLower.png',
+                filenameStem: 'row-mean-raw-lower',
+              },
+              {
+                key: 'gapBandRawOdMap',
+                title: 'rowMeanRawGap.png',
+                filenameStem: 'row-mean-raw-gap',
+              },
+              {
+                key: 'displayBackgroundOdMap',
+                title: 'rowMeanDisplayBackground.png',
+                filenameStem: 'row-mean-display-background',
+              },
+              {
+                key: 'preNormalizeCompositeOdMap',
+                title: 'rowMeanPreNormalizeComposite.png',
+                filenameStem: 'row-mean-pre-normalize-composite',
+              },
+              {
+                key: 'postNormalizeDisplayMap',
+                title: 'rowMeanPostNormalizeDisplay.png',
+                filenameStem: 'row-mean-post-normalize-display',
+              },
+              {
+                key: 'displayAnatomyMap',
+                title: 'rowMeanDisplayAnatomy.png',
+                filenameStem: 'row-mean-display-anatomy',
+              },
+              {
+                key: 'backgroundPresentationMap',
+                title: 'rowMeanBackgroundPresentation.png',
+                filenameStem: 'row-mean-background-presentation',
+              },
+              {
+                key: 'finalCompositeDisplayMap',
+                title: 'rowMeanFinalDisplay.png',
+                filenameStem: 'row-mean-final-display',
+              },
+            ];
+            for (const plotSpec of rowMeanPlotSpecs) {
+              const pixels = attempt.result.debugMaps?.[plotSpec.key];
+              if (!pixels) {
+                continue;
+              }
+              appendRowMeanPlotImage(
+                `${spec.title} ${plotSpec.title}`,
+                `${spec.prefix}-${attempt.label}-${plotSpec.filenameStem}`,
+                pixels,
+                attempt.result.width,
+                attempt.result.height,
+                [
+                  `label=${attempt.label}`,
+                  `backend=${attempt.resolvedBackend}`,
+                  `reconstructionMode=${attempt.reconstructionMode}`,
+                  `stageHint=${
+                    spec.candidate?.metricStage ?? attempt.toothBandStageDiagnostics?.stageHint ?? 'na'
+                  }`,
                 ].join('\n')
               );
             }
@@ -14269,6 +15870,12 @@ export function useCPROrchestrator({
                 blackClip: sample.blackClip ?? null,
                 retainedSampleMask: sample.retainedSampleMask ?? null,
                 middleBandLeak: sample.middleBandLeak ?? null,
+                renderBranchCode: sample.renderBranchCode ?? null,
+                selectedSupportHypothesis: sample.selectedSupportHypothesis ?? null,
+                focalTroughSharpness: sample.focalTroughSharpness ?? null,
+                outOfTroughSuppression: sample.outOfTroughSuppression ?? null,
+                rawProjectedAttenuation: sample.rawProjectedAttenuation ?? null,
+                finalDisplayImage: sample.finalDisplayImage ?? null,
                 holeMetricWouldCount: sample.holeMetricWouldCount,
                 holeMetricReasons: sample.holeMetricReasons ?? [],
               })
@@ -14515,10 +16122,13 @@ export function useCPROrchestrator({
       let panoWorkerResult = displayedAttempt.result;
       let panoDebugSummary = displayedAttempt.summary;
       let adaptiveVoi = displayedAttempt.voi;
-      let displayedOutputMode: 'legacy' | 'workerGpuPhase2' | 'virtualPanoPhase2' =
-        usingForcedGpuDisplayForDebug
+      const displayedAttemptRouteDiagnostic = resolveWorkerDisplayRouteDiagnostic(
+        displayedAttempt.workerDebugPayload
+      );
+      let displayedOutputMode: PanoDisplayedOutputMode =
+        usingForcedGpuDisplayForDebug || usingDegradedPreviewFallback
           ? resolveDisplayedOutputModeFromWorkerResult({
-              routeDiagnostic: resolveWorkerDisplayRouteDiagnostic(displayedAttempt.workerDebugPayload),
+              routeDiagnostic: displayedAttemptRouteDiagnostic,
               workerDebugPayload: displayedAttempt.workerDebugPayload,
             })
           : selectedDisplayedOutputMode;
@@ -14538,11 +16148,18 @@ export function useCPROrchestrator({
         phase2VirtualPano.voi &&
         phase2BaseAttempt
       );
+      const displayingRejectedPhase2VirtualPanoForDebug = Boolean(
+        displayUsesPhase2VirtualPano &&
+          phase2VirtualPano.displayDecisionReason &&
+          phase2VirtualPano.displayDecisionReason.startsWith(
+            'debug-force-display-rejected-pano-v2-fusion'
+          )
+      );
       if (displayUsesPhase2VirtualPano && phase2BaseAttempt) {
         panoWorkerResult = phase2WorkerResult;
         panoDebugSummary = phase2VirtualPano.summary;
         adaptiveVoi = phase2VirtualPano.voi;
-        displayedOutputMode = 'virtualPanoPhase2';
+        displayedOutputMode = phase2DisplayedOutputMode;
         displayedSourceLabel = phase2BaseAttempt.label;
         displayedSourceAggregation = phase2BaseAttempt.aggregation;
         selectedPanoWidth = phase2BaseAttempt.panoWidth;
@@ -14556,8 +16173,18 @@ export function useCPROrchestrator({
           phase2VirtualPano.displayDecisionReason ===
           'accepted-by-worker-and-orchestrator-after-rejected-seed-revival-rule'
             ? 'phase2-virtual-pano-accepted-after-rejected-seed-revival-rule'
+            : phase2VirtualPano.displayDecisionReason?.startsWith(
+                  'debug-force-display-rejected-pano-v2-fusion'
+                )
+              ? 'debug-force-display-rejected-pano-v2-fusion'
             : 'phase2-virtual-pano-accepted';
       }
+      const displayIntensityDomain = displayUsesPhase2VirtualPano
+        ? phase2VirtualPano.intensityDomain
+        : displayedAttempt.intensityDomain;
+      const displayHuDomain = displayUsesPhase2VirtualPano
+        ? phase2VirtualPano.huDomain
+        : displayedAttempt.huDomain;
       const displayingQcFailedRankedTop =
         !usingForcedGpuDisplayForDebug &&
         !usingDegradedPreviewFallback &&
@@ -14569,9 +16196,9 @@ export function useCPROrchestrator({
       const displayedWorkerDebugPayload = displayUsesPhase2VirtualPano
         ? phase2WorkerResult?.workerDebugPayload ?? null
         : displayedAttempt.workerDebugPayload ?? null;
-      const displayedRouteDiagnostic = resolveWorkerDisplayRouteDiagnostic(
-        displayedWorkerDebugPayload
-      );
+      const displayedRouteDiagnostic = displayUsesPhase2VirtualPano
+        ? resolveWorkerDisplayRouteDiagnostic(displayedWorkerDebugPayload)
+        : displayedAttemptRouteDiagnostic;
       const displayedWorkerDiagnostic =
         displayedWorkerDebugPayload &&
         typeof displayedWorkerDebugPayload === 'object' &&
@@ -14737,6 +16364,7 @@ export function useCPROrchestrator({
               displayedOutputMode,
             qualityStatus:
               usingForcedGpuDisplayForDebug ||
+              displayingRejectedPhase2VirtualPanoForDebug ||
               usingDegradedPreviewFallback ||
               displayingQcFailedRankedTop
                 ? 'degraded'
@@ -14769,6 +16397,7 @@ export function useCPROrchestrator({
         qualityGatePassed: displayedQualityGateCandidate.pass,
         qualityStatus:
           usingForcedGpuDisplayForDebug ||
+          displayingRejectedPhase2VirtualPanoForDebug ||
           usingDegradedPreviewFallback ||
           displayingQcFailedRankedTop
             ? 'degraded'
@@ -14884,6 +16513,7 @@ export function useCPROrchestrator({
           const displayingDegradedPanoPreview = usingDegradedPreviewFallback;
           const qualityStatusForDisplay: PanoQualityStatus =
             usingForcedGpuDisplayForDebug ||
+            displayingRejectedPhase2VirtualPanoForDebug ||
             displayingDegradedPanoPreview ||
             displayingQcFailedRankedTop
               ? 'degraded'
@@ -14892,6 +16522,10 @@ export function useCPROrchestrator({
             ? `[CPR] Debug override is forcing the GPU pano candidate "${displayedAttempt.label}" for inspection. Normal selection chose "${selectedAttempt.label}". GPU reject reasons: ${formatPhase4RejectReasonsForMessage(
                 displayedQualityGateCandidate.rejectReasons
               )}.`
+            : displayingRejectedPhase2VirtualPanoForDebug
+              ? `[CPR] Debug override is forcing the rejected pano-v2 fusion output for inspection. Reject reasons: ${formatPhase4RejectReasonsForMessage(
+                  displayedQualityGateCandidate.rejectReasons
+                )}.`
             : displayingDegradedPanoPreview
               ? usingEmergencyDegradedPreviewFallback
                 ? `[CPR] Displaying emergency debug pano from "${displayedAttempt.label}" because no accepted pano is available. Reject reasons: ${formatPhase4RejectReasonsForMessage(
@@ -14939,8 +16573,8 @@ export function useCPROrchestrator({
             qualityGateRejectReasons: displayedQualityGateCandidate.rejectReasons,
             qualityGateSelectionReason: qualityGateDisplaySelectionReason,
             qualityGateMessage: qualityMessageForDisplay,
-            huDomain: displayedAttempt.huDomain,
-            intensityDomain: displayedAttempt.intensityDomain,
+            huDomain: displayHuDomain,
+            intensityDomain: displayIntensityDomain,
             windowWidth: adaptiveVoi.windowWidth,
             windowCenter: adaptiveVoi.windowCenter,
             slope: panoWorkerResult.slope,

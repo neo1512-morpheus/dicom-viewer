@@ -22,9 +22,9 @@ export function CPROrchestratorProvider({
     commandsManager,
     sourceViewportId: 'cpr-axial',
     panoWidth: 800,
-    panoHeight: 400,
-    slabHalfThicknessMm: 3,
-    slabSamples: 11,
+    panoHeight: 500,
+    slabHalfThicknessMm: 15,
+    slabSamples: 41,
     aggregation: 'MEAN',
   });
 

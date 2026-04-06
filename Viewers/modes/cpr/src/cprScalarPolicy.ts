@@ -18,9 +18,13 @@ export interface StoredValueNormalizationPolicy {
   heuristicOverride: boolean;
   sampledMin: number;
   sampledMax: number;
+  observedRawMin: number;
+  observedRawMax: number;
+  overflowConditionObserved: boolean;
   unsignedPackedArtifactDetected: boolean;
   hasBitDepthRangeMismatch: boolean;
   shouldNormalizeStoredValues: boolean;
+  normalizationBranch: 'none' | 'packed-bit-extraction' | 'overflow-rescale';
   normalizationSignature: string | null;
   normalizeStoredSample?: (value: number) => number;
 }
@@ -83,6 +87,29 @@ export function sampleScalarRange(data: ArrayLike<number>): { min: number; max: 
   const step = Math.max(1, Math.floor(data.length / 4096));
 
   for (let i = 0; i < data.length; i += step) {
+    const value = Number(data[i]);
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    if (value < min) {
+      min = value;
+    }
+    if (value > max) {
+      max = value;
+    }
+  }
+
+  return {
+    min: Number.isFinite(min) ? min : 0,
+    max: Number.isFinite(max) ? max : 0,
+  };
+}
+
+export function scanScalarRangeExact(data: ArrayLike<number>): { min: number; max: number } {
+  let min = Infinity;
+  let max = -Infinity;
+
+  for (let i = 0; i < data.length; i++) {
     const value = Number(data[i]);
     if (!Number.isFinite(value)) {
       continue;
@@ -216,6 +243,8 @@ export function resolveStoredValueNormalizationPolicy(params: {
   pixelRepresentation?: number;
   allowStoredValueNormalization?: boolean;
   disableStoredValueNormalization?: boolean;
+  observedRawMin?: number;
+  observedRawMax?: number;
 }): StoredValueNormalizationPolicy {
   const {
     scalarData,
@@ -228,6 +257,8 @@ export function resolveStoredValueNormalizationPolicy(params: {
     pixelRepresentation,
     allowStoredValueNormalization,
     disableStoredValueNormalization,
+    observedRawMin,
+    observedRawMax,
   } = params;
 
   const safeSlope =
@@ -261,6 +292,15 @@ export function resolveStoredValueNormalizationPolicy(params: {
   const effectiveIsPreScaled = preScaledResolution.effectiveIsPreScaled;
   const sampledMin = preScaledResolution.sampledMin;
   const sampledMax = preScaledResolution.sampledMax;
+  const exactRawRange =
+    Number.isFinite(observedRawMin) && Number.isFinite(observedRawMax)
+      ? {
+          min: Number(observedRawMin),
+          max: Number(observedRawMax),
+        }
+      : scanScalarRangeExact(scalarData);
+  const exactObservedRawMin = exactRawRange.min;
+  const exactObservedRawMax = exactRawRange.max;
   const normalizationEligible =
     !effectiveIsPreScaled &&
     safeBitsStored < 16 &&
@@ -273,6 +313,10 @@ export function resolveStoredValueNormalizationPolicy(params: {
     normalizationEligible &&
     safePixelRepresentation === 0 &&
     (sampledMin < -1 || sampledMax > nominalStoredMax + 8);
+  const overflowConditionObserved =
+    normalizationEligible &&
+    Number.isFinite(exactObservedRawMax) &&
+    exactObservedRawMax > nominalStoredMax;
   const hasBitDepthRangeMismatch =
     normalizationEligible &&
     (sampledMin < nominalSignedMin - 8 || sampledMax > nominalStoredMax + 8);
@@ -303,10 +347,43 @@ export function resolveStoredValueNormalizationPolicy(params: {
     shouldNormalizeStoredValues && normalizedBitsStored > 0 ? 1 << (normalizedBitsStored - 1) : 0;
   const storedRange =
     shouldNormalizeStoredValues && normalizedBitsStored > 0 ? 1 << normalizedBitsStored : 0;
+  const bitExtractionCeilingHu =
+    shouldNormalizeStoredValues && normalizedBitsStored > 0
+      ? nominalStoredMax * safeSlope + safeIntercept
+      : Number.NEGATIVE_INFINITY;
+  const shouldUseOverflowRescale =
+    shouldNormalizeStoredValues &&
+    unsignedPackedArtifactDetected &&
+    overflowConditionObserved &&
+    bitExtractionCeilingHu < 1500 &&
+    Number.isFinite(exactObservedRawMin) &&
+    Number.isFinite(exactObservedRawMax) &&
+    exactObservedRawMax > exactObservedRawMin &&
+    Number.isFinite(safeSlope) &&
+    Math.abs(safeSlope) > 1e-8;
+  const overflowRescaleDenominator =
+    shouldUseOverflowRescale ? exactObservedRawMax - exactObservedRawMin : 1;
+  const targetHuMin = safeIntercept;
+  const targetHuMax = 3500;
+  const targetStoredMin = shouldUseOverflowRescale ? (targetHuMin - safeIntercept) / safeSlope : 0;
+  const targetStoredMax = shouldUseOverflowRescale ? (targetHuMax - safeIntercept) / safeSlope : 0;
+  const normalizationBranch: StoredValueNormalizationPolicy['normalizationBranch'] =
+    shouldNormalizeStoredValues
+      ? shouldUseOverflowRescale
+        ? 'overflow-rescale'
+        : 'packed-bit-extraction'
+      : 'none';
   const normalizeStoredSample = shouldNormalizeStoredValues
     ? (value: number): number => {
       if (!Number.isFinite(value)) {
         return 0;
+      }
+      if (shouldUseOverflowRescale) {
+        const rawInt16 = Number(value);
+        const normalizedFraction =
+          (rawInt16 - exactObservedRawMin) / Math.max(1e-6, overflowRescaleDenominator);
+        const clampedFraction = Math.max(0, Math.min(1, normalizedFraction));
+        return targetStoredMin + clampedFraction * (targetStoredMax - targetStoredMin);
       }
       const intValue = Math.round(value);
       const rawU16 = intValue & 0xffff;
@@ -324,7 +401,9 @@ export function resolveStoredValueNormalizationPolicy(params: {
     }
     : undefined;
   const normalizationSignature = shouldNormalizeStoredValues
-    ? `packed:${normalizedBitsStored}:${normalizedHighBit}:${bitAlignmentShift}:${safePixelRepresentation ?? 'na'}`
+    ? shouldUseOverflowRescale
+      ? `overflow-rescale:${normalizedBitsStored}:${normalizedHighBit}:${safePixelRepresentation ?? 'na'}:${Math.round(exactObservedRawMin)}:${Math.round(exactObservedRawMax)}`
+      : `packed:${normalizedBitsStored}:${normalizedHighBit}:${bitAlignmentShift}:${safePixelRepresentation ?? 'na'}`
     : null;
 
   return {
@@ -338,9 +417,13 @@ export function resolveStoredValueNormalizationPolicy(params: {
     heuristicOverride: preScaledResolution.heuristicOverride,
     sampledMin,
     sampledMax,
+    observedRawMin: exactObservedRawMin,
+    observedRawMax: exactObservedRawMax,
+    overflowConditionObserved,
     unsignedPackedArtifactDetected,
     hasBitDepthRangeMismatch,
     shouldNormalizeStoredValues,
+    normalizationBranch,
     normalizationSignature,
     normalizeStoredSample,
   };
@@ -357,6 +440,8 @@ export function createHuScalarTransform(params: {
   pixelRepresentation?: number;
   allowStoredValueNormalization?: boolean;
   disableStoredValueNormalization?: boolean;
+  observedRawMin?: number;
+  observedRawMax?: number;
 }): HuScalarTransform {
   const policy = resolveStoredValueNormalizationPolicy(params);
   const shouldApplyModalityLut =
@@ -410,6 +495,8 @@ export function normalizeScalarDataToHuFloat32(params: {
   pixelRepresentation?: number;
   allowStoredValueNormalization?: boolean;
   disableStoredValueNormalization?: boolean;
+  observedRawMin?: number;
+  observedRawMax?: number;
   targetBuffer?: Float32Array | null;
 }): NormalizeScalarDataToHuResult {
   const transform = createHuScalarTransform(params);

@@ -3,6 +3,16 @@ export type CprDebugImageMode = 'hu' | 'unit' | 'signed' | 'positive';
 export interface CprDebugReportRow {
   label: string;
   checksum: number | null;
+  candidateSource?: string | null;
+  rendererVariant?: string | null;
+  renderSupportMode?: string | null;
+  metricStage?: string | null;
+  workerBranchSelected?: boolean | null;
+  workerQcAccepted?: boolean | null;
+  workerQcStage?: string | null;
+  rejectReasonsStage?: string | null;
+  orchestratorAccepted?: boolean | null;
+  emergencyDebugPreviewDisplayed?: boolean | null;
   supportP50: number | null;
   bgOutlier05: number | null;
   bgOutlier10: number | null;
@@ -75,11 +85,18 @@ export interface CprDebugProbeRow {
   blackClip?: number | null;
   retainedSampleMask?: number | null;
   middleBandLeak?: number | null;
+  renderBranchCode?: number | null;
+  selectedSupportHypothesis?: number | null;
+  focalTroughSharpness?: number | null;
+  outOfTroughSuppression?: number | null;
+  rawProjectedAttenuation?: number | null;
+  finalDisplayImage?: number | null;
   holeMetricWouldCount?: boolean;
   holeMetricReasons?: string[];
 }
 
 const downloadedCprDebugArtifactRunIds = new Set<string>();
+const publishedCprDebugArtifactUrls = new Map<string, string[]>();
 
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) {
@@ -217,7 +234,7 @@ function encodeImageDataUrl(image: CprDebugReportImage): string | null {
 }
 
 function triggerDownload(filename: string, text: string, mimeType: string): void {
-  if (typeof document === 'undefined' || typeof URL === 'undefined') {
+  if (typeof document === 'undefined' || typeof URL === 'undefined' || !document.body) {
     return;
   }
 
@@ -226,16 +243,98 @@ function triggerDownload(filename: string, text: string, mimeType: string): void
   const link = document.createElement('a');
   link.href = url;
   link.download = filename;
+  link.rel = 'noopener noreferrer';
+  link.style.display = 'none';
   document.body.appendChild(link);
-  link.click();
+  link.dispatchEvent(
+    new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    })
+  );
   document.body.removeChild(link);
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function publishPersistentDownloadLinks(
+  runId: string,
+  downloads: Array<{ filename: string; text: string; mimeType: string }>
+): void {
+  if (typeof document === 'undefined' || typeof URL === 'undefined' || !document.body) {
+    return;
+  }
+
+  const safeRunId = sanitizeFilenamePart(runId || 'cpr-debug');
+  const existingUrls = publishedCprDebugArtifactUrls.get(safeRunId);
+  existingUrls?.forEach(url => URL.revokeObjectURL(url));
+
+  const containerId = 'cpr-debug-artifact-link-panel';
+  let container = document.getElementById(containerId) as HTMLDivElement | null;
+  if (!container) {
+    container = document.createElement('div');
+    container.id = containerId;
+    container.style.position = 'fixed';
+    container.style.right = '16px';
+    container.style.bottom = '16px';
+    container.style.zIndex = '2147483647';
+    container.style.maxWidth = '320px';
+    container.style.padding = '10px 12px';
+    container.style.background = 'rgba(0, 0, 0, 0.86)';
+    container.style.border = '1px solid rgba(0, 180, 255, 0.55)';
+    container.style.borderRadius = '8px';
+    container.style.fontFamily = 'monospace';
+    container.style.fontSize = '12px';
+    container.style.lineHeight = '1.35';
+    container.style.color = '#d7f6ff';
+    container.style.boxShadow = '0 12px 28px rgba(0, 0, 0, 0.45)';
+    document.body.appendChild(container);
+  }
+
+  const urls: string[] = [];
+  const linksHtml = downloads
+    .map(download => {
+      const blob = new Blob([download.text], { type: download.mimeType });
+      const url = URL.createObjectURL(blob);
+      urls.push(url);
+      return `<div style="margin-top:6px"><a href="${url}" download="${escapeHtml(
+        download.filename
+      )}" style="color:#7fe8ff;text-decoration:underline">${escapeHtml(download.filename)}</a></div>`;
+    })
+    .join('');
+  publishedCprDebugArtifactUrls.set(safeRunId, urls);
+
+  container.innerHTML = `
+    <div style="font-weight:700">CPR Debug Artifacts</div>
+    <div style="opacity:0.82;margin-top:4px">runId=${escapeHtml(runId)}</div>
+    ${linksHtml}
+  `;
+}
+
+function triggerQueuedDownloads(
+  downloads: Array<{ filename: string; text: string; mimeType: string }>
+): void {
+  downloads.forEach((download, index) => {
+    window.setTimeout(() => {
+      triggerDownload(download.filename, download.text, download.mimeType);
+    }, index * 220);
+  });
 }
 
 function buildAttemptTableCsv(rows: CprDebugReportRow[]): string {
   const header = [
     'label',
     'checksum',
+    'candidateSource',
+    'rendererVariant',
+    'renderSupportMode',
+    'metricStage',
+    'workerBranchSelected',
+    'workerQcAccepted',
+    'workerQcStage',
+    'rejectReasonsStage',
+    'orchestratorAccepted',
+    'emergencyDebugPreviewDisplayed',
     'supportP50',
     'bgOutlier05',
     'bgOutlier10',
@@ -256,6 +355,32 @@ function buildAttemptTableCsv(rows: CprDebugReportRow[]): string {
     [
       row.label,
       row.checksum ?? '',
+      row.candidateSource ?? '',
+      row.rendererVariant ?? '',
+      row.renderSupportMode ?? '',
+      row.metricStage ?? '',
+      row.workerBranchSelected === undefined || row.workerBranchSelected === null
+        ? ''
+        : row.workerBranchSelected
+          ? 'yes'
+          : 'no',
+      row.workerQcAccepted === undefined || row.workerQcAccepted === null
+        ? ''
+        : row.workerQcAccepted
+          ? 'yes'
+          : 'no',
+      row.workerQcStage ?? '',
+      row.rejectReasonsStage ?? '',
+      row.orchestratorAccepted === undefined || row.orchestratorAccepted === null
+        ? ''
+        : row.orchestratorAccepted
+          ? 'yes'
+          : 'no',
+      row.emergencyDebugPreviewDisplayed === undefined || row.emergencyDebugPreviewDisplayed === null
+        ? ''
+        : row.emergencyDebugPreviewDisplayed
+          ? 'yes'
+          : 'no',
       row.supportP50 ?? '',
       row.bgOutlier05 ?? '',
       row.bgOutlier10 ?? '',
@@ -318,6 +443,12 @@ function buildProbeTableCsv(rows: CprDebugProbeRow[]): string {
     'blackClip',
     'retainedSampleMask',
     'middleBandLeak',
+    'renderBranchCode',
+    'selectedSupportHypothesis',
+    'focalTroughSharpness',
+    'outOfTroughSuppression',
+    'rawProjectedAttenuation',
+    'finalDisplayImage',
     'holeMetricWouldCount',
     'holeMetricReasons',
   ];
@@ -362,6 +493,12 @@ function buildProbeTableCsv(rows: CprDebugProbeRow[]): string {
       row.blackClip ?? '',
       row.retainedSampleMask ?? '',
       row.middleBandLeak ?? '',
+      row.renderBranchCode ?? '',
+      row.selectedSupportHypothesis ?? '',
+      row.focalTroughSharpness ?? '',
+      row.outOfTroughSuppression ?? '',
+      row.rawProjectedAttenuation ?? '',
+      row.finalDisplayImage ?? '',
       row.holeMetricWouldCount === undefined ? '' : row.holeMetricWouldCount ? 'yes' : 'no',
       row.holeMetricReasons?.join('|') ?? '',
     ]
@@ -385,6 +522,16 @@ function buildReportHtml(params: {
       row => `<tr>
   <td>${escapeHtml(row.label)}</td>
   <td>${row.checksum ?? 'na'}</td>
+  <td>${escapeHtml(row.candidateSource ?? '')}</td>
+  <td>${escapeHtml(row.rendererVariant ?? '')}</td>
+  <td>${escapeHtml(row.renderSupportMode ?? '')}</td>
+  <td>${escapeHtml(row.metricStage ?? '')}</td>
+  <td>${row.workerBranchSelected === undefined || row.workerBranchSelected === null ? 'na' : row.workerBranchSelected ? 'yes' : 'no'}</td>
+  <td>${row.workerQcAccepted === undefined || row.workerQcAccepted === null ? 'na' : row.workerQcAccepted ? 'yes' : 'no'}</td>
+  <td>${escapeHtml(row.workerQcStage ?? '')}</td>
+  <td>${escapeHtml(row.rejectReasonsStage ?? '')}</td>
+  <td>${row.orchestratorAccepted === undefined || row.orchestratorAccepted === null ? 'na' : row.orchestratorAccepted ? 'yes' : 'no'}</td>
+  <td>${row.emergencyDebugPreviewDisplayed === undefined || row.emergencyDebugPreviewDisplayed === null ? 'na' : row.emergencyDebugPreviewDisplayed ? 'yes' : 'no'}</td>
   <td>${row.supportP50 ?? 'na'}</td>
   <td>${row.bgOutlier05 ?? 'na'}</td>
   <td>${row.bgOutlier10 ?? 'na'}</td>
@@ -436,6 +583,12 @@ function buildReportHtml(params: {
   <td>${row.blackClip ?? 'na'}</td>
   <td>${row.retainedSampleMask ?? 'na'}</td>
   <td>${row.middleBandLeak ?? 'na'}</td>
+  <td>${row.renderBranchCode ?? 'na'}</td>
+  <td>${row.selectedSupportHypothesis ?? 'na'}</td>
+  <td>${row.focalTroughSharpness ?? 'na'}</td>
+  <td>${row.outOfTroughSuppression ?? 'na'}</td>
+  <td>${row.rawProjectedAttenuation ?? 'na'}</td>
+  <td>${row.finalDisplayImage ?? 'na'}</td>
   <td>${row.holeMetricWouldCount === undefined ? 'na' : row.holeMetricWouldCount ? 'yes' : 'no'}</td>
   <td>${escapeHtml(row.holeMetricReasons?.join(', ') ?? '')}</td>
 </tr>`
@@ -499,6 +652,16 @@ function buildReportHtml(params: {
       <tr>
         <th>Label</th>
         <th>Checksum</th>
+        <th>candidateSource</th>
+        <th>rendererVariant</th>
+        <th>renderSupportMode</th>
+        <th>metricStage</th>
+        <th>workerBranch</th>
+        <th>workerQc</th>
+        <th>workerQcStage</th>
+        <th>rejectStage</th>
+        <th>orchestrator</th>
+        <th>emergencyPreview</th>
         <th>supportP50</th>
         <th>bg05</th>
         <th>bg10</th>
@@ -556,6 +719,12 @@ function buildReportHtml(params: {
         <th>blackClip</th>
         <th>retained</th>
         <th>middleLeak</th>
+        <th>renderBranch</th>
+        <th>supportHypothesis</th>
+        <th>focalSharpness</th>
+        <th>outOfTrough</th>
+        <th>rawProjection</th>
+        <th>finalDisplay</th>
         <th>holeMetric</th>
         <th>holeReasons</th>
       </tr>
@@ -610,6 +779,30 @@ export function downloadCprDebugArtifacts(params: {
   const csv = csvSections.join('\n');
 
   downloadedCprDebugArtifactRunIds.add(safeRunId);
-  triggerDownload(`cpr-debug-report-${safeRunId}.html`, html, 'text/html;charset=utf-8');
-  triggerDownload(`cpr-attempt-table-${safeRunId}.csv`, csv, 'text/csv;charset=utf-8');
+  const htmlFilename = `cprhtml-${safeRunId}.html`;
+  const csvFilename = `cprcsv-${safeRunId}.csv`;
+  console.log(`[CPR][${params.runId}] [CPR-DEBUG-ARTIFACT-EXPORT-JSON]`, {
+    runId: params.runId,
+    htmlFilename,
+    csvFilename,
+    reportRowCount: params.rows.length,
+    probeRowCount: params.probeRows?.length ?? 0,
+    imageCount: params.images.length,
+  });
+  const downloads = [
+    {
+      filename: htmlFilename,
+      text: html,
+      mimeType: 'text/html;charset=utf-8',
+    },
+    {
+      filename: csvFilename,
+      text: csv,
+      mimeType: 'text/csv;charset=utf-8',
+    },
+  ];
+  publishPersistentDownloadLinks(params.runId, downloads);
+  triggerQueuedDownloads([
+    ...downloads,
+  ]);
 }

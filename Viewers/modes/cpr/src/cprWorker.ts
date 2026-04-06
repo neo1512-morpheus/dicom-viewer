@@ -3,11 +3,37 @@ import {
   createHuScalarTransform,
   resolveStoredValueNormalizationPolicy,
 } from './cprScalarPolicy';
+import {
+  resolveWorkerCompatiblePanoReconstructionMode,
+  type PanoReconstructionMode,
+  type WorkerCompatiblePanoReconstructionMode,
+} from './panoV2Types';
+import {
+  applyPanoV2WorkerRouteDiagnostic,
+  getPanoV2WorkerRendererFamily,
+  getPanoV2WorkerRouteReason,
+  resolvePanoV2WorkerRoute,
+} from './panoV2WorkerRoute';
+import {
+  buildPanoV2GeometryDiagnostics,
+  refinePanoV2TrackFromScores,
+} from './panoV2Geometry';
+import {
+  buildPanoV2StraightenedVolume,
+  buildPanoV2StraightenedVolumeDiagnostics,
+} from './panoV2Volume';
+import {
+  buildPanoV2FullPlaneLayerImages,
+  buildPanoV2LayerRenderResult,
+  toPanoV2LayerRenderDiagnostics,
+} from './panoV2LayerRenderer';
+import { buildPanoV2FusionResult } from './panoV2Fusion';
 
 type GpuRendererModule = typeof import('./cprGpuRenderer');
 
 let gpuRendererModule: GpuRendererModule | null = null;
 let gpuRendererModulePromise: Promise<GpuRendererModule> | null = null;
+const CPR_WORKER_IMPLEMENTATION_VERSION = '2026-04-06-worker-fingerprint-1';
 
 // Avoid blocking worker bootstrap on the large GPU renderer module.
 async function loadGpuRendererModule(): Promise<GpuRendererModule> {
@@ -83,9 +109,11 @@ interface CPRWorkerInput {
   highBit?: number;
   pixelRepresentation?: number;
   isPreScaled?: boolean;
+  observedRawMin?: number;
+  observedRawMax?: number;
   debugRunId?: string;
   attemptLabel?: string;
-  reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  reconstructionMode?: PanoReconstructionMode;
   renderBackend?: 'gpu' | 'cpu';
   allowLegacyFallback?: boolean;
   sourceVolumeId?: string;
@@ -107,6 +135,8 @@ interface CPRWorkerVolumeState {
   highBit?: number;
   pixelRepresentation?: number;
   isPreScaled?: boolean;
+  observedRawMin?: number;
+  observedRawMax?: number;
   storedValueNormalizationApplied?: boolean;
   unsignedPackedArtifactDetected?: boolean;
   normalizationSignature?: string | null;
@@ -144,7 +174,7 @@ interface CPRWorkerRenderInput {
     | 'raw-stored-values-debug';
   debugRunId?: string;
   attemptLabel?: string;
-  reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  reconstructionMode?: PanoReconstructionMode;
   renderBackend?: 'gpu' | 'cpu';
   allowLegacyFallback?: boolean;
   sourceVolumeId?: string;
@@ -185,14 +215,12 @@ function isMat4ArrayLike(value: unknown): value is ArrayLike<number> {
   return true;
 }
 
-function resolveReconstructionMode(value: unknown): 'legacy' | 'virtualPanoPhase1' | 'virtualPano' {
-  return value === 'virtualPanoPhase1' || value === 'virtualPano' || value === 'legacy'
-    ? value
-    : 'legacy';
+function resolveReconstructionMode(value: unknown): WorkerCompatiblePanoReconstructionMode {
+  return resolveWorkerCompatiblePanoReconstructionMode(value);
 }
 
 function resolveCpuFallbackReconstructionMode(
-  requestedMode: 'legacy' | 'virtualPanoPhase1' | 'virtualPano'
+  requestedMode: PanoReconstructionMode
 ): 'virtualPano' {
   return requestedMode === 'virtualPano' ? requestedMode : 'virtualPano';
 }
@@ -203,7 +231,7 @@ function resolveRequestedRenderBackend(value: unknown): 'gpu' | 'cpu' {
 
 function shouldRouteRequestedReconstructionToTrueVirtualPano(input: {
   renderBackend?: 'gpu' | 'cpu';
-  reconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  reconstructionMode?: PanoReconstructionMode;
 }): boolean {
   return (
     resolveRequestedRenderBackend(input.renderBackend) === 'gpu' &&
@@ -260,6 +288,7 @@ interface CPRWorkerInitSuccess {
   type: 'INIT_SUCCESS';
   requestId: string;
   sessionKey: string;
+  implementationVersion?: string;
 }
 
 interface CPRWorkerDisposeSuccess {
@@ -277,7 +306,7 @@ function logWorkerRouteDecision(params: {
   attemptLabel?: string | null;
   sourceVolumeId?: string | null;
   requestedBackend: 'gpu' | 'cpu';
-  requestedReconstructionMode: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
+  requestedReconstructionMode: PanoReconstructionMode;
   actualRendererBackend: 'gpu' | 'cpu';
   actualRendererFamily: string;
   routeReason: string;
@@ -339,6 +368,1098 @@ function percentile(values: number[], q: number): number {
   }
   const t = index - low;
   return sorted[low] * (1 - t) + sorted[high] * t;
+}
+
+interface AuditHistogramSummary {
+  sampleCount: number;
+  threshold: number;
+  min: number | null;
+  p10: number | null;
+  p50: number | null;
+  p90: number | null;
+  max: number | null;
+  fractionAboveThreshold: number;
+}
+
+interface AuditRangeSummary {
+  finiteCount: number;
+  min: number | null;
+  max: number | null;
+}
+
+function summarizeAuditValues(values: number[], threshold: number): AuditHistogramSummary {
+  if (!values.length) {
+    return {
+      sampleCount: 0,
+      threshold,
+      min: null,
+      p10: null,
+      p50: null,
+      p90: null,
+      max: null,
+      fractionAboveThreshold: 0,
+    };
+  }
+
+  let min = Infinity;
+  let max = -Infinity;
+  let aboveThresholdCount = 0;
+  for (let i = 0; i < values.length; i++) {
+    const value = Number(values[i]);
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    if (value < min) {
+      min = value;
+    }
+    if (value > max) {
+      max = value;
+    }
+    if (value > threshold) {
+      aboveThresholdCount++;
+    }
+  }
+
+  return {
+    sampleCount: values.length,
+    threshold,
+    min: Number.isFinite(min) ? min : null,
+    p10: percentile(values, 0.1),
+    p50: percentile(values, 0.5),
+    p90: percentile(values, 0.9),
+    max: Number.isFinite(max) ? max : null,
+    fractionAboveThreshold: aboveThresholdCount / Math.max(1, values.length),
+  };
+}
+
+function summarizeAuditRange(
+  values: Float32Array | Int16Array | Uint16Array,
+  normalizeStoredSample: ((value: number) => number) | undefined,
+  safeSlope: number,
+  safeIntercept: number,
+  shouldApplyModalityLut: boolean
+): {
+  rawStoredRange: AuditRangeSummary;
+  normalizedStoredRange: AuditRangeSummary;
+  normalizedHuRange: AuditRangeSummary;
+} {
+  let rawMin = Infinity;
+  let rawMax = -Infinity;
+  let rawCount = 0;
+  let normalizedStoredMin = Infinity;
+  let normalizedStoredMax = -Infinity;
+  let normalizedStoredCount = 0;
+  let normalizedHuMin = Infinity;
+  let normalizedHuMax = -Infinity;
+  let normalizedHuCount = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    const rawValue = Number(values[i]);
+    if (!Number.isFinite(rawValue)) {
+      continue;
+    }
+
+    rawCount++;
+    if (rawValue < rawMin) {
+      rawMin = rawValue;
+    }
+    if (rawValue > rawMax) {
+      rawMax = rawValue;
+    }
+
+    const normalizedStoredValue = normalizeStoredSample
+      ? normalizeStoredSample(rawValue)
+      : rawValue;
+    if (Number.isFinite(normalizedStoredValue)) {
+      normalizedStoredCount++;
+      if (normalizedStoredValue < normalizedStoredMin) {
+        normalizedStoredMin = normalizedStoredValue;
+      }
+      if (normalizedStoredValue > normalizedStoredMax) {
+        normalizedStoredMax = normalizedStoredValue;
+      }
+
+      const normalizedHuValue = shouldApplyModalityLut
+        ? normalizedStoredValue * safeSlope + safeIntercept
+        : normalizedStoredValue;
+      if (Number.isFinite(normalizedHuValue)) {
+        normalizedHuCount++;
+        if (normalizedHuValue < normalizedHuMin) {
+          normalizedHuMin = normalizedHuValue;
+        }
+        if (normalizedHuValue > normalizedHuMax) {
+          normalizedHuMax = normalizedHuValue;
+        }
+      }
+    }
+  }
+
+  return {
+    rawStoredRange: {
+      finiteCount: rawCount,
+      min: Number.isFinite(rawMin) ? rawMin : null,
+      max: Number.isFinite(rawMax) ? rawMax : null,
+    },
+    normalizedStoredRange: {
+      finiteCount: normalizedStoredCount,
+      min: Number.isFinite(normalizedStoredMin) ? normalizedStoredMin : null,
+      max: Number.isFinite(normalizedStoredMax) ? normalizedStoredMax : null,
+    },
+    normalizedHuRange: {
+      finiteCount: normalizedHuCount,
+      min: Number.isFinite(normalizedHuMin) ? normalizedHuMin : null,
+      max: Number.isFinite(normalizedHuMax) ? normalizedHuMax : null,
+    },
+  };
+}
+
+function weightedMedianFromBuffer(
+  values: ArrayLike<number>,
+  weights: ArrayLike<number>,
+  count: number
+): number {
+  if (count <= 0) {
+    return NaN;
+  }
+
+  const entries: Array<{ value: number; weight: number }> = [];
+  let totalWeight = 0;
+  for (let i = 0; i < count; i++) {
+    const value = Number(values[i]);
+    const weight = Math.max(0, Number(weights[i]));
+    if (!Number.isFinite(value) || weight <= 1e-6) {
+      continue;
+    }
+    entries.push({ value, weight });
+    totalWeight += weight;
+  }
+
+  if (!entries.length || totalWeight <= 1e-6) {
+    return NaN;
+  }
+
+  entries.sort((a, b) => a.value - b.value);
+  const targetWeight = totalWeight * 0.5;
+  let cumulativeWeight = 0;
+  for (let i = 0; i < entries.length; i++) {
+    cumulativeWeight += entries[i].weight;
+    if (cumulativeWeight >= targetWeight) {
+      return entries[i].value;
+    }
+  }
+
+  return entries[entries.length - 1].value;
+}
+
+function weightedMedianFromSortedPairs(values: number[], weights: number[]): number {
+  if (!values.length || values.length !== weights.length) {
+    return NaN;
+  }
+  const entries = values
+    .map((value, index) => ({
+      value,
+      weight: Math.max(0, Number(weights[index])),
+    }))
+    .filter(entry => Number.isFinite(entry.value) && entry.weight > 1e-6)
+    .sort((a, b) => a.value - b.value);
+  if (!entries.length) {
+    return NaN;
+  }
+  const totalWeight = entries.reduce((sum, entry) => sum + entry.weight, 0);
+  const targetWeight = totalWeight * 0.5;
+  let cumulativeWeight = 0;
+  for (const entry of entries) {
+    cumulativeWeight += entry.weight;
+    if (cumulativeWeight >= targetWeight) {
+      return entry.value;
+    }
+  }
+  return entries[entries.length - 1].value;
+}
+
+function weightedMadFromBuffer(
+  values: ArrayLike<number>,
+  weights: ArrayLike<number>,
+  count: number,
+  median: number
+): number {
+  if (!Number.isFinite(median) || count <= 0) {
+    return NaN;
+  }
+
+  const deviations = new Float32Array(count);
+  for (let i = 0; i < count; i++) {
+    deviations[i] = Math.abs(Number(values[i]) - median);
+  }
+  return weightedMedianFromBuffer(deviations, weights, count);
+}
+
+interface RobustFocalProjectionResult {
+  valid: boolean;
+  projectedHu: number;
+  supportDepthMm: number;
+  supportConfidence: number;
+  participatingSamples: number;
+  score: number;
+  toneProxy: number;
+  attenuationProxy: number;
+}
+
+function evaluateRobustFocalProjection(params: {
+  sampleValues: ArrayLike<number>;
+  sampleDepthsMm: ArrayLike<number>;
+  sampleCount: number;
+  centerDepthMm: number;
+  sigmaMm: number;
+  softThreshold: number;
+  hardThreshold: number;
+  reliability: number;
+  toothBandFocus: number;
+}): RobustFocalProjectionResult {
+  const {
+    sampleValues,
+    sampleDepthsMm,
+    sampleCount,
+    centerDepthMm,
+    sigmaMm,
+    softThreshold,
+    hardThreshold,
+    reliability,
+    toothBandFocus,
+  } = params;
+
+  if (sampleCount <= 0 || !Number.isFinite(centerDepthMm)) {
+    return {
+      valid: false,
+      projectedHu: NaN,
+      supportDepthMm: centerDepthMm,
+      supportConfidence: 0,
+      participatingSamples: 0,
+      score: 0,
+      toneProxy: 0,
+      attenuationProxy: 0,
+    };
+  }
+
+  const effectiveSigmaMm = Math.max(
+    0.18,
+    sigmaMm * CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionSigmaScale
+  );
+  const hardDen = Math.max(hardThreshold - softThreshold, 80);
+  const toothSoftFloor = softThreshold - Math.max(220, hardDen * 1.6);
+  const toothSoftCeiling = hardThreshold + Math.max(60, hardDen * 0.35);
+  const shellPenaltyStart = hardThreshold + 180;
+  const shellPenaltyEnd = hardThreshold + 620;
+  const rawWeights = new Float32Array(sampleCount);
+  let rawWeightTotal = 0;
+  let troughWeightTotal = 0;
+  let toothSupportSeed = 0;
+  let offTroughSupportSeed = 0;
+  let gradientWeightedSum = 0;
+  let gradientWeightTotal = 0;
+  let previousValue = 0;
+  let previousWeight = 0;
+  let hasPrevious = false;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const value = Number(sampleValues[i]);
+    const depthMm = Number(sampleDepthsMm[i]);
+    const deltaMm = depthMm - centerDepthMm;
+    const asymmetricSigmaMm =
+      deltaMm > 0
+        ? effectiveSigmaMm * CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionAsymmetricFarSideScale
+        : effectiveSigmaMm;
+    const denom = 2 * asymmetricSigmaMm * asymmetricSigmaMm;
+    const troughWeight = Math.exp(-(deltaMm * deltaMm) / Math.max(1e-4, denom));
+    if (troughWeight <= 1e-5) {
+      rawWeights[i] = 0;
+      continue;
+    }
+
+    const toothLikelihood = smoothstepRange(toothSoftFloor, toothSoftCeiling, value);
+    const shellPenalty = smoothstepRange(shellPenaltyStart, shellPenaltyEnd, value);
+    const rawWeight = troughWeight * (0.2 + 0.8 * toothLikelihood) * (1 - 0.28 * shellPenalty);
+    rawWeights[i] = rawWeight;
+    rawWeightTotal += rawWeight;
+    troughWeightTotal += troughWeight;
+    toothSupportSeed += toothLikelihood * rawWeight;
+    if (Math.abs(deltaMm) > effectiveSigmaMm * 1.35 && toothLikelihood > 0.24) {
+      offTroughSupportSeed += rawWeight * toothLikelihood;
+    }
+
+    if (hasPrevious) {
+      const pairWeight = Math.sqrt(Math.max(1e-6, previousWeight * rawWeight));
+      gradientWeightedSum += pairWeight * Math.abs(value - previousValue);
+      gradientWeightTotal += pairWeight;
+    }
+    previousValue = value;
+    previousWeight = rawWeight;
+    hasPrevious = true;
+  }
+
+  if (rawWeightTotal <= 1e-4) {
+    return {
+      valid: false,
+      projectedHu: NaN,
+      supportDepthMm: centerDepthMm,
+      supportConfidence: 0,
+      participatingSamples: 0,
+      score: 0,
+      toneProxy: 0,
+      attenuationProxy: 0,
+    };
+  }
+
+  const weightedMedian = weightedMedianFromBuffer(sampleValues, rawWeights, sampleCount);
+  const weightedMad = weightedMadFromBuffer(sampleValues, rawWeights, sampleCount, weightedMedian);
+  const robustScaleHu = Math.max(
+    CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMadFloorHu,
+    Number.isFinite(weightedMad) ? weightedMad * 1.4826 : 0
+  );
+  const robustWeights = new Float32Array(sampleCount);
+  let robustWeightTotal = 0;
+  let robustWeightedSum = 0;
+  let robustConsistencySum = 0;
+  let participatingSamples = 0;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const value = Number(sampleValues[i]);
+    const baseWeight = rawWeights[i];
+    if (baseWeight <= 1e-6) {
+      continue;
+    }
+    const residual = Math.abs(value - weightedMedian) / Math.max(1e-6, robustScaleHu);
+    let robustWeight = 0;
+    if (residual < CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionRobustCutoff) {
+      const t = residual / CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionRobustCutoff;
+      const taper = 1 - t * t;
+      robustWeight = baseWeight * taper * taper;
+    }
+    robustWeights[i] = robustWeight;
+    if (robustWeight <= 1e-6) {
+      continue;
+    }
+    const toothLikelihood = smoothstepRange(toothSoftFloor, toothSoftCeiling, value);
+    robustWeightTotal += robustWeight;
+    robustWeightedSum += value * robustWeight;
+    robustConsistencySum += toothLikelihood * robustWeight;
+    if (robustWeight > rawWeightTotal * 0.01) {
+      participatingSamples++;
+    }
+  }
+
+  const trimmedMean = robustWeightTotal > 1e-4 ? robustWeightedSum / robustWeightTotal : weightedMedian;
+  const projectedHu =
+    trimmedMean * (1 - CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMedianBlend) +
+    weightedMedian * CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMedianBlend;
+  const consistency = clampNumber(
+    robustWeightTotal > 1e-4 ? robustConsistencySum / robustWeightTotal : toothSupportSeed / rawWeightTotal,
+    0,
+    1
+  );
+  const compactness = clampNumber(rawWeightTotal / Math.max(1e-6, troughWeightTotal), 0, 1);
+  const offTroughPenalty = clampNumber(offTroughSupportSeed / Math.max(1e-6, rawWeightTotal), 0, 1);
+  const normalizedSharpness = clampNumber(
+    gradientWeightTotal > 1e-4
+      ? gradientWeightedSum / (gradientWeightTotal * Math.max(140, robustScaleHu * 2.6))
+      : 0,
+    0,
+    1
+  );
+  const score = clampNumber(
+    reliability * CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionReliabilityWeight +
+      normalizedSharpness * CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionSharpnessWeight +
+      consistency * CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionConsistencyWeight +
+      compactness * CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionCompactnessWeight -
+      offTroughPenalty * CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionOffTroughPenaltyWeight +
+      toothBandFocus * 0.04,
+    0,
+    1.4
+  );
+  const supportConfidence = clampNumber(
+    reliability * 0.5 + compactness * 0.22 + consistency * 0.18 + normalizedSharpness * 0.1,
+    0,
+    1
+  );
+  const toneProxy = clampNumber(
+    smoothstepRange(
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMax,
+      projectedHu
+    ),
+    0,
+    1
+  );
+
+  return {
+    valid: Number.isFinite(projectedHu),
+    projectedHu: clampNumber(
+      projectedHu,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMax
+    ),
+    supportDepthMm: centerDepthMm,
+    supportConfidence,
+    participatingSamples: Math.max(1, participatingSamples),
+    score,
+    toneProxy,
+    attenuationProxy: toneProxy,
+  };
+}
+
+interface VirtualRadiographHypothesisResult {
+  valid: boolean;
+  hypothesisCode: number;
+  projectedAttenuation: number;
+  backgroundAttenuation: number;
+  focalDetailHu: number;
+  focalMedianHu: number;
+  supportDepthMm: number;
+  supportConfidence: number;
+  participatingSamples: number;
+  sharpness: number;
+  consistency: number;
+  compactness: number;
+  outOfTroughFraction: number;
+  score: number;
+}
+
+function huToAttenuationProxy(hu: number): number {
+  return Math.max(
+    0,
+    7.5e-4 *
+      Math.max(0, hu + 1000) *
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographMuGamma
+  );
+}
+
+function computeRadiographSampleValidity(sampleCount: number): number {
+  if (sampleCount >= 3) {
+    return 1;
+  }
+  if (sampleCount === 2) {
+    return 0.65;
+  }
+  if (sampleCount === 1) {
+    return 0.35;
+  }
+  return 0;
+}
+
+function computeRadiographContinuousRowWeights(
+  row: number,
+  upperAnchorRow: number,
+  lowerAnchorRow: number,
+  sigmaRow = 28
+): {
+  upper: number;
+  lower: number;
+  envelope: number;
+} {
+  const safeSigma = Math.max(1e-3, sigmaRow);
+  const upperWeightRaw = Math.exp(-0.5 * ((row - upperAnchorRow) / safeSigma) ** 2);
+  const lowerWeightRaw = Math.exp(-0.5 * ((row - lowerAnchorRow) / safeSigma) ** 2);
+  const weightSum = Math.max(1e-6, upperWeightRaw + lowerWeightRaw);
+  return {
+    upper: upperWeightRaw / weightSum,
+    lower: lowerWeightRaw / weightSum,
+    envelope: clampNumber(upperWeightRaw + lowerWeightRaw, 0, 1),
+  };
+}
+
+interface VirtualRadiographBandRows {
+  upperAnchorRow: number;
+  lowerAnchorRow: number;
+  midRow: number;
+  toothHalf: number;
+  gapHalf: number;
+  upperRows: [number, number];
+  gapRows: [number, number];
+  lowerRows: [number, number];
+  bgTopRows: [number, number];
+  bgGapRows: [number, number];
+  bgBottomRows: [number, number];
+}
+
+function computeVirtualRadiographBandRows(
+  panoHeight: number,
+  panoCenterRow: number,
+  upperAnchorRow?: number,
+  lowerAnchorRow?: number
+): VirtualRadiographBandRows {
+  const resolvedUpperAnchorRow = Number.isFinite(upperAnchorRow)
+    ? Math.max(0, Math.min(panoHeight - 2, Math.round(Number(upperAnchorRow))))
+    : Math.max(0, Math.min(panoHeight - 2, Math.round(panoCenterRow * 0.85)));
+  const resolvedLowerAnchorRow = Number.isFinite(lowerAnchorRow)
+    ? Math.max(
+        resolvedUpperAnchorRow + 1,
+        Math.min(panoHeight - 1, Math.round(Number(lowerAnchorRow)))
+      )
+    : Math.max(
+        resolvedUpperAnchorRow + 1,
+        Math.min(panoHeight - 1, Math.round(panoCenterRow * 1.4))
+      );
+  const midRow = Math.round(0.5 * (resolvedUpperAnchorRow + resolvedLowerAnchorRow));
+  const toothHalf = Math.max(
+    16,
+    Math.min(24, Math.round(0.35 * (resolvedLowerAnchorRow - resolvedUpperAnchorRow)))
+  );
+  const gapHalf = 5;
+  const upperRows: [number, number] = [
+    Math.max(0, resolvedUpperAnchorRow - toothHalf),
+    Math.max(0, Math.min(panoHeight - 1, midRow - gapHalf - 1)),
+  ];
+  const gapRows: [number, number] = [
+    Math.max(0, Math.min(panoHeight - 1, midRow - gapHalf)),
+    Math.max(0, Math.min(panoHeight - 1, midRow + gapHalf)),
+  ];
+  const lowerRows: [number, number] = [
+    Math.max(0, Math.min(panoHeight - 1, midRow + gapHalf + 1)),
+    Math.max(0, Math.min(panoHeight - 1, resolvedLowerAnchorRow + toothHalf)),
+  ];
+  return {
+    upperAnchorRow: resolvedUpperAnchorRow,
+    lowerAnchorRow: resolvedLowerAnchorRow,
+    midRow,
+    toothHalf,
+    gapHalf,
+    upperRows,
+    gapRows,
+    lowerRows,
+    bgTopRows: [0, Math.max(0, upperRows[0] - 8)],
+    bgGapRows: [
+      Math.max(0, Math.min(panoHeight - 1, upperRows[1] + 2)),
+      Math.max(0, Math.min(panoHeight - 1, lowerRows[0] - 2)),
+    ],
+    bgBottomRows: [Math.max(0, lowerRows[1] + 8), Math.max(0, panoHeight - 1)],
+  };
+}
+
+function cosineEdgeBlend01(t: number): number {
+  const clamped = clampNumber(t, 0, 1);
+  return 0.5 - 0.5 * Math.cos(Math.PI * clamped);
+}
+
+function computeVirtualRadiographRowBandWeights(
+  row: number,
+  panoHeight: number,
+  bandRows: VirtualRadiographBandRows,
+  edgeBlendPx = 4
+): {
+  upper: number;
+  gap: number;
+  lower: number;
+  background: number;
+  toothMask: number;
+} {
+  const bandWeight = (start: number, end: number): number => {
+    if (start > end) {
+      return 0;
+    }
+    if (row >= start && row <= end) {
+      return 1;
+    }
+    if (row >= start - edgeBlendPx && row < start) {
+      return cosineEdgeBlend01((row - (start - edgeBlendPx)) / Math.max(1, edgeBlendPx));
+    }
+    if (row > end && row <= end + edgeBlendPx) {
+      return cosineEdgeBlend01(((end + edgeBlendPx) - row) / Math.max(1, edgeBlendPx));
+    }
+    return 0;
+  };
+
+  let upper = bandWeight(bandRows.upperRows[0], bandRows.upperRows[1]);
+  let gap = bandWeight(bandRows.gapRows[0], bandRows.gapRows[1]);
+  let lower = bandWeight(bandRows.lowerRows[0], bandRows.lowerRows[1]);
+  const total = upper + gap + lower;
+  let background = total < 1 ? 1 - total : 0;
+  if (row < 0 || row >= panoHeight) {
+    upper = 0;
+    gap = 0;
+    lower = 0;
+    background = 1;
+  } else if (total > 1e-6 && total > 1) {
+    upper /= total;
+    gap /= total;
+    lower /= total;
+    background = 0;
+  }
+  return {
+    upper,
+    gap,
+    lower,
+    background,
+    toothMask: clampNumber(upper + lower, 0, 1),
+  };
+}
+
+function computeVirtualRadiographExclusiveRowMasks(
+  row: number,
+  panoHeight: number,
+  bandRows: VirtualRadiographBandRows
+): {
+  upper: number;
+  gap: number;
+  lower: number;
+  outside: number;
+  toothMask: number;
+} {
+  if (row < 0 || row >= panoHeight) {
+    return { upper: 0, gap: 0, lower: 0, outside: 1, toothMask: 0 };
+  }
+  if (row >= bandRows.upperRows[0] && row <= bandRows.upperRows[1]) {
+    return { upper: 1, gap: 0, lower: 0, outside: 0, toothMask: 1 };
+  }
+  if (row >= bandRows.lowerRows[0] && row <= bandRows.lowerRows[1]) {
+    return { upper: 0, gap: 0, lower: 1, outside: 0, toothMask: 1 };
+  }
+  if (row >= bandRows.gapRows[0] && row <= bandRows.gapRows[1]) {
+    return { upper: 0, gap: 1, lower: 0, outside: 0, toothMask: 0 };
+  }
+  return { upper: 0, gap: 0, lower: 0, outside: 1, toothMask: 0 };
+}
+
+function boxBlurFloat32Map(
+  source: Float32Array,
+  width: number,
+  height: number,
+  radius: number
+): Float32Array {
+  if (radius <= 0 || width <= 0 || height <= 0 || source.length !== width * height) {
+    return source.slice();
+  }
+
+  const horizontal = new Float32Array(source.length);
+  const output = new Float32Array(source.length);
+
+  for (let row = 0; row < height; row++) {
+    const prefix = new Float64Array(width + 1);
+    for (let col = 0; col < width; col++) {
+      prefix[col + 1] = prefix[col] + Number(source[planeIndex(col, row, width)] || 0);
+    }
+    for (let col = 0; col < width; col++) {
+      const start = Math.max(0, col - radius);
+      const end = Math.min(width - 1, col + radius);
+      const count = end - start + 1;
+      horizontal[planeIndex(col, row, width)] = Number(
+        (prefix[end + 1] - prefix[start]) / Math.max(1, count)
+      );
+    }
+  }
+
+  for (let col = 0; col < width; col++) {
+    const prefix = new Float64Array(height + 1);
+    for (let row = 0; row < height; row++) {
+      prefix[row + 1] = prefix[row] + Number(horizontal[planeIndex(col, row, width)] || 0);
+    }
+    for (let row = 0; row < height; row++) {
+      const start = Math.max(0, row - radius);
+      const end = Math.min(height - 1, row + radius);
+      const count = end - start + 1;
+      output[planeIndex(col, row, width)] = Number(
+        (prefix[end + 1] - prefix[start]) / Math.max(1, count)
+      );
+    }
+  }
+
+  return output;
+}
+
+function smoothWeightedDepthPath(
+  source: Float32Array,
+  reliability: Float32Array | undefined,
+  radius = 2
+): Float32Array {
+  const output = new Float32Array(source.length);
+  for (let col = 0; col < source.length; col++) {
+    let weightedSum = 0;
+    let weightTotal = 0;
+    for (let offset = -radius; offset <= radius; offset++) {
+      const neighbor = col + offset;
+      if (neighbor < 0 || neighbor >= source.length) {
+        continue;
+      }
+      const reliabilityWeight = clampNumber(Number(reliability?.[neighbor]) || 0, 0.08, 1);
+      const distanceWeight = 1 / (1 + Math.abs(offset));
+      const weight = reliabilityWeight * distanceWeight;
+      weightedSum += Number(source[neighbor]) * weight;
+      weightTotal += weight;
+    }
+    output[col] = weightTotal > 1e-6 ? weightedSum / weightTotal : Number(source[col]);
+  }
+  return output;
+}
+
+function enforceSeparatedArchDepths(params: {
+  upperDepths: Float32Array;
+  lowerDepths: Float32Array;
+  upperReliability?: Float32Array;
+  lowerReliability?: Float32Array;
+  approxTroughHalfWidthMm: number;
+  depthHalfRangeMm: number;
+}): {
+  upperDepths: Float32Array;
+  lowerDepths: Float32Array;
+  interBandDeltaMeanMm: number;
+  interBandDeltaMinMm: number;
+  nonCrossingViolations: number;
+} {
+  const {
+    upperDepths,
+    lowerDepths,
+    upperReliability,
+    lowerReliability,
+    approxTroughHalfWidthMm,
+    depthHalfRangeMm,
+  } = params;
+  let upper = smoothWeightedDepthPath(upperDepths, upperReliability, 2);
+  let lower = smoothWeightedDepthPath(lowerDepths, lowerReliability, 2);
+  const deltaMinMm = clampNumber(approxTroughHalfWidthMm + 0.5, 1.25, 2);
+
+  for (let iteration = 0; iteration < 4; iteration++) {
+    for (let col = 0; col < upper.length; col++) {
+      const delta = Number(lower[col]) - Number(upper[col]);
+      if (delta < deltaMinMm) {
+        const mid = 0.5 * (Number(upper[col]) + Number(lower[col]));
+        upper[col] = clampNumber(mid - 0.5 * deltaMinMm, -depthHalfRangeMm, depthHalfRangeMm);
+        lower[col] = clampNumber(mid + 0.5 * deltaMinMm, -depthHalfRangeMm, depthHalfRangeMm);
+      }
+    }
+    upper = smoothWeightedDepthPath(upper, upperReliability, 2);
+    lower = smoothWeightedDepthPath(lower, lowerReliability, 2);
+  }
+
+  let interBandDeltaSum = 0;
+  let interBandDeltaMin = Number.POSITIVE_INFINITY;
+  let nonCrossingViolations = 0;
+  for (let col = 0; col < upper.length; col++) {
+    const delta = Number(lower[col]) - Number(upper[col]);
+    interBandDeltaSum += delta;
+    interBandDeltaMin = Math.min(interBandDeltaMin, delta);
+    if (delta < 0) {
+      nonCrossingViolations++;
+    }
+  }
+  return {
+    upperDepths: upper,
+    lowerDepths: lower,
+    interBandDeltaMeanMm: upper.length > 0 ? interBandDeltaSum / upper.length : 0,
+    interBandDeltaMinMm: Number.isFinite(interBandDeltaMin) ? interBandDeltaMin : 0,
+    nonCrossingViolations,
+  };
+}
+
+function evaluateVirtualPanoramicRadiographHypothesis(params: {
+  sampleValues: ArrayLike<number>;
+  sampleDepthsMm: ArrayLike<number>;
+  sampleCount: number;
+  centerDepthMm: number;
+  focalSigmaMm: number;
+  contextSigmaMm: number;
+  depthStepMm: number;
+  reliability: number;
+  rowPrior: number;
+  toothBandFocus: number;
+  hypothesisCode: number;
+}): VirtualRadiographHypothesisResult {
+  const {
+    sampleValues,
+    sampleDepthsMm,
+    sampleCount,
+    centerDepthMm,
+    focalSigmaMm,
+    contextSigmaMm,
+    depthStepMm,
+    reliability,
+    rowPrior,
+    toothBandFocus,
+    hypothesisCode,
+  } = params;
+
+  if (sampleCount <= 0 || !Number.isFinite(centerDepthMm)) {
+    return {
+      valid: false,
+      hypothesisCode,
+      projectedAttenuation: 0,
+      backgroundAttenuation: 0,
+      focalDetailHu: NaN,
+      focalMedianHu: NaN,
+      supportDepthMm: centerDepthMm,
+      supportConfidence: 0,
+      participatingSamples: 0,
+      sharpness: 0,
+      consistency: 0,
+      compactness: 0,
+      outOfTroughFraction: 1,
+      score: 0,
+    };
+  }
+
+  type Contribution = {
+    hu: number;
+    weight: number;
+    weighted: number;
+    mu: number;
+    depthMm: number;
+  };
+  const inTroughContributions: Contribution[] = [];
+  const allInTroughContributions: Contribution[] = [];
+  const huGradientSamples: { hu: number; weight: number; depthMm: number }[] = [];
+  let inWeightTotal = 0;
+  let outWeightTotal = 0;
+  let offTroughIntegral = 0;
+  let participatingSamples = 0;
+
+  const sigmaIn = Math.max(0.24, focalSigmaMm);
+  const tau = Math.max(0.6, focalSigmaMm * 1.75 + 0.2);
+  const sigmaOut = Math.max(0.9, tau * 0.9);
+  const beta = 0.08;
+  for (let i = 0; i < sampleCount; i++) {
+    const value = Number(sampleValues[i]);
+    const depthMm = Number(sampleDepthsMm[i]);
+    if (!Number.isFinite(value) || !Number.isFinite(depthMm)) {
+      continue;
+    }
+    const mu = huToAttenuationProxy(value);
+    const deltaMm = depthMm - centerDepthMm;
+    const absDeltaMm = Math.abs(deltaMm);
+    const inWeight =
+      absDeltaMm <= tau
+        ? Math.exp(-0.5 * (deltaMm / sigmaIn) ** 2)
+        : beta * Math.exp(-0.5 * ((absDeltaMm - tau) / sigmaOut) ** 2);
+    const weighted = inWeight * mu * depthStepMm;
+    if (inWeight > 1e-5 && weighted > 1e-8) {
+      const contribution = {
+        hu: value,
+        weight: inWeight,
+        weighted,
+        mu,
+        depthMm,
+      };
+      allInTroughContributions.push(contribution);
+      inTroughContributions.push(contribution);
+      huGradientSamples.push({ hu: value, weight: inWeight, depthMm });
+      inWeightTotal += inWeight * depthStepMm;
+      if (inWeight > 0.08) {
+        participatingSamples++;
+      }
+    }
+    if (absDeltaMm > 0.6 && absDeltaMm <= 2.0) {
+      const outWeight = Math.exp(-0.5 * ((absDeltaMm - 0.6) / 0.9) ** 2);
+      offTroughIntegral += outWeight * mu * depthStepMm;
+      outWeightTotal += outWeight * depthStepMm;
+    }
+  }
+
+  if (allInTroughContributions.length < 1 || inWeightTotal <= 1e-6) {
+    return {
+      valid: false,
+      hypothesisCode,
+      projectedAttenuation: 0,
+      backgroundAttenuation: 0,
+      focalDetailHu: NaN,
+      focalMedianHu: NaN,
+      supportDepthMm: centerDepthMm,
+      supportConfidence: 0,
+      participatingSamples: 0,
+      sharpness: 0,
+      consistency: 0,
+      compactness: 0,
+      outOfTroughFraction: 1,
+      score: 0,
+    };
+  }
+
+  inTroughContributions.sort((a, b) => a.weighted - b.weighted);
+  const totalContribution = inTroughContributions.reduce((sum, item) => sum + item.weighted, 0);
+  let trimmedContribution = 0;
+  const lowTrimTarget = totalContribution * 0.1;
+  const highTrimTarget = totalContribution * 0.1;
+  let lowTrimAccum = 0;
+  let highTrimAccum = 0;
+  let trimmedWeightTotal = 0;
+  let trimmedHuWeightedSum = 0;
+  const trimmedHuValues: number[] = [];
+  const trimmedHuWeights: number[] = [];
+  for (let index = 0; index < inTroughContributions.length; index++) {
+    const item = inTroughContributions[index];
+    if (lowTrimAccum < lowTrimTarget) {
+      lowTrimAccum += item.weighted;
+      continue;
+    }
+    const reverseIndex = inTroughContributions.length - 1 - index;
+    if (reverseIndex >= index && highTrimAccum < highTrimTarget) {
+      const highItem = inTroughContributions[reverseIndex];
+      if (highItem === item) {
+        highTrimAccum += item.weighted;
+        continue;
+      }
+    }
+    trimmedContribution += item.weighted;
+    trimmedWeightTotal += item.weight;
+    trimmedHuWeightedSum += item.hu * item.weight;
+    trimmedHuValues.push(item.hu);
+    trimmedHuWeights.push(item.weight);
+  }
+  if (trimmedHuValues.length === 0) {
+    for (const item of allInTroughContributions) {
+      trimmedContribution += item.weighted;
+      trimmedWeightTotal += item.weight;
+      trimmedHuWeightedSum += item.hu * item.weight;
+      trimmedHuValues.push(item.hu);
+      trimmedHuWeights.push(item.weight);
+    }
+  }
+  const focalMedianHu = weightedMedianFromSortedPairs(trimmedHuValues, trimmedHuWeights);
+  const focalTrimmedMeanHu =
+    trimmedWeightTotal > 1e-6 ? trimmedHuWeightedSum / trimmedWeightTotal : focalMedianHu;
+  const focalDetailHu =
+    focalTrimmedMeanHu * (1 - CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographMedianBlend) +
+    focalMedianHu * CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographMedianBlend;
+  const backgroundCorrectedAttenuation = Math.max(0, trimmedContribution - 0.35 * offTroughIntegral);
+  const projectedAttenuation = 1.35 * backgroundCorrectedAttenuation;
+  const backgroundAttenuation = 1.35 * offTroughIntegral;
+  const outOfTroughFraction = clampNumber(
+    backgroundAttenuation / Math.max(1e-6, projectedAttenuation + backgroundAttenuation),
+    0,
+    1
+  );
+  const compactness = clampNumber(
+    inWeightTotal / Math.max(1e-6, inWeightTotal + outWeightTotal),
+    0,
+    1
+  );
+  huGradientSamples.sort((a, b) => a.depthMm - b.depthMm);
+  let gradientWeightedSum = 0;
+  let gradientWeightTotal = 0;
+  for (let index = 1; index < huGradientSamples.length; index++) {
+    const prev = huGradientSamples[index - 1];
+    const next = huGradientSamples[index];
+    const pairWeight = Math.sqrt(Math.max(1e-6, prev.weight * next.weight));
+    gradientWeightedSum += Math.abs(next.hu - prev.hu) * pairWeight;
+    gradientWeightTotal += pairWeight;
+  }
+  const sharpness = clampNumber(
+    gradientWeightTotal > 1e-5
+      ? gradientWeightedSum / (gradientWeightTotal * 170)
+      : 0,
+    0,
+    1
+  );
+  const consistency = clampNumber(
+    trimmedWeightTotal > 1e-5
+      ? trimmedHuValues.reduce(
+          (sum, value, index) =>
+            sum +
+            smoothstepRange(-150, 1800, value) * trimmedHuWeights[index],
+          0
+        ) /
+          trimmedWeightTotal
+      : 0,
+    0,
+    1
+  );
+  const airPenalty = clampNumber((-780 - focalDetailHu) / 240, 0, 1);
+  const sampleValidity = computeRadiographSampleValidity(participatingSamples);
+  const supportConfidence = clampNumber(
+    reliability * 0.5 +
+      compactness * 0.18 +
+      consistency * 0.14 +
+      sharpness * 0.18 +
+      rowPrior * 0.08 -
+      outOfTroughFraction * 0.16 -
+      airPenalty * 0.18,
+    0,
+    1
+  ) * sampleValidity;
+  const score = clampNumber(
+    supportConfidence * 0.56 +
+      sharpness * 0.16 +
+      consistency * 0.12 +
+      rowPrior * 0.08 +
+      toothBandFocus * 0.08 -
+      outOfTroughFraction * 0.22 -
+      airPenalty * 0.16,
+    0,
+    1.6
+  ) * sampleValidity;
+
+  return {
+    valid:
+      Number.isFinite(projectedAttenuation) &&
+      Number.isFinite(focalDetailHu) &&
+      !(participatingSamples === 0 && projectedAttenuation <= 1e-6),
+    hypothesisCode,
+    projectedAttenuation,
+    backgroundAttenuation,
+    focalDetailHu: clampNumber(
+      focalDetailHu,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuCeiling
+    ),
+    focalMedianHu: clampNumber(
+      focalMedianHu,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuCeiling
+    ),
+    supportDepthMm: centerDepthMm,
+    supportConfidence,
+    participatingSamples,
+    sharpness,
+    consistency,
+    compactness,
+    outOfTroughFraction,
+    score,
+  };
+}
+
+function applyTriangularBlur2D(
+  source: Float32Array,
+  width: number,
+  height: number
+): Float32Array {
+  if (width <= 1 || height <= 1 || source.length !== width * height) {
+    return new Float32Array(source);
+  }
+
+  const temp = new Float32Array(source.length);
+  const output = new Float32Array(source.length);
+
+  for (let row = 0; row < height; row++) {
+    for (let col = 0; col < width; col++) {
+      let weightedSum = 0;
+      let weightTotal = 0;
+      for (let offset = -1; offset <= 1; offset++) {
+        const neighborCol = col + offset;
+        if (neighborCol < 0 || neighborCol >= width) {
+          continue;
+        }
+        const weight = offset === 0 ? 2 : 1;
+        weightedSum += source[row * width + neighborCol] * weight;
+        weightTotal += weight;
+      }
+      temp[row * width + col] = weightTotal > 0 ? weightedSum / weightTotal : source[row * width + col];
+    }
+  }
+
+  for (let row = 0; row < height; row++) {
+    for (let col = 0; col < width; col++) {
+      let weightedSum = 0;
+      let weightTotal = 0;
+      for (let offset = -1; offset <= 1; offset++) {
+        const neighborRow = row + offset;
+        if (neighborRow < 0 || neighborRow >= height) {
+          continue;
+        }
+        const weight = offset === 0 ? 2 : 1;
+        weightedSum += temp[neighborRow * width + col] * weight;
+        weightTotal += weight;
+      }
+      output[row * width + col] = weightTotal > 0 ? weightedSum / weightTotal : temp[row * width + col];
+    }
+  }
+
+  return output;
 }
 
 function worldToVoxel(
@@ -747,6 +1868,7 @@ function computeAutoDisplayWindow(pixelData: Float32Array): {
 function summarizeFiniteFloat32Buffer(buffer: Float32Array): {
   min: number;
   max: number;
+  mean: number;
   p10: number;
   p50: number;
   p90: number;
@@ -764,9 +1886,15 @@ function summarizeFiniteFloat32Buffer(buffer: Float32Array): {
     return null;
   }
 
+  let sum = 0;
+  for (let i = 0; i < samples.length; i++) {
+    sum += samples[i];
+  }
+
   return {
     min: percentile(samples, 0),
     max: percentile(samples, 1),
+    mean: sum / samples.length,
     p10: percentile(samples, 0.1),
     p50: percentile(samples, 0.5),
     p90: percentile(samples, 0.9),
@@ -784,46 +1912,112 @@ const CPU_VIRTUAL_PANO_MODEL_PARAMS = {
   thresholdHardPercentile: 0.74,
   gradCapPercentile: 0.85,
   supportMeanWeight: 0.68,
+  supportCoreWeight: 0.24,
+  supportCoreSoftWeight: 0.16,
+  supportInteriorGradientWeight: 0.1,
   gradientWeight: 0.3,
   balanceWeight: 0.16,
   lowBandPenaltyWeight: 0.9,
+  supportOffTroughLeakPenaltyWeight: 0.24,
+  supportSilhouettePenaltyWeight: 0.2,
   edgePenaltyScale: 0.58,
   depthCenterPenaltyScale: 0.16,
   crownBiasPenaltyScale: 0.32,
   supportReliabilityWeight: 0.24,
   supportAmbiguityWeight: 0.16,
+  supportDepthProminenceWeight: 0.42,
+  supportDepthProminenceReliabilityWeight: 0.16,
+  supportDepthPlateauPenaltyWeight: 0.2,
   supportLowReliabilityPenalty: 0.26,
   supportEdgeShelfWeight: 0.18,
   supportRepairLowReliabilityThreshold: 0.38,
-  supportRepairJumpMm: 0.66,
-  supportRepairBlend: 0.74,
+  supportRepairJumpMm: 0.62,
+  supportRepairBlend: 0.72,
   supportRepairEdgeShelfMarginMm: 0.35,
-  supportRepairScoreGapThreshold: 0.11,
+  supportRepairScoreGapThreshold: 0.075,
   supportRepairBestDepthDriftMm: 0.7,
   supportEnvelopeAnchorReliabilityThreshold: 0.56,
   supportEnvelopeAnchorScoreGapThreshold: 0.12,
-  supportEnvelopeHalfWidthMinMm: 0.72,
-  supportEnvelopeHalfWidthMaxMm: 1.58,
-  supportEnvelopePenaltyScale: 0.42,
-  supportEnvelopeRepairBlend: 0.78,
-  pathSmoothPasses: 3,
+  supportEnvelopeHalfWidthMinMm: 0.7,
+  supportEnvelopeHalfWidthMaxMm: 1.52,
+  supportEnvelopePenaltyScale: 0.44,
+  supportEnvelopeRepairBlend: 0.72,
+  supportSeedNeighborBlend: 0.52,
+  supportSeedJumpMm: 1.05,
+  supportSeedEnvelopeRelaxationMm: 0.3,
+  supportSeedConfidenceFloor: 0.6,
+  pathSmoothPasses: 2,
   supportDualArchCollapseMinRetention: 0.34,
-  supportSigmaLowReliabilityBoostMm: 0.24,
-  supportSigmaMm: 0.82,
+  supportSigmaLowReliabilityBoostMm: 0.42,
+  supportSigmaMm: 1.12,
   supportEnergyWindowScale: 1.6,
   alphaScale: 0.68,
   emissionDenScale: 2.4,
   emissionDenMin: 260,
-  contextSigmaScale: 1.95,
+  contextSigmaScale: 1.45,
   contextThresholdOffset: 180,
   contextThresholdBlend: 0.42,
-  contextWeightFloor: 0.08,
-  contextBlendBase: 0.18,
-  contextBlendLowReliabilityScale: 0.26,
-  contextBlendOuterRowScale: 0.22,
-  contextBlendToothPreserve: 0.08,
+  contextWeightFloor: 0.02,
+  contextBlendBase: 0.05,
+  contextBlendLowReliabilityScale: 0.16,
+  contextBlendOuterRowScale: 0.18,
+  contextBlendToothPreserve: 0.22,
+  contextInnerRingSuppression: 0.92,
+  contextToothBandWeightSuppression: 0.82,
+  contextToothBandBlendMax: 0.14,
+  contextOuterBandBlendMax: 0.34,
+  contextToothBandFallbackCeilingHu: -140,
   contextHuFloor: -820,
   contextHuCeiling: 780,
+  supportDualArchToothBandMidlinePull: 0.7,
+  focalProjectionToothBandFocusThreshold: 0.24,
+  focalProjectionSigmaScale: 1.06,
+  focalProjectionAsymmetricFarSideScale: 0.90,
+  focalProjectionMedianBlend: 0.25,
+  focalProjectionMadFloorHu: 42,
+  focalProjectionRobustCutoff: 2.35,
+  focalProjectionLateBlendGap: 0.085,
+  focalProjectionLateBlendMax: 0.18,
+  focalProjectionReliabilityWeight: 0.42,
+  focalProjectionSharpnessWeight: 0.24,
+  focalProjectionConsistencyWeight: 0.22,
+  focalProjectionCompactnessWeight: 0.12,
+  focalProjectionOffTroughPenaltyWeight: 0.16,
+  focalProjectionToothBandContextBlendMax: 0.06,
+  focalProjectionMinMergedScoreGap: 0.04,
+  focalProjectionMinBranchScoreGap: 0.04,
+  focalProjectionMinSupportConfidence: 0.6,
+  focalProjectionMinBranchReliability: 0.9,
+  focalProjectionMinWinnerGap: 0.05,
+  focalProjectionAirHuFloor: -850,
+  radiographMuScaleHu: 1333.3333333333333,
+  radiographMuGamma: 1,
+  radiographFocalSigmaScale: 0.82,
+  radiographContextSigmaScale: 2.1,
+  radiographBundleSpreadScale: 0.72,
+  radiographFarSideSigmaScale: 0.82,
+  radiographMedianBlend: 0.28,
+  radiographMadFloorHu: 48,
+  radiographRobustCutoff: 2.35,
+  radiographHypothesisWinnerGap: 0.055,
+  radiographHypothesisLateBlendGap: 0.006,
+  radiographHypothesisLateBlendMax: 0.035,
+  radiographOutOfTroughRingSuppression: 0.72,
+  radiographBackgroundBlendOuter: 0.12,
+  radiographBackgroundBlendLower: 0.08,
+  radiographBackgroundBlendToothMax: 0.008,
+  radiographBackgroundDarkenScale: 0.72,
+  radiographDisplayGamma: 0.68,
+  radiographDisplayOuterGamma: 0.88,
+  radiographSharpenStrength: 0.25,
+  radiographDetailRestoreStrength: 0.24,
+  radiographDefocusStrength: 0.52,
+  radiographQuietBackgroundHu: 28,
+  radiographHighlightCompressionStrength: 0.35,
+  radiographUpperBandQuietBlend: 0.18,
+  radiographLowerBandQuietBlend: 0.34,
+  radiographOutputHuFloor: 0,
+  radiographOutputHuCeiling: 4095,
   archSyntheticDetailHalfWidthMm: 0.72,
   archSyntheticDetailLowReliabilityBoostMm: 0.34,
   archSyntheticContextHalfWidthMm: 1.45,
@@ -865,19 +2059,42 @@ const CPU_VIRTUAL_PANO_MODEL_PARAMS = {
   dualArchProjectionContinuityPenaltyPerMm: 0.16,
   dualArchProjectionBaseDepthPenaltyPerMm: 0.05,
   dualArchProjectionAmbiguityGapThreshold: 0.045,
+  dualArchProjectionAmbiguityWindowTightenMm: 0.56,
+  dualArchProjectionAmbiguityThresholdBoost: 0.12,
+  dualArchProjectionOuterBandThresholdBoost: 0.2,
+  dualArchProjectionTopBandThresholdBoost: 0.16,
+  dualArchProjectionAmbiguityToothBandTightenMm: 0.24,
+  dualArchProjectionAmbiguityToothBandThresholdBoost: 0.08,
+  dualArchProjectionAmbiguityOffBandRescueFloorBoostHu: 320,
+  dualArchProjectionAmbiguityTopFractionBoost: -0.12,
+  dualArchProjectionAmbiguityNeighborDepthBlend: 0.52,
+  dualArchProjectionAmbiguityNeighborTiltBlend: 0.38,
+  dualArchProjectionAmbiguityWeightedMeanBlend: 0.72,
+  dualArchProjectionToothRowWeightedMeanBoost: 0.14,
+  dualArchProjectionSparseEligibleWeightedMeanBoost: 0.18,
+  dualArchProjectionNeighborFallbackBlend: 0.68,
+  dualArchProjectionTopBandSuppressionStart: 0.18,
+  dualArchProjectionTopBandSuppressionScale: 0.6,
   dualArchProjectionFocalHalfWidthMm: 2.25,
   dualArchProjectionOffBandRescueFloorHu: 980,
   dualArchProjectionLowerBandOffBandRescueBoostHu: 120,
   dualArchProjectionLowerPenaltyDarkenHu: 140,
   dualArchProjectionLowerPenaltyMaxBlend: 0.42,
-  lowerPenaltyRowStart: 0.5,
+  dualArchProjectionTopPenaltyDarkenHu: 180,
+  dualArchProjectionTopPenaltyMaxBlend: 0.44,
+  adaptiveBackgroundSuppressionAmbiguityProtectReduction: 0.56,
+  adaptiveBackgroundSuppressionStripeHorizontalContrastHu: 140,
+  adaptiveBackgroundSuppressionStripeVerticalEdgeScaleHu: 80,
+  adaptiveBackgroundSuppressionStripeProtectReduction: 0.72,
+  adaptiveBackgroundSuppressionStripeAttenuationBoost: 0.34,
+  lowerPenaltyRowStart: 0.56,
   lowerPenaltyRowEnd: 0.86,
-  lowerPenaltyBase: 0.16,
-  lowerPenaltyLowConfidenceScale: 0.62,
-  attenuationStrength: 1.82,
-  gamma: 1.12,
-  signalFloor: 0.04,
-  signalCeiling: 0.975,
+  lowerPenaltyBase: 0.08,
+  lowerPenaltyLowConfidenceScale: 0.38,
+  attenuationStrength: 1.28,
+  gamma: 0.72,
+  signalFloor: 0.02,
+  signalCeiling: 0.99,
   outputHuMin: -930,
   outputHuMax: 1550,
 };
@@ -953,6 +2170,10 @@ interface ScalarSamplingPolicy {
   shouldApplyModalityLut: boolean;
   shouldNormalizeStoredValues: boolean;
   unsignedPackedArtifactDetected: boolean;
+  overflowConditionObserved: boolean;
+  normalizationBranch: 'none' | 'packed-bit-extraction' | 'overflow-rescale';
+  observedRawMin: number;
+  observedRawMax: number;
   normalizeStoredSample?: (value: number) => number;
   normalizationSignature: string | null;
   safeInterpolationOobValue: number;
@@ -970,6 +2191,8 @@ function resolveScalarSamplingPolicy(input: CPRWorkerInput): ScalarSamplingPolic
     highBit,
     pixelRepresentation,
     isPreScaled,
+    observedRawMin,
+    observedRawMax,
     applyModalityLut,
     debugScalarSamplingMode,
   } = input;
@@ -984,6 +2207,8 @@ function resolveScalarSamplingPolicy(input: CPRWorkerInput): ScalarSamplingPolic
     highBit,
     pixelRepresentation,
     isPreScaled,
+    observedRawMin,
+    observedRawMax,
   });
   const requestedModalityLutApplied =
     typeof applyModalityLut === 'boolean'
@@ -1024,6 +2249,10 @@ function resolveScalarSamplingPolicy(input: CPRWorkerInput): ScalarSamplingPolic
     shouldApplyModalityLut,
     shouldNormalizeStoredValues,
     unsignedPackedArtifactDetected: transform.unsignedPackedArtifactDetected,
+    overflowConditionObserved: transform.overflowConditionObserved,
+    normalizationBranch: transform.normalizationBranch,
+    observedRawMin: transform.observedRawMin,
+    observedRawMax: transform.observedRawMax,
     normalizeStoredSample,
     normalizationSignature,
     safeInterpolationOobValue: transform.safeInterpolationOobValue,
@@ -1400,6 +2629,7 @@ function summarizeVirtualPanoOutput(
   toothBandP90: number;
   toothBandBrightFraction: number;
   lowerBandMean: number;
+  lowerBandP50: number;
   lowerBandBrightFraction: number;
   supportDepthClampFraction: number;
 } {
@@ -1429,6 +2659,7 @@ function summarizeVirtualPanoOutput(
   let lowerBandCount = 0;
   let lowerBandBrightCount = 0;
   const toothBandValues: number[] = [];
+  const lowerBandValues: number[] = [];
 
   for (let row = 0; row < panoHeight; row++) {
     for (let col = 0; col < panoWidth; col++) {
@@ -1450,6 +2681,7 @@ function summarizeVirtualPanoOutput(
       if (row >= lowerBandStartRow && row <= lowerBandEndRow) {
         lowerBandSum += value;
         lowerBandCount++;
+        lowerBandValues.push(value);
         if (value > -200) {
           lowerBandBrightCount++;
         }
@@ -1475,6 +2707,7 @@ function summarizeVirtualPanoOutput(
     toothBandP90: toothBandValues.length > 0 ? percentile(toothBandValues, 0.9) : 0,
     toothBandBrightFraction: toothBandCount > 0 ? toothBandBrightCount / toothBandCount : 0,
     lowerBandMean: lowerBandCount > 0 ? lowerBandSum / lowerBandCount : 0,
+    lowerBandP50: lowerBandValues.length > 0 ? percentile(lowerBandValues, 0.5) : 0,
     lowerBandBrightFraction: lowerBandCount > 0 ? lowerBandBrightCount / lowerBandCount : 0,
     supportDepthClampFraction: panoWidth > 0 ? supportDepthClampCount / panoWidth : 0,
   };
@@ -1605,8 +2838,13 @@ function renderVirtualPanoFromSupportPath(params: {
   selectedDepthMm: Float32Array;
   upperSupportDepthMm?: Float32Array;
   lowerSupportDepthMm?: Float32Array;
+  upperSupportAnchorRow?: number;
+  lowerSupportAnchorRow?: number;
   upperSupportReliabilityByCol?: Float32Array;
   lowerSupportReliabilityByCol?: Float32Array;
+  supportScoreGapByCol?: Float32Array;
+  upperSupportScoreGapByCol?: Float32Array;
+  lowerSupportScoreGapByCol?: Float32Array;
   softThresholdByCol: Float32Array;
   hardThresholdByCol: Float32Array;
   supportTiltMmByCol?: Float32Array;
@@ -1650,6 +2888,12 @@ function renderVirtualPanoFromSupportPath(params: {
     };
     troughSigmaMm: number;
     approxTroughHalfWidthMm: number;
+    supportConfidenceP10: number;
+    supportConfidenceP50: number;
+    supportConfidenceP90: number;
+    supportPathConfidenceP10: number;
+    supportPathConfidenceP50: number;
+    supportPathConfidenceP90: number;
     lowerPenaltyP50: number;
     lowerPenaltyP90: number;
     toneResponseP50: number;
@@ -1659,6 +2903,10 @@ function renderVirtualPanoFromSupportPath(params: {
     contextBlendMean: number;
     contextWeightFractionMean: number;
     columnSupportReliabilityP50: number;
+    upperDetailHuP50: number;
+    lowerDetailHuP50: number;
+    detailSampleFractionMean: number;
+    shadowLiftMean: number;
     attenuationStrength: number;
     gamma: number;
     outputHuMin: number;
@@ -1675,8 +2923,13 @@ function renderVirtualPanoFromSupportPath(params: {
     selectedDepthMm,
     upperSupportDepthMm,
     lowerSupportDepthMm,
+    upperSupportAnchorRow,
+    lowerSupportAnchorRow,
     upperSupportReliabilityByCol,
     lowerSupportReliabilityByCol,
+    supportScoreGapByCol,
+    upperSupportScoreGapByCol,
+    lowerSupportScoreGapByCol,
     softThresholdByCol,
     hardThresholdByCol,
     supportTiltMmByCol,
@@ -1704,6 +2957,13 @@ function renderVirtualPanoFromSupportPath(params: {
     !!lowerSupportDepthMm &&
     upperSupportDepthMm.length === panoWidth &&
     lowerSupportDepthMm.length === panoWidth;
+  const hasMergedSupportScoreGap =
+    !!supportScoreGapByCol && supportScoreGapByCol.length === panoWidth;
+  const hasDualArchSupportScoreGap =
+    !!upperSupportScoreGapByCol &&
+    !!lowerSupportScoreGapByCol &&
+    upperSupportScoreGapByCol.length === panoWidth &&
+    lowerSupportScoreGapByCol.length === panoWidth;
   const supportDepthMap = new Float32Array(planeSize);
   const supportConfidenceMap = new Float32Array(planeSize);
   const upperSupportDepthMap = hasDualArchSupport ? new Float32Array(planeSize) : undefined;
@@ -1733,13 +2993,26 @@ function renderVirtualPanoFromSupportPath(params: {
   let contextWeightFractionCount = 0;
   let contextBlendFactorSum = 0;
   let contextBlendFactorCount = 0;
+  const sampleValueBuffer = new Float32Array(depthSamples);
+  const sampleDepthBuffer = new Float32Array(depthSamples);
 
   for (let row = 0; row < panoHeight; row++) {
     const yNorm = panoCenterRow > 0 ? (row - panoCenterRow) / panoCenterRow : 0;
+    const toothBandFocus = 1 - clampUnitInterval(Math.abs(yNorm - 0.08) / 0.56);
     const archBlend =
       hasDualArchSupport && lowerHoldStartRow > upperHoldEndRow
         ? smoothstep01((row - upperHoldEndRow) / Math.max(1, lowerHoldStartRow - upperHoldEndRow))
         : 0;
+    const rowArchBlend = hasDualArchSupport
+      ? clampNumber(
+          archBlend * (1 - toothBandFocus * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDualArchToothBandMidlinePull) +
+            0.5 *
+              toothBandFocus *
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDualArchToothBandMidlinePull,
+          0,
+          1
+        )
+      : 0;
 
     for (let col = 0; col < panoWidth; col++) {
       const pixelIndex = planeIndex(col, row, panoWidth);
@@ -1757,9 +3030,19 @@ function renderVirtualPanoFromSupportPath(params: {
       const lowerSupportReliability = hasDualArchSupport
         ? clampUnitInterval(Number(lowerSupportReliabilityByCol?.[col]) || 0)
         : 0;
+      const mergedSupportScoreGap = hasMergedSupportScoreGap
+        ? Math.max(0, Number(supportScoreGapByCol?.[col]) || 0)
+        : 0;
+      const upperSupportScoreGap = hasDualArchSupportScoreGap
+        ? Math.max(0, Number(upperSupportScoreGapByCol?.[col]) || 0)
+        : mergedSupportScoreGap;
+      const lowerSupportScoreGap = hasDualArchSupportScoreGap
+        ? Math.max(0, Number(lowerSupportScoreGapByCol?.[col]) || 0)
+        : mergedSupportScoreGap;
       const columnSupportReliability = hasDualArchSupport
         ? clampUnitInterval(
-            (upperSupportReliability * (1 - archBlend) + lowerSupportReliability * archBlend) * 0.72 +
+            (upperSupportReliability * (1 - rowArchBlend) + lowerSupportReliability * rowArchBlend) *
+              0.72 +
               Math.min(upperSupportReliability, lowerSupportReliability) * 0.28
           )
         : 1;
@@ -1781,9 +3064,9 @@ function renderVirtualPanoFromSupportPath(params: {
           (lowerSupportDepthRawMm - mergedSupportDepthBaseMm) * archSeparationRetention
         : mergedSupportDepthBaseMm;
       const supportSigmaMm = hasDualArchSupport
-        ? upperArchSigmaMm * (1 - archBlend) +
-          lowerArchSigmaMm * archBlend +
-          Math.abs(lowerSupportDepthBaseMm - upperSupportDepthBaseMm) * 0.04 +
+        ? upperArchSigmaMm * (1 - rowArchBlend) +
+          lowerArchSigmaMm * rowArchBlend +
+          Math.abs(lowerSupportDepthBaseMm - upperSupportDepthBaseMm) * 0.02 +
           (1 - columnSupportReliability) *
             CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSigmaLowReliabilityBoostMm
         : SUPPORT_SIGMA_MM;
@@ -1826,13 +3109,15 @@ function renderVirtualPanoFromSupportPath(params: {
           continue;
         }
 
-        validDepthCount++;
         inBoundsSampleCount++;
         if (yNorm >= 0.65) {
           lowerBandInBoundsSampleCount++;
         }
 
         const depthMm = Number(virtualPanoDepthOffsetsMm[depth]);
+        sampleValueBuffer[validDepthCount] = value;
+        sampleDepthBuffer[validDepthCount] = depthMm;
+        validDepthCount++;
         const absDelta = Math.abs(depthMm - supportDepthMm);
         const troughWeight = Math.exp(-(absDelta * absDelta) / supportDenom);
         const contextTroughWeight = Math.exp(-(absDelta * absDelta) / contextDenom);
@@ -1852,12 +3137,25 @@ function renderVirtualPanoFromSupportPath(params: {
           }
         }
         const contextResponse = clampNumber((value - contextSoftThreshold) / contextDen, 0, 1);
+        const contextRingWeight = Math.max(
+          0,
+          contextTroughWeight -
+            troughWeight * CPU_VIRTUAL_PANO_MODEL_PARAMS.contextInnerRingSuppression
+        );
+        const contextToothBandSuppress = Math.max(
+          0.08,
+          1 -
+            toothBandFocus *
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.contextToothBandWeightSuppression *
+              smoothstep01((columnSupportReliability - 0.35) / 0.5)
+        );
         const contextWeight =
-          contextTroughWeight *
+          contextRingWeight *
           Math.max(
             CPU_VIRTUAL_PANO_MODEL_PARAMS.contextWeightFloor,
             Math.sqrt(contextResponse)
-          );
+          ) *
+          contextToothBandSuppress;
         if (contextWeight > 1e-4) {
           contextWeightedSum +=
             clampNumber(
@@ -1880,13 +3178,8 @@ function renderVirtualPanoFromSupportPath(params: {
         }
       }
 
-      if (validDepthCount > 0) {
-        retainedWeightFractionSum += retainedSampleCount / validDepthCount;
-        retainedWeightFractionCount++;
-      }
-
       const attenuationSignal = clampNumber(accumulatedSignal, 0, 1);
-      const supportConfidence =
+      const attenuationSupportConfidence =
         validDepthCount > 0 ? clampNumber(retainedSampleCount / validDepthCount, 0, 1) : 0;
       const pseudoAttenuation =
         attenuationSignal > 0 ? -Math.log(Math.max(1e-3, 1 - attenuationSignal)) : 0;
@@ -1904,26 +3197,253 @@ function renderVirtualPanoFromSupportPath(params: {
       const lowerPenalty =
         lowerPenaltyRow *
         (CPU_VIRTUAL_PANO_MODEL_PARAMS.lowerPenaltyBase +
-          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowerPenaltyLowConfidenceScale * (1 - supportConfidence));
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowerPenaltyLowConfidenceScale *
+            (1 - attenuationSupportConfidence));
       const correctedAttenuation = Math.max(0, pseudoAttenuation - lowerPenalty);
-      let toneResponse =
+      let attenuationToneResponse =
         1 -
         Math.exp(
           -CPU_VIRTUAL_PANO_MODEL_PARAMS.attenuationStrength * correctedAttenuation
         );
-      toneResponse = Math.pow(clampNumber(toneResponse, 0, 1), CPU_VIRTUAL_PANO_MODEL_PARAMS.gamma);
-      toneResponse = smoothstepRange(
+      attenuationToneResponse = Math.pow(
+        clampNumber(attenuationToneResponse, 0, 1),
+        CPU_VIRTUAL_PANO_MODEL_PARAMS.gamma
+      );
+      attenuationToneResponse = smoothstepRange(
         CPU_VIRTUAL_PANO_MODEL_PARAMS.signalFloor,
         CPU_VIRTUAL_PANO_MODEL_PARAMS.signalCeiling,
-        toneResponse
+        attenuationToneResponse
       );
-      const detailHu =
+      const attenuationDetailHu =
         retainedSampleCount <= 0 || validDepthCount <= 0
           ? -1000
           : CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin +
-            toneResponse *
+            attenuationToneResponse *
               (CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMax -
                 CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin);
+      let renderedSupportDepthMm = supportDepthMm;
+      let renderedSupportConfidence = attenuationSupportConfidence;
+      let renderedDetailHu = attenuationDetailHu;
+      let renderedToneResponse =
+        retainedSampleCount > 0 && validDepthCount > 0 ? attenuationToneResponse : 0;
+      let renderedAttenuation = correctedAttenuation;
+      let renderedParticipatingSamples = retainedSampleCount;
+      let renderedSupportBlend = rowArchBlend;
+      let usedRobustToothProjection = false;
+      const useRobustToothProjection =
+        toothBandFocus > CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionToothBandFocusThreshold &&
+        validDepthCount >= 4;
+      if (useRobustToothProjection) {
+        const upperSupportDepthMmForRender = clampNumber(
+          upperSupportDepthBaseMm + supportTiltMm * yNorm,
+          -virtualPanoDepthHalfRangeMm,
+          virtualPanoDepthHalfRangeMm
+        );
+        const lowerSupportDepthMmForRender = clampNumber(
+          lowerSupportDepthBaseMm + supportTiltMm * yNorm,
+          -virtualPanoDepthHalfRangeMm,
+          virtualPanoDepthHalfRangeMm
+        );
+        const projectionCandidates: Array<
+          RobustFocalProjectionResult & { blendAnchor: number; biasedScore: number }
+        > = [];
+        if (!hasDualArchSupport) {
+          const singleCandidate = evaluateRobustFocalProjection({
+            sampleValues: sampleValueBuffer,
+            sampleDepthsMm: sampleDepthBuffer,
+            sampleCount: validDepthCount,
+            centerDepthMm: supportDepthMm,
+            sigmaMm: supportSigmaMm,
+            softThreshold,
+            hardThreshold,
+            reliability: columnSupportReliability,
+            toothBandFocus,
+          });
+          if (singleCandidate.valid) {
+            projectionCandidates.push({
+              ...singleCandidate,
+              blendAnchor: 0,
+              biasedScore: singleCandidate.score,
+            });
+          }
+        } else {
+          const archPriorStrength = 0.04 + (1 - toothBandFocus) * 0.06;
+          const upperCandidate = evaluateRobustFocalProjection({
+            sampleValues: sampleValueBuffer,
+            sampleDepthsMm: sampleDepthBuffer,
+            sampleCount: validDepthCount,
+            centerDepthMm: upperSupportDepthMmForRender,
+            sigmaMm: upperArchSigmaMm,
+            softThreshold,
+            hardThreshold,
+            reliability: upperSupportReliability,
+            toothBandFocus,
+          });
+          if (upperCandidate.valid) {
+            projectionCandidates.push({
+              ...upperCandidate,
+              blendAnchor: 0,
+              biasedScore:
+                upperCandidate.score + (1 - rowArchBlend) * archPriorStrength,
+            });
+          }
+          const lowerCandidate = evaluateRobustFocalProjection({
+            sampleValues: sampleValueBuffer,
+            sampleDepthsMm: sampleDepthBuffer,
+            sampleCount: validDepthCount,
+            centerDepthMm: lowerSupportDepthMmForRender,
+            sigmaMm: lowerArchSigmaMm,
+            softThreshold,
+            hardThreshold,
+            reliability: lowerSupportReliability,
+            toothBandFocus,
+          });
+          if (lowerCandidate.valid) {
+            projectionCandidates.push({
+              ...lowerCandidate,
+              blendAnchor: 1,
+              biasedScore: lowerCandidate.score + rowArchBlend * archPriorStrength,
+            });
+          }
+        }
+
+        projectionCandidates.sort((a, b) => b.biasedScore - a.biasedScore);
+        const bestCandidate = projectionCandidates[0];
+        const secondCandidate = projectionCandidates[1];
+        if (bestCandidate) {
+          const bestBranchReliability =
+            bestCandidate.blendAnchor < 0.5 ? upperSupportReliability : lowerSupportReliability;
+          const bestBranchScoreGap =
+            bestCandidate.blendAnchor < 0.5 ? upperSupportScoreGap : lowerSupportScoreGap;
+          const winnerGap = secondCandidate
+            ? Math.abs(bestCandidate.biasedScore - secondCandidate.biasedScore)
+            : CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinWinnerGap;
+          const branchSeparationMm = hasDualArchSupport
+            ? Math.abs(upperSupportDepthMmForRender - lowerSupportDepthMmForRender)
+            : 0;
+          const projectionConfidenceGate = clampNumber(
+            smoothstepRange(
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinMergedScoreGap,
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinMergedScoreGap + 0.03,
+              mergedSupportScoreGap
+            ) *
+              smoothstepRange(
+                CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinBranchScoreGap,
+                CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinBranchScoreGap + 0.03,
+                bestBranchScoreGap
+              ) *
+              smoothstepRange(
+                CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinBranchReliability,
+                Math.min(
+                  0.99,
+                  CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinBranchReliability + 0.07
+                ),
+                bestBranchReliability
+              ) *
+              smoothstepRange(
+                CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinSupportConfidence,
+                Math.min(
+                  0.95,
+                  CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinSupportConfidence + 0.14
+                ),
+                bestCandidate.supportConfidence
+              ) *
+              smoothstepRange(
+                CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionAirHuFloor,
+                CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionAirHuFloor + 220,
+                bestCandidate.projectedHu
+              ) *
+              (secondCandidate
+                ? smoothstepRange(
+                    CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinWinnerGap,
+                    CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinWinnerGap + 0.04,
+                    winnerGap
+                  )
+                : 1),
+            0,
+            1
+          );
+          const branchCompromise =
+            hasDualArchSupport &&
+            branchSeparationMm > supportHalfWidthMm * 1.1 &&
+            secondCandidate &&
+            winnerGap < CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionMinWinnerGap;
+          if (projectionConfidenceGate < 0.35 || branchCompromise) {
+            projectionCandidates.length = 0;
+          }
+        }
+        if (projectionCandidates.length > 0 && bestCandidate) {
+          let selectedProjectionHu = bestCandidate.projectedHu;
+          let selectedSupportDepth = bestCandidate.supportDepthMm;
+          let selectedSupportBlend = bestCandidate.blendAnchor;
+          let selectedSupportConfidence = bestCandidate.supportConfidence;
+          let selectedParticipatingSamples = bestCandidate.participatingSamples;
+          if (
+            secondCandidate &&
+            Math.abs(bestCandidate.biasedScore - secondCandidate.biasedScore) <
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionLateBlendGap &&
+            Math.abs(bestCandidate.supportDepthMm - secondCandidate.supportDepthMm) <
+              supportHalfWidthMm * 1.8
+          ) {
+            const normalizedGap =
+              Math.abs(bestCandidate.biasedScore - secondCandidate.biasedScore) /
+              Math.max(1e-4, CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionLateBlendGap);
+            const lateBlend = clampNumber(
+              (1 - normalizedGap) *
+                CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionLateBlendMax,
+              0,
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionLateBlendMax
+            );
+            selectedProjectionHu =
+              bestCandidate.projectedHu * (1 - lateBlend) +
+              secondCandidate.projectedHu * lateBlend;
+            selectedSupportDepth =
+              bestCandidate.supportDepthMm * (1 - lateBlend) +
+              secondCandidate.supportDepthMm * lateBlend;
+            selectedSupportBlend =
+              bestCandidate.blendAnchor * (1 - lateBlend) +
+              secondCandidate.blendAnchor * lateBlend;
+            selectedSupportConfidence =
+              bestCandidate.supportConfidence * (1 - lateBlend) +
+              secondCandidate.supportConfidence * lateBlend;
+            selectedParticipatingSamples = Math.max(
+              bestCandidate.participatingSamples,
+              secondCandidate.participatingSamples
+            );
+          }
+          const projectionBlend = clampNumber(
+            0.38 + toothBandFocus * 0.42 + selectedSupportConfidence * 0.18,
+            0.42,
+            0.96
+          );
+          renderedDetailHu = clampNumber(
+            attenuationDetailHu * (1 - projectionBlend) +
+              selectedProjectionHu * projectionBlend,
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin,
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMax
+          );
+          renderedSupportDepthMm = selectedSupportDepth;
+          renderedSupportConfidence = selectedSupportConfidence;
+          renderedParticipatingSamples = Math.max(
+            renderedParticipatingSamples,
+            selectedParticipatingSamples
+          );
+          renderedSupportBlend = selectedSupportBlend;
+          renderedToneResponse = clampNumber(
+            smoothstepRange(
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin,
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMax,
+              renderedDetailHu
+            ),
+            0,
+            1
+          );
+          renderedAttenuation =
+            correctedAttenuation * (1 - projectionBlend * 0.7) +
+            bestCandidate.attenuationProxy * projectionBlend * 0.7;
+          usedRobustToothProjection = true;
+        }
+      }
       const contextHu =
         contextWeightTotal > 1e-4
           ? clampNumber(
@@ -1931,43 +3451,81 @@ function renderVirtualPanoFromSupportPath(params: {
               CPU_VIRTUAL_PANO_MODEL_PARAMS.contextHuFloor,
               CPU_VIRTUAL_PANO_MODEL_PARAMS.contextHuCeiling
             )
-          : detailHu;
+          : renderedDetailHu;
       const structuralReliability = clampUnitInterval(
-        supportConfidence * 0.45 + columnSupportReliability * 0.55
+        renderedSupportConfidence * 0.45 + columnSupportReliability * 0.55
       );
-      const toothBandFocus = 1 - clampUnitInterval(Math.abs(yNorm - 0.08) / 0.92);
-      const contextBlendFactor = clampNumber(
+      const rawContextBlendFactor = clampNumber(
         CPU_VIRTUAL_PANO_MODEL_PARAMS.contextBlendBase +
           (1 - structuralReliability) *
             CPU_VIRTUAL_PANO_MODEL_PARAMS.contextBlendLowReliabilityScale +
           (1 - toothBandFocus) * CPU_VIRTUAL_PANO_MODEL_PARAMS.contextBlendOuterRowScale -
-          toneResponse * toothBandFocus * CPU_VIRTUAL_PANO_MODEL_PARAMS.contextBlendToothPreserve,
-        0.12,
-        0.58
+          renderedToneResponse *
+            toothBandFocus *
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.contextBlendToothPreserve,
+        0,
+        1
       );
-      if (retainedSampleCount <= 0 || validDepthCount <= 0) {
-        fallbackNoEligibleCount++;
-        pixelData[pixelIndex] = contextWeightTotal > 1e-4 ? contextHu : -1000;
-      } else {
-        pixelData[pixelIndex] = detailHu * (1 - contextBlendFactor) + contextHu * contextBlendFactor;
+      const contextBlendFactor = clampNumber(
+        rawContextBlendFactor,
+        toothBandFocus > 0.36 ? 0 : 0.02,
+        usedRobustToothProjection
+          ? CPU_VIRTUAL_PANO_MODEL_PARAMS.focalProjectionToothBandContextBlendMax +
+              (1 - structuralReliability) * 0.04
+          : toothBandFocus > 0.28
+          ? CPU_VIRTUAL_PANO_MODEL_PARAMS.contextToothBandBlendMax +
+              (1 - structuralReliability) * 0.08
+          : CPU_VIRTUAL_PANO_MODEL_PARAMS.contextOuterBandBlendMax
+      );
+      if (validDepthCount > 0) {
+        retainedWeightFractionSum += renderedParticipatingSamples / validDepthCount;
+        retainedWeightFractionCount++;
       }
-      detailHuMap[pixelIndex] = detailHu;
+      const hasRenderableDetail =
+        validDepthCount > 0 &&
+        (retainedSampleCount > 0 || (usedRobustToothProjection && renderedParticipatingSamples > 0));
+      if (!hasRenderableDetail) {
+        fallbackNoEligibleCount++;
+        const toothBandFallbackCeilingHu = Math.min(
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.contextToothBandFallbackCeilingHu,
+          softThreshold - 40
+        );
+        pixelData[pixelIndex] =
+          toothBandFocus > 0.34
+            ? contextWeightTotal > 1e-4
+              ? clampNumber(
+                  contextHu,
+                  CPU_VIRTUAL_PANO_MODEL_PARAMS.contextHuFloor,
+                  toothBandFallbackCeilingHu
+                )
+              : Math.max(
+                  CPU_VIRTUAL_PANO_MODEL_PARAMS.contextHuFloor,
+                  toothBandFallbackCeilingHu - 120
+                )
+            : contextWeightTotal > 1e-4
+              ? contextHu
+              : -1000;
+      } else {
+        pixelData[pixelIndex] =
+          renderedDetailHu * (1 - contextBlendFactor) + contextHu * contextBlendFactor;
+      }
+      detailHuMap[pixelIndex] = renderedDetailHu;
       contextHuMap[pixelIndex] = contextHu;
       contextBlendFactorMap[pixelIndex] = contextBlendFactor;
       columnSupportReliabilityMap[pixelIndex] = columnSupportReliability;
-      supportDepthMap[pixelIndex] = supportDepthMm;
-      supportConfidenceMap[pixelIndex] = supportConfidence;
+      supportDepthMap[pixelIndex] = renderedSupportDepthMm;
+      supportConfidenceMap[pixelIndex] = renderedSupportConfidence;
       if (upperSupportDepthMap && lowerSupportDepthMap && supportBlendMap) {
         upperSupportDepthMap[pixelIndex] = upperSupportDepthBaseMm;
         lowerSupportDepthMap[pixelIndex] = lowerSupportDepthBaseMm;
         upperSupportConfidenceMap![pixelIndex] = upperSupportReliability;
         lowerSupportConfidenceMap![pixelIndex] = lowerSupportReliability;
-        supportBlendMap[pixelIndex] = archBlend;
+        supportBlendMap[pixelIndex] = renderedSupportBlend;
       }
-      totalAttenuationMap[pixelIndex] = correctedAttenuation;
+      totalAttenuationMap[pixelIndex] = renderedAttenuation;
       lowerPenaltyMap[pixelIndex] = lowerPenalty;
-      participatingSampleCountMap[pixelIndex] = retainedSampleCount;
-      toneResponseMap[pixelIndex] = retainedSampleCount > 0 && validDepthCount > 0 ? toneResponse : 0;
+      participatingSampleCountMap[pixelIndex] = renderedParticipatingSamples;
+      toneResponseMap[pixelIndex] = hasRenderableDetail ? renderedToneResponse : 0;
       troughHalfWidthMap[pixelIndex] = supportHalfWidthMm;
       if (validDepthCount > 0) {
         contextWeightFractionSum += contextWeightTotal / validDepthCount;
@@ -1980,7 +3538,7 @@ function renderVirtualPanoFromSupportPath(params: {
         lowerBandRenderCount++;
         lowerBandAttenuationSum += lowerPenalty;
         lowerBandAttenuationMax = Math.max(lowerBandAttenuationMax, lowerPenalty);
-        if (toneResponse < 0.12) {
+        if (renderedToneResponse < 0.12) {
           lowerBandSuppressedCount++;
         }
       }
@@ -2088,9 +3646,11 @@ function renderVirtualPanoFromSupportPath(params: {
   const toneResponseSummary = summarizeFiniteFloat32Buffer(toneResponseMap);
   const detailHuSummary = summarizeFiniteFloat32Buffer(detailHuMap);
   const contextHuSummary = summarizeFiniteFloat32Buffer(contextHuMap);
+  const supportConfidenceSummary = summarizeFiniteFloat32Buffer(supportConfidenceMap);
   const columnSupportReliabilitySummary = summarizeFiniteFloat32Buffer(
     columnSupportReliabilityMap
   );
+  const participatingSampleSummary = summarizeFiniteFloat32Buffer(participatingSampleCountMap);
 
   return {
     pixelData,
@@ -2174,6 +3734,12 @@ function renderVirtualPanoFromSupportPath(params: {
             ((upperArchSigmaMm + lowerArchSigmaMm) *
               CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnergyWindowScale)
           : SUPPORT_SIGMA_MM * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnergyWindowScale,
+      supportConfidenceP10: supportConfidenceSummary?.p10 ?? columnSupportReliabilitySummary?.p10 ?? 0,
+      supportConfidenceP50: supportConfidenceSummary?.p50 ?? columnSupportReliabilitySummary?.p50 ?? 0,
+      supportConfidenceP90: supportConfidenceSummary?.p90 ?? columnSupportReliabilitySummary?.p90 ?? 0,
+      supportPathConfidenceP10: columnSupportReliabilitySummary?.p10 ?? 0,
+      supportPathConfidenceP50: columnSupportReliabilitySummary?.p50 ?? 0,
+      supportPathConfidenceP90: columnSupportReliabilitySummary?.p90 ?? 0,
       lowerPenaltyP50: lowerPenaltySummary?.p50 ?? 0,
       lowerPenaltyP90: lowerPenaltySummary?.p90 ?? 0,
       toneResponseP50: toneResponseSummary?.p50 ?? 0,
@@ -2185,10 +3751,2208 @@ function renderVirtualPanoFromSupportPath(params: {
       contextWeightFractionMean:
         contextWeightFractionCount > 0 ? contextWeightFractionSum / contextWeightFractionCount : 0,
       columnSupportReliabilityP50: columnSupportReliabilitySummary?.p50 ?? 0,
+      upperDetailHuP50: detailHuSummary?.p50 ?? 0,
+      lowerDetailHuP50: detailHuSummary?.p50 ?? 0,
+      detailSampleFractionMean: participatingSampleSummary?.mean
+        ? participatingSampleSummary.mean / Math.max(1, depthSamples)
+        : retainedWeightFractionMean,
+      shadowLiftMean: 0,
       attenuationStrength: CPU_VIRTUAL_PANO_MODEL_PARAMS.attenuationStrength,
       gamma: CPU_VIRTUAL_PANO_MODEL_PARAMS.gamma,
       outputHuMin: CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMin,
       outputHuMax: CPU_VIRTUAL_PANO_MODEL_PARAMS.outputHuMax,
+    },
+  };
+}
+
+type VirtualPanoramicRadiographStageName = 'rawProjection' | 'postSuppression' | 'finalDisplay';
+
+interface VirtualPanoramicRadiographLocalizedReadout {
+  centerTeeth: {
+    focalSharpnessP50: number;
+    rawProjectedAttenuationP50: number;
+    postSuppressionP50: number;
+    preNormalizeCompositeP50: number;
+    postNormalizeDisplayP50: number;
+    finalDisplayP50: number;
+    backgroundPresentationP50: number;
+    hasSignalFraction: number;
+    contextContributionP50: number;
+    backgroundFillContributionP50: number;
+    hypothesisSwitchFraction: number;
+  };
+  upperCloudBand: {
+    outOfTroughSuppressionP50: number;
+    rawProjectedAttenuationP50: number;
+    postSuppressionP50: number;
+    preNormalizeCompositeP50: number;
+    postNormalizeDisplayP50: number;
+    finalDisplayP50: number;
+    backgroundPresentationP50: number;
+    hasSignalFraction: number;
+    contextContributionP50: number;
+    backgroundFillContributionP50: number;
+  };
+  lowerGranularField: {
+    outOfTroughSuppressionP50: number;
+    rawProjectedAttenuationP50: number;
+    postSuppressionP50: number;
+    preNormalizeCompositeP50: number;
+    postNormalizeDisplayP50: number;
+    finalDisplayP50: number;
+    backgroundPresentationP50: number;
+    hasSignalFraction: number;
+    contextContributionP50: number;
+    backgroundFillContributionP50: number;
+    speckleFraction: number;
+    verticalStreakScore: number;
+  };
+}
+
+interface VirtualPanoramicRadiographStageMetrics {
+  stage: VirtualPanoramicRadiographStageName;
+  lowerBandBrightFraction: number;
+  lowerBandMean: number;
+  lowerBandP50: number;
+  toothBandMean: number;
+  toothBandP10: number;
+  toothBandP90: number;
+  toothBandContrastRange: number;
+  focalSharpnessCenterThirdP50: number;
+  interToothValleyContrast: number;
+  intraToothGradationScore: number;
+  crownHighlightSaturationFraction: number;
+  occlusalDarkCapFraction: number;
+  offTroughEnergyTopRatio: number;
+  offTroughEnergyMiddleRatio: number;
+  offTroughEnergyBottomRatio: number;
+  lowerFieldSpeckleFraction: number;
+  lowerFieldVerticalStreakScore: number;
+  underRootVerticalSmearScore: number;
+  hypothesisSwitchFraction: number;
+  selectedUpperHypothesisFraction: number;
+  selectedLowerHypothesisFraction: number;
+  selectedBlendHypothesisFraction: number;
+  finalDisplayLowClipFraction: number;
+  finalDisplayHighClipFraction: number;
+  finalDisplayHistogramOccupancy: number;
+  rawZeroButFinalBrightFraction: number;
+  outsideRowsBrightnessP95: number;
+  gapRowsBrightnessP95: number;
+  bandBoundaryJumpMean: number;
+  localizedReadout: VirtualPanoramicRadiographLocalizedReadout;
+}
+
+interface VirtualPanoramicRadiographQualityDecision {
+  rejectReasons: string[];
+  acceptedByLowerBandTolerance: boolean;
+  acceptedByToothBandTolerance: boolean;
+  usedAsOutput: boolean;
+}
+
+function summarizeRadiographDisplayOutput(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  selectedDepthMm: Float32Array;
+  virtualPanoDepthHalfRangeMm: number;
+  outputFloor: number;
+  outputCeiling: number;
+  bandRows: VirtualRadiographBandRows;
+  preNormalizeCompositeOdMap?: Float32Array | null;
+}): ReturnType<typeof summarizeVirtualPanoOutput> {
+  const {
+    pixelData,
+    panoWidth,
+    panoHeight,
+    selectedDepthMm,
+    virtualPanoDepthHalfRangeMm,
+    outputFloor,
+    outputCeiling,
+    bandRows,
+    preNormalizeCompositeOdMap,
+  } = params;
+  const toothBandStartRow = Math.max(0, Math.min(bandRows.upperRows[0], bandRows.lowerRows[0]));
+  const toothBandEndRow = Math.max(
+    toothBandStartRow,
+    Math.min(panoHeight - 1, Math.max(bandRows.upperRows[1], bandRows.lowerRows[1]))
+  );
+  const lowerBandStartRow = Math.max(0, Math.min(panoHeight - 1, bandRows.bgBottomRows[0]));
+  const lowerBandEndRow = Math.max(
+    lowerBandStartRow,
+    Math.min(panoHeight - 1, bandRows.bgBottomRows[1])
+  );
+  const toothBrightThreshold = outputFloor + (outputCeiling - outputFloor) * 0.82;
+  const lowerBrightThreshold = outputFloor + (outputCeiling - outputFloor) * 0.18;
+
+  let minValue = Number.POSITIVE_INFINITY;
+  let maxValue = Number.NEGATIVE_INFINITY;
+  let toothBandSum = 0;
+  let toothBandCount = 0;
+  let toothBandBrightCount = 0;
+  let lowerBandSum = 0;
+  let lowerBandCount = 0;
+  let lowerBandBrightCount = 0;
+  const toothBandValues: number[] = [];
+  const lowerBandValues: number[] = [];
+
+  for (let row = 0; row < panoHeight; row++) {
+    const exclusiveMasks = computeVirtualRadiographExclusiveRowMasks(row, panoHeight, bandRows);
+    for (let col = 0; col < panoWidth; col++) {
+      const pixelIndex = planeIndex(col, row, panoWidth);
+      const value = Number(pixelData[pixelIndex]);
+      const anatomyOd = Math.max(0, Number(preNormalizeCompositeOdMap?.[pixelIndex]) || 0);
+      const hasAnatomySignal = anatomyOd > 1e-6;
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+      minValue = Math.min(minValue, value);
+      maxValue = Math.max(maxValue, value);
+      if (
+        row >= toothBandStartRow &&
+        row <= toothBandEndRow &&
+        exclusiveMasks.toothMask > 0.5 &&
+        hasAnatomySignal
+      ) {
+        toothBandSum += value;
+        toothBandCount++;
+        toothBandValues.push(value);
+        if (value >= toothBrightThreshold) {
+          toothBandBrightCount++;
+        }
+      }
+      if (row >= lowerBandStartRow && row <= lowerBandEndRow && !hasAnatomySignal) {
+        lowerBandSum += value;
+        lowerBandCount++;
+        lowerBandValues.push(value);
+        if (value >= lowerBrightThreshold) {
+          lowerBandBrightCount++;
+        }
+      }
+    }
+  }
+
+  let supportDepthClampCount = 0;
+  for (let col = 0; col < selectedDepthMm.length; col++) {
+    if (Math.abs(Number(selectedDepthMm[col])) > virtualPanoDepthHalfRangeMm - 0.5) {
+      supportDepthClampCount++;
+    }
+  }
+
+  const safeMin = Number.isFinite(minValue) ? minValue : outputFloor;
+  const safeMax = Number.isFinite(maxValue) ? maxValue : outputCeiling;
+  return {
+    minValue: safeMin,
+    maxValue: safeMax,
+    range: safeMax - safeMin,
+    toothBandMean: toothBandCount > 0 ? toothBandSum / toothBandCount : 0,
+    toothBandP10: toothBandValues.length > 0 ? percentile(toothBandValues, 0.1) : 0,
+    toothBandP90: toothBandValues.length > 0 ? percentile(toothBandValues, 0.9) : 0,
+    toothBandBrightFraction: toothBandCount > 0 ? toothBandBrightCount / toothBandCount : 0,
+    lowerBandMean: lowerBandCount > 0 ? lowerBandSum / lowerBandCount : 0,
+    lowerBandP50: lowerBandValues.length > 0 ? percentile(lowerBandValues, 0.5) : 0,
+    lowerBandBrightFraction: lowerBandCount > 0 ? lowerBandBrightCount / lowerBandCount : 0,
+    supportDepthClampFraction:
+      selectedDepthMm.length > 0 ? supportDepthClampCount / selectedDepthMm.length : 0,
+  };
+}
+
+function computeVirtualPanoramicRadiographRawProjectionStage(params: {
+  panoWidth: number;
+  panoHeight: number;
+  panoCenterRow: number;
+  upperSupportAnchorRow?: number;
+  lowerSupportAnchorRow?: number;
+  focalTroughSharpnessMap: Float32Array;
+  outOfTroughSuppressionMap: Float32Array;
+  rawProjectedAttenuationMap: Float32Array;
+  backgroundAttenuationMap: Float32Array;
+}): {
+  stage: 'rawProjection';
+  rawProjectedAttenuationP50: number;
+  rawProjectedAttenuationP90: number;
+  focalSharpnessCenterThirdP50: number;
+  offTroughEnergyTopRatio: number;
+  offTroughEnergyMiddleRatio: number;
+  offTroughEnergyBottomRatio: number;
+} {
+  const {
+    panoWidth,
+    panoHeight,
+    panoCenterRow,
+    upperSupportAnchorRow,
+    lowerSupportAnchorRow,
+    focalTroughSharpnessMap,
+    outOfTroughSuppressionMap,
+    rawProjectedAttenuationMap,
+    backgroundAttenuationMap,
+  } = params;
+  const bandRows = computeVirtualRadiographBandRows(
+    panoHeight,
+    panoCenterRow,
+    upperSupportAnchorRow,
+    lowerSupportAnchorRow
+  );
+
+  const rawSummary = summarizeFiniteFloat32Buffer(rawProjectedAttenuationMap);
+  const centerSharpnessValues: number[] = [];
+  let topOffEnergy = 0;
+  let middleOffEnergy = 0;
+  let bottomOffEnergy = 0;
+  let topOnEnergy = 0;
+  let middleOnEnergy = 0;
+  let bottomOnEnergy = 0;
+
+  for (let row = 0; row < panoHeight; row++) {
+    const toothBandRow =
+      (row >= bandRows.upperRows[0] && row <= bandRows.upperRows[1]) ||
+      (row >= bandRows.lowerRows[0] && row <= bandRows.lowerRows[1]);
+    const bandLabel =
+      row >= bandRows.upperRows[0] && row <= bandRows.upperRows[1]
+        ? 0
+        : row >= bandRows.gapRows[0] && row <= bandRows.gapRows[1]
+        ? 1
+        : row >= bandRows.lowerRows[0] && row <= bandRows.lowerRows[1]
+        ? 2
+        : -1;
+
+    for (let col = 0; col < panoWidth; col++) {
+      const pixelIndex = planeIndex(col, row, panoWidth);
+      const rawAttenuation = Math.max(0, Number(rawProjectedAttenuationMap[pixelIndex]) || 0);
+      const backgroundAttenuation =
+        Math.max(0, Number(backgroundAttenuationMap[pixelIndex]) || 0) *
+        clampUnitInterval(Number(outOfTroughSuppressionMap[pixelIndex]) || 0);
+
+      if (
+        toothBandRow &&
+        col >= Math.floor(panoWidth / 3) &&
+        col < Math.ceil((panoWidth * 2) / 3)
+      ) {
+        centerSharpnessValues.push(
+          clampUnitInterval(Number(focalTroughSharpnessMap[pixelIndex]) || 0)
+        );
+      }
+
+      if (bandLabel === 0) {
+        topOffEnergy += backgroundAttenuation;
+        topOnEnergy += rawAttenuation;
+      } else if (bandLabel === 1) {
+        middleOffEnergy += backgroundAttenuation;
+        middleOnEnergy += rawAttenuation;
+      } else if (bandLabel === 2) {
+        bottomOffEnergy += backgroundAttenuation;
+        bottomOnEnergy += rawAttenuation;
+      }
+    }
+  }
+
+  const centerSharpnessSummary = summarizeFiniteNumberArray(centerSharpnessValues);
+
+  return {
+    stage: 'rawProjection',
+    rawProjectedAttenuationP50: rawSummary?.p50 ?? 0,
+    rawProjectedAttenuationP90: rawSummary?.p90 ?? 0,
+    focalSharpnessCenterThirdP50: centerSharpnessSummary?.p50 ?? 0,
+    offTroughEnergyTopRatio: topOffEnergy / Math.max(1e-6, topOnEnergy),
+    offTroughEnergyMiddleRatio: middleOffEnergy / Math.max(1e-6, middleOnEnergy),
+    offTroughEnergyBottomRatio: bottomOffEnergy / Math.max(1e-6, bottomOnEnergy),
+  };
+}
+
+function summarizeFiniteNumberArray(values: number[]): ReturnType<typeof summarizeFiniteFloat32Buffer> {
+  if (values.length === 0) {
+    return null;
+  }
+
+  return summarizeFiniteFloat32Buffer(Float32Array.from(values));
+}
+
+function computeVirtualPanoramicRadiographStageMetrics(params: {
+  stage: VirtualPanoramicRadiographStageName;
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  panoCenterRow: number;
+  upperSupportAnchorRow?: number;
+  lowerSupportAnchorRow?: number;
+  selectedDepthMm: Float32Array;
+  virtualPanoDepthHalfRangeMm: number;
+  selectedSupportHypothesisMap: Float32Array;
+  focalTroughSharpnessMap: Float32Array;
+  outOfTroughSuppressionMap: Float32Array;
+  rawProjectedAttenuationMap: Float32Array;
+  backgroundAttenuationMap: Float32Array;
+  preNormalizeCompositeOdMap: Float32Array;
+  postNormalizeDisplayMap: Float32Array;
+  finalCompositeDisplayMap: Float32Array;
+  backgroundPresentationMap: Float32Array;
+  contextContributionMap: Float32Array;
+  backgroundFillContributionMap: Float32Array;
+  outputHuFloor: number;
+  outputHuCeiling: number;
+}): VirtualPanoramicRadiographStageMetrics {
+  const {
+    stage,
+    pixelData,
+    panoWidth,
+    panoHeight,
+    panoCenterRow,
+    upperSupportAnchorRow,
+    lowerSupportAnchorRow,
+    selectedDepthMm,
+    virtualPanoDepthHalfRangeMm,
+    selectedSupportHypothesisMap,
+    focalTroughSharpnessMap,
+    outOfTroughSuppressionMap,
+    rawProjectedAttenuationMap,
+    backgroundAttenuationMap,
+    preNormalizeCompositeOdMap,
+    postNormalizeDisplayMap,
+    finalCompositeDisplayMap,
+    backgroundPresentationMap,
+    contextContributionMap,
+    backgroundFillContributionMap,
+    outputHuFloor,
+    outputHuCeiling,
+  } = params;
+  const bandRows = computeVirtualRadiographBandRows(
+    panoHeight,
+    panoCenterRow,
+    upperSupportAnchorRow,
+    lowerSupportAnchorRow
+  );
+
+  const summary = summarizeRadiographDisplayOutput({
+    pixelData,
+    panoWidth,
+    panoHeight,
+    selectedDepthMm,
+    virtualPanoDepthHalfRangeMm,
+    outputFloor: outputHuFloor,
+    outputCeiling: outputHuCeiling,
+    bandRows,
+    preNormalizeCompositeOdMap,
+  });
+
+  const centerSharpnessValues: number[] = [];
+  const centerRawValues: number[] = [];
+  const centerPostSuppressionValues: number[] = [];
+  const centerPreNormalizeValues: number[] = [];
+  const centerPostNormalizeValues: number[] = [];
+  const centerDisplayValues: number[] = [];
+  const centerBackgroundPresentationValues: number[] = [];
+  const centerContextContributionValues: number[] = [];
+  const centerBackgroundFillValues: number[] = [];
+  const upperSuppressionValues: number[] = [];
+  const upperRawValues: number[] = [];
+  const upperPostSuppressionValues: number[] = [];
+  const upperPreNormalizeValues: number[] = [];
+  const upperPostNormalizeValues: number[] = [];
+  const upperDisplayValues: number[] = [];
+  const upperBackgroundPresentationValues: number[] = [];
+  const upperContextContributionValues: number[] = [];
+  const upperBackgroundFillValues: number[] = [];
+  const lowerSuppressionValues: number[] = [];
+  const lowerRawValues: number[] = [];
+  const lowerPostSuppressionValues: number[] = [];
+  const lowerPreNormalizeValues: number[] = [];
+  const lowerPostNormalizeValues: number[] = [];
+  const lowerDisplayValues: number[] = [];
+  const lowerBackgroundPresentationValues: number[] = [];
+  const lowerContextContributionValues: number[] = [];
+  const lowerBackgroundFillValues: number[] = [];
+  const outsideBrightnessValues: number[] = [];
+  const gapBrightnessValues: number[] = [];
+  const colSums = new Float64Array(panoWidth);
+  const colCounts = new Uint32Array(panoWidth);
+  const rowSums = new Float64Array(panoHeight);
+  const rowCounts = new Uint32Array(panoHeight);
+  const histBins = new Uint32Array(32);
+  const clipLowThreshold = outputHuFloor + 28;
+  const clipHighThreshold = outputHuCeiling - 28;
+  const histSpan = Math.max(1, outputHuCeiling - outputHuFloor);
+  let centerHypothesisSwitches = 0;
+  let centerHypothesisPairs = 0;
+  let valleyContrastSum = 0;
+  let valleyContrastCount = 0;
+  let gradationSum = 0;
+  let gradationCount = 0;
+  let crownHighlightCount = 0;
+  let crownRegionCount = 0;
+  let darkCapCount = 0;
+  let lowerSpeckleCount = 0;
+  let lowerFieldCount = 0;
+  let rootHorizontalEdgeSum = 0;
+  let rootVerticalEdgeSum = 0;
+  let rootEdgeCount = 0;
+  let selectedUpperCount = 0;
+  let selectedLowerCount = 0;
+  let selectedBlendCount = 0;
+  let hypothesisCount = 0;
+  let clipLowCount = 0;
+  let clipHighCount = 0;
+  let displaySampleCount = 0;
+  let topOffEnergy = 0;
+  let middleOffEnergy = 0;
+  let bottomOffEnergy = 0;
+  let topOnEnergy = 0;
+  let middleOnEnergy = 0;
+  let bottomOnEnergy = 0;
+  let centerSignalCount = 0;
+  let centerSignalTotal = 0;
+  let upperSignalCount = 0;
+  let upperSignalTotal = 0;
+  let lowerSignalCount = 0;
+  let lowerSignalTotal = 0;
+  let rawZeroCandidateCount = 0;
+  let rawZeroFinalBrightCount = 0;
+  let bandBoundaryJumpSum = 0;
+  let bandBoundaryJumpCount = 0;
+
+  const upperBoundaryStartRow = Math.max(0, bandRows.upperRows[0]);
+  const upperBoundaryEndRow = Math.max(0, Math.min(panoHeight - 1, bandRows.upperRows[1] + 1));
+  const lowerBoundaryStartRow = Math.max(0, bandRows.lowerRows[0]);
+  const lowerBoundaryEndRow = Math.max(0, Math.min(panoHeight - 1, bandRows.lowerRows[1] + 1));
+
+  for (let row = 0; row < panoHeight; row++) {
+    const exclusiveMasks = computeVirtualRadiographExclusiveRowMasks(row, panoHeight, bandRows);
+    const continuousRowWeights = computeRadiographContinuousRowWeights(
+      row,
+      bandRows.upperAnchorRow,
+      bandRows.lowerAnchorRow,
+      Math.max(52, Math.round(panoHeight * 0.13))
+    );
+    const centerToothBand = exclusiveMasks.toothMask > 0.5;
+    const crownRoofBand =
+      row >= Math.max(0, bandRows.upperRows[0] - 4) &&
+      row <= Math.min(panoHeight - 1, bandRows.upperRows[0] + 6);
+    const upperCloudBand = exclusiveMasks.outside > 0.5 && row <= bandRows.bgTopRows[1];
+    const lowerGranularField = exclusiveMasks.outside > 0.5 && row >= bandRows.bgBottomRows[0];
+    const gapBand = exclusiveMasks.gap > 0.5;
+    const underRootBand =
+      continuousRowWeights.envelope >= 0.18 &&
+      continuousRowWeights.lower >= 0.45 &&
+      row >= Math.max(bandRows.lowerRows[0], bandRows.lowerAnchorRow - 4);
+    const bandLabel = exclusiveMasks.upper > 0.5 ? 0 : gapBand ? 1 : exclusiveMasks.lower > 0.5 ? 2 : -1;
+
+    for (let col = 0; col < panoWidth; col++) {
+      const pixelIndex = planeIndex(col, row, panoWidth);
+      const finalValue = Number(pixelData[pixelIndex]);
+      const finalDisplayNormalized =
+        outputHuCeiling > outputHuFloor
+          ? clampNumber((finalValue - outputHuFloor) / (outputHuCeiling - outputHuFloor), 0, 1)
+          : 0;
+      const rawAttenuation = Math.max(0, Number(rawProjectedAttenuationMap[pixelIndex]) || 0);
+      const postSuppressionValue = rawAttenuation;
+      const preNormalizeComposite = Math.max(
+        0,
+        Number(preNormalizeCompositeOdMap[pixelIndex]) || 0
+      );
+      const postNormalizeDisplay = clampUnitInterval(
+        Number(postNormalizeDisplayMap[pixelIndex]) || 0
+      );
+      const finalCompositeDisplay = clampUnitInterval(
+        Number(finalCompositeDisplayMap[pixelIndex]) || 0
+      );
+      const hasAnatomySignal = preNormalizeComposite > 1e-6;
+      const backgroundPresentation = clampUnitInterval(
+        Number(backgroundPresentationMap[pixelIndex]) || 0
+      );
+      const contextContribution = Math.max(
+        0,
+        Number(contextContributionMap[pixelIndex]) || 0
+      );
+      const backgroundFillContribution = Math.max(
+        0,
+        Number(backgroundFillContributionMap[pixelIndex]) || 0
+      );
+      const backgroundAttenuation =
+        Math.max(0, Number(backgroundAttenuationMap[pixelIndex]) || 0) *
+        clampUnitInterval(Number(outOfTroughSuppressionMap[pixelIndex]) || 0);
+      const sharpness = clampUnitInterval(Number(focalTroughSharpnessMap[pixelIndex]) || 0);
+      const hypothesisCode = Math.round(Number(selectedSupportHypothesisMap[pixelIndex]) || 0);
+      const centerThird = col >= panoWidth / 3 && col < (panoWidth * 2) / 3;
+
+      if (stage === 'finalDisplay') {
+        if (exclusiveMasks.upper > 0.5 && hasAnatomySignal) {
+          topOnEnergy += finalCompositeDisplay;
+        } else if (exclusiveMasks.lower > 0.5 && hasAnatomySignal) {
+          bottomOnEnergy += finalCompositeDisplay;
+        } else if (centerToothBand && hasAnatomySignal) {
+          middleOnEnergy += finalCompositeDisplay;
+        }
+        if (upperCloudBand && !hasAnatomySignal) {
+          topOffEnergy += finalCompositeDisplay;
+        } else if (gapBand && !hasAnatomySignal) {
+          middleOffEnergy += finalCompositeDisplay;
+        } else if (lowerGranularField && !hasAnatomySignal) {
+          bottomOffEnergy += finalCompositeDisplay;
+        }
+      } else if (bandLabel === 0) {
+        topOffEnergy += backgroundAttenuation;
+        topOnEnergy += rawAttenuation;
+      } else if (bandLabel === 1) {
+        middleOffEnergy += backgroundAttenuation;
+        middleOnEnergy += rawAttenuation;
+      } else if (bandLabel === 2) {
+        bottomOffEnergy += backgroundAttenuation;
+        bottomOnEnergy += rawAttenuation;
+      }
+
+      if (hasAnatomySignal) {
+        const histIndex = Math.max(
+          0,
+          Math.min(
+            histBins.length - 1,
+            Math.floor(((finalValue - outputHuFloor) / histSpan) * histBins.length)
+          )
+        );
+        histBins[histIndex]++;
+        displaySampleCount++;
+        if (finalValue <= clipLowThreshold) {
+          clipLowCount++;
+        }
+        if (finalValue >= clipHighThreshold) {
+          clipHighCount++;
+        }
+      }
+
+      if (centerToothBand && centerThird) {
+        centerSharpnessValues.push(sharpness);
+        centerRawValues.push(rawAttenuation);
+        centerPostSuppressionValues.push(postSuppressionValue);
+        centerPreNormalizeValues.push(preNormalizeComposite);
+        centerPostNormalizeValues.push(postNormalizeDisplay);
+        centerDisplayValues.push(finalValue);
+        centerBackgroundPresentationValues.push(backgroundPresentation);
+        centerContextContributionValues.push(contextContribution);
+        centerBackgroundFillValues.push(backgroundFillContribution);
+        centerSignalTotal++;
+        if (rawAttenuation > 1e-6) {
+          centerSignalCount++;
+        }
+        if (col > 0 && col < panoWidth - 1) {
+          const left = Number(pixelData[planeIndex(col - 1, row, panoWidth)]);
+          const right = Number(pixelData[planeIndex(col + 1, row, panoWidth)]);
+          const valley = Math.max(0, (left + right) * 0.5 - finalValue);
+          if (valley > 0) {
+            valleyContrastSum += valley;
+            valleyContrastCount++;
+          }
+        }
+        const left = col > 0 ? Number(pixelData[planeIndex(col - 1, row, panoWidth)]) : finalValue;
+        const right =
+          col + 1 < panoWidth ? Number(pixelData[planeIndex(col + 1, row, panoWidth)]) : finalValue;
+        const up = row > 0 ? Number(pixelData[planeIndex(col, row - 1, panoWidth)]) : finalValue;
+        const down =
+          row + 1 < panoHeight ? Number(pixelData[planeIndex(col, row + 1, panoWidth)]) : finalValue;
+        gradationSum +=
+          (Math.abs(finalValue - left) +
+            Math.abs(finalValue - right) +
+            Math.abs(finalValue - up) +
+            Math.abs(finalValue - down)) /
+          4;
+        gradationCount++;
+      }
+
+      if (centerToothBand) {
+        if (hypothesisCode === 1) {
+          selectedUpperCount++;
+          hypothesisCount++;
+        } else if (hypothesisCode === 2) {
+          selectedLowerCount++;
+          hypothesisCount++;
+        } else if (hypothesisCode === 3) {
+          selectedBlendCount++;
+          hypothesisCount++;
+        }
+      }
+
+      if (centerToothBand && centerThird && col > 0) {
+        const prevCode = Math.round(
+          Number(selectedSupportHypothesisMap[planeIndex(col - 1, row, panoWidth)]) || 0
+        );
+        if (prevCode > 0 && hypothesisCode > 0) {
+          centerHypothesisPairs++;
+          if (prevCode !== hypothesisCode) {
+            centerHypothesisSwitches++;
+          }
+        }
+      }
+
+      if (crownRoofBand) {
+        crownRegionCount++;
+        if (finalValue >= outputHuCeiling - 70) {
+          crownHighlightCount++;
+        }
+        if (finalValue <= outputHuFloor + 140) {
+          darkCapCount++;
+        }
+      }
+
+      if (upperCloudBand) {
+        upperSuppressionValues.push(Number(outOfTroughSuppressionMap[pixelIndex]) || 0);
+        upperRawValues.push(rawAttenuation);
+        upperPostSuppressionValues.push(postSuppressionValue);
+        upperPreNormalizeValues.push(preNormalizeComposite);
+        upperPostNormalizeValues.push(postNormalizeDisplay);
+        upperDisplayValues.push(finalValue);
+        upperBackgroundPresentationValues.push(backgroundPresentation);
+        upperContextContributionValues.push(contextContribution);
+        upperBackgroundFillValues.push(backgroundFillContribution);
+        upperSignalTotal++;
+        if (rawAttenuation > 1e-6) {
+          upperSignalCount++;
+        }
+        if (!hasAnatomySignal) {
+          outsideBrightnessValues.push(finalCompositeDisplay);
+        }
+      }
+
+      if (lowerGranularField) {
+        lowerSuppressionValues.push(Number(outOfTroughSuppressionMap[pixelIndex]) || 0);
+        lowerRawValues.push(rawAttenuation);
+        lowerPostSuppressionValues.push(postSuppressionValue);
+        lowerPreNormalizeValues.push(preNormalizeComposite);
+        lowerPostNormalizeValues.push(postNormalizeDisplay);
+        lowerDisplayValues.push(finalValue);
+        lowerBackgroundPresentationValues.push(backgroundPresentation);
+        lowerContextContributionValues.push(contextContribution);
+        lowerBackgroundFillValues.push(backgroundFillContribution);
+        lowerSignalTotal++;
+        if (rawAttenuation > 1e-6) {
+          lowerSignalCount++;
+        }
+        if (!hasAnatomySignal) {
+          outsideBrightnessValues.push(finalCompositeDisplay);
+        }
+        lowerFieldCount++;
+        colSums[col] += finalValue;
+        colCounts[col]++;
+        rowSums[row] += finalValue;
+        rowCounts[row]++;
+        const left = col > 0 ? Number(pixelData[planeIndex(col - 1, row, panoWidth)]) : finalValue;
+        const right =
+          col + 1 < panoWidth ? Number(pixelData[planeIndex(col + 1, row, panoWidth)]) : finalValue;
+        const up = row > 0 ? Number(pixelData[planeIndex(col, row - 1, panoWidth)]) : finalValue;
+        const down =
+          row + 1 < panoHeight ? Number(pixelData[planeIndex(col, row + 1, panoWidth)]) : finalValue;
+        const localMean = (left + right + up + down) * 0.25;
+        if (
+          Math.abs(finalValue - localMean) >
+          Math.max(110, (summary.toothBandP90 - summary.toothBandP10) * 0.055)
+        ) {
+          lowerSpeckleCount++;
+        }
+      }
+
+      if (gapBand && !hasAnatomySignal) {
+        gapBrightnessValues.push(finalCompositeDisplay);
+      }
+
+      if (!hasAnatomySignal && (Number(outOfTroughSuppressionMap[pixelIndex]) || 0) >= 0.999) {
+        rawZeroCandidateCount++;
+        if (finalCompositeDisplay > 0.03) {
+          rawZeroFinalBrightCount++;
+        }
+      }
+
+      if (underRootBand && hasAnatomySignal && col > 0 && row > 0) {
+        const left = Number(pixelData[planeIndex(col - 1, row, panoWidth)]);
+        const up = Number(pixelData[planeIndex(col, row - 1, panoWidth)]);
+        rootHorizontalEdgeSum += Math.abs(finalValue - left);
+        rootVerticalEdgeSum += Math.abs(finalValue - up);
+        rootEdgeCount++;
+      }
+    }
+
+    const boundaryPairs: Array<[number, number]> = [];
+    if (row === upperBoundaryStartRow && row > 0) {
+      boundaryPairs.push([row - 1, row]);
+    }
+    if (row === upperBoundaryEndRow && row > 0) {
+      boundaryPairs.push([row - 1, row]);
+    }
+    if (row === lowerBoundaryStartRow && row > 0) {
+      boundaryPairs.push([row - 1, row]);
+    }
+    if (row === lowerBoundaryEndRow && row > 0) {
+      boundaryPairs.push([row - 1, row]);
+    }
+    for (const [prevRow, nextRow] of boundaryPairs) {
+      for (let col = 0; col < panoWidth; col++) {
+        const prevValue = clampUnitInterval(
+          Number(finalCompositeDisplayMap[planeIndex(col, prevRow, panoWidth)]) || 0
+        );
+        const nextValue = clampUnitInterval(
+          Number(finalCompositeDisplayMap[planeIndex(col, nextRow, panoWidth)]) || 0
+        );
+        bandBoundaryJumpSum += Math.abs(nextValue - prevValue);
+        bandBoundaryJumpCount++;
+      }
+    }
+  }
+
+  const centerSharpnessSummary = summarizeFiniteNumberArray(centerSharpnessValues);
+  const centerRawSummary = summarizeFiniteNumberArray(centerRawValues);
+  const centerPostSuppressionSummary = summarizeFiniteNumberArray(centerPostSuppressionValues);
+  const centerPreNormalizeSummary = summarizeFiniteNumberArray(centerPreNormalizeValues);
+  const centerPostNormalizeSummary = summarizeFiniteNumberArray(centerPostNormalizeValues);
+  const centerDisplaySummary = summarizeFiniteNumberArray(centerDisplayValues);
+  const centerBackgroundPresentationSummary = summarizeFiniteNumberArray(
+    centerBackgroundPresentationValues
+  );
+  const upperSuppressionSummary = summarizeFiniteNumberArray(upperSuppressionValues);
+  const upperRawSummary = summarizeFiniteNumberArray(upperRawValues);
+  const upperPostSuppressionSummary = summarizeFiniteNumberArray(upperPostSuppressionValues);
+  const upperPreNormalizeSummary = summarizeFiniteNumberArray(upperPreNormalizeValues);
+  const upperPostNormalizeSummary = summarizeFiniteNumberArray(upperPostNormalizeValues);
+  const upperDisplaySummary = summarizeFiniteNumberArray(upperDisplayValues);
+  const upperBackgroundPresentationSummary = summarizeFiniteNumberArray(
+    upperBackgroundPresentationValues
+  );
+  const lowerSuppressionSummary = summarizeFiniteNumberArray(lowerSuppressionValues);
+  const lowerRawSummary = summarizeFiniteNumberArray(lowerRawValues);
+  const lowerPostSuppressionSummary = summarizeFiniteNumberArray(lowerPostSuppressionValues);
+  const lowerPreNormalizeSummary = summarizeFiniteNumberArray(lowerPreNormalizeValues);
+  const lowerPostNormalizeSummary = summarizeFiniteNumberArray(lowerPostNormalizeValues);
+  const lowerDisplaySummary = summarizeFiniteNumberArray(lowerDisplayValues);
+  const lowerBackgroundPresentationSummary = summarizeFiniteNumberArray(
+    lowerBackgroundPresentationValues
+  );
+  const centerContextSummary = summarizeFiniteNumberArray(centerContextContributionValues);
+  const centerBackgroundFillSummary = summarizeFiniteNumberArray(centerBackgroundFillValues);
+  const upperContextSummary = summarizeFiniteNumberArray(upperContextContributionValues);
+  const upperBackgroundFillSummary = summarizeFiniteNumberArray(upperBackgroundFillValues);
+  const lowerContextSummary = summarizeFiniteNumberArray(lowerContextContributionValues);
+  const lowerBackgroundFillSummary = summarizeFiniteNumberArray(lowerBackgroundFillValues);
+  const outsideRowsBrightnessP95 =
+    outsideBrightnessValues.length > 0 ? percentile(outsideBrightnessValues, 0.95) : 0;
+  const gapRowsBrightnessP95 =
+    gapBrightnessValues.length > 0 ? percentile(gapBrightnessValues, 0.95) : 0;
+  const colMeans: number[] = [];
+  const rowMeans: number[] = [];
+  for (let col = 0; col < panoWidth; col++) {
+    if (colCounts[col] > 0) {
+      colMeans.push(colSums[col] / colCounts[col]);
+    }
+  }
+  for (let row = 0; row < panoHeight; row++) {
+    if (rowCounts[row] > 0) {
+      rowMeans.push(rowSums[row] / rowCounts[row]);
+    }
+  }
+  const colMeanSummary = summarizeFiniteNumberArray(colMeans);
+  const rowMeanSummary = summarizeFiniteNumberArray(rowMeans);
+  let colVar = 0;
+  for (const value of colMeans) {
+    colVar += (value - (colMeanSummary?.mean ?? 0)) ** 2;
+  }
+  let rowVar = 0;
+  for (const value of rowMeans) {
+    rowVar += (value - (rowMeanSummary?.mean ?? 0)) ** 2;
+  }
+  const colSigma = colMeans.length > 0 ? Math.sqrt(colVar / colMeans.length) : 0;
+  const rowSigma = rowMeans.length > 0 ? Math.sqrt(rowVar / rowMeans.length) : 0;
+  let occupiedBins = 0;
+  const minBinCount = Math.max(1, Math.round(pixelData.length * 0.0025));
+  for (let binIndex = 0; binIndex < histBins.length; binIndex++) {
+    if (histBins[binIndex] >= minBinCount) {
+      occupiedBins++;
+    }
+  }
+
+  return {
+    stage,
+    lowerBandBrightFraction: summary.lowerBandBrightFraction,
+    lowerBandMean: summary.lowerBandMean,
+    lowerBandP50: summary.lowerBandP50,
+    toothBandMean: summary.toothBandMean,
+    toothBandP10: summary.toothBandP10,
+    toothBandP90: summary.toothBandP90,
+    toothBandContrastRange: summary.toothBandP90 - summary.toothBandP10,
+    focalSharpnessCenterThirdP50: centerSharpnessSummary?.p50 ?? 0,
+    interToothValleyContrast:
+      valleyContrastCount > 0 ? valleyContrastSum / valleyContrastCount : 0,
+    intraToothGradationScore: gradationCount > 0 ? gradationSum / gradationCount : 0,
+    crownHighlightSaturationFraction:
+      crownRegionCount > 0 ? crownHighlightCount / crownRegionCount : 0,
+    occlusalDarkCapFraction: crownRegionCount > 0 ? darkCapCount / crownRegionCount : 0,
+    offTroughEnergyTopRatio: topOnEnergy > 1e-6 ? topOffEnergy / topOnEnergy : 0,
+    offTroughEnergyMiddleRatio: middleOnEnergy > 1e-6 ? middleOffEnergy / middleOnEnergy : 0,
+    offTroughEnergyBottomRatio: bottomOnEnergy > 1e-6 ? bottomOffEnergy / bottomOnEnergy : 0,
+    lowerFieldSpeckleFraction: lowerFieldCount > 0 ? lowerSpeckleCount / lowerFieldCount : 0,
+    lowerFieldVerticalStreakScore: rowSigma > 1e-6 ? colSigma / rowSigma : colSigma > 0 ? 999 : 0,
+    underRootVerticalSmearScore:
+      rootEdgeCount > 0 && rootVerticalEdgeSum > 1e-6
+        ? rootHorizontalEdgeSum / rootVerticalEdgeSum
+        : 0,
+    hypothesisSwitchFraction:
+      centerHypothesisPairs > 0 ? centerHypothesisSwitches / centerHypothesisPairs : 0,
+    selectedUpperHypothesisFraction:
+      hypothesisCount > 0 ? selectedUpperCount / hypothesisCount : 0,
+    selectedLowerHypothesisFraction:
+      hypothesisCount > 0 ? selectedLowerCount / hypothesisCount : 0,
+    selectedBlendHypothesisFraction:
+      hypothesisCount > 0 ? selectedBlendCount / hypothesisCount : 0,
+    finalDisplayLowClipFraction: displaySampleCount > 0 ? clipLowCount / displaySampleCount : 0,
+    finalDisplayHighClipFraction: displaySampleCount > 0 ? clipHighCount / displaySampleCount : 0,
+    finalDisplayHistogramOccupancy: histBins.length > 0 ? occupiedBins / histBins.length : 0,
+    rawZeroButFinalBrightFraction:
+      rawZeroCandidateCount > 0 ? rawZeroFinalBrightCount / rawZeroCandidateCount : 0,
+    outsideRowsBrightnessP95,
+    gapRowsBrightnessP95,
+    bandBoundaryJumpMean: bandBoundaryJumpCount > 0 ? bandBoundaryJumpSum / bandBoundaryJumpCount : 0,
+    localizedReadout: {
+      centerTeeth: {
+        focalSharpnessP50: centerSharpnessSummary?.p50 ?? 0,
+        rawProjectedAttenuationP50: centerRawSummary?.p50 ?? 0,
+        postSuppressionP50: centerPostSuppressionSummary?.p50 ?? 0,
+        preNormalizeCompositeP50: centerPreNormalizeSummary?.p50 ?? 0,
+        postNormalizeDisplayP50: centerPostNormalizeSummary?.p50 ?? 0,
+        finalDisplayP50: centerDisplaySummary?.p50 ?? 0,
+        backgroundPresentationP50: centerBackgroundPresentationSummary?.p50 ?? 0,
+        hasSignalFraction: centerSignalTotal > 0 ? centerSignalCount / centerSignalTotal : 0,
+        contextContributionP50: centerContextSummary?.p50 ?? 0,
+        backgroundFillContributionP50: centerBackgroundFillSummary?.p50 ?? 0,
+        hypothesisSwitchFraction:
+          centerHypothesisPairs > 0 ? centerHypothesisSwitches / centerHypothesisPairs : 0,
+      },
+      upperCloudBand: {
+        outOfTroughSuppressionP50: upperSuppressionSummary?.p50 ?? 0,
+        rawProjectedAttenuationP50: upperRawSummary?.p50 ?? 0,
+        postSuppressionP50: upperPostSuppressionSummary?.p50 ?? 0,
+        preNormalizeCompositeP50: upperPreNormalizeSummary?.p50 ?? 0,
+        postNormalizeDisplayP50: upperPostNormalizeSummary?.p50 ?? 0,
+        finalDisplayP50: upperDisplaySummary?.p50 ?? 0,
+        backgroundPresentationP50: upperBackgroundPresentationSummary?.p50 ?? 0,
+        hasSignalFraction: upperSignalTotal > 0 ? upperSignalCount / upperSignalTotal : 0,
+        contextContributionP50: upperContextSummary?.p50 ?? 0,
+        backgroundFillContributionP50: upperBackgroundFillSummary?.p50 ?? 0,
+      },
+      lowerGranularField: {
+        outOfTroughSuppressionP50: lowerSuppressionSummary?.p50 ?? 0,
+        rawProjectedAttenuationP50: lowerRawSummary?.p50 ?? 0,
+        postSuppressionP50: lowerPostSuppressionSummary?.p50 ?? 0,
+        preNormalizeCompositeP50: lowerPreNormalizeSummary?.p50 ?? 0,
+        postNormalizeDisplayP50: lowerPostNormalizeSummary?.p50 ?? 0,
+        finalDisplayP50: lowerDisplaySummary?.p50 ?? 0,
+        backgroundPresentationP50: lowerBackgroundPresentationSummary?.p50 ?? 0,
+        hasSignalFraction: lowerSignalTotal > 0 ? lowerSignalCount / lowerSignalTotal : 0,
+        contextContributionP50: lowerContextSummary?.p50 ?? 0,
+        backgroundFillContributionP50: lowerBackgroundFillSummary?.p50 ?? 0,
+        speckleFraction: lowerFieldCount > 0 ? lowerSpeckleCount / lowerFieldCount : 0,
+        verticalStreakScore: rowSigma > 1e-6 ? colSigma / rowSigma : colSigma > 0 ? 999 : 0,
+      },
+    },
+  };
+}
+
+function evaluateVirtualPanoramicRadiographStageQuality(
+  stageMetrics: VirtualPanoramicRadiographStageMetrics
+): VirtualPanoramicRadiographQualityDecision {
+  const rejectReasons: string[] = [];
+  if (stageMetrics.focalSharpnessCenterThirdP50 < 0.56) {
+    rejectReasons.push('radiograph-focal-trough-sharpness-too-low');
+  }
+  if (stageMetrics.interToothValleyContrast < 70) {
+    rejectReasons.push('radiograph-tooth-separation-too-low');
+  }
+  if (stageMetrics.intraToothGradationScore < 52) {
+    rejectReasons.push('radiograph-internal-gradation-too-low');
+  }
+  if (stageMetrics.crownHighlightSaturationFraction > 0.18) {
+    rejectReasons.push('radiograph-crown-highlight-saturation-too-high');
+  }
+  if (stageMetrics.occlusalDarkCapFraction > 0.19) {
+    rejectReasons.push('radiograph-occlusal-dark-cap-too-high');
+  }
+  if (stageMetrics.offTroughEnergyTopRatio > 0.52) {
+    rejectReasons.push('radiograph-off-trough-top-energy-too-high');
+  }
+  if (stageMetrics.offTroughEnergyMiddleRatio > 0.38) {
+    rejectReasons.push('radiograph-off-trough-middle-energy-too-high');
+  }
+  if (stageMetrics.offTroughEnergyBottomRatio > 0.34) {
+    rejectReasons.push('radiograph-off-trough-bottom-energy-too-high');
+  }
+  if (
+    stageMetrics.rawZeroButFinalBrightFraction > 0.04 ||
+    stageMetrics.outsideRowsBrightnessP95 > 0.15 ||
+    stageMetrics.gapRowsBrightnessP95 > 0.15
+  ) {
+    rejectReasons.push('radiograph-lower-field-bright-fill-too-high');
+  }
+  if (stageMetrics.bandBoundaryJumpMean > 0.14) {
+    rejectReasons.push('radiograph-band-boundary-jump-too-high');
+  }
+  if (stageMetrics.lowerFieldSpeckleFraction > 0.11) {
+    rejectReasons.push('radiograph-lower-field-speckle-too-high');
+  }
+  if (stageMetrics.lowerFieldVerticalStreakScore > 2.15) {
+    rejectReasons.push('radiograph-lower-field-vertical-streak-too-high');
+  }
+  if (stageMetrics.underRootVerticalSmearScore > 2.5) {
+    rejectReasons.push('radiograph-under-root-vertical-smear-too-high');
+  }
+  if (stageMetrics.hypothesisSwitchFraction > 0.18) {
+    rejectReasons.push('radiograph-hypothesis-switch-too-high');
+  }
+  if (stageMetrics.finalDisplayLowClipFraction > 0.11) {
+    rejectReasons.push('radiograph-final-display-low-clipping-too-high');
+  }
+  if (stageMetrics.finalDisplayHighClipFraction > 0.095) {
+    rejectReasons.push('radiograph-final-display-high-clipping-too-high');
+  }
+  if (stageMetrics.finalDisplayHistogramOccupancy < 0.16) {
+    rejectReasons.push('radiograph-final-display-histogram-occupancy-too-low');
+  }
+
+  const lowerBandOnlyRejectReasons = new Set([
+    'radiograph-lower-field-bright-fill-too-high',
+    'radiograph-lower-field-speckle-too-high',
+    'radiograph-lower-field-vertical-streak-too-high',
+    'radiograph-off-trough-bottom-energy-too-high',
+  ]);
+  const nonLowerBandRejectReasons = rejectReasons.filter(
+    reason => !lowerBandOnlyRejectReasons.has(reason)
+  );
+  const acceptedByLowerBandTolerance =
+    rejectReasons.length > 0 &&
+    nonLowerBandRejectReasons.length === 0 &&
+    stageMetrics.lowerBandBrightFraction <= 0.11 &&
+    stageMetrics.lowerFieldSpeckleFraction <= 0.16 &&
+    stageMetrics.lowerFieldVerticalStreakScore <= 2.5 &&
+    stageMetrics.toothBandContrastRange >= 420 &&
+    stageMetrics.focalSharpnessCenterThirdP50 >= 0.6;
+  const acceptedByToothBandTolerance =
+    rejectReasons.length > 0 &&
+    rejectReasons.every(
+      reason =>
+        reason === 'radiograph-final-display-low-clipping-too-high' ||
+        reason === 'radiograph-off-trough-middle-energy-too-high'
+    ) &&
+    stageMetrics.toothBandContrastRange >= 520 &&
+    stageMetrics.intraToothGradationScore >= 60 &&
+    stageMetrics.crownHighlightSaturationFraction <= 0.12 &&
+    stageMetrics.occlusalDarkCapFraction <= 0.15;
+
+  return {
+    rejectReasons,
+    acceptedByLowerBandTolerance,
+    acceptedByToothBandTolerance,
+    usedAsOutput:
+      rejectReasons.length === 0 || acceptedByLowerBandTolerance || acceptedByToothBandTolerance,
+  };
+}
+
+function renderVirtualPanoramicRadiograph(params: {
+  virtualPanoStack: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  planeSize: number;
+  panoCenterRow: number;
+  virtualPanoDepthOffsetsMm: Float32Array;
+  selectedDepthMm: Float32Array;
+  upperSupportDepthMm?: Float32Array;
+  lowerSupportDepthMm?: Float32Array;
+  upperSupportAnchorRow?: number;
+  lowerSupportAnchorRow?: number;
+  upperSupportReliabilityByCol?: Float32Array;
+  lowerSupportReliabilityByCol?: Float32Array;
+  supportScoreGapByCol?: Float32Array;
+  upperSupportScoreGapByCol?: Float32Array;
+  lowerSupportScoreGapByCol?: Float32Array;
+  softThresholdByCol: Float32Array;
+  hardThresholdByCol: Float32Array;
+  supportTiltMmByCol?: Float32Array;
+  virtualPanoDepthHalfRangeMm: number;
+}): {
+  pixelData: Float32Array;
+  summary: ReturnType<typeof summarizeVirtualPanoOutput>;
+  debugMaps: GpuPanoDebugMaps;
+  diagnostics: {
+    enabled: boolean;
+    usedAsOutput: boolean;
+    acceptedByLowerBandTolerance: boolean;
+    acceptedByToothBandTolerance: boolean;
+    renderSupportMode: 'singlePath' | 'radiographDualHypothesis';
+    pipelineVariant: 'virtualPanoramicRadiograph';
+    rendererFamilyName: 'virtual-panoramic-radiograph';
+    rendererCandidateSource: 'worker-cpu-virtual-panoramic-radiograph';
+    workerBranchSelected: boolean;
+    workerQcAccepted: boolean;
+    workerQcStage: 'postSuppression' | 'finalDisplay';
+    rejectReasonsStage: 'postSuppression' | 'finalDisplay';
+    rejectReasons: string[];
+    eligibleSampleFraction: number;
+    lowerBandEligibleFraction: number;
+    emptyFallbackFraction: number;
+    retainedWeightFractionMean: number;
+    offTroughEnergyRatio: number;
+    lowerSuppressionRatio: number;
+    toothBandMean: number;
+    lowerBandMean: number;
+    postRenderLowerBackgroundSuppression: {
+      coverageFraction: number;
+      meanAttenuation: number;
+      maxAttenuation: number;
+    };
+    supportTiltMode: 'disabled' | 'linear';
+    supportTiltFirst8Mm: number[];
+    supportTiltMeanAbsMm: number;
+    supportTiltMaxAbsMm: number;
+    supportDepthFirst8Mm: number[];
+    upperSupportDepthFirst8Mm: number[];
+    lowerSupportDepthFirst8Mm: number[];
+    upperSupportReliabilityP50: number;
+    lowerSupportReliabilityP50: number;
+    supportBlendRows: {
+      upperHoldEnd: number;
+      lowerHoldStart: number;
+    };
+    actualFinalPanoHeight: number;
+    upperAnchorRow: number;
+    lowerAnchorRow: number;
+    troughSigmaMm: number;
+    approxTroughHalfWidthMm: number;
+    rowUpperWeightP10: number;
+    rowUpperWeightP50: number;
+    rowUpperWeightP90: number;
+    rowLowerWeightP10: number;
+    rowLowerWeightP50: number;
+    rowLowerWeightP90: number;
+    supportConfidenceP10: number;
+    supportConfidenceP50: number;
+    supportConfidenceP90: number;
+    supportPathConfidenceP10: number;
+    supportPathConfidenceP50: number;
+    supportPathConfidenceP90: number;
+    lowerPenaltyP50: number;
+    lowerPenaltyP90: number;
+    toneResponseP50: number;
+    toneResponseP90: number;
+    detailHuP50: number;
+    contextHuP50: number;
+    contextBlendMean: number;
+    contextWeightFractionMean: number;
+    columnSupportReliabilityP50: number;
+    upperDetailHuP50: number;
+    lowerDetailHuP50: number;
+    detailSampleFractionMean: number;
+    shadowLiftMean: number;
+    attenuationStrength: number;
+    gamma: number;
+    outputHuMin: number;
+    outputHuMax: number;
+    rawProjectedAttenuationP50: number;
+    focalSharpnessP50: number;
+    outOfTroughSuppressionP50: number;
+    participatingSamplesP10: number;
+    participatingSamplesP50: number;
+    participatingSamplesP90: number;
+    sampleValidityP10: number;
+    sampleValidityP50: number;
+    sampleValidityP90: number;
+    backgroundTroughNarrowGateP50: number;
+    backgroundTroughNarrowGateP90: number;
+    rawProjectionStage: {
+      stage: 'rawProjection';
+      rawProjectedAttenuationP50: number;
+      rawProjectedAttenuationP90: number;
+      focalSharpnessCenterThirdP50: number;
+      offTroughEnergyTopRatio: number;
+      offTroughEnergyMiddleRatio: number;
+      offTroughEnergyBottomRatio: number;
+    };
+    postSuppressionStage: VirtualPanoramicRadiographStageMetrics;
+    finalDisplayStage?: VirtualPanoramicRadiographStageMetrics;
+    localizedReadout: VirtualPanoramicRadiographLocalizedReadout;
+  };
+} {
+  const {
+    virtualPanoStack,
+    panoWidth,
+    panoHeight,
+    planeSize,
+    panoCenterRow,
+    virtualPanoDepthOffsetsMm,
+    selectedDepthMm,
+    upperSupportDepthMm,
+    lowerSupportDepthMm,
+    upperSupportAnchorRow,
+    lowerSupportAnchorRow,
+    upperSupportReliabilityByCol,
+    lowerSupportReliabilityByCol,
+    supportScoreGapByCol,
+    upperSupportScoreGapByCol,
+    lowerSupportScoreGapByCol,
+    supportTiltMmByCol,
+    virtualPanoDepthHalfRangeMm,
+  } = params;
+
+  const depthSamples = virtualPanoDepthOffsetsMm.length;
+  const depthStepMm =
+    depthSamples > 1
+      ? Math.abs(Number(virtualPanoDepthOffsetsMm[1]) - Number(virtualPanoDepthOffsetsMm[0]))
+      : 0.25;
+  const pixelData = new Float32Array(planeSize);
+  const supportDepthMap = new Float32Array(planeSize);
+  const supportConfidenceMap = new Float32Array(planeSize);
+  const upperSupportDepthMap =
+    upperSupportDepthMm && upperSupportDepthMm.length === panoWidth
+      ? new Float32Array(planeSize)
+      : undefined;
+  const lowerSupportDepthMap =
+    lowerSupportDepthMm && lowerSupportDepthMm.length === panoWidth
+      ? new Float32Array(planeSize)
+      : undefined;
+  const upperSupportConfidenceMap = upperSupportDepthMap ? new Float32Array(planeSize) : undefined;
+  const lowerSupportConfidenceMap = lowerSupportDepthMap ? new Float32Array(planeSize) : undefined;
+  const supportBlendMap = upperSupportDepthMap ? new Float32Array(planeSize) : undefined;
+  const totalAttenuationMap = new Float32Array(planeSize);
+  const lowerPenaltyMap = new Float32Array(planeSize);
+  const participatingSampleCountMap = new Float32Array(planeSize);
+  const toneResponseMap = new Float32Array(planeSize);
+  const troughHalfWidthMap = new Float32Array(planeSize);
+  const detailHuMap = new Float32Array(planeSize);
+  const contextHuMap = new Float32Array(planeSize);
+  const contextBlendFactorMap = new Float32Array(planeSize);
+  const columnSupportReliabilityMap = new Float32Array(planeSize);
+  const upperDetailHuMap = upperSupportDepthMap ? new Float32Array(planeSize) : undefined;
+  const lowerDetailHuMap = lowerSupportDepthMap ? new Float32Array(planeSize) : undefined;
+  const renderBranchMap = new Float32Array(planeSize);
+  const selectedSupportHypothesisMap = new Float32Array(planeSize);
+  const focalTroughSharpnessMap = new Float32Array(planeSize);
+  const outOfTroughSuppressionMap = new Float32Array(planeSize);
+  const rawProjectedAttenuationMap = new Float32Array(planeSize);
+  const upperProjectedAttenuationMap = new Float32Array(planeSize);
+  const lowerProjectedAttenuationMap = new Float32Array(planeSize);
+  const upperBandRawOdMap = new Float32Array(planeSize);
+  const lowerBandRawOdMap = new Float32Array(planeSize);
+  const gapBandRawOdMap = new Float32Array(planeSize);
+  const outsideRowsRawOdMap = new Float32Array(planeSize);
+  const displayBackgroundOdMap = new Float32Array(planeSize);
+  const bandMaskUpperMap = new Float32Array(planeSize);
+  const bandMaskGapMap = new Float32Array(planeSize);
+  const bandMaskLowerMap = new Float32Array(planeSize);
+  const bandMaskOutsideMap = new Float32Array(planeSize);
+  const normalizationEligibleMaskMap = new Float32Array(planeSize);
+  const preNormalizeCompositeOdMap = new Float32Array(planeSize);
+  const postNormalizeDisplayMap = new Float32Array(planeSize);
+  const displayAnatomyMap = new Float32Array(planeSize);
+  const backgroundPresentationMap = new Float32Array(planeSize);
+  const finalCompositeDisplayMap = new Float32Array(planeSize);
+  const contextContributionMap = new Float32Array(planeSize);
+  const backgroundFillContributionMap = new Float32Array(planeSize);
+  const finalDisplayImageMap = new Float32Array(planeSize);
+  const backgroundAttenuationMap = new Float32Array(planeSize);
+  const baseDisplayNormMap = new Float32Array(planeSize);
+  const backgroundDisplayNormMap = new Float32Array(planeSize);
+  const detailDisplayNormMap = new Float32Array(planeSize);
+  const preSharpenDisplayNormMap = new Float32Array(planeSize);
+  const sampleValueBuffer = new Float32Array(depthSamples);
+  const sampleDepthBuffer = new Float32Array(depthSamples);
+  const hasSupportTilt = !!supportTiltMmByCol && supportTiltMmByCol.length === panoWidth;
+  const hasDualArchSupport =
+    !!upperSupportDepthMm &&
+    !!lowerSupportDepthMm &&
+    upperSupportDepthMm.length === panoWidth &&
+    lowerSupportDepthMm.length === panoWidth;
+  const hasMergedScoreGaps = !!supportScoreGapByCol && supportScoreGapByCol.length === panoWidth;
+  const hasDualArchScoreGaps =
+    !!upperSupportScoreGapByCol &&
+    !!lowerSupportScoreGapByCol &&
+    upperSupportScoreGapByCol.length === panoWidth &&
+    lowerSupportScoreGapByCol.length === panoWidth;
+  const SUPPORT_SIGMA_MM = CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSigmaMm;
+  const upperHoldEndRow = Math.max(0, Math.min(panoHeight - 1, Math.round(panoCenterRow * 0.08)));
+  const lowerHoldStartRow = Math.max(
+    upperHoldEndRow + 1,
+    Math.min(panoHeight - 1, Math.round(panoCenterRow * 0.42))
+  );
+  const bandRows = computeVirtualRadiographBandRows(
+    panoHeight,
+    panoCenterRow,
+    upperSupportAnchorRow,
+    lowerSupportAnchorRow
+  );
+
+  let eligibleSampleCount = 0;
+  let lowerBandEligibleSampleCount = 0;
+  let inBoundsSampleCount = 0;
+  let lowerBandInBoundsSampleCount = 0;
+  let fallbackNoEligibleCount = 0;
+  let retainedWeightFractionSum = 0;
+  let retainedWeightFractionCount = 0;
+  let onSupportEnergy = 0;
+  let offSupportEnergy = 0;
+  let contextBlendFactorSum = 0;
+  let contextBlendFactorCount = 0;
+  let contextWeightFractionSum = 0;
+  let contextWeightFractionCount = 0;
+  let shadowLiftSum = 0;
+  let shadowLiftCount = 0;
+  let lowerBandRenderCount = 0;
+  let lowerBandSuppressedCount = 0;
+  let lowerBandAttenuationSum = 0;
+  let lowerBandAttenuationMax = 0;
+
+  for (let row = 0; row < panoHeight; row++) {
+    const yNorm = panoCenterRow > 0 ? (row - panoCenterRow) / panoCenterRow : 0;
+    const rowBandWeights = computeVirtualRadiographRowBandWeights(row, panoHeight, bandRows, 4);
+    const toothBandWeight = rowBandWeights.upper + rowBandWeights.lower;
+    const toothBandFocus = clampNumber(Math.max(rowBandWeights.upper, rowBandWeights.lower), 0, 1);
+    const lowerBandFocus = clampNumber(
+      rowBandWeights.lower + (row >= bandRows.lowerRows[0] ? rowBandWeights.background : 0),
+      0,
+      1
+    );
+    const rowArchBlend =
+      hasDualArchSupport && toothBandWeight > 1e-6
+        ? clampNumber(rowBandWeights.lower / toothBandWeight, 0, 1)
+        : row >= bandRows.midRow
+        ? 1
+        : 0;
+    let previousRowHypothesisCode = 0;
+    let previousRowHypothesisConfidence = 0;
+    let previousRowHypothesisSharpness = 0;
+
+    for (let col = 0; col < panoWidth; col++) {
+      const pixelIndex = planeIndex(col, row, panoWidth);
+      const supportTiltMm = hasSupportTilt ? Number(supportTiltMmByCol?.[col]) : 0;
+      const mergedSupportDepthMm = clampNumber(
+        Number(selectedDepthMm[col]) + supportTiltMm * yNorm,
+        -virtualPanoDepthHalfRangeMm,
+        virtualPanoDepthHalfRangeMm
+      );
+      const upperSupportDepthLocalMm = hasDualArchSupport
+        ? clampNumber(
+            Number(upperSupportDepthMm?.[col] ?? selectedDepthMm[col]) + supportTiltMm * yNorm,
+            -virtualPanoDepthHalfRangeMm,
+            virtualPanoDepthHalfRangeMm
+          )
+        : mergedSupportDepthMm;
+      const lowerSupportDepthLocalMm = hasDualArchSupport
+        ? clampNumber(
+            Number(lowerSupportDepthMm?.[col] ?? selectedDepthMm[col]) + supportTiltMm * yNorm,
+            -virtualPanoDepthHalfRangeMm,
+            virtualPanoDepthHalfRangeMm
+          )
+        : mergedSupportDepthMm;
+      const upperReliability = hasDualArchSupport
+        ? clampUnitInterval(Number(upperSupportReliabilityByCol?.[col]) || 0)
+        : 1;
+      const lowerReliability = hasDualArchSupport
+        ? clampUnitInterval(Number(lowerSupportReliabilityByCol?.[col]) || 0)
+        : 1;
+      const mergedScoreGap = hasMergedScoreGaps
+        ? Math.max(0, Number(supportScoreGapByCol?.[col]) || 0)
+        : 0;
+      const upperScoreGap = hasDualArchScoreGaps
+        ? Math.max(0, Number(upperSupportScoreGapByCol?.[col]) || 0)
+        : mergedScoreGap;
+      const lowerScoreGap = hasDualArchScoreGaps
+        ? Math.max(0, Number(lowerSupportScoreGapByCol?.[col]) || 0)
+        : mergedScoreGap;
+      const columnReliability = hasDualArchSupport
+        ? clampUnitInterval(
+            upperReliability * (1 - rowArchBlend) * 0.55 +
+              lowerReliability * rowArchBlend * 0.55 +
+              Math.max(upperReliability, lowerReliability) * 0.45
+          )
+        : 1;
+      const focalSigmaMmBase = Math.max(
+        0.18,
+        (SUPPORT_SIGMA_MM +
+          (1 - columnReliability) *
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSigmaLowReliabilityBoostMm) *
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographFocalSigmaScale
+      );
+      const focalSigmaMm = Math.max(0.18, focalSigmaMmBase * 1.15);
+      const effectiveTroughHalfWidthMm = focalSigmaMm * 1.75 + 0.2;
+      const contextSigmaMm = Math.max(
+        focalSigmaMm * 1.7,
+        focalSigmaMm * CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographContextSigmaScale
+      );
+      let validDepthCount = 0;
+      for (let depth = 0; depth < depthSamples; depth++) {
+        const value = Number(virtualPanoStack[stackIndex(depth, pixelIndex, planeSize)]);
+        if (!Number.isFinite(value)) {
+          continue;
+        }
+        sampleValueBuffer[validDepthCount] = value;
+        sampleDepthBuffer[validDepthCount] = Number(virtualPanoDepthOffsetsMm[depth]);
+        validDepthCount++;
+      }
+      inBoundsSampleCount += validDepthCount;
+      if (row >= bandRows.bgBottomRows[0]) {
+        lowerBandInBoundsSampleCount += validDepthCount;
+      }
+
+      const upperRowPrior = hasDualArchSupport ? 1 - rowArchBlend : 1;
+      const lowerRowPrior = hasDualArchSupport ? rowArchBlend : 0;
+      const rowContinuityGate = smoothstepRange(0.28, 0.68, toothBandFocus);
+      const continuityPreferenceCode =
+        hasDualArchSupport && rowContinuityGate > 0.02 ? previousRowHypothesisCode : 0;
+      const continuityPreferenceWeight =
+        rowContinuityGate *
+        clampNumber(
+          0.55 * previousRowHypothesisConfidence + 0.45 * previousRowHypothesisSharpness,
+          0,
+          1
+        );
+      const candidates: VirtualRadiographHypothesisResult[] = [];
+      let singleCandidateEval: VirtualRadiographHypothesisResult | null = null;
+      let upperCandidateEval: VirtualRadiographHypothesisResult | null = null;
+      let lowerCandidateEval: VirtualRadiographHypothesisResult | null = null;
+      if (validDepthCount >= 3) {
+        if (!hasDualArchSupport) {
+          singleCandidateEval = evaluateVirtualPanoramicRadiographHypothesis({
+            sampleValues: sampleValueBuffer,
+            sampleDepthsMm: sampleDepthBuffer,
+            sampleCount: validDepthCount,
+            centerDepthMm: mergedSupportDepthMm,
+            focalSigmaMm,
+            contextSigmaMm,
+            depthStepMm,
+            reliability: columnReliability,
+            rowPrior: 1,
+            toothBandFocus,
+            hypothesisCode: 0,
+          });
+          if (singleCandidateEval.valid) {
+            candidates.push(singleCandidateEval);
+          }
+        } else {
+          upperCandidateEval = evaluateVirtualPanoramicRadiographHypothesis({
+            sampleValues: sampleValueBuffer,
+            sampleDepthsMm: sampleDepthBuffer,
+            sampleCount: validDepthCount,
+            centerDepthMm: upperSupportDepthLocalMm,
+            focalSigmaMm: focalSigmaMm * 0.95,
+            contextSigmaMm,
+            depthStepMm,
+            reliability: upperReliability,
+            rowPrior: upperRowPrior,
+            toothBandFocus,
+            hypothesisCode: 1,
+          });
+          if (upperCandidateEval.valid) {
+            candidates.push({
+              ...upperCandidateEval,
+              score:
+                upperCandidateEval.score +
+                smoothstepRange(0.01, 0.08, upperScoreGap) * 0.11 +
+                smoothstepRange(0.01, 0.08, mergedScoreGap) * 0.06 +
+                smoothstepRange(0.68, 0.9, upperReliability) * 0.04 +
+                (continuityPreferenceCode === 1 ? continuityPreferenceWeight * 0.085 : 0),
+            });
+          }
+          lowerCandidateEval = evaluateVirtualPanoramicRadiographHypothesis({
+            sampleValues: sampleValueBuffer,
+            sampleDepthsMm: sampleDepthBuffer,
+            sampleCount: validDepthCount,
+            centerDepthMm: lowerSupportDepthLocalMm,
+            focalSigmaMm: focalSigmaMm * 1.05,
+            contextSigmaMm,
+            depthStepMm,
+            reliability: lowerReliability,
+            rowPrior: lowerRowPrior,
+            toothBandFocus,
+            hypothesisCode: 2,
+          });
+          if (lowerCandidateEval.valid) {
+            candidates.push({
+              ...lowerCandidateEval,
+              score:
+                lowerCandidateEval.score +
+                smoothstepRange(0.01, 0.08, lowerScoreGap) * 0.11 +
+                smoothstepRange(0.01, 0.08, mergedScoreGap) * 0.06 +
+                smoothstepRange(0.68, 0.9, lowerReliability) * 0.04 +
+                (continuityPreferenceCode === 2 ? continuityPreferenceWeight * 0.085 : 0),
+            });
+          }
+        }
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+      let selectedCandidate = candidates[0];
+      let renderBranchCode = 0;
+      let selectedHypothesisCode = selectedCandidate?.hypothesisCode ?? 0;
+      let selectedBlend = selectedHypothesisCode === 2 ? 1 : 0;
+      if (
+        hasDualArchSupport &&
+        selectedCandidate &&
+        continuityPreferenceCode > 0 &&
+        continuityPreferenceCode !== selectedHypothesisCode &&
+        rowContinuityGate > 0.04
+      ) {
+        const continuityCandidate = candidates.find(
+          candidate => candidate.hypothesisCode === continuityPreferenceCode
+        );
+        if (continuityCandidate) {
+          const continuitySwitchGap = Math.max(
+            0,
+            Number(selectedCandidate.score) - Number(continuityCandidate.score)
+          );
+          const continuityHoldThreshold =
+            0.03 + (1 - continuityPreferenceWeight) * 0.015 + (1 - rowContinuityGate) * 0.012;
+          if (
+            continuitySwitchGap <= continuityHoldThreshold &&
+            continuityCandidate.supportConfidence >= 0.58 &&
+            continuityCandidate.sharpness >= 0.08
+          ) {
+            selectedCandidate = continuityCandidate;
+            selectedHypothesisCode = continuityPreferenceCode;
+            selectedBlend = selectedHypothesisCode === 2 ? 1 : 0;
+            renderBranchCode = 4;
+          }
+        }
+      }
+      if (selectedCandidate && candidates[1]) {
+        const secondCandidate = candidates[1];
+        const winnerGap = Math.abs(selectedCandidate.score - secondCandidate.score);
+        const branchSeparationMm =
+          selectedCandidate.hypothesisCode > 0 &&
+          secondCandidate.hypothesisCode > 0 &&
+          hasDualArchSupport
+            ? Math.abs(upperSupportDepthLocalMm - lowerSupportDepthLocalMm)
+            : 0;
+        if (
+          winnerGap <
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographHypothesisLateBlendGap &&
+          branchSeparationMm < SUPPORT_SIGMA_MM * 0.72 &&
+          selectedCandidate.supportConfidence > 0.82 &&
+          secondCandidate.supportConfidence > 0.82 &&
+          toothBandFocus < 0.42
+        ) {
+          const lateBlend = clampNumber(
+            (1 -
+              winnerGap /
+                Math.max(
+                  1e-4,
+                  CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographHypothesisLateBlendGap
+                )) *
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographHypothesisLateBlendMax,
+            0,
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographHypothesisLateBlendMax
+          );
+          selectedCandidate = {
+            ...selectedCandidate,
+            projectedAttenuation:
+              selectedCandidate.projectedAttenuation * (1 - lateBlend) +
+              secondCandidate.projectedAttenuation * lateBlend,
+            backgroundAttenuation:
+              selectedCandidate.backgroundAttenuation * (1 - lateBlend) +
+              secondCandidate.backgroundAttenuation * lateBlend,
+            focalDetailHu:
+              selectedCandidate.focalDetailHu * (1 - lateBlend) +
+              secondCandidate.focalDetailHu * lateBlend,
+            focalMedianHu:
+              selectedCandidate.focalMedianHu * (1 - lateBlend) +
+              secondCandidate.focalMedianHu * lateBlend,
+            supportDepthMm:
+              selectedCandidate.supportDepthMm * (1 - lateBlend) +
+              secondCandidate.supportDepthMm * lateBlend,
+            supportConfidence:
+              selectedCandidate.supportConfidence * (1 - lateBlend) +
+              secondCandidate.supportConfidence * lateBlend,
+            participatingSamples: Math.max(
+              selectedCandidate.participatingSamples,
+              secondCandidate.participatingSamples
+            ),
+            sharpness:
+              selectedCandidate.sharpness * (1 - lateBlend) +
+              secondCandidate.sharpness * lateBlend,
+            consistency:
+              selectedCandidate.consistency * (1 - lateBlend) +
+              secondCandidate.consistency * lateBlend,
+            compactness:
+              selectedCandidate.compactness * (1 - lateBlend) +
+              secondCandidate.compactness * lateBlend,
+            outOfTroughFraction:
+              selectedCandidate.outOfTroughFraction * (1 - lateBlend) +
+              secondCandidate.outOfTroughFraction * lateBlend,
+            score:
+              selectedCandidate.score * (1 - lateBlend) + secondCandidate.score * lateBlend,
+          };
+          renderBranchCode = 2;
+          selectedHypothesisCode = 3;
+          selectedBlend =
+            selectedCandidate.hypothesisCode === 2 && secondCandidate.hypothesisCode === 1
+              ? 0.5 + lateBlend * 0.5
+              : selectedCandidate.hypothesisCode === 1 && secondCandidate.hypothesisCode === 2
+              ? 0.5 - lateBlend * 0.5
+              : 0.5;
+        }
+      }
+
+      if (!selectedCandidate || !selectedCandidate.valid) {
+        fallbackNoEligibleCount++;
+        const useLowerFallback = hasDualArchSupport ? rowArchBlend >= 0.5 : false;
+        selectedCandidate = evaluateVirtualPanoramicRadiographHypothesis({
+          sampleValues: sampleValueBuffer,
+          sampleDepthsMm: sampleDepthBuffer,
+          sampleCount: validDepthCount,
+          centerDepthMm: hasDualArchSupport
+            ? useLowerFallback
+              ? lowerSupportDepthLocalMm
+              : upperSupportDepthLocalMm
+            : mergedSupportDepthMm,
+          focalSigmaMm: focalSigmaMm * 1.4,
+          contextSigmaMm: contextSigmaMm * 1.1,
+          depthStepMm,
+          reliability: Math.max(
+            0.25,
+            hasDualArchSupport
+              ? useLowerFallback
+                ? lowerReliability
+                : upperReliability
+              : columnReliability
+          ),
+          rowPrior: hasDualArchSupport
+            ? useLowerFallback
+              ? lowerRowPrior
+              : upperRowPrior
+            : 1,
+          toothBandFocus,
+          hypothesisCode: hasDualArchSupport ? (useLowerFallback ? 2 : 1) : 0,
+        });
+        renderBranchCode = 3;
+        selectedHypothesisCode = hasDualArchSupport ? (rowArchBlend >= 0.5 ? 2 : 1) : 0;
+        selectedBlend = selectedHypothesisCode === 2 ? 1 : 0;
+      } else if (renderBranchCode === 0) {
+        renderBranchCode = 1;
+      }
+
+      if (hasDualArchSupport) {
+        const backgroundBandWeight = clampNumber(
+          rowBandWeights.gap + rowBandWeights.background,
+          0,
+          1
+        );
+        if (
+          backgroundBandWeight >= Math.max(rowBandWeights.upper, rowBandWeights.lower)
+        ) {
+          const gapBackgroundAttenuation = Math.max(
+            0,
+            0.5 *
+              ((upperCandidateEval?.backgroundAttenuation ?? 0) +
+                (lowerCandidateEval?.backgroundAttenuation ?? 0))
+          );
+          selectedCandidate = {
+            valid: true,
+            hypothesisCode: 0,
+            projectedAttenuation: 0,
+            backgroundAttenuation: gapBackgroundAttenuation,
+            focalDetailHu: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor,
+            focalMedianHu: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor,
+            supportDepthMm: mergedSupportDepthMm,
+            supportConfidence: Math.max(0.12, columnReliability * 0.28),
+            participatingSamples: 0,
+            sharpness: 0,
+            consistency: 0,
+            compactness: 0,
+            outOfTroughFraction: 1,
+            score: 0,
+          };
+          renderBranchCode = backgroundBandWeight > 0.98 ? 3 : 4;
+          selectedHypothesisCode = 0;
+          selectedBlend = 0.5;
+        } else if (rowBandWeights.upper >= rowBandWeights.lower && upperCandidateEval?.valid) {
+          selectedCandidate = upperCandidateEval;
+          renderBranchCode = rowBandWeights.upper > 0.98 ? 1 : 4;
+          selectedHypothesisCode = 1;
+          selectedBlend = 0;
+        } else if (lowerCandidateEval?.valid) {
+          selectedCandidate = lowerCandidateEval;
+          renderBranchCode = rowBandWeights.lower > 0.98 ? 1 : 4;
+          selectedHypothesisCode = 2;
+          selectedBlend = 1;
+        }
+      }
+
+      if (hasDualArchSupport && toothBandFocus > 0.18 && selectedHypothesisCode > 0) {
+        previousRowHypothesisCode = selectedHypothesisCode;
+        previousRowHypothesisConfidence = selectedCandidate?.supportConfidence ?? 0;
+        previousRowHypothesisSharpness = selectedCandidate?.sharpness ?? 0;
+      } else if (toothBandFocus < 0.08) {
+        previousRowHypothesisCode = 0;
+        previousRowHypothesisConfidence = 0;
+        previousRowHypothesisSharpness = 0;
+      }
+
+      const selectedOutOfTroughBlur = clampNumber(
+        selectedCandidate
+          ? selectedCandidate.outOfTroughFraction * 0.72 +
+              (1 - selectedCandidate.sharpness) * 0.28
+          : 1,
+        0,
+        1
+      );
+      const participatingSamples = selectedCandidate?.participatingSamples ?? 0;
+      const supportConfidence = selectedCandidate?.supportConfidence ?? 0;
+      const rawAttenuation = Math.max(0, selectedCandidate?.projectedAttenuation ?? 0);
+      const upperProjectedAttenuation = Math.max(
+        0,
+        hasDualArchSupport
+          ? upperCandidateEval?.projectedAttenuation ?? 0
+          : selectedCandidate?.projectedAttenuation ?? 0
+      );
+      const lowerProjectedAttenuation = Math.max(
+        0,
+        hasDualArchSupport
+          ? lowerCandidateEval?.projectedAttenuation ?? 0
+          : selectedCandidate?.projectedAttenuation ?? 0
+      );
+      const backgroundAttenuation = Math.max(
+        0,
+        selectedCandidate?.backgroundAttenuation ?? rawAttenuation
+      );
+      const focalDetailHu = Number.isFinite(selectedCandidate?.focalDetailHu)
+        ? Number(selectedCandidate?.focalDetailHu)
+        : CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor;
+      const lowerSuppressionProxy =
+        lowerBandFocus * (0.16 + (1 - supportConfidence) * 0.18) +
+        selectedOutOfTroughBlur * lowerBandFocus * 0.24;
+
+      eligibleSampleCount += participatingSamples;
+      if (row >= bandRows.bgBottomRows[0]) {
+        lowerBandEligibleSampleCount += participatingSamples;
+      }
+      onSupportEnergy += rawAttenuation;
+      offSupportEnergy += backgroundAttenuation * selectedOutOfTroughBlur;
+      if (validDepthCount > 0) {
+        retainedWeightFractionSum += participatingSamples / validDepthCount;
+        retainedWeightFractionCount++;
+      }
+
+      rawProjectedAttenuationMap[pixelIndex] = rawAttenuation;
+      upperProjectedAttenuationMap[pixelIndex] = upperProjectedAttenuation;
+      lowerProjectedAttenuationMap[pixelIndex] = lowerProjectedAttenuation;
+      backgroundAttenuationMap[pixelIndex] = backgroundAttenuation;
+      focalTroughSharpnessMap[pixelIndex] = selectedCandidate?.sharpness ?? 0;
+      outOfTroughSuppressionMap[pixelIndex] = selectedOutOfTroughBlur;
+      renderBranchMap[pixelIndex] = renderBranchCode;
+      selectedSupportHypothesisMap[pixelIndex] = selectedHypothesisCode;
+      supportDepthMap[pixelIndex] = selectedCandidate?.supportDepthMm ?? mergedSupportDepthMm;
+      supportConfidenceMap[pixelIndex] = supportConfidence;
+      participatingSampleCountMap[pixelIndex] = participatingSamples;
+      troughHalfWidthMap[pixelIndex] = effectiveTroughHalfWidthMm;
+      detailHuMap[pixelIndex] = focalDetailHu;
+      contextHuMap[pixelIndex] = backgroundAttenuation;
+      contextBlendFactorMap[pixelIndex] = 0;
+      columnSupportReliabilityMap[pixelIndex] = supportConfidence;
+      totalAttenuationMap[pixelIndex] = rawAttenuation;
+      lowerPenaltyMap[pixelIndex] = lowerSuppressionProxy;
+      toneResponseMap[pixelIndex] = 0;
+      if (upperSupportDepthMap && lowerSupportDepthMap && supportBlendMap) {
+        upperSupportDepthMap[pixelIndex] = upperSupportDepthLocalMm;
+        lowerSupportDepthMap[pixelIndex] = lowerSupportDepthLocalMm;
+        upperSupportConfidenceMap![pixelIndex] = upperReliability;
+        lowerSupportConfidenceMap![pixelIndex] = lowerReliability;
+        supportBlendMap[pixelIndex] = selectedBlend;
+      }
+      if (upperDetailHuMap && lowerDetailHuMap) {
+        upperDetailHuMap[pixelIndex] =
+          upperCandidateEval?.valid || singleCandidateEval?.valid
+            ? Number(
+                upperCandidateEval?.focalDetailHu ??
+                  singleCandidateEval?.focalDetailHu ??
+                  focalDetailHu
+              )
+            : CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor;
+        lowerDetailHuMap[pixelIndex] =
+          lowerCandidateEval?.valid || singleCandidateEval?.valid
+            ? Number(
+                lowerCandidateEval?.focalDetailHu ??
+                  singleCandidateEval?.focalDetailHu ??
+                  focalDetailHu
+              )
+            : CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor;
+      }
+
+      if (row >= bandRows.bgBottomRows[0]) {
+        lowerBandRenderCount++;
+        lowerBandAttenuationSum += lowerSuppressionProxy;
+        lowerBandAttenuationMax = Math.max(lowerBandAttenuationMax, lowerSuppressionProxy);
+        if (selectedOutOfTroughBlur > 0.42 || focalDetailHu < -600) {
+          lowerBandSuppressedCount++;
+        }
+      }
+    }
+  }
+
+  const rawProjectedSummary = summarizeFiniteFloat32Buffer(rawProjectedAttenuationMap);
+  const detailSummary = summarizeFiniteFloat32Buffer(detailHuMap);
+  const sharpnessSummary = summarizeFiniteFloat32Buffer(focalTroughSharpnessMap);
+  const outOfTroughSummary = summarizeFiniteFloat32Buffer(outOfTroughSuppressionMap);
+  const outputHuSpan =
+    CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuCeiling -
+    CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor;
+  const compositeOdValues: number[] = [];
+  const rowUpperWeightValues: number[] = [];
+  const rowLowerWeightValues: number[] = [];
+  const sampleValidityValues: number[] = [];
+  const finalDisplayGamma = 0.72;
+  let zeroSignalCompositeInvariantFailures = 0;
+  let backgroundOnlyNormalizationInvariantFailures = 0;
+  let backgroundPresentationInvariantFailures = 0;
+
+  for (let row = 0; row < panoHeight; row++) {
+    const exclusiveMasks = computeVirtualRadiographExclusiveRowMasks(row, panoHeight, bandRows);
+    const continuousRowWeights = computeRadiographContinuousRowWeights(
+      row,
+      bandRows.upperAnchorRow,
+      bandRows.lowerAnchorRow,
+      Math.max(52, Math.round(panoHeight * 0.13))
+    );
+    rowUpperWeightValues.push(continuousRowWeights.upper);
+    rowLowerWeightValues.push(continuousRowWeights.lower);
+
+    for (let col = 0; col < panoWidth; col++) {
+      const pixelIndex = planeIndex(col, row, panoWidth);
+      const upperProjectedAttenuation = Math.max(0, upperProjectedAttenuationMap[pixelIndex]);
+      const lowerProjectedAttenuation = Math.max(0, lowerProjectedAttenuationMap[pixelIndex]);
+      const backgroundAttenuation = Math.max(0, backgroundAttenuationMap[pixelIndex]);
+      const selectedProjectedAttenuation = Math.max(0, rawProjectedAttenuationMap[pixelIndex]);
+      const selectedParticipatingSamples = Math.max(
+        0,
+        Math.round(Number(participatingSampleCountMap[pixelIndex]) || 0)
+      );
+      const renderBranchCode = Math.round(Number(renderBranchMap[pixelIndex]) || 0);
+      const selectedHypothesisCode = Math.round(
+        Number(selectedSupportHypothesisMap[pixelIndex]) || 0
+      );
+      const maskSum =
+        exclusiveMasks.upper +
+        exclusiveMasks.gap +
+        exclusiveMasks.lower +
+        exclusiveMasks.outside;
+      const backgroundOnlySelected =
+        selectedProjectedAttenuation <= 1e-6 &&
+        selectedParticipatingSamples === 0 &&
+        selectedHypothesisCode === 0 &&
+        (renderBranchCode === 3 || renderBranchCode === 4);
+      const upperBandRawOd =
+        upperProjectedAttenuation *
+        continuousRowWeights.upper *
+        continuousRowWeights.envelope;
+      const lowerBandRawOd =
+        lowerProjectedAttenuation *
+        continuousRowWeights.lower *
+        continuousRowWeights.envelope;
+      const sampleValidity = computeRadiographSampleValidity(selectedParticipatingSamples);
+      sampleValidityValues.push(sampleValidity);
+      const zeroSelectedAnatomy =
+        selectedProjectedAttenuation <= 1e-6 &&
+        selectedParticipatingSamples === 0 &&
+        continuousRowWeights.envelope < 0.12;
+      let anatomyOd = zeroSelectedAnatomy ? 0 : upperBandRawOd + lowerBandRawOd;
+      if (row < bandRows.upperAnchorRow + 6 && anatomyOd > 1e-6 && anatomyOd < 0.04) {
+        anatomyOd = Math.max(anatomyOd, 0.02);
+      }
+      const hasAnatomySignal = anatomyOd > 1e-6;
+      const displayBackgroundOd =
+        backgroundAttenuation * CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographBackgroundDarkenScale;
+      const gapBandRawOd = 0;
+      const outsideRowsRawOd = 0;
+      const contextContribution = 0;
+      const backgroundFillContribution = 0;
+      const preNormalizeCompositeOd = anatomyOd;
+      const normalizationEligible =
+        !zeroSelectedAnatomy &&
+        hasAnatomySignal &&
+        continuousRowWeights.envelope >= 0.08 &&
+        preNormalizeCompositeOd > 1e-6
+          ? 1
+          : 0;
+
+      bandMaskUpperMap[pixelIndex] = exclusiveMasks.upper;
+      bandMaskGapMap[pixelIndex] = exclusiveMasks.gap;
+      bandMaskLowerMap[pixelIndex] = exclusiveMasks.lower;
+      bandMaskOutsideMap[pixelIndex] = exclusiveMasks.outside;
+      upperBandRawOdMap[pixelIndex] = upperBandRawOd;
+      lowerBandRawOdMap[pixelIndex] = lowerBandRawOd;
+      gapBandRawOdMap[pixelIndex] = gapBandRawOd;
+      outsideRowsRawOdMap[pixelIndex] = outsideRowsRawOd;
+      displayBackgroundOdMap[pixelIndex] = displayBackgroundOd;
+      normalizationEligibleMaskMap[pixelIndex] = normalizationEligible;
+      preNormalizeCompositeOdMap[pixelIndex] = preNormalizeCompositeOd;
+      contextContributionMap[pixelIndex] = contextContribution;
+      backgroundFillContributionMap[pixelIndex] = backgroundFillContribution;
+      contextBlendFactorMap[pixelIndex] = 0;
+      contextBlendFactorCount++;
+      contextWeightFractionSum += 0;
+      contextWeightFractionCount++;
+      shadowLiftSum += 0;
+      shadowLiftCount++;
+      baseDisplayNormMap[pixelIndex] = anatomyOd;
+      backgroundDisplayNormMap[pixelIndex] = displayBackgroundOd;
+      detailDisplayNormMap[pixelIndex] = 0;
+      preSharpenDisplayNormMap[pixelIndex] = preNormalizeCompositeOd;
+
+      if (Math.abs(maskSum - 1) > 1e-6) {
+        preNormalizeCompositeOdMap[pixelIndex] = 0;
+        normalizationEligibleMaskMap[pixelIndex] = 0;
+      }
+      if (selectedProjectedAttenuation <= 1e-6 && preNormalizeCompositeOdMap[pixelIndex] > 1e-6) {
+        if (upperProjectedAttenuation <= 1e-6 && lowerProjectedAttenuation <= 1e-6) {
+          zeroSignalCompositeInvariantFailures++;
+        }
+      }
+      if ((backgroundOnlySelected || zeroSelectedAnatomy) && normalizationEligibleMaskMap[pixelIndex] > 0.5) {
+        backgroundOnlyNormalizationInvariantFailures++;
+      }
+      if (normalizationEligibleMaskMap[pixelIndex] > 0.5) {
+        compositeOdValues.push(preNormalizeCompositeOdMap[pixelIndex]);
+      }
+    }
+  }
+
+  const compositeStart =
+    compositeOdValues.length > 0 ? percentile(compositeOdValues, 0.01) : rawProjectedSummary?.p10 ?? 0;
+  const compositeEnd =
+    compositeOdValues.length > 0 ? percentile(compositeOdValues, 0.995) : rawProjectedSummary?.p90 ?? 1;
+  const compositeSpan = Math.max(1e-4, compositeEnd - compositeStart);
+
+  for (let pixelIndex = 0; pixelIndex < planeSize; pixelIndex++) {
+    const preNormalizeCompositeOd = Math.max(0, preNormalizeCompositeOdMap[pixelIndex]);
+    const normalizedAnatomy = clampNumber(
+      (preNormalizeCompositeOd - compositeStart) / compositeSpan,
+      0,
+      1
+    );
+    const postNormalizeDisplay =
+      normalizationEligibleMaskMap[pixelIndex] > 0.5 ? normalizedAnatomy : 0;
+    const backgroundPresentation = 0;
+    const finalDisplayNorm = Math.pow(postNormalizeDisplay, finalDisplayGamma);
+    const finalHu =
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor +
+      Math.round(finalDisplayNorm * outputHuSpan);
+
+    postNormalizeDisplayMap[pixelIndex] = postNormalizeDisplay;
+    displayAnatomyMap[pixelIndex] = finalDisplayNorm;
+    backgroundPresentationMap[pixelIndex] = backgroundPresentation;
+    finalCompositeDisplayMap[pixelIndex] = finalDisplayNorm;
+    toneResponseMap[pixelIndex] = finalDisplayNorm;
+    pixelData[pixelIndex] = clampNumber(
+      finalHu,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuCeiling
+    );
+    finalDisplayImageMap[pixelIndex] = pixelData[pixelIndex];
+    if (Math.abs(Number(backgroundPresentationMap[pixelIndex]) || 0) > 1e-6) {
+      backgroundPresentationInvariantFailures++;
+    }
+  }
+
+  if (
+    zeroSignalCompositeInvariantFailures > 0 ||
+    backgroundOnlyNormalizationInvariantFailures > 0 ||
+    backgroundPresentationInvariantFailures > 0
+  ) {
+    console.warn(
+      '[CPR-RADIOGRAPH-COMPOSITE-INVARIANT]',
+      JSON.stringify({
+        zeroSignalCompositeInvariantFailures,
+        backgroundOnlyNormalizationInvariantFailures,
+        backgroundPresentationInvariantFailures,
+      })
+    );
+  }
+
+  const summary = summarizeRadiographDisplayOutput({
+    pixelData,
+    panoWidth,
+    panoHeight,
+    selectedDepthMm,
+    virtualPanoDepthHalfRangeMm,
+    outputFloor: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor,
+    outputCeiling: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuCeiling,
+    bandRows,
+  });
+  const postSuppressionStage = computeVirtualPanoramicRadiographStageMetrics({
+    stage: 'postSuppression',
+    pixelData,
+    panoWidth,
+    panoHeight,
+    panoCenterRow,
+    selectedDepthMm,
+    virtualPanoDepthHalfRangeMm,
+    selectedSupportHypothesisMap,
+    focalTroughSharpnessMap,
+    outOfTroughSuppressionMap,
+    rawProjectedAttenuationMap,
+    backgroundAttenuationMap,
+    preNormalizeCompositeOdMap,
+    postNormalizeDisplayMap,
+    finalCompositeDisplayMap,
+    backgroundPresentationMap,
+    contextContributionMap,
+    backgroundFillContributionMap,
+    outputHuFloor: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor,
+    outputHuCeiling: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuCeiling,
+    upperSupportAnchorRow: bandRows.upperAnchorRow,
+    lowerSupportAnchorRow: bandRows.lowerAnchorRow,
+  });
+  const postSuppressionDecision =
+    evaluateVirtualPanoramicRadiographStageQuality(postSuppressionStage);
+  const toothBandContrastRange = postSuppressionStage.toothBandContrastRange;
+  const lowerSuppressionRatio =
+    summary.toothBandMean > 1e-6 ? summary.lowerBandMean / summary.toothBandMean : 1;
+  const emptyFallbackFraction = planeSize > 0 ? fallbackNoEligibleCount / planeSize : 0;
+  const eligibleSampleFraction =
+    inBoundsSampleCount > 0 ? eligibleSampleCount / inBoundsSampleCount : 0;
+  const lowerBandEligibleFraction =
+    lowerBandInBoundsSampleCount > 0
+      ? lowerBandEligibleSampleCount / lowerBandInBoundsSampleCount
+      : 0;
+  const retainedWeightFractionMean =
+    retainedWeightFractionCount > 0 ? retainedWeightFractionSum / retainedWeightFractionCount : 0;
+  const offTroughEnergyRatio = onSupportEnergy > 1e-6 ? offSupportEnergy / onSupportEnergy : 0;
+  const columnSupportReliabilitySummary = summarizeFiniteFloat32Buffer(columnSupportReliabilityMap);
+  const supportConfidenceSummary = summarizeFiniteFloat32Buffer(supportConfidenceMap);
+  const lowerPenaltySummary = summarizeFiniteFloat32Buffer(lowerPenaltyMap);
+  const toneResponseSummary = summarizeFiniteFloat32Buffer(toneResponseMap);
+  const contextHuSummary = summarizeFiniteFloat32Buffer(contextHuMap);
+  const detailHuSummary = summarizeFiniteFloat32Buffer(detailHuMap);
+  const upperDetailHuSummary = upperDetailHuMap
+    ? summarizeFiniteFloat32Buffer(upperDetailHuMap)
+    : null;
+  const lowerDetailHuSummary = lowerDetailHuMap
+    ? summarizeFiniteFloat32Buffer(lowerDetailHuMap)
+    : null;
+  const participatingSampleSummary = summarizeFiniteFloat32Buffer(participatingSampleCountMap);
+  const sampleValiditySummary = summarizeFiniteNumberArray(sampleValidityValues);
+  const rowUpperWeightSummary = summarizeFiniteNumberArray(rowUpperWeightValues);
+  const rowLowerWeightSummary = summarizeFiniteNumberArray(rowLowerWeightValues);
+  const renderSharpnessSummary = summarizeFiniteFloat32Buffer(focalTroughSharpnessMap);
+  const renderBlurSummary = summarizeFiniteFloat32Buffer(outOfTroughSuppressionMap);
+  const upperDetailBandValues: number[] = [];
+  const lowerDetailBandValues: number[] = [];
+  let toothBandDetailSampleFractionSum = 0;
+  let toothBandDetailSampleFractionCount = 0;
+  for (let row = 0; row < panoHeight; row++) {
+    const exclusiveMasks = computeVirtualRadiographExclusiveRowMasks(row, panoHeight, bandRows);
+    for (let col = 0; col < panoWidth; col++) {
+      const pixelIndex = planeIndex(col, row, panoWidth);
+      const participatingSamples = Number(participatingSampleCountMap[pixelIndex]) || 0;
+      if (exclusiveMasks.toothMask > 0.5) {
+        toothBandDetailSampleFractionSum += participatingSamples / Math.max(1, depthSamples);
+        toothBandDetailSampleFractionCount++;
+      }
+      if (exclusiveMasks.upper > 0.5 && upperDetailHuMap && participatingSamples > 0) {
+        upperDetailBandValues.push(Number(upperDetailHuMap[pixelIndex]) || 0);
+      }
+      if (exclusiveMasks.lower > 0.5 && lowerDetailHuMap && participatingSamples > 0) {
+        lowerDetailBandValues.push(Number(lowerDetailHuMap[pixelIndex]) || 0);
+      }
+    }
+  }
+  const upperDetailBandP50 =
+    upperDetailBandValues.length > 0
+      ? percentile(upperDetailBandValues, 0.5)
+      : upperDetailHuSummary?.p50 ?? detailHuSummary?.p50 ?? 0;
+  const lowerDetailBandP50 =
+    lowerDetailBandValues.length > 0
+      ? percentile(lowerDetailBandValues, 0.5)
+      : lowerDetailHuSummary?.p50 ?? detailHuSummary?.p50 ?? 0;
+  const toothBandDetailSampleFractionMean =
+    toothBandDetailSampleFractionCount > 0
+      ? toothBandDetailSampleFractionSum / toothBandDetailSampleFractionCount
+      : participatingSampleSummary?.mean
+        ? participatingSampleSummary.mean / Math.max(1, depthSamples)
+        : retainedWeightFractionMean;
+  const rawProjectionStage = computeVirtualPanoramicRadiographRawProjectionStage({
+    panoWidth,
+    panoHeight,
+    panoCenterRow,
+    upperSupportAnchorRow: bandRows.upperAnchorRow,
+    lowerSupportAnchorRow: bandRows.lowerAnchorRow,
+    focalTroughSharpnessMap,
+    outOfTroughSuppressionMap,
+    rawProjectedAttenuationMap,
+    backgroundAttenuationMap,
+  });
+  let supportTiltMeanAbsMm = 0;
+  let supportTiltMaxAbsMm = 0;
+  for (let col = 0; col < panoWidth; col++) {
+    const absTiltMm = Math.abs(hasSupportTilt ? Number(supportTiltMmByCol?.[col]) : 0);
+    supportTiltMeanAbsMm += absTiltMm;
+    supportTiltMaxAbsMm = Math.max(supportTiltMaxAbsMm, absTiltMm);
+  }
+  supportTiltMeanAbsMm = panoWidth > 0 ? supportTiltMeanAbsMm / panoWidth : 0;
+
+  return {
+    pixelData,
+    summary,
+    debugMaps: {
+      renderBranchMap,
+      selectedSupportHypothesisMap,
+      focalTroughSharpnessMap,
+      outOfTroughSuppressionMap,
+      rawProjectedAttenuationMap,
+      upperProjectedAttenuationMap,
+      lowerProjectedAttenuationMap,
+      upperBandRawOdMap,
+      lowerBandRawOdMap,
+      gapBandRawOdMap,
+      outsideRowsRawOdMap,
+      displayBackgroundOdMap,
+      bandMaskUpperMap,
+      bandMaskGapMap,
+      bandMaskLowerMap,
+      bandMaskOutsideMap,
+      normalizationEligibleMaskMap,
+      preNormalizeCompositeOdMap,
+      postNormalizeDisplayMap,
+      displayAnatomyMap,
+      backgroundPresentationMap,
+      finalCompositeDisplayMap,
+      contextContributionMap,
+      backgroundFillContributionMap,
+      finalDisplayImageMap,
+      supportDepthMap,
+      supportConfidenceMap,
+      upperSupportDepthMap,
+      lowerSupportDepthMap,
+      upperSupportConfidenceMap,
+      lowerSupportConfidenceMap,
+      supportBlendMap,
+      totalAttenuationMap,
+      lowerPenaltyMap,
+      participatingSampleCountMap,
+      toneResponseMap,
+      troughHalfWidthMap,
+      detailHuMap,
+      contextHuMap,
+      contextBlendFactorMap,
+      columnSupportReliabilityMap,
+      upperDetailHuMap,
+      lowerDetailHuMap,
+    },
+    diagnostics: {
+      enabled: true,
+      usedAsOutput: postSuppressionDecision.usedAsOutput,
+      acceptedByLowerBandTolerance: postSuppressionDecision.acceptedByLowerBandTolerance,
+      acceptedByToothBandTolerance: postSuppressionDecision.acceptedByToothBandTolerance,
+      renderSupportMode: hasDualArchSupport ? 'radiographDualHypothesis' : 'singlePath',
+      pipelineVariant: 'virtualPanoramicRadiograph',
+      rendererFamilyName: 'virtual-panoramic-radiograph',
+      rendererCandidateSource: 'worker-cpu-virtual-panoramic-radiograph',
+      workerBranchSelected: true,
+      workerQcAccepted: postSuppressionDecision.usedAsOutput,
+      workerQcStage: 'postSuppression',
+      rejectReasonsStage: 'postSuppression',
+      rejectReasons: postSuppressionDecision.rejectReasons,
+      eligibleSampleFraction,
+      lowerBandEligibleFraction,
+      emptyFallbackFraction,
+      retainedWeightFractionMean,
+      offTroughEnergyRatio,
+      lowerSuppressionRatio,
+      toothBandMean: summary.toothBandMean,
+      lowerBandMean: summary.lowerBandMean,
+      postRenderLowerBackgroundSuppression: {
+        coverageFraction:
+          lowerBandRenderCount > 0 ? lowerBandSuppressedCount / lowerBandRenderCount : 0,
+        meanAttenuation:
+          lowerBandRenderCount > 0 ? lowerBandAttenuationSum / lowerBandRenderCount : 0,
+        maxAttenuation: lowerBandAttenuationMax,
+      },
+      supportTiltMode: hasSupportTilt ? 'linear' : 'disabled',
+      supportTiltFirst8Mm: Array.from(
+        (supportTiltMmByCol || new Float32Array(0)).subarray(
+          0,
+          Math.min(8, supportTiltMmByCol?.length ?? 0)
+        )
+      ).map(value => Math.round(Number(value) * 1000) / 1000),
+      supportTiltMeanAbsMm,
+      supportTiltMaxAbsMm,
+      supportDepthFirst8Mm: Array.from(
+        selectedDepthMm.subarray(0, Math.min(8, selectedDepthMm.length))
+      ).map(value => Math.round(Number(value) * 1000) / 1000),
+      upperSupportDepthFirst8Mm: Array.from(
+        (upperSupportDepthMm || selectedDepthMm).subarray(
+          0,
+          Math.min(8, (upperSupportDepthMm || selectedDepthMm).length)
+        )
+      ).map(value => Math.round(Number(value) * 1000) / 1000),
+      lowerSupportDepthFirst8Mm: Array.from(
+        (lowerSupportDepthMm || selectedDepthMm).subarray(
+          0,
+          Math.min(8, (lowerSupportDepthMm || selectedDepthMm).length)
+        )
+      ).map(value => Math.round(Number(value) * 1000) / 1000),
+      upperSupportReliabilityP50:
+        upperSupportReliabilityByCol && upperSupportReliabilityByCol.length > 0
+          ? percentile(Array.from(upperSupportReliabilityByCol), 0.5)
+          : 0,
+      lowerSupportReliabilityP50:
+        lowerSupportReliabilityByCol && lowerSupportReliabilityByCol.length > 0
+          ? percentile(Array.from(lowerSupportReliabilityByCol), 0.5)
+          : 0,
+      supportBlendRows: {
+        upperHoldEnd: upperHoldEndRow,
+        lowerHoldStart: lowerHoldStartRow,
+      },
+      actualFinalPanoHeight: panoHeight,
+      upperAnchorRow: bandRows.upperAnchorRow,
+      lowerAnchorRow: bandRows.lowerAnchorRow,
+      troughSigmaMm: SUPPORT_SIGMA_MM * CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographFocalSigmaScale * 1.15,
+      approxTroughHalfWidthMm:
+        SUPPORT_SIGMA_MM *
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographFocalSigmaScale *
+          1.15 *
+          1.75 +
+        0.2,
+      rowUpperWeightP10: rowUpperWeightSummary?.p10 ?? 0,
+      rowUpperWeightP50: rowUpperWeightSummary?.p50 ?? 0,
+      rowUpperWeightP90: rowUpperWeightSummary?.p90 ?? 0,
+      rowLowerWeightP10: rowLowerWeightSummary?.p10 ?? 0,
+      rowLowerWeightP50: rowLowerWeightSummary?.p50 ?? 0,
+      rowLowerWeightP90: rowLowerWeightSummary?.p90 ?? 0,
+      supportConfidenceP10: supportConfidenceSummary?.p10 ?? columnSupportReliabilitySummary?.p10 ?? 0,
+      supportConfidenceP50: supportConfidenceSummary?.p50 ?? columnSupportReliabilitySummary?.p50 ?? 0,
+      supportConfidenceP90: supportConfidenceSummary?.p90 ?? columnSupportReliabilitySummary?.p90 ?? 0,
+      supportPathConfidenceP10: columnSupportReliabilitySummary?.p10 ?? 0,
+      supportPathConfidenceP50: columnSupportReliabilitySummary?.p50 ?? 0,
+      supportPathConfidenceP90: columnSupportReliabilitySummary?.p90 ?? 0,
+      lowerPenaltyP50: lowerPenaltySummary?.p50 ?? 0,
+      lowerPenaltyP90: lowerPenaltySummary?.p90 ?? 0,
+      toneResponseP50: toneResponseSummary?.p50 ?? 0,
+      toneResponseP90: toneResponseSummary?.p90 ?? 0,
+      detailHuP50: detailHuSummary?.p50 ?? 0,
+      contextHuP50: contextHuSummary?.p50 ?? 0,
+      contextBlendMean:
+        contextBlendFactorCount > 0 ? contextBlendFactorSum / contextBlendFactorCount : 0,
+      contextWeightFractionMean:
+        contextWeightFractionCount > 0 ? contextWeightFractionSum / contextWeightFractionCount : 0,
+      columnSupportReliabilityP50: columnSupportReliabilitySummary?.p50 ?? 0,
+      upperDetailHuP50: upperDetailBandP50,
+      lowerDetailHuP50: lowerDetailBandP50,
+      detailSampleFractionMean: toothBandDetailSampleFractionMean,
+      shadowLiftMean: shadowLiftCount > 0 ? shadowLiftSum / shadowLiftCount : 0,
+      attenuationStrength: 1,
+      gamma: finalDisplayGamma,
+      outputHuMin: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor,
+      outputHuMax: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuCeiling,
+      rawProjectedAttenuationP50: rawProjectedSummary?.p50 ?? 0,
+      focalSharpnessP50: renderSharpnessSummary?.p50 ?? 0,
+      outOfTroughSuppressionP50: renderBlurSummary?.p50 ?? 0,
+      participatingSamplesP10: participatingSampleSummary?.p10 ?? 0,
+      participatingSamplesP50: participatingSampleSummary?.p50 ?? 0,
+      participatingSamplesP90: participatingSampleSummary?.p90 ?? 0,
+      sampleValidityP10: sampleValiditySummary?.p10 ?? 0,
+      sampleValidityP50: sampleValiditySummary?.p50 ?? 0,
+      sampleValidityP90: sampleValiditySummary?.p90 ?? 0,
+      backgroundTroughNarrowGateP50: renderBlurSummary?.p50 ?? 0,
+      backgroundTroughNarrowGateP90: renderBlurSummary?.p90 ?? 0,
+      rawProjectionStage,
+      postSuppressionStage,
+      localizedReadout: postSuppressionStage.localizedReadout,
     },
   };
 }
@@ -2210,6 +5974,9 @@ function renderDualArchToothProjectionPano(params: {
   lowerSupportAnchorRow?: number;
   upperSupportReliabilityByCol?: Float32Array;
   lowerSupportReliabilityByCol?: Float32Array;
+  supportScoreGapByCol?: Float32Array;
+  upperSupportScoreGapByCol?: Float32Array;
+  lowerSupportScoreGapByCol?: Float32Array;
   softThresholdByCol?: Float32Array;
   hardThresholdByCol?: Float32Array;
   supportTiltMmByCol?: Float32Array;
@@ -2290,6 +6057,9 @@ function renderDualArchToothProjectionPano(params: {
     lowerSupportAnchorRow,
     upperSupportReliabilityByCol,
     lowerSupportReliabilityByCol,
+    supportScoreGapByCol,
+    upperSupportScoreGapByCol,
+    lowerSupportScoreGapByCol,
     softThresholdByCol,
     hardThresholdByCol,
     supportTiltMmByCol,
@@ -2324,6 +6094,13 @@ function renderDualArchToothProjectionPano(params: {
     !!hardThresholdByCol &&
     softThresholdByCol.length === panoWidth &&
     hardThresholdByCol.length === panoWidth;
+  const hasMergedSupportScoreGaps =
+    !!supportScoreGapByCol && supportScoreGapByCol.length === panoWidth;
+  const hasDualArchSupportScoreGaps =
+    !!upperSupportScoreGapByCol &&
+    !!lowerSupportScoreGapByCol &&
+    upperSupportScoreGapByCol.length === panoWidth &&
+    lowerSupportScoreGapByCol.length === panoWidth;
   const hasDualArchAnchors =
     hasDualArchSupport &&
     Number.isFinite(upperSupportAnchorRow) &&
@@ -2362,19 +6139,25 @@ function renderDualArchToothProjectionPano(params: {
   const eligibleValues = new Float32Array(depthSamples);
   const supportBlendUpperSummaryRows: number[] = [];
   const supportBlendLowerSummaryRows: number[] = [];
-
-  let activePixelCount = 0;
-  let eligibleSampleCount = 0;
-  let lowerBandEligibleSampleCount = 0;
-  let inBoundsSampleCount = 0;
-  let lowerBandInBoundsSampleCount = 0;
-  let fallbackNoEligibleCount = 0;
-  let retainedWeightFractionSum = 0;
-  let retainedWeightFractionCount = 0;
-  let onSupportEnergy = 0;
-  let offSupportEnergy = 0;
-  let detailSampleFractionSum = 0;
-  let detailSampleFractionCount = 0;
+  const ambiguityGapThreshold = CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityGapThreshold;
+  const resolvedCenterRowByCol = new Int16Array(panoWidth);
+  const resolvedHalfHeightByCol = new Float32Array(panoWidth);
+  const upperAnchorRowByCol = new Float32Array(panoWidth);
+  const lowerAnchorRowByCol = new Float32Array(panoWidth);
+  const upperSupportDepthBaseByCol = new Float32Array(panoWidth);
+  const lowerSupportDepthBaseByCol = new Float32Array(panoWidth);
+  const mergedSupportDepthBaseByCol = new Float32Array(panoWidth);
+  const upperReliabilityByCol = new Float32Array(panoWidth);
+  const lowerReliabilityByCol = new Float32Array(panoWidth);
+  const columnSupportReliabilityBaseByCol = new Float32Array(panoWidth);
+  const upperSupportScoreGapByColResolved = new Float32Array(panoWidth);
+  const lowerSupportScoreGapByColResolved = new Float32Array(panoWidth);
+  const columnSupportScoreGapByColResolved = new Float32Array(panoWidth);
+  const columnSoftThresholdByCol = new Float32Array(panoWidth);
+  const columnHardThresholdByCol = new Float32Array(panoWidth);
+  const columnHardDenByCol = new Float32Array(panoWidth);
+  const supportTiltResolvedByCol = new Float32Array(panoWidth);
+  const columnAmbiguityByCol = new Float32Array(panoWidth);
 
   for (let col = 0; col < panoWidth; col++) {
     const rawCenterRow = hasAdaptiveCenterRows ? Number(centerRowByCol?.[col]) : panoCenterRow;
@@ -2384,7 +6167,10 @@ function renderDualArchToothProjectionPano(params: {
     const rawHalfHeight = hasAdaptiveHalfHeights
       ? Number(halfHeightByCol?.[col])
       : Math.max(resolvedCenterRow, panoHeight - 1 - resolvedCenterRow);
-    const resolvedHalfHeight = Math.max(1, Number.isFinite(rawHalfHeight) ? rawHalfHeight : panoCenterRow);
+    const resolvedHalfHeight = Math.max(
+      1,
+      Number.isFinite(rawHalfHeight) ? rawHalfHeight : panoCenterRow
+    );
     const upperAnchorRowForCol = hasDualArchAnchors
       ? clampNumber(resolvedCenterRow + upperAnchorOffsetFromCenter, 0, panoHeight - 2)
       : clampNumber(resolvedCenterRow - resolvedHalfHeight * 0.18, 0, panoHeight - 2);
@@ -2399,10 +6185,6 @@ function renderDualArchToothProjectionPano(params: {
           1,
           panoHeight - 1
         );
-
-    supportBlendUpperSummaryRows.push(Math.round(upperAnchorRowForCol));
-    supportBlendLowerSummaryRows.push(Math.round(lowerAnchorRowForCol));
-
     const upperSupportDepthBaseMm =
       hasDualArchSupport && Number.isFinite(Number(upperSupportDepthMm?.[col]))
         ? Number(upperSupportDepthMm?.[col])
@@ -2424,9 +6206,193 @@ function renderDualArchToothProjectionPano(params: {
       0,
       1
     );
+    const columnSupportReliabilityBase = hasDualArchSupport
+      ? clampNumber(((upperReliability + lowerReliability) * 0.5) * 0.72 + Math.min(upperReliability, lowerReliability) * 0.28, 0, 1)
+      : 1;
     const columnSoftThreshold = hasThresholdProfiles ? Number(softThresholdByCol?.[col]) : -150;
     const columnHardThreshold = hasThresholdProfiles ? Number(hardThresholdByCol?.[col]) : 280;
     const columnHardDen = Math.max(140, columnHardThreshold - columnSoftThreshold);
+    const upperSupportScoreGap = hasDualArchSupportScoreGaps
+      ? Math.max(0, Number(upperSupportScoreGapByCol?.[col]) || 0)
+      : hasMergedSupportScoreGaps
+        ? Math.max(0, Number(supportScoreGapByCol?.[col]) || 0)
+        : ambiguityGapThreshold * 3;
+    const lowerSupportScoreGap = hasDualArchSupportScoreGaps
+      ? Math.max(0, Number(lowerSupportScoreGapByCol?.[col]) || 0)
+      : hasMergedSupportScoreGaps
+        ? Math.max(0, Number(supportScoreGapByCol?.[col]) || 0)
+        : ambiguityGapThreshold * 3;
+    const columnSupportScoreGap = hasDualArchSupportScoreGaps
+      ? Math.min(upperSupportScoreGap, lowerSupportScoreGap)
+      : hasMergedSupportScoreGaps
+        ? Math.max(0, Number(supportScoreGapByCol?.[col]) || 0)
+        : ambiguityGapThreshold * 3;
+    const scoreGapAmbiguityGate = clampNumber(
+      (ambiguityGapThreshold * 2.2 - columnSupportScoreGap) /
+        Math.max(1e-6, ambiguityGapThreshold * 2.2),
+      0,
+      1
+    );
+    const reliabilityAmbiguityGate = clampNumber(
+      (0.74 - columnSupportReliabilityBase) / 0.26,
+      0,
+      1
+    );
+
+    resolvedCenterRowByCol[col] = resolvedCenterRow;
+    resolvedHalfHeightByCol[col] = resolvedHalfHeight;
+    upperAnchorRowByCol[col] = upperAnchorRowForCol;
+    lowerAnchorRowByCol[col] = lowerAnchorRowForCol;
+    upperSupportDepthBaseByCol[col] = upperSupportDepthBaseMm;
+    lowerSupportDepthBaseByCol[col] = lowerSupportDepthBaseMm;
+    mergedSupportDepthBaseByCol[col] = mergedSupportDepthBaseMm;
+    upperReliabilityByCol[col] = upperReliability;
+    lowerReliabilityByCol[col] = lowerReliability;
+    columnSupportReliabilityBaseByCol[col] = columnSupportReliabilityBase;
+    upperSupportScoreGapByColResolved[col] = upperSupportScoreGap;
+    lowerSupportScoreGapByColResolved[col] = lowerSupportScoreGap;
+    columnSupportScoreGapByColResolved[col] = columnSupportScoreGap;
+    columnSoftThresholdByCol[col] = columnSoftThreshold;
+    columnHardThresholdByCol[col] = columnHardThreshold;
+    columnHardDenByCol[col] = columnHardDen;
+    supportTiltResolvedByCol[col] = hasSupportTilt ? Number(supportTiltMmByCol?.[col]) : 0;
+    columnAmbiguityByCol[col] = clampNumber(
+      scoreGapAmbiguityGate * 0.86 + reliabilityAmbiguityGate * 0.14,
+      0,
+      1
+    );
+    supportBlendUpperSummaryRows.push(Math.round(upperAnchorRowForCol));
+    supportBlendLowerSummaryRows.push(Math.round(lowerAnchorRowForCol));
+  }
+
+  for (let col = 0; col < panoWidth; col++) {
+    const columnAmbiguity = Number(columnAmbiguityByCol[col]);
+    if (columnAmbiguity <= 0.18) {
+      continue;
+    }
+
+    let neighborWeightTotal = 0;
+    let mergedDepthNeighborSum = 0;
+    let upperDepthNeighborSum = 0;
+    let lowerDepthNeighborSum = 0;
+    let tiltNeighborSum = 0;
+    for (let offset = -2; offset <= 2; offset++) {
+      if (offset === 0) {
+        continue;
+      }
+      const neighborCol = col + offset;
+      if (neighborCol < 0 || neighborCol >= panoWidth) {
+        continue;
+      }
+      const distanceWeight = 1 / (1 + Math.abs(offset));
+      const neighborWeight =
+        distanceWeight *
+        clampNumber(
+          columnSupportReliabilityBaseByCol[neighborCol] *
+            (1 - columnAmbiguityByCol[neighborCol] * 0.55),
+          0.05,
+          1
+        );
+      if (neighborWeight <= 1e-4) {
+        continue;
+      }
+      neighborWeightTotal += neighborWeight;
+      mergedDepthNeighborSum += mergedSupportDepthBaseByCol[neighborCol] * neighborWeight;
+      upperDepthNeighborSum += upperSupportDepthBaseByCol[neighborCol] * neighborWeight;
+      lowerDepthNeighborSum += lowerSupportDepthBaseByCol[neighborCol] * neighborWeight;
+      tiltNeighborSum += supportTiltResolvedByCol[neighborCol] * neighborWeight;
+    }
+
+    if (neighborWeightTotal <= 1e-4) {
+      continue;
+    }
+
+    const neighborSupportWeight = clampNumber(neighborWeightTotal / 1.5, 0, 1);
+    const depthBlend =
+      columnAmbiguity *
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityNeighborDepthBlend *
+      neighborSupportWeight;
+    const tiltBlend =
+      columnAmbiguity *
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityNeighborTiltBlend *
+      neighborSupportWeight;
+    const maxAdjacentDepthDeltaMm =
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionMaxAdjacentDepthDeltaMm;
+    const mergedNeighborDepth = mergedDepthNeighborSum / neighborWeightTotal;
+    const upperNeighborDepth = upperDepthNeighborSum / neighborWeightTotal;
+    const lowerNeighborDepth = lowerDepthNeighborSum / neighborWeightTotal;
+    const tiltNeighbor = tiltNeighborSum / neighborWeightTotal;
+
+    const mergedDepthBase = Number(mergedSupportDepthBaseByCol[col]);
+    const upperDepthBase = Number(upperSupportDepthBaseByCol[col]);
+    const lowerDepthBase = Number(lowerSupportDepthBaseByCol[col]);
+    const mergedTargetDepth = clampNumber(
+      mergedNeighborDepth,
+      mergedDepthBase - maxAdjacentDepthDeltaMm,
+      mergedDepthBase + maxAdjacentDepthDeltaMm
+    );
+    const upperTargetDepth = clampNumber(
+      upperNeighborDepth,
+      upperDepthBase - maxAdjacentDepthDeltaMm,
+      upperDepthBase + maxAdjacentDepthDeltaMm
+    );
+    const lowerTargetDepth = clampNumber(
+      lowerNeighborDepth,
+      lowerDepthBase - maxAdjacentDepthDeltaMm,
+      lowerDepthBase + maxAdjacentDepthDeltaMm
+    );
+
+    mergedSupportDepthBaseByCol[col] = clampNumber(
+      mergedDepthBase + (mergedTargetDepth - mergedDepthBase) * depthBlend,
+      -virtualPanoDepthHalfRangeMm,
+      virtualPanoDepthHalfRangeMm
+    );
+    upperSupportDepthBaseByCol[col] = clampNumber(
+      upperDepthBase + (upperTargetDepth - upperDepthBase) * depthBlend,
+      -virtualPanoDepthHalfRangeMm,
+      virtualPanoDepthHalfRangeMm
+    );
+    lowerSupportDepthBaseByCol[col] = clampNumber(
+      lowerDepthBase + (lowerTargetDepth - lowerDepthBase) * depthBlend,
+      -virtualPanoDepthHalfRangeMm,
+      virtualPanoDepthHalfRangeMm
+    );
+    supportTiltResolvedByCol[col] =
+      supportTiltResolvedByCol[col] +
+      (tiltNeighbor - supportTiltResolvedByCol[col]) * tiltBlend;
+  }
+
+  let activePixelCount = 0;
+  let eligibleSampleCount = 0;
+  let lowerBandEligibleSampleCount = 0;
+  let inBoundsSampleCount = 0;
+  let lowerBandInBoundsSampleCount = 0;
+  let fallbackNoEligibleCount = 0;
+  let retainedWeightFractionSum = 0;
+  let retainedWeightFractionCount = 0;
+  let onSupportEnergy = 0;
+  let offSupportEnergy = 0;
+  let detailSampleFractionSum = 0;
+  let detailSampleFractionCount = 0;
+
+  for (let col = 0; col < panoWidth; col++) {
+    const resolvedCenterRow = Number(resolvedCenterRowByCol[col]);
+    const resolvedHalfHeight = Number(resolvedHalfHeightByCol[col]);
+    const upperAnchorRowForCol = Number(upperAnchorRowByCol[col]);
+    const lowerAnchorRowForCol = Number(lowerAnchorRowByCol[col]);
+    const upperSupportDepthBaseMm = Number(upperSupportDepthBaseByCol[col]);
+    const lowerSupportDepthBaseMm = Number(lowerSupportDepthBaseByCol[col]);
+    const mergedSupportDepthBaseMm = Number(mergedSupportDepthBaseByCol[col]);
+    const upperReliability = Number(upperReliabilityByCol[col]);
+    const lowerReliability = Number(lowerReliabilityByCol[col]);
+    const columnSoftThreshold = Number(columnSoftThresholdByCol[col]);
+    const columnHardThreshold = Number(columnHardThresholdByCol[col]);
+    const columnHardDen = Number(columnHardDenByCol[col]);
+    const upperSupportScoreGap = Number(upperSupportScoreGapByColResolved[col]);
+    const lowerSupportScoreGap = Number(lowerSupportScoreGapByColResolved[col]);
+    const columnSupportScoreGap = Number(columnSupportScoreGapByColResolved[col]);
+    const columnAmbiguityBase = Number(columnAmbiguityByCol[col]);
+    const supportTiltBaseMm = Number(supportTiltResolvedByCol[col]);
 
     for (let row = 0; row < panoHeight; row++) {
       const pixelIndex = planeIndex(col, row, panoWidth);
@@ -2448,7 +6414,7 @@ function renderDualArchToothProjectionPano(params: {
             1
           )
         : 1;
-      const supportTiltMm = hasSupportTilt ? Number(supportTiltMmByCol?.[col]) : 0;
+      const supportTiltMm = supportTiltBaseMm;
       const supportDepthMm = clampNumber(
         supportDepthBaseMm +
           supportTiltMm * yNorm * CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionSupportTiltScale,
@@ -2467,10 +6433,45 @@ function renderDualArchToothProjectionPano(params: {
         -virtualPanoDepthHalfRangeMm,
         virtualPanoDepthHalfRangeMm
       );
-      const supportWindowHalfWidthMm =
+      const supportScoreGap = hasDualArchSupportScoreGaps
+        ? upperSupportScoreGap * (1 - supportBlend) + lowerSupportScoreGap * supportBlend
+        : columnSupportScoreGap;
+      const scoreGapAmbiguityGate = clampNumber(
+        (ambiguityGapThreshold * 2.2 - supportScoreGap) /
+          Math.max(1e-6, ambiguityGapThreshold * 2.2),
+        0,
+        1
+      );
+      const reliabilityAmbiguityGate = clampNumber((0.74 - columnSupportReliability) / 0.26, 0, 1);
+      const supportAmbiguityGate = clampNumber(
+        columnAmbiguityBase * 0.35 + scoreGapAmbiguityGate * 0.55 + reliabilityAmbiguityGate * 0.1,
+        0,
+        1
+      );
+      const toothRowGate =
+        1 -
+        smoothstep01(clampNumber((Math.abs(yNorm) - 0.08) / 0.58, 0, 1));
+      const topBandSuppression = smoothstep01(
+        clampNumber(
+          (-yNorm - CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionTopBandSuppressionStart) /
+            Math.max(1e-6, CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionTopBandSuppressionScale),
+          0,
+          1
+        )
+      );
+      const supportOuterBandFocus = clampNumber((Math.abs(yNorm) - 0.06) / 0.72, 0, 1);
+      const ambiguityOuterBandGate = supportAmbiguityGate * supportOuterBandFocus;
+      const ambiguityToothBandGate = supportAmbiguityGate * toothRowGate;
+      const supportWindowHalfWidthMm = Math.max(
+        depthStepMm * 2.2,
         CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionWindowHalfWidthMm +
-        (1 - columnSupportReliability) *
-          CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionWindowLowReliabilityBoostMm;
+          (1 - columnSupportReliability) *
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionWindowLowReliabilityBoostMm -
+          ambiguityOuterBandGate *
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityWindowTightenMm -
+          ambiguityToothBandGate *
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityToothBandTightenMm
+      );
       const supportWindowSigmaMm = Math.max(depthStepMm * 2.5, supportWindowHalfWidthMm * 0.58);
       const outerWindowHalfWidthMm = Math.min(
         virtualPanoDepthHalfRangeMm,
@@ -2482,22 +6483,36 @@ function renderDualArchToothProjectionPano(params: {
         CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionFocalHalfWidthMm
       );
       const rowFocalEligibilityHalfWidthMm = Math.max(
-        depthStepMm * 1.75,
+        depthStepMm * 1.5,
         focalEligibilityHalfWidthMm -
           lowerBandSuppression * 0.85 -
+          topBandSuppression * 0.92 -
+          ambiguityOuterBandGate *
+            (CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityWindowTightenMm * 0.78) -
+          ambiguityToothBandGate *
+            (CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityToothBandTightenMm * 0.85) -
           Math.max(0, 0.74 - columnSupportReliability) * 0.25
       );
       const rowToothAdmissionThreshold = clampNumber(
         0.08 +
           lowerBandSuppression * 0.24 +
+          topBandSuppression *
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionTopBandThresholdBoost +
+          ambiguityOuterBandGate *
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityThresholdBoost +
+          ambiguityToothBandGate *
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityToothBandThresholdBoost +
           Math.max(0, 0.78 - columnSupportReliability) * 0.1,
         0.05,
-        0.62
+        0.74
       );
       const rowOffBandToothAdmissionThreshold = clampNumber(
-        rowToothAdmissionThreshold + 0.16,
+        rowToothAdmissionThreshold +
+          0.14 +
+          ambiguityOuterBandGate *
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionOuterBandThresholdBoost,
         0.12,
-        0.82
+        0.9
       );
       let eligibleCount = 0;
       let rayMax = backgroundHu;
@@ -2505,6 +6520,8 @@ function renderDualArchToothProjectionPano(params: {
       let retainedTopSampleCount = 0;
       let bestToothlikeSample = backgroundHu;
       let bestToothlikeResponse = 0;
+      let eligibleWeightedSum = 0;
+      let eligibleWeightTotal = 0;
 
       activePixelCount++;
       supportDepthMap[pixelIndex] = supportDepthMm;
@@ -2571,6 +6588,9 @@ function renderDualArchToothProjectionPano(params: {
           CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionOffBandRescueFloorHu +
             lowerBandSuppression *
               CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionLowerBandOffBandRescueBoostHu +
+            topBandSuppression * 140 +
+            ambiguityOuterBandGate *
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityOffBandRescueFloorBoostHu +
             Math.max(0, 0.82 - columnSupportReliability) * 140
         );
         const passesReducerGate =
@@ -2586,23 +6606,100 @@ function renderDualArchToothProjectionPano(params: {
         if (passesReducerGate) {
           eligibleValues[eligibleCount] = clampedSample;
           eligibleCount++;
+          const retainedSampleWeight = Math.max(
+            0.08,
+            supportWeight *
+              (isOutsideFocalEligibilityWindow ? 0.32 : 1) *
+              (0.82 + hardResponse * 0.18)
+          );
+          eligibleWeightedSum += clampedSample * retainedSampleWeight;
+          eligibleWeightTotal += retainedSampleWeight;
         }
       }
 
       let pixelValue = backgroundHu;
+      let neighborSupportedValue = backgroundHu;
+      let neighborSupportedWeight = 0;
+      if (toothRowGate > 0.2 && col > 0) {
+        const leftPixelIndex = planeIndex(col - 1, row, panoWidth);
+        const leftParticipation = Number(participatingSampleCountMap[leftPixelIndex]);
+        const leftTone = Number(toneResponseMap[leftPixelIndex]);
+        const leftValue = Number(pixelData[leftPixelIndex]);
+        if (
+          leftParticipation > 0.5 &&
+          leftTone > 0.05 &&
+          Number.isFinite(leftValue) &&
+          leftValue > quietBackgroundHu + 30
+        ) {
+          neighborSupportedValue += (leftValue - backgroundHu) * 0.7;
+          neighborSupportedWeight += 0.7;
+        }
+      }
+      if (toothRowGate > 0.2 && col > 1) {
+        const left2PixelIndex = planeIndex(col - 2, row, panoWidth);
+        const left2Participation = Number(participatingSampleCountMap[left2PixelIndex]);
+        const left2Tone = Number(toneResponseMap[left2PixelIndex]);
+        const left2Value = Number(pixelData[left2PixelIndex]);
+        if (
+          left2Participation > 0.5 &&
+          left2Tone > 0.05 &&
+          Number.isFinite(left2Value) &&
+          left2Value > quietBackgroundHu + 30
+        ) {
+          neighborSupportedValue += (left2Value - backgroundHu) * 0.35;
+          neighborSupportedWeight += 0.35;
+        }
+      }
+      if (neighborSupportedWeight > 1e-4) {
+        neighborSupportedValue =
+          backgroundHu + (neighborSupportedValue - backgroundHu) / neighborSupportedWeight;
+      }
       if (eligibleCount > 0) {
         sortValuesAscending(eligibleValues, eligibleCount);
-        const contributingCount = Math.max(1, Math.ceil(eligibleCount * 0.30));
-        
-        // CRITICAL: Must start at the end of the ascending array to get the highest values
+        const contributingFraction = clampNumber(
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionTopFraction +
+            supportAmbiguityGate *
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityTopFractionBoost +
+            Math.max(lowerBandSuppression, topBandSuppression) * 0.16,
+          0.12,
+          0.72
+        );
+        const contributingCount = Math.max(1, Math.ceil(eligibleCount * contributingFraction));
         const startIndex = eligibleCount - contributingCount;
         let topSum = 0;
-        
         for (let i = startIndex; i < eligibleCount; i++) {
           topSum += eligibleValues[i];
         }
-        
-        pixelValue = topSum / contributingCount;
+        const topTailMean = topSum / contributingCount;
+        const weightedEligibleMean =
+          eligibleWeightTotal > 1e-4 ? eligibleWeightedSum / eligibleWeightTotal : topTailMean;
+        const sparseEligibleGate = clampNumber((2.5 - eligibleCount) / 2.5, 0, 1);
+        const weightedMeanBlend = clampNumber(
+          supportAmbiguityGate *
+            (CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityWeightedMeanBlend +
+              toothRowGate *
+                CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionToothRowWeightedMeanBoost +
+              sparseEligibleGate *
+                CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionSparseEligibleWeightedMeanBoost),
+          0,
+          0.88
+        );
+        pixelValue =
+          topTailMean + (weightedEligibleMean - topTailMean) * weightedMeanBlend;
+        if (
+          neighborSupportedWeight > 1e-4 &&
+          toothRowGate > 0.24 &&
+          sparseEligibleGate > 0 &&
+          supportAmbiguityGate > 0.28
+        ) {
+          const continuityBlend = clampNumber(
+            supportAmbiguityGate * sparseEligibleGate * toothRowGate * 0.18,
+            0,
+            0.18
+          );
+          pixelValue =
+            pixelValue + (neighborSupportedValue - pixelValue) * continuityBlend;
+        }
         retainedTopSampleCount = contributingCount;
         eligibleSampleCount += eligibleCount;
         if (yNorm >= 0.65) {
@@ -2618,13 +6715,34 @@ function renderDualArchToothProjectionPano(params: {
           yNorm <= CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionTopBackgroundOnlyRowEnd;
         const shouldPreferBackgroundFallback =
           lowerBandSuppression > 0.32 ||
+          topBandSuppression > 0.24 ||
+          ambiguityOuterBandGate > 0.44 ||
           (columnSupportReliability < 0.72 && yNorm > 0.28);
+        const canUseNeighborFallback =
+          neighborSupportedWeight > 1e-4 &&
+          toothRowGate > 0.24 &&
+          !upperRowBackgroundOnlyFallback &&
+          (supportAmbiguityGate > 0.28 || columnSupportReliability < 0.86);
         if (
           !upperRowBackgroundOnlyFallback &&
           bestToothlikeResponse >= rowToothAdmissionThreshold * 0.72 &&
           bestToothlikeSample > backgroundHu
         ) {
           pixelValue = bestToothlikeSample;
+        } else if (canUseNeighborFallback) {
+          const toothSeed =
+            bestToothlikeResponse >= rowToothAdmissionThreshold * 0.42 &&
+            bestToothlikeSample > backgroundHu
+              ? bestToothlikeSample
+              : quietBackgroundHu;
+          const fallbackBlend = clampNumber(
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionNeighborFallbackBlend +
+              supportAmbiguityGate * 0.16,
+            0.4,
+            0.9
+          );
+          pixelValue =
+            toothSeed + (neighborSupportedValue - toothSeed) * fallbackBlend;
         } else {
           pixelValue =
             shouldPreferBackgroundFallback || upperRowBackgroundOnlyFallback
@@ -2658,12 +6776,33 @@ function renderDualArchToothProjectionPano(params: {
               lowerPenalty
             );
       }
+      const topPenalty =
+        topBandSuppression *
+        (0.18 + supportAmbiguityGate * 0.34) *
+        (retainedTopSampleCount <= 1 ? 1.08 : 1);
+      if (topPenalty > 1e-4 && pixelValue > quietBackgroundHu) {
+        const darkTarget = Math.max(
+          quietBackgroundHu,
+          Math.min(
+            pixelValue -
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionTopPenaltyDarkenHu * topBandSuppression,
+            Math.max(quietBackgroundHu, columnSoftThreshold - 90)
+          )
+        );
+        pixelValue =
+          pixelValue +
+          (darkTarget - pixelValue) *
+            Math.min(
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionTopPenaltyMaxBlend,
+              topPenalty
+            );
+      }
       pixelValue = clampNumber(pixelValue, outputHuFloor, outputHuCeiling);
       pixelData[pixelIndex] = pixelValue;
       detailHuMap[pixelIndex] = pixelValue;
       contextHuMap[pixelIndex] = pixelValue;
       participatingSampleCountMap[pixelIndex] = retainedTopSampleCount;
-      totalAttenuationMap[pixelIndex] = lowerPenalty;
+      totalAttenuationMap[pixelIndex] = lowerPenalty + topPenalty;
       toneResponseMap[pixelIndex] =
         validDepthCount > 0
           ? clampNumber(retainedTopSampleCount / Math.max(1, validDepthCount), 0, 1)
@@ -4393,12 +8532,13 @@ function buildSupportDepthEnvelope(params: {
       scoreGap /
         Math.max(0.08, CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeAnchorScoreGapThreshold * 1.8)
     );
-    const confidence = clampUnitInterval(reliability * 0.7 + gapConfidence * 0.3);
-    const relaxedWidthBoost = usedRelaxedAnchors ? 0.12 : 0;
-    const anchorWidthBias = anchorMask[col] ? -0.08 : 0.1;
+    const confidence = clampUnitInterval(reliability * 0.62 + gapConfidence * 0.38);
+    const relaxedWidthBoost = usedRelaxedAnchors ? 0.14 : 0;
+    const anchorWidthBias = anchorMask[col] ? -0.08 : 0.08;
     halfWidthMmByCol[col] = clampNumber(
       CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMaxMm -
-        confidence * 0.68 +
+        reliability * 0.16 -
+        gapConfidence * 0.34 +
         relaxedWidthBoost +
         anchorWidthBias,
       CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMinMm,
@@ -4413,6 +8553,149 @@ function buildSupportDepthEnvelope(params: {
     anchorFraction: width > 0 ? anchorCount / width : 0,
     usedRelaxedAnchors,
     halfWidthSummary: summarizeFiniteFloat32Buffer(halfWidthMmByCol),
+  };
+}
+
+function buildSoftSeededSupportDepthPath(params: {
+  bestDepthByCol: Float32Array;
+  bestReliabilityByCol: Float32Array;
+  scoreGapByCol: Float32Array;
+  reliabilityByColDepth: Float32Array;
+  depthOffsetsMm: Float32Array;
+  depthSamples: number;
+  depthHalfRangeMm: number;
+  smoothScratch: Float32Array;
+}): {
+  seededDepthMmByCol: Float32Array;
+  seededReliabilityByCol: Float32Array;
+} {
+  const {
+    bestDepthByCol,
+    bestReliabilityByCol,
+    scoreGapByCol,
+    reliabilityByColDepth,
+    depthOffsetsMm,
+    depthSamples,
+    depthHalfRangeMm,
+    smoothScratch,
+  } = params;
+  const width = bestDepthByCol.length;
+  const seededDepthMmByCol = new Float32Array(bestDepthByCol);
+  const seededReliabilityInput = new Float32Array(bestReliabilityByCol);
+  const baseEnvelope = buildSupportDepthEnvelope({
+    bestDepthByCol,
+    bestReliabilityByCol,
+    scoreGapByCol,
+    depthHalfRangeMm,
+    smoothScratch,
+  });
+  const relaxedEnvelopeHalfWidthMmByCol = new Float32Array(baseEnvelope.halfWidthMmByCol.length);
+  for (let col = 0; col < baseEnvelope.halfWidthMmByCol.length; col++) {
+    relaxedEnvelopeHalfWidthMmByCol[col] = clampNumber(
+      Number(baseEnvelope.halfWidthMmByCol[col]) +
+        CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSeedEnvelopeRelaxationMm,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMinMm,
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMaxMm +
+        CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSeedEnvelopeRelaxationMm
+    );
+  }
+  const seededPathStability = stabilizeSupportDepthPath({
+    selectedDepthMm: seededDepthMmByCol,
+    selectedReliabilityByCol: seededReliabilityInput,
+    reliabilityByColDepth,
+    depthOffsetsMm,
+    depthSamples,
+    smoothScratch,
+    depthHalfRangeMm,
+    bestDepthByCol,
+    scoreGapByCol,
+    lowReliabilityThreshold: CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSeedConfidenceFloor,
+    jumpMmThreshold: CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSeedJumpMm,
+    repairBlend: 0.84,
+    scoreGapThreshold:
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeAnchorScoreGapThreshold - 0.02,
+    bestDepthDriftMmThreshold: 1.2,
+    envelopeCenterMmByCol: baseEnvelope.centerMmByCol,
+    envelopeHalfWidthMmByCol: relaxedEnvelopeHalfWidthMmByCol,
+    envelopeRepairBlend: 0.72,
+  });
+  const neighborBlendedDepthMmByCol = new Float32Array(seededDepthMmByCol);
+
+  for (let col = 0; col < width; col++) {
+    const seededReliability = clampUnitInterval(
+      Number(seededPathStability.selectedReliabilityByCol[col]) || 0
+    );
+    const scoreGap = Math.max(0, Number(scoreGapByCol[col]) || 0);
+    const gapConfidence = clampUnitInterval(
+      scoreGap /
+        Math.max(0.08, CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeAnchorScoreGapThreshold * 1.8)
+    );
+    const seedConfidence = clampUnitInterval(seededReliability * 0.6 + gapConfidence * 0.4);
+    const unstable = seededPathStability.unstableMask[col] === 1;
+    if (!unstable && seedConfidence >= 0.76) {
+      continue;
+    }
+
+    let neighborWeightSum = 0;
+    let neighborDepthSum = 0;
+    for (let offset = -2; offset <= 2; offset++) {
+      if (offset === 0) {
+        continue;
+      }
+      const neighborCol = col + offset;
+      if (neighborCol < 0 || neighborCol >= width) {
+        continue;
+      }
+      const neighborDepth = Number(seededDepthMmByCol[neighborCol]);
+      if (!Number.isFinite(neighborDepth)) {
+        continue;
+      }
+      const neighborReliability = clampUnitInterval(
+        Number(seededPathStability.selectedReliabilityByCol[neighborCol]) || 0
+      );
+      const neighborGap = Math.max(0, Number(scoreGapByCol[neighborCol]) || 0);
+      const neighborGapConfidence = clampUnitInterval(
+        neighborGap /
+          Math.max(
+            0.08,
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeAnchorScoreGapThreshold * 1.8
+          )
+      );
+      const neighborConfidence = clampUnitInterval(
+        neighborReliability * 0.6 + neighborGapConfidence * 0.4
+      );
+      const distanceWeight = offset === 0 ? 1 : 1 / (1 + Math.abs(offset));
+      const weight = Math.max(0.05, neighborConfidence) * distanceWeight;
+      neighborWeightSum += weight;
+      neighborDepthSum += neighborDepth * weight;
+    }
+
+    if (neighborWeightSum <= 1e-4) {
+      continue;
+    }
+
+    const neighborDepthMm = neighborDepthSum / neighborWeightSum;
+    const blend = clampNumber(
+      (1 - seedConfidence) * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSeedNeighborBlend +
+        (unstable ? 0.12 : 0),
+      0,
+      0.66
+    );
+    const envelopeCenterMm = Number(baseEnvelope.centerMmByCol[col]) || 0;
+    const envelopeHalfWidthMm = Math.max(
+      0.35,
+      Number(relaxedEnvelopeHalfWidthMmByCol[col]) || 0.35
+    );
+    neighborBlendedDepthMmByCol[col] = clampNumber(
+      Number(seededDepthMmByCol[col]) * (1 - blend) + neighborDepthMm * blend,
+      envelopeCenterMm - envelopeHalfWidthMm,
+      envelopeCenterMm + envelopeHalfWidthMm
+    );
+  }
+
+  return {
+    seededDepthMmByCol: neighborBlendedDepthMmByCol,
+    seededReliabilityByCol: seededPathStability.selectedReliabilityByCol,
   };
 }
 
@@ -4543,12 +8826,12 @@ function stabilizeSupportDepthPath(params: {
     envelopeRepairBlend = CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeRepairBlend,
   } = params;
   void smoothScratch;
-  void smoothPasses;
 
   const width = selectedDepthMm.length;
   const unstableMask = new Uint8Array(width);
   let repairedColumnCount = 0;
   let envelopeClampCount = 0;
+  const repairPassCount = Math.max(1, Math.min(2, smoothPasses));
 
   const computeWindowMedian = (col: number, radius: number): number => {
     const windowValues: number[] = [];
@@ -4575,7 +8858,7 @@ function stabilizeSupportDepthPath(params: {
     return percentile(windowValues, 0.5);
   };
 
-  for (let pass = 0; pass < 2; pass++) {
+  for (let pass = 0; pass < repairPassCount; pass++) {
     for (let col = 0; col < width; col++) {
       const currentDepthMm = Number(selectedDepthMm[col]);
       const reliability = clampUnitInterval(Number(selectedReliabilityByCol[col]) || 0);
@@ -4599,12 +8882,26 @@ function stabilizeSupportDepthPath(params: {
           : Number.POSITIVE_INFINITY;
       const outsideEnvelope = Math.abs(currentDepthMm - envelopeCenterMm) > envelopeHalfWidthMm;
       const edgeShelf = Math.abs(currentDepthMm) >= depthHalfRangeMm - edgeShelfMarginMm;
+      const scoreGapAmbiguity = clampUnitInterval(
+        (scoreGapThreshold * 1.35 - scoreGap) / Math.max(1e-6, scoreGapThreshold * 1.35)
+      );
+      const jumpInstability =
+        prevJumpMm > jumpMmThreshold * 0.88 || nextJumpMm > jumpMmThreshold * 0.88;
+      const driftInstability = bestDepthDriftMm > bestDepthDriftMmThreshold * 0.92;
+      const lowConfidenceAmbiguity =
+        reliability < Math.min(0.86, lowReliabilityThreshold + 0.2);
+      const weakScoreGap = scoreGap < scoreGapThreshold * 0.8;
+      const veryWeakScoreGap = scoreGap < scoreGapThreshold * 0.5;
       const ambiguousSupport =
-        scoreGap < scoreGapThreshold && reliability < Math.min(0.9, lowReliabilityThreshold + 0.18);
+        (veryWeakScoreGap && lowConfidenceAmbiguity) ||
+        (weakScoreGap &&
+          (driftInstability || jumpInstability) &&
+          (lowConfidenceAmbiguity || scoreGapAmbiguity > 0.62)) ||
+        (scoreGapAmbiguity > 0.82 && driftInstability && jumpInstability);
       const forcedDrift =
         bestDepthDriftMm > bestDepthDriftMmThreshold &&
-        scoreGap < scoreGapThreshold * 2.5 &&
-        reliability < 0.72;
+        scoreGap < scoreGapThreshold * 2 &&
+        reliability < 0.66;
       const unstable =
         reliability < lowReliabilityThreshold ||
         prevJumpMm > jumpMmThreshold ||
@@ -4621,16 +8918,21 @@ function stabilizeSupportDepthPath(params: {
       }
 
       const blend = clampNumber(
-        repairBlend + Math.max(0, lowReliabilityThreshold - reliability) * 0.5,
+        repairBlend +
+          Math.max(0, lowReliabilityThreshold - reliability) * 0.38 +
+          scoreGapAmbiguity * 0.06,
         repairBlend,
-        0.92
+        0.84
       );
       let repairTargetMm = localMedianMm;
       if (ambiguousSupport && Number.isFinite(bestDepthMm)) {
-        repairTargetMm = localMedianMm * 0.7 + bestDepthMm * 0.3;
+        repairTargetMm =
+          localMedianMm * 0.36 +
+          bestDepthMm * 0.42 +
+          envelopeCenterMm * 0.22;
       }
       if (forcedDrift && Number.isFinite(bestDepthMm)) {
-        repairTargetMm = repairTargetMm * 0.55 + bestDepthMm * 0.45;
+        repairTargetMm = repairTargetMm * 0.45 + bestDepthMm * 0.55;
       }
       if (outsideEnvelope && Number.isFinite(envelopeCenterMm)) {
         repairTargetMm = repairTargetMm * (1 - envelopeRepairBlend) + envelopeCenterMm * envelopeRepairBlend;
@@ -4698,20 +9000,34 @@ function stabilizeSupportDepthPath(params: {
       ? Math.abs(depthMm - envelopeCenterMm)
       : 0;
     const outsideEnvelope = envelopeDriftMm > envelopeHalfWidthMm;
+    const scoreGapAmbiguity = clampUnitInterval(
+      (scoreGapThreshold * 1.35 - scoreGap) / Math.max(1e-6, scoreGapThreshold * 1.35)
+    );
+    const jumpInstability =
+      prevJumpMm > jumpMmThreshold * 0.88 || nextJumpMm > jumpMmThreshold * 0.88;
+    const driftInstability = bestDepthDriftMm > bestDepthDriftMmThreshold * 0.92;
+    const lowConfidenceAmbiguity =
+      reliability < Math.min(0.86, lowReliabilityThreshold + 0.2);
+    const weakScoreGap = scoreGap < scoreGapThreshold * 0.8;
+    const veryWeakScoreGap = scoreGap < scoreGapThreshold * 0.5;
     const ambiguousSupport =
-      scoreGap < scoreGapThreshold && reliability < Math.min(0.9, lowReliabilityThreshold + 0.18);
+      (veryWeakScoreGap && lowConfidenceAmbiguity) ||
+      (weakScoreGap &&
+        (driftInstability || jumpInstability) &&
+        (lowConfidenceAmbiguity || scoreGapAmbiguity > 0.62)) ||
+      (scoreGapAmbiguity > 0.82 && driftInstability && jumpInstability);
     const forcedDrift =
       bestDepthDriftMm > bestDepthDriftMmThreshold &&
-      scoreGap < scoreGapThreshold * 2.5 &&
-      reliability < 0.72;
+      scoreGap < scoreGapThreshold * 2 &&
+      reliability < 0.66;
     const edgeShelf = Math.abs(depthMm) >= depthHalfRangeMm - edgeShelfMarginMm;
     let reliabilityPenalty = 1;
     if (ambiguousSupport) {
-      reliabilityPenalty *= 0.82;
+      reliabilityPenalty *= 1 - scoreGapAmbiguity * 0.18;
       ambiguousCount++;
     }
     if (forcedDrift) {
-      reliabilityPenalty *= 0.72;
+      reliabilityPenalty *= 0.78;
       forcedDriftCount++;
     }
     if (outsideEnvelope) {
@@ -4817,7 +9133,9 @@ function suppressLowerBackground(
   width: number,
   height: number,
   rowSpacingMm: number,
-  minBandBottomRow?: number
+  minBandBottomRow?: number,
+  columnSupportScoreGapByCol?: Float32Array,
+  columnSupportReliabilityByCol?: Float32Array
 ): {
   suppressionWeights: Float32Array;
   toothBandBottomRows: Float32Array;
@@ -4866,6 +9184,11 @@ function suppressLowerBackground(
   const clampedMinBandBottomRow = Number.isFinite(minBandBottomRow)
     ? clampNumber(Number(minBandBottomRow), rowSearchStart, rowSearchEnd)
     : rowSearchStart;
+  const hasColumnSupportScoreGap =
+    !!columnSupportScoreGapByCol && columnSupportScoreGapByCol.length === width;
+  const hasColumnSupportReliability =
+    !!columnSupportReliabilityByCol && columnSupportReliabilityByCol.length === width;
+  const ambiguityGapThreshold = CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionAmbiguityGapThreshold;
 
   for (let col = 0; col < width; col++) {
     const columnArray = new Array<number>(height);
@@ -4958,6 +9281,24 @@ function suppressLowerBackground(
     const bandBottomRow = Number(toothBandBottomRows[col]);
     const edgeProtectThreshold = Number(columnEdgeProtectThresholds[col]);
     const intensityProtectThreshold = Number(columnIntensityProtectThresholds[col]);
+    const columnScoreGap = hasColumnSupportScoreGap
+      ? Math.max(0, Number(columnSupportScoreGapByCol?.[col]) || 0)
+      : ambiguityGapThreshold * 3;
+    const columnSupportReliability = hasColumnSupportReliability
+      ? clampNumber(Number(columnSupportReliabilityByCol?.[col]) || 0, 0, 1)
+      : 1;
+    const scoreGapAmbiguityGate = clampNumber(
+      (ambiguityGapThreshold * 2.2 - columnScoreGap) /
+        Math.max(1e-6, ambiguityGapThreshold * 2.2),
+      0,
+      1
+    );
+    const reliabilityAmbiguityGate = clampNumber((0.74 - columnSupportReliability) / 0.26, 0, 1);
+    const columnAmbiguityGate = clampNumber(
+      scoreGapAmbiguityGate * 0.86 + reliabilityAmbiguityGate * 0.14,
+      0,
+      1
+    );
     for (let row = 0; row < height; row++) {
       const depthRows = row - bandBottomRow - 0.5;
       if (depthRows <= 0) {
@@ -4979,7 +9320,13 @@ function suppressLowerBackground(
 
       const prevValue = row > 0 ? Number(source[pixelIndex - width]) : value;
       const nextValue = row < height - 1 ? Number(source[pixelIndex + width]) : value;
+      const leftValue = col > 0 ? Number(source[pixelIndex - 1]) : value;
+      const rightValue = col < width - 1 ? Number(source[pixelIndex + 1]) : value;
       const localEdge = Math.max(Math.abs(value - prevValue), Math.abs(nextValue - value));
+      const horizontalContrast = Math.max(
+        Math.abs(value - leftValue),
+        Math.abs(rightValue - value)
+      );
       const edgeProtect = clampNumber(
         (localEdge - edgeProtectThreshold) / Math.max(20, edgeProtectThreshold * 0.75),
         0,
@@ -4991,8 +9338,37 @@ function suppressLowerBackground(
         0,
         1
       );
-      const structureProtect = Math.min(1, Math.max(edgeProtect, intensityProtect * 0.85));
-      const attenuation = baseSuppression * (1 - 0.88 * structureProtect);
+      const stripeGate =
+        columnAmbiguityGate *
+        clampNumber(
+          (horizontalContrast -
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.adaptiveBackgroundSuppressionStripeHorizontalContrastHu -
+            localEdge * 0.7) /
+            Math.max(
+              40,
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.adaptiveBackgroundSuppressionStripeVerticalEdgeScaleHu
+            ),
+          0,
+          1
+        ) *
+        clampNumber(
+          (value - CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionQuietBackgroundHu - 90) / 220,
+          0,
+          1
+        );
+      const structureProtect =
+        Math.min(1, Math.max(edgeProtect, intensityProtect * 0.85)) *
+        (1 - columnAmbiguityGate * CPU_VIRTUAL_PANO_MODEL_PARAMS.adaptiveBackgroundSuppressionAmbiguityProtectReduction) *
+        (1 - stripeGate * CPU_VIRTUAL_PANO_MODEL_PARAMS.adaptiveBackgroundSuppressionStripeProtectReduction);
+      const attenuation = clampNumber(
+        baseSuppression *
+          (1 +
+            columnAmbiguityGate * 0.34 +
+            stripeGate * CPU_VIRTUAL_PANO_MODEL_PARAMS.adaptiveBackgroundSuppressionStripeAttenuationBoost) *
+          (1 - 0.88 * structureProtect),
+        0,
+        1
+      );
       if (attenuation <= 0.005) {
         continue;
       }
@@ -5220,6 +9596,7 @@ function computeVirtualSupportPathFromScores(params: {
   bestCandidateDepthMm: Float32Array;
   selectedReliabilityByCol: Float32Array;
   scoreGapByCol: Float32Array;
+  supportEnvelopeHalfWidthMmByCol: Float32Array;
   bestCandidateReliabilitySummary: ReturnType<typeof summarizeFiniteFloat32Buffer>;
   bestCandidateDepthSummary: ReturnType<typeof summarizeFiniteFloat32Buffer>;
   selectedReliabilitySummary: ReturnType<typeof summarizeFiniteFloat32Buffer>;
@@ -5480,6 +9857,7 @@ function computeVirtualSupportPathFromScores(params: {
         bestCandidateDepthMm: constrainedBestDepthsMm,
         selectedReliabilityByCol: constrainedReliabilityByCol,
         scoreGapByCol: constrainedScoreGapByCol,
+        supportEnvelopeHalfWidthMmByCol: constrainedEnvelopeHalfWidthMmByCol,
         bestCandidateReliabilitySummary: constrainedReliabilitySummary,
         bestCandidateDepthSummary: constrainedDepthSummary,
         selectedReliabilitySummary: constrainedReliabilitySummary,
@@ -5543,6 +9921,7 @@ function computeVirtualSupportPathFromScores(params: {
       bestCandidateDepthMm: lockedBestDepthsMm,
       selectedReliabilityByCol: lockedReliabilityByCol,
       scoreGapByCol: lockedScoreGapByCol,
+      supportEnvelopeHalfWidthMmByCol: lockedEnvelopeHalfWidthMmByCol,
       bestCandidateReliabilitySummary: lockedReliabilitySummary,
       bestCandidateDepthSummary: lockedDepthSummary,
       selectedReliabilitySummary: lockedReliabilitySummary,
@@ -5630,16 +10009,26 @@ function computeVirtualSupportPathFromScores(params: {
       ambiguousColumnCount++;
     }
   }
-  const supportDepthEnvelope = buildSupportDepthEnvelope({
+  const softSeededSupportPath = buildSoftSeededSupportDepthPath({
     bestDepthByCol: bestCandidateDepthMm,
     bestReliabilityByCol: columnBestReliability,
+    scoreGapByCol,
+    reliabilityByColDepth,
+    depthOffsetsMm,
+    depthSamples,
+    depthHalfRangeMm,
+    smoothScratch,
+  });
+  const supportDepthEnvelope = buildSupportDepthEnvelope({
+    bestDepthByCol: softSeededSupportPath.seededDepthMmByCol,
+    bestReliabilityByCol: softSeededSupportPath.seededReliabilityByCol,
     scoreGapByCol,
     depthHalfRangeMm,
     smoothScratch,
   });
   const envelopeAdjustedScores = applySupportDepthEnvelopeScorePenalty({
     scoreByColDepth,
-    bestReliabilityByCol: columnBestReliability,
+    bestReliabilityByCol: softSeededSupportPath.seededReliabilityByCol,
     centerMmByCol: supportDepthEnvelope.centerMmByCol,
     halfWidthMmByCol: supportDepthEnvelope.halfWidthMmByCol,
     depthOffsetsMm,
@@ -5670,7 +10059,7 @@ function computeVirtualSupportPathFromScores(params: {
     depthSamples,
     smoothScratch,
     depthHalfRangeMm,
-    bestDepthByCol: bestCandidateDepthMm,
+    bestDepthByCol: softSeededSupportPath.seededDepthMmByCol,
     scoreGapByCol,
     smoothPasses: Math.max(1, pathSmoothPasses - 1),
     envelopeCenterMmByCol: supportDepthEnvelope.centerMmByCol,
@@ -5710,11 +10099,16 @@ function computeVirtualSupportPathFromScores(params: {
 
   return {
     selectedDepthMm,
-    bestCandidateDepthMm,
+    bestCandidateDepthMm: softSeededSupportPath.seededDepthMmByCol,
     selectedReliabilityByCol,
     scoreGapByCol,
-    bestCandidateReliabilitySummary: summarizeFiniteFloat32Buffer(columnBestReliability),
-    bestCandidateDepthSummary: summarizeFiniteFloat32Buffer(bestCandidateDepthMm),
+    supportEnvelopeHalfWidthMmByCol: supportDepthEnvelope.halfWidthMmByCol,
+    bestCandidateReliabilitySummary: summarizeFiniteFloat32Buffer(
+      softSeededSupportPath.seededReliabilityByCol
+    ),
+    bestCandidateDepthSummary: summarizeFiniteFloat32Buffer(
+      softSeededSupportPath.seededDepthMmByCol
+    ),
     selectedReliabilitySummary: summarizeFiniteFloat32Buffer(selectedReliabilityByCol),
     scoreGapSummary: summarizeFiniteFloat32Buffer(scoreGapByCol),
     ambiguousColumnCount,
@@ -5740,6 +10134,7 @@ function generatePanorama(
   options?: {
     requestedReconstructionMode?: 'legacy' | 'virtualPanoPhase1' | 'virtualPano';
     gpuFallbackCause?: 'gpu-render-failed' | 'gpu-phase2-gate-failed' | null;
+    usesPanoV2Bridge?: boolean;
   }
 ): {
   pixelData: Float32Array;
@@ -5927,16 +10322,15 @@ function generatePanorama(
       if (minRequiredOffset <= maxAllowedOffset) {
         fittedVerticalCenterOffsetMm = Math.max(minRequiredOffset, Math.min(0, maxAllowedOffset));
       } else {
-        // No single offset can fit the entire window for all frames; choose least-violation midpoint.
         fittedVerticalCenterOffsetMm = (minRequiredOffset + maxAllowedOffset) / 2;
       }
     }
   }
 
-  const baseCenterOffsetLimitMm = Math.min(8, Math.max(3.5, vertHalfMm * 0.5));
+  const baseCenterOffsetLimitMm = Math.min(12, Math.max(5, vertHalfMm * 0.5));
   const fitOffsetLimitMm = Math.min(
-    3.2,
-    Math.max(1.2, Math.min(baseCenterOffsetLimitMm * 0.6, vertHalfMm * 0.18))
+    8.0,
+    Math.max(2.0, Math.min(baseCenterOffsetLimitMm * 0.8, vertHalfMm * 0.25))
   );
   const requestedCenterOffsetMm = rigidVerticalSliceMode
     ? 0
@@ -7034,6 +11428,176 @@ function generatePanorama(
     return Number.isFinite(sample) ? sample : Number.NaN;
   };
 
+  {
+    const auditStartedAt = performance.now();
+    const auditRowStart = Math.max(0, Math.min(panoHeight - 1, 213));
+    const auditRowEnd = Math.max(auditRowStart, Math.min(panoHeight - 1, 351));
+    const auditRowCount = Math.max(0, auditRowEnd - auditRowStart + 1);
+    const auditTotalPositions = panoWidth * auditRowCount;
+    const targetAuditSampleCount = Math.min(10000, auditTotalPositions);
+    const rawStoredAuditValues: number[] = [];
+    const normalizedStoredAuditValues: number[] = [];
+    const normalizedHuAuditValues: number[] = [];
+    const auditSampleStride =
+      targetAuditSampleCount > 0 ? auditTotalPositions / targetAuditSampleCount : 0;
+    const bufferRangeSummary = summarizeAuditRange(
+      scalarData,
+      normalizeStoredSample,
+      safeSlope,
+      safeIntercept,
+      shouldApplyModalityLut
+    );
+    const safeBitsStored =
+      Number.isFinite(input.bitsStored) && Number(input.bitsStored) > 0
+        ? Math.floor(Number(input.bitsStored))
+        : 16;
+    const nominalStoredMax =
+      safeBitsStored < 31 ? (1 << safeBitsStored) - 1 : Number.MAX_SAFE_INTEGER;
+
+    for (let sampleIndex = 0; sampleIndex < targetAuditSampleCount; sampleIndex++) {
+      const linearIndex = Math.max(
+        0,
+        Math.min(
+          auditTotalPositions - 1,
+          Math.floor((sampleIndex + 0.5) * auditSampleStride)
+        )
+      );
+      const rowOffset = Math.floor(linearIndex / Math.max(1, panoWidth));
+      const col = Math.max(0, Math.min(panoWidth - 1, linearIndex % Math.max(1, panoWidth)));
+      const row = Math.max(auditRowStart, Math.min(auditRowEnd, auditRowStart + rowOffset));
+      const frame = frames[col];
+      if (!frame) {
+        continue;
+      }
+
+      const [px, py, pz] = frame.position;
+      const [vertDirX, vertDirY, vertDirZ] = verticalDirs[col] || effectiveVerticalDir;
+      const columnVerticalCenterOffsetMm = Number(localCenterOffsetsMm[col]);
+      const vertOffsetMm =
+        columnVerticalCenterOffsetMm + (effectiveVerticalHalfMm - row * vertStepMm);
+      const wx = px + vertOffsetMm * vertDirX;
+      const wy = py + vertOffsetMm * vertDirY;
+      const wz = pz + vertOffsetMm * vertDirZ;
+      const [vi, vj, vk] = worldToVoxel(wx, wy, wz, origin, spacing, invDir, worldToIndex);
+      const rawStoredValue = trilinear(
+        scalarData,
+        dimensions,
+        vi,
+        vj,
+        vk,
+        Number.NaN
+      );
+      if (!Number.isFinite(rawStoredValue)) {
+        continue;
+      }
+
+      const normalizedStoredValue = normalizeStoredSample
+        ? normalizeStoredSample(rawStoredValue)
+        : rawStoredValue;
+      const normalizedHuValue = sampleWorldIntensityForVirtualPano(wx, wy, wz);
+      if (!Number.isFinite(normalizedStoredValue) || !Number.isFinite(normalizedHuValue)) {
+        continue;
+      }
+
+      rawStoredAuditValues.push(rawStoredValue);
+      normalizedStoredAuditValues.push(normalizedStoredValue);
+      normalizedHuAuditValues.push(normalizedHuValue);
+    }
+
+    console.log(
+      '[CPR-NORMALIZATION-AUDIT-JSON]',
+      JSON.stringify({
+        stage: 'worker-render-audit',
+        implementationVersion: CPR_WORKER_IMPLEMENTATION_VERSION,
+        runId: input.debugRunId ?? null,
+        attemptLabel: input.attemptLabel ?? null,
+        sourceVolumeId: input.sourceVolumeId ?? null,
+        reconstructionMode,
+        renderBackend: input.renderBackend ?? null,
+        transferredBuffer: {
+          materializedNormalizedBufferBeforeWorker: false,
+          workerReceivesRawScalarData: true,
+          rawStoredRange: bufferRangeSummary.rawStoredRange,
+          normalizedScalarBufferBeforeWorker: null,
+          note:
+            'The worker receives raw scalarData and applies stored-value correction on read. There is no pre-normalized scalar buffer transferred from the main thread.',
+        },
+        normalizationPath: {
+          scalarType:
+            scalarData && scalarData.constructor ? scalarData.constructor.name : 'unknown',
+          bitsStored: input.bitsStored ?? null,
+          bitsAllocated: input.bitsAllocated ?? null,
+          highBit: input.highBit ?? null,
+          pixelRepresentation: input.pixelRepresentation ?? null,
+          effectiveIsPreScaled: input.isPreScaled === true,
+          unsignedPackedArtifactDetected,
+          overflowConditionObserved: scalarPolicy.overflowConditionObserved,
+          storedValueNormalizationApplied: shouldNormalizeStoredValues,
+          normalizationBranch: scalarPolicy.normalizationBranch,
+          normalizationSignature: scalarPolicy.normalizationSignature,
+          observedRawRangeFromPolicy: {
+            min: scalarPolicy.observedRawMin,
+            max: scalarPolicy.observedRawMax,
+          },
+          codePath: {
+            policyFunction: 'cprScalarPolicy.resolveStoredValueNormalizationPolicy',
+            unsignedPackedArtifactCondition:
+              'safePixelRepresentation === 0 && (sampledMin < -1 || sampledMax > nominalStoredMax + 8)',
+            normalizationFunction:
+              shouldNormalizeStoredValues && normalizeStoredSample
+                ? scalarPolicy.normalizationBranch === 'overflow-rescale'
+                  ? 'normalizeStoredSample(value): direct linear overflow-rescale from observed raw Int16 range to clinical HU surrogate stored range'
+                  : 'normalizeStoredSample(value): rawU16 -> bitAlignmentShift -> storedMask -> optional signed decode'
+                : 'no packed-value correction branch entered',
+            renderSamplingFunction:
+              'sampleWorldIntensityForVirtualPano -> trilinear(..., normalizeStoredSample) -> optional slope/intercept',
+            overflowHeuristicCondition: 'scalarMax > ((1 << bitsStored) - 1)',
+            overflowConditionObserved: scalarPolicy.overflowConditionObserved,
+            hardClampAppliedInUnsignedPackedBranch: false,
+            hardRescaleAppliedInUnsignedPackedBranch: false,
+          },
+          modalityLut: {
+            applied: shouldApplyModalityLut,
+            requestedApplied: requestedModalityLutApplied,
+            rescaleSlope: safeSlope,
+            rescaleIntercept: safeIntercept,
+            applicationOrder:
+              normalizeStoredSample && shouldApplyModalityLut
+                ? 'after-unsigned-packed-correction'
+                : shouldApplyModalityLut
+                  ? 'applied-to-raw-samples-without-packed-correction'
+                  : 'not-applied',
+            transformsCompoundingIncorrectly: false,
+            compoundingAssessment:
+              'Current code path performs at most one packed-value correction and one modality LUT application in sequence; no duplicate slope/intercept application is present in this branch.',
+          },
+          fullBufferRanges: {
+            rawStored: bufferRangeSummary.rawStoredRange,
+            normalizedStoredBeforeModalityLut: bufferRangeSummary.normalizedStoredRange,
+            normalizedHu: bufferRangeSummary.normalizedHuRange,
+          },
+        },
+        toothBandSampling: {
+          requestedSampleCount: targetAuditSampleCount,
+          effectiveSampleCount: rawStoredAuditValues.length,
+          rowRange: {
+            start: auditRowStart,
+            end: auditRowEnd,
+          },
+          centerDepthOffsetMm: 0,
+          columnCount: panoWidth,
+          rawStoredHistogram: summarizeAuditValues(rawStoredAuditValues, 2000),
+          normalizedStoredHistogramBeforeModalityLut: summarizeAuditValues(
+            normalizedStoredAuditValues,
+            2000
+          ),
+          normalizedHuHistogram: summarizeAuditValues(normalizedHuAuditValues, 1500),
+        },
+        auditComputationMs: performance.now() - auditStartedAt,
+      })
+    );
+  }
+
   let virtualPanoPhase12Diagnostics: Record<string, unknown>;
   let virtualPanoRenderDiagnostics: Record<string, unknown> = {
     enabled: enableVirtualPanoRender,
@@ -7048,8 +11612,18 @@ function generatePanorama(
   let virtualPanoSelectedForOutput = false;
   let finalDebugMaps: GpuPanoDebugMaps | undefined;
   let lowerArchAnchorRowForBackgroundSuppression: number | undefined;
+  let virtualPanoDepthHalfRangeMm: number | undefined;
+  let virtualMergedDepthMm: Float32Array | undefined;
+  let virtualMergedSelectedReliabilityByCol: Float32Array | undefined;
+  let virtualMergedScoreGapByCol: Float32Array | undefined;
+  let panoV2GeometryDiagnostics: ReturnType<typeof buildPanoV2GeometryDiagnostics> | null = null;
+  let panoV2VolumeDiagnostics: ReturnType<typeof buildPanoV2StraightenedVolumeDiagnostics> | null = null;
+  let panoV2LayerDiagnostics: ReturnType<typeof toPanoV2LayerRenderDiagnostics> | null = null;
+  let panoV2FusionDiagnostics: ReturnType<typeof buildPanoV2FusionResult>['diagnostics'] | null =
+    null;
+  let panoV2FusionPixelData: Float32Array | null = null;
   if (shouldComputeVirtualPano) {
-    const virtualPanoDepthHalfRangeMm = 5.5;
+    virtualPanoDepthHalfRangeMm = 5.5;
     const virtualPanoDepthStepMm = 0.25;
     const virtualPanoDepthSamples =
       Math.max(3, Math.round((virtualPanoDepthHalfRangeMm * 2) / virtualPanoDepthStepMm) + 1) | 0;
@@ -7086,6 +11660,11 @@ function generatePanorama(
       rowFromNormalizedOffset(0.55)
     );
     const toothBandEndRow = Math.max(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.55));
+    const toothCoreStartRow = Math.min(
+      rowFromNormalizedOffset(-0.02),
+      rowFromNormalizedOffset(0.38)
+    );
+    const toothCoreEndRow = Math.max(rowFromNormalizedOffset(-0.02), rowFromNormalizedOffset(0.38));
     const topBandStartRow = Math.min(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.05));
     const topBandEndRow = Math.max(rowFromNormalizedOffset(-0.35), rowFromNormalizedOffset(0.05));
     const bottomBandStartRow = Math.min(
@@ -7223,12 +11802,27 @@ function generatePanorama(
       const hardThreshold = Number(virtualHardThresholdByCol[col]);
       const hardDen = Math.max(hardThreshold - softThreshold, 1e-6);
       const gradCap = Math.max(1, Number(virtualGradCapByCol[col]));
+      const topHardMeanByDepth = new Float32Array(virtualPanoDepthSamples);
+      const bottomHardMeanByDepth = new Float32Array(virtualPanoDepthSamples);
+      const toothCoreHardMeanByDepth = new Float32Array(virtualPanoDepthSamples);
+      const toothCoreSoftMeanByDepth = new Float32Array(virtualPanoDepthSamples);
+      const toothInteriorGradientByDepth = new Float32Array(virtualPanoDepthSamples);
+      const gradMeanByDepth = new Float32Array(virtualPanoDepthSamples);
+      const lowMeanByDepth = new Float32Array(virtualPanoDepthSamples);
+      const supportSignalByDepth = new Float32Array(virtualPanoDepthSamples);
+      const offTroughLeakByDepth = new Float32Array(virtualPanoDepthSamples);
 
       for (let depth = 0; depth < virtualPanoDepthSamples; depth++) {
         let topHardAccum = 0;
         let topHardCount = 0;
         let bottomHardAccum = 0;
         let bottomHardCount = 0;
+        let toothCoreHardAccum = 0;
+        let toothCoreHardCount = 0;
+        let toothCoreSoftAccum = 0;
+        let toothCoreSoftCount = 0;
+        let toothInteriorGradientAccum = 0;
+        let toothInteriorGradientCount = 0;
         let gradAccum = 0;
         let gradCount = 0;
         let lowAccum = 0;
@@ -7260,6 +11854,47 @@ function generatePanorama(
           const hardResponse = clampNumber((centerValue - softThreshold) / hardDen, 0, 1);
           bottomHardAccum += hardResponse;
           bottomHardCount++;
+        }
+
+        for (let row = toothCoreStartRow; row <= toothCoreEndRow; row++) {
+          const pixelIndex = planeIndex(col, row, panoWidth);
+          const centerValue = Number(
+            virtualPanoStack[stackIndex(depth, pixelIndex, virtualPanoPlaneSize)]
+          );
+          if (!Number.isFinite(centerValue)) {
+            continue;
+          }
+
+          const hardResponse = clampNumber((centerValue - softThreshold) / hardDen, 0, 1);
+          const softResponse = clampNumber(
+            (centerValue - (softThreshold - hardDen * 0.22)) / Math.max(90, hardDen * 1.18),
+            0,
+            1
+          );
+          toothCoreHardAccum += hardResponse;
+          toothCoreHardCount++;
+          toothCoreSoftAccum += softResponse;
+          toothCoreSoftCount++;
+          if (row > toothCoreStartRow && row < toothCoreEndRow) {
+            const plusRow = Number(
+              virtualPanoStack[
+              stackIndex(depth, planeIndex(col, row + 1, panoWidth), virtualPanoPlaneSize)
+              ]
+            );
+            const minusRow = Number(
+              virtualPanoStack[
+              stackIndex(depth, planeIndex(col, row - 1, panoWidth), virtualPanoPlaneSize)
+              ]
+            );
+            if (Number.isFinite(plusRow) && Number.isFinite(minusRow)) {
+              toothInteriorGradientAccum += clampNumber(
+                Math.abs(plusRow - minusRow) / Math.max(24, gradCap * 0.78),
+                0,
+                1
+              );
+              toothInteriorGradientCount++;
+            }
+          }
         }
 
         for (let row = toothBandStartRow; row <= toothBandEndRow; row++) {
@@ -7316,9 +11951,98 @@ function generatePanorama(
 
         const topHardMean = topHardCount > 0 ? topHardAccum / topHardCount : 0;
         const bottomHardMean = bottomHardCount > 0 ? bottomHardAccum / bottomHardCount : 0;
-        const supportMean = Math.min(topHardMean, bottomHardMean);
+        const toothCoreHardMean =
+          toothCoreHardCount > 0 ? toothCoreHardAccum / toothCoreHardCount : 0;
+        const toothCoreSoftMean =
+          toothCoreSoftCount > 0 ? toothCoreSoftAccum / toothCoreSoftCount : toothCoreHardMean;
+        const toothInteriorGradientMean =
+          toothInteriorGradientCount > 0
+            ? toothInteriorGradientAccum / toothInteriorGradientCount
+            : 0;
         const gradMean = gradCount > 0 ? gradAccum / gradCount : 0;
         const lowMean = lowCount > 0 ? lowAccum / lowCount : 0;
+        const supportMean = clampUnitInterval(
+          Math.min(topHardMean, bottomHardMean) *
+            (1 -
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.supportCoreWeight -
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.supportCoreSoftWeight) +
+            toothCoreHardMean * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportCoreWeight +
+            toothCoreSoftMean * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportCoreSoftWeight
+        );
+        const silhouettePenalty = clampUnitInterval(
+          (Math.max(topHardMean, bottomHardMean) -
+            (toothCoreSoftMean * 0.72 + toothCoreHardMean * 0.28)) *
+            1.2
+        );
+        const offTroughLeak = clampUnitInterval(
+          lowMean - (supportMean * 0.64 + toothCoreSoftMean * 0.18 + toothCoreHardMean * 0.18)
+        );
+        const supportSignal = clampUnitInterval(
+          supportMean * 0.48 +
+            toothCoreHardMean * 0.18 +
+            toothCoreSoftMean * 0.1 +
+            toothInteriorGradientMean *
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.supportInteriorGradientWeight +
+            gradMean * 0.14 -
+            silhouettePenalty * 0.12 -
+            offTroughLeak * 0.1
+        );
+        topHardMeanByDepth[depth] = topHardMean;
+        bottomHardMeanByDepth[depth] = bottomHardMean;
+        toothCoreHardMeanByDepth[depth] = toothCoreHardMean;
+        toothCoreSoftMeanByDepth[depth] = toothCoreSoftMean;
+        toothInteriorGradientByDepth[depth] = toothInteriorGradientMean;
+        gradMeanByDepth[depth] = gradMean;
+        lowMeanByDepth[depth] = lowMean;
+        supportSignalByDepth[depth] = supportSignal;
+        offTroughLeakByDepth[depth] = clampUnitInterval(
+          offTroughLeak + silhouettePenalty * 0.16
+        );
+      }
+
+      for (let depth = 0; depth < virtualPanoDepthSamples; depth++) {
+        const topHardMean = Number(topHardMeanByDepth[depth]);
+        const bottomHardMean = Number(bottomHardMeanByDepth[depth]);
+        const toothCoreHardMean = Number(toothCoreHardMeanByDepth[depth]);
+        const toothCoreSoftMean = Number(toothCoreSoftMeanByDepth[depth]);
+        const toothInteriorGradientMean = Number(toothInteriorGradientByDepth[depth]);
+        const gradMean = Number(gradMeanByDepth[depth]);
+        const lowMean = Number(lowMeanByDepth[depth]);
+        const supportMean = clampUnitInterval(
+          Math.min(topHardMean, bottomHardMean) *
+            (1 -
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.supportCoreWeight -
+              CPU_VIRTUAL_PANO_MODEL_PARAMS.supportCoreSoftWeight) +
+            toothCoreHardMean * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportCoreWeight +
+            toothCoreSoftMean * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportCoreSoftWeight
+        );
+        const supportSignal = Number(supportSignalByDepth[depth]);
+        const offTroughLeak = Number(offTroughLeakByDepth[depth]);
+        let neighborSignalAccum = 0;
+        let neighborSignalWeight = 0;
+        for (let offset = -2; offset <= 2; offset++) {
+          if (offset === 0) {
+            continue;
+          }
+          const neighborDepth = depth + offset;
+          if (neighborDepth < 0 || neighborDepth >= virtualPanoDepthSamples) {
+            continue;
+          }
+          const weight = Math.abs(offset) === 1 ? 0.72 : 0.28;
+          neighborSignalAccum += Number(supportSignalByDepth[neighborDepth]) * weight;
+          neighborSignalWeight += weight;
+        }
+        const neighborSignal =
+          neighborSignalWeight > 1e-6 ? neighborSignalAccum / neighborSignalWeight : supportSignal;
+        const depthProminence = clampUnitInterval((supportSignal - neighborSignal + 0.02) / 0.14);
+        const depthPlateauPenalty = clampUnitInterval(
+          (neighborSignal - supportSignal + 0.01) / 0.14
+        );
+        const silhouettePenalty = clampUnitInterval(
+          (Math.max(topHardMean, bottomHardMean) -
+            (toothCoreSoftMean * 0.72 + toothCoreHardMean * 0.28)) *
+            1.2
+        );
         const crownRootBalance =
           1 - clampNumber(Math.abs(topHardMean - bottomHardMean) * 1.35, 0, 1);
         const depthMm = Number(virtualPanoDepthOffsetsMm[depth]);
@@ -7335,23 +12059,43 @@ function generatePanorama(
           CPU_VIRTUAL_PANO_MODEL_PARAMS.crownBiasPenaltyScale;
         const supportReliability = clampUnitInterval(
           CPU_VIRTUAL_PANO_MODEL_PARAMS.supportMeanWeight * supportMean +
-            CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean +
+            CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean * 0.9 +
             CPU_VIRTUAL_PANO_MODEL_PARAMS.balanceWeight * crownRootBalance +
-            (1 - lowMean) * 0.22 +
-            Math.min(topHardMean, bottomHardMean) * 0.12
+            toothCoreHardMean * 0.16 +
+            toothCoreSoftMean * 0.08 +
+            toothInteriorGradientMean * 0.08 +
+            (1 - lowMean) * 0.18 +
+            depthProminence * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDepthProminenceReliabilityWeight -
+            silhouettePenalty * (CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSilhouettePenaltyWeight * 0.62) -
+            depthPlateauPenalty * (CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDepthPlateauPenaltyWeight * 0.58) -
+            offTroughLeak * 0.1
         );
-        const supportAmbiguity = clampUnitInterval(Math.abs(topHardMean - bottomHardMean) * 1.15);
+        const supportAmbiguity = clampUnitInterval(
+          Math.abs(topHardMean - bottomHardMean) * 1.05 +
+            silhouettePenalty * 0.32 +
+            depthPlateauPenalty * 0.38 +
+            offTroughLeak * 0.18 -
+            depthProminence * 0.24 -
+            toothInteriorGradientMean * 0.12
+        );
         const edgeShelfPenalty = clampUnitInterval(
           edgeDistanceMm <= 1.5 ? 1 - edgeDistanceMm / 1.5 : 0
         );
         const baseScore =
           CPU_VIRTUAL_PANO_MODEL_PARAMS.supportMeanWeight * supportMean +
-          CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean +
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean * 0.92 +
           CPU_VIRTUAL_PANO_MODEL_PARAMS.balanceWeight * crownRootBalance -
-          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowBandPenaltyWeight * lowMean -
+          silhouettePenalty * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSilhouettePenaltyWeight -
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowBandPenaltyWeight * lowMean * 0.62 -
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.supportOffTroughLeakPenaltyWeight * offTroughLeak -
           edgePenalty -
           depthCenterPenalty -
-          crownBiasPenalty;
+          crownBiasPenalty +
+          toothCoreHardMean * 0.18 +
+          toothCoreSoftMean * 0.08 +
+          toothInteriorGradientMean * 0.06 +
+          depthProminence * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDepthProminenceWeight -
+          depthPlateauPenalty * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDepthPlateauPenaltyWeight;
         const stabilityBoost =
           supportReliability * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportReliabilityWeight -
           supportAmbiguity * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportAmbiguityWeight -
@@ -7368,42 +12112,64 @@ function generatePanorama(
         );
         const upperSupportReliability = clampUnitInterval(
           CPU_VIRTUAL_PANO_MODEL_PARAMS.supportMeanWeight * upperSupportMean +
-            CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean * 0.95 +
-            CPU_VIRTUAL_PANO_MODEL_PARAMS.balanceWeight * upperArchBalance * 0.82 +
-            (1 - lowMean) * 0.18 +
-            topHardMean * 0.16
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean * 0.95 +
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.balanceWeight * upperArchBalance * 0.82 +
+          toothCoreHardMean * 0.12 +
+          toothCoreSoftMean * 0.06 +
+          toothInteriorGradientMean * 0.06 +
+          (1 - lowMean) * 0.18 +
+          topHardMean * 0.12 -
+          silhouettePenalty * 0.1
         );
         const lowerSupportReliability = clampUnitInterval(
           CPU_VIRTUAL_PANO_MODEL_PARAMS.supportMeanWeight * lowerSupportMean +
-            CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean * 0.95 +
-            CPU_VIRTUAL_PANO_MODEL_PARAMS.balanceWeight * lowerArchBalance * 0.82 +
-            (1 - lowMean) * 0.14 +
-            bottomHardMean * 0.16
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean * 0.95 +
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.balanceWeight * lowerArchBalance * 0.82 +
+          toothCoreHardMean * 0.12 +
+          toothCoreSoftMean * 0.06 +
+          toothInteriorGradientMean * 0.06 +
+          (1 - lowMean) * 0.14 +
+          bottomHardMean * 0.12 -
+          silhouettePenalty * 0.1
         );
         const upperScore =
           CPU_VIRTUAL_PANO_MODEL_PARAMS.supportMeanWeight * upperSupportMean +
           CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean +
           CPU_VIRTUAL_PANO_MODEL_PARAMS.balanceWeight * upperArchBalance * 0.82 -
-          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowBandPenaltyWeight * lowMean * 0.9 -
+          silhouettePenalty * (CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSilhouettePenaltyWeight * 0.82) -
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowBandPenaltyWeight * lowMean * 0.48 -
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.supportOffTroughLeakPenaltyWeight * offTroughLeak * 0.82 -
           edgePenalty -
           depthCenterPenalty * 0.9 -
           Math.max(0, bottomHardMean - topHardMean) * 0.28 +
+          toothCoreHardMean * 0.14 +
+          toothCoreSoftMean * 0.06 +
+          toothInteriorGradientMean * 0.05 +
           upperSupportReliability * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportReliabilityWeight -
           supportAmbiguity * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportAmbiguityWeight * 0.9 -
           edgeShelfPenalty * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEdgeShelfWeight * 0.9 -
+          depthPlateauPenalty * (CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDepthPlateauPenaltyWeight * 0.92) +
+          depthProminence * (CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDepthProminenceWeight * 0.88) +
           Math.max(0, 0.35 - upperSupportReliability) *
             CPU_VIRTUAL_PANO_MODEL_PARAMS.supportLowReliabilityPenalty;
         const lowerScore =
           CPU_VIRTUAL_PANO_MODEL_PARAMS.supportMeanWeight * lowerSupportMean +
           CPU_VIRTUAL_PANO_MODEL_PARAMS.gradientWeight * gradMean +
           CPU_VIRTUAL_PANO_MODEL_PARAMS.balanceWeight * lowerArchBalance * 0.82 -
-          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowBandPenaltyWeight * lowMean * 1.08 -
+          silhouettePenalty * (CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSilhouettePenaltyWeight * 0.82) -
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.lowBandPenaltyWeight * lowMean * 0.76 -
+          CPU_VIRTUAL_PANO_MODEL_PARAMS.supportOffTroughLeakPenaltyWeight * offTroughLeak * 1.12 -
           edgePenalty -
           depthCenterPenalty * 0.9 -
           Math.max(0, topHardMean - bottomHardMean) * 0.28 +
+          toothCoreHardMean * 0.14 +
+          toothCoreSoftMean * 0.06 +
+          toothInteriorGradientMean * 0.05 +
           lowerSupportReliability * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportReliabilityWeight -
           supportAmbiguity * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportAmbiguityWeight * 0.9 -
           edgeShelfPenalty * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEdgeShelfWeight * 0.9 -
+          depthPlateauPenalty * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDepthPlateauPenaltyWeight +
+          depthProminence * CPU_VIRTUAL_PANO_MODEL_PARAMS.supportDepthProminenceWeight +
           Math.max(0, 0.35 - lowerSupportReliability) *
             CPU_VIRTUAL_PANO_MODEL_PARAMS.supportLowReliabilityPenalty;
         const scoreIndex = col * virtualPanoDepthSamples + depth;
@@ -7414,13 +12180,13 @@ function generatePanorama(
       }
     }
 
-    const manualSupportBaseDepthMm = enableVirtualPanoRender ? 0 : undefined;
-    const manualSupportFollowHalfWidthMm = enableVirtualPanoRender
-      ? CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionDepthFollowHalfWidthMm
-      : undefined;
-    const manualSupportMaxAdjacentDepthDeltaMm = enableVirtualPanoRender
-      ? CPU_VIRTUAL_PANO_MODEL_PARAMS.dualArchProjectionMaxAdjacentDepthDeltaMm
-      : undefined;
+    // True virtual pano should solve support over the full sampled depth stack.
+    // The older 0 mm base-depth lock kept every retry family in the same
+    // constrained regime and prevented the free envelope/DP/stabilize path from
+    // correcting ambiguous support.
+    const manualSupportBaseDepthMm = undefined;
+    const manualSupportFollowHalfWidthMm = undefined;
+    const manualSupportMaxAdjacentDepthDeltaMm = undefined;
     const virtualUpperSupportPath = computeVirtualSupportPathFromScores({
       scoreByColDepth: virtualUpperScoreByColDepth,
       reliabilityByColDepth: virtualUpperSupportReliabilityByColDepth,
@@ -7449,6 +12215,136 @@ function generatePanorama(
       constrainedFollowHalfWidthMm: manualSupportFollowHalfWidthMm,
       maxAdjacentDepthDeltaMm: manualSupportMaxAdjacentDepthDeltaMm,
     });
+    if (options?.usesPanoV2Bridge) {
+      const refinedUpperTrack = refinePanoV2TrackFromScores({
+        label: 'upperArch',
+        anchorRow: Math.round((topBandStartRow + topBandEndRow) * 0.5),
+        panoWidth,
+        depthSamples: virtualPanoDepthSamples,
+        depthOffsetsMm: virtualPanoDepthOffsetsMm,
+        rawScoreByColDepth: virtualUpperScoreByColDepth,
+        rawReliabilityByColDepth: virtualUpperSupportReliabilityByColDepth,
+        baseSelectedDepthMm: virtualUpperSupportPath.selectedDepthMm,
+        baseSelectedReliabilityByCol: virtualUpperSupportPath.selectedReliabilityByCol,
+        baseScoreGapByCol: virtualUpperSupportPath.scoreGapByCol,
+        baseUnstableMask: virtualUpperSupportPath.pathStability.unstableMask,
+        baseEnvelopeHalfWidthMmByCol: virtualUpperSupportPath.supportEnvelopeHalfWidthMmByCol,
+      });
+      const refinedLowerTrack = refinePanoV2TrackFromScores({
+        label: 'lowerArch',
+        anchorRow: Math.round((bottomBandStartRow + bottomBandEndRow) * 0.5),
+        panoWidth,
+        depthSamples: virtualPanoDepthSamples,
+        depthOffsetsMm: virtualPanoDepthOffsetsMm,
+        rawScoreByColDepth: virtualLowerScoreByColDepth,
+        rawReliabilityByColDepth: virtualLowerSupportReliabilityByColDepth,
+        baseSelectedDepthMm: virtualLowerSupportPath.selectedDepthMm,
+        baseSelectedReliabilityByCol: virtualLowerSupportPath.selectedReliabilityByCol,
+        baseScoreGapByCol: virtualLowerSupportPath.scoreGapByCol,
+        baseUnstableMask: virtualLowerSupportPath.pathStability.unstableMask,
+        baseEnvelopeHalfWidthMmByCol: virtualLowerSupportPath.supportEnvelopeHalfWidthMmByCol,
+      });
+
+      virtualUpperSupportPath.selectedDepthMm = refinedUpperTrack.selectedDepthMm;
+      virtualUpperSupportPath.selectedReliabilityByCol = refinedUpperTrack.selectedReliabilityByCol;
+      virtualUpperSupportPath.scoreGapByCol = refinedUpperTrack.scoreGapByCol;
+      virtualUpperSupportPath.supportEnvelopeHalfWidthMmByCol =
+        refinedUpperTrack.envelopeHalfWidthMmByCol ?? virtualUpperSupportPath.supportEnvelopeHalfWidthMmByCol;
+      virtualUpperSupportPath.ambiguousColumnCount = refinedUpperTrack.ambiguousColumnCount;
+      virtualUpperSupportPath.depthMinMm = refinedUpperTrack.depthMinMm;
+      virtualUpperSupportPath.depthMaxMm = refinedUpperTrack.depthMaxMm;
+      virtualUpperSupportPath.depthStdMm = refinedUpperTrack.depthStdMm;
+      virtualUpperSupportPath.pathJumpP95Mm = refinedUpperTrack.pathJumpP95Mm;
+      virtualUpperSupportPath.pathJumpMaxMm = refinedUpperTrack.pathJumpMaxMm;
+      virtualUpperSupportPath.selectedReliabilitySummary = summarizeFiniteFloat32Buffer(
+        refinedUpperTrack.selectedReliabilityByCol
+      );
+      virtualUpperSupportPath.scoreGapSummary = summarizeFiniteFloat32Buffer(
+        refinedUpperTrack.scoreGapByCol
+      );
+      virtualUpperSupportPath.bestCandidateDepthSummary = summarizeFiniteFloat32Buffer(
+        refinedUpperTrack.selectedDepthMm
+      );
+      virtualUpperSupportPath.bestCandidateReliabilitySummary =
+        virtualUpperSupportPath.selectedReliabilitySummary;
+      virtualUpperSupportPath.pathStability = {
+        ...virtualUpperSupportPath.pathStability,
+        selectedReliabilityByCol: refinedUpperTrack.selectedReliabilityByCol,
+        unstableMask: refinedUpperTrack.unstableMask,
+        unreliableFraction:
+          panoWidth > 0
+            ? Array.from(refinedUpperTrack.unstableMask).reduce((sum, value) => sum + value, 0) /
+              panoWidth
+            : 0,
+        pathJumpP95Mm: refinedUpperTrack.pathJumpP95Mm,
+        pathJumpMaxMm: refinedUpperTrack.pathJumpMaxMm,
+        ambiguousFraction:
+          panoWidth > 0 ? refinedUpperTrack.ambiguousColumnCount / panoWidth : 0,
+        forcedDriftFraction: 0,
+        bestDepthDriftP50Mm: 0,
+        bestDepthDriftP95Mm: 0,
+        outsideEnvelopeFraction: 0,
+        envelopeClampFraction: 0,
+        envelopeDriftP50Mm: 0,
+        envelopeDriftP95Mm: 0,
+      };
+      virtualUpperSupportPath.supportEnvelope = {
+        ...virtualUpperSupportPath.supportEnvelope,
+        halfWidthSummary: summarizeFiniteFloat32Buffer(
+          refinedUpperTrack.envelopeHalfWidthMmByCol ?? new Float32Array(0)
+        ),
+      };
+
+      virtualLowerSupportPath.selectedDepthMm = refinedLowerTrack.selectedDepthMm;
+      virtualLowerSupportPath.selectedReliabilityByCol = refinedLowerTrack.selectedReliabilityByCol;
+      virtualLowerSupportPath.scoreGapByCol = refinedLowerTrack.scoreGapByCol;
+      virtualLowerSupportPath.supportEnvelopeHalfWidthMmByCol =
+        refinedLowerTrack.envelopeHalfWidthMmByCol ?? virtualLowerSupportPath.supportEnvelopeHalfWidthMmByCol;
+      virtualLowerSupportPath.ambiguousColumnCount = refinedLowerTrack.ambiguousColumnCount;
+      virtualLowerSupportPath.depthMinMm = refinedLowerTrack.depthMinMm;
+      virtualLowerSupportPath.depthMaxMm = refinedLowerTrack.depthMaxMm;
+      virtualLowerSupportPath.depthStdMm = refinedLowerTrack.depthStdMm;
+      virtualLowerSupportPath.pathJumpP95Mm = refinedLowerTrack.pathJumpP95Mm;
+      virtualLowerSupportPath.pathJumpMaxMm = refinedLowerTrack.pathJumpMaxMm;
+      virtualLowerSupportPath.selectedReliabilitySummary = summarizeFiniteFloat32Buffer(
+        refinedLowerTrack.selectedReliabilityByCol
+      );
+      virtualLowerSupportPath.scoreGapSummary = summarizeFiniteFloat32Buffer(
+        refinedLowerTrack.scoreGapByCol
+      );
+      virtualLowerSupportPath.bestCandidateDepthSummary = summarizeFiniteFloat32Buffer(
+        refinedLowerTrack.selectedDepthMm
+      );
+      virtualLowerSupportPath.bestCandidateReliabilitySummary =
+        virtualLowerSupportPath.selectedReliabilitySummary;
+      virtualLowerSupportPath.pathStability = {
+        ...virtualLowerSupportPath.pathStability,
+        selectedReliabilityByCol: refinedLowerTrack.selectedReliabilityByCol,
+        unstableMask: refinedLowerTrack.unstableMask,
+        unreliableFraction:
+          panoWidth > 0
+            ? Array.from(refinedLowerTrack.unstableMask).reduce((sum, value) => sum + value, 0) /
+              panoWidth
+            : 0,
+        pathJumpP95Mm: refinedLowerTrack.pathJumpP95Mm,
+        pathJumpMaxMm: refinedLowerTrack.pathJumpMaxMm,
+        ambiguousFraction:
+          panoWidth > 0 ? refinedLowerTrack.ambiguousColumnCount / panoWidth : 0,
+        forcedDriftFraction: 0,
+        bestDepthDriftP50Mm: 0,
+        bestDepthDriftP95Mm: 0,
+        outsideEnvelopeFraction: 0,
+        envelopeClampFraction: 0,
+        envelopeDriftP50Mm: 0,
+        envelopeDriftP95Mm: 0,
+      };
+      virtualLowerSupportPath.supportEnvelope = {
+        ...virtualLowerSupportPath.supportEnvelope,
+        halfWidthSummary: summarizeFiniteFloat32Buffer(
+          refinedLowerTrack.envelopeHalfWidthMmByCol ?? new Float32Array(0)
+        ),
+      };
+    }
     const bandLabels = ['upperArch', 'lowerArch'] as const;
     const bandAnchorRows = [
       Math.round((topBandStartRow + topBandEndRow) * 0.5),
@@ -7459,26 +12355,112 @@ function generatePanorama(
       virtualUpperSupportPath.selectedDepthMm,
       virtualLowerSupportPath.selectedDepthMm,
     ];
-    let nonCrossingViolations = 0;
+    const approxTroughHalfWidthMm =
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSigmaMm *
+      CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographFocalSigmaScale *
+      1.75;
+    const separatedBandDepths = enforceSeparatedArchDepths({
+      upperDepths: virtualUpperSupportPath.selectedDepthMm,
+      lowerDepths: virtualLowerSupportPath.selectedDepthMm,
+      upperReliability: virtualUpperSupportPath.selectedReliabilityByCol,
+      lowerReliability: virtualLowerSupportPath.selectedReliabilityByCol,
+      approxTroughHalfWidthMm,
+      depthHalfRangeMm: virtualPanoDepthHalfRangeMm,
+    });
+    virtualUpperSupportPath.selectedDepthMm = separatedBandDepths.upperDepths;
+    virtualLowerSupportPath.selectedDepthMm = separatedBandDepths.lowerDepths;
+    bandDepthsMm[0] = separatedBandDepths.upperDepths;
+    bandDepthsMm[1] = separatedBandDepths.lowerDepths;
+    const nonCrossingViolations = separatedBandDepths.nonCrossingViolations;
 
-    for (let col = 0; col < panoWidth; col++) {
-      for (let b = 1; b < bandDepthsMm.length; b++) {
-        const prevBandDepth = Number(bandDepthsMm[b - 1][col]);
-        let currentDepth = Number(bandDepthsMm[b][col]);
-
-        // Non-crossing: band[b] should not be more than 0.5mm "past" band[b-1]
-        if (currentDepth < prevBandDepth - 0.5) {
-          nonCrossingViolations++;
-          currentDepth = prevBandDepth - 0.5;
-        }
-
-        bandDepthsMm[b][col] = currentDepth;
-      }
+    if (options?.usesPanoV2Bridge) {
+      panoV2GeometryDiagnostics = buildPanoV2GeometryDiagnostics({
+        panoWidth,
+        upperArch: {
+          label: 'upperArch',
+          anchorRow: bandAnchorRows[0],
+          selectedDepthMm: virtualUpperSupportPath.selectedDepthMm,
+          selectedReliabilityByCol: virtualUpperSupportPath.selectedReliabilityByCol,
+          scoreGapByCol: virtualUpperSupportPath.scoreGapByCol,
+          unstableMask: virtualUpperSupportPath.pathStability.unstableMask,
+          envelopeHalfWidthMmByCol: virtualUpperSupportPath.supportEnvelopeHalfWidthMmByCol,
+          ambiguousGapThreshold: 0.055,
+          lowConfidenceThreshold: 0.58,
+        },
+        lowerArch: {
+          label: 'lowerArch',
+          anchorRow: bandAnchorRows[1],
+          selectedDepthMm: virtualLowerSupportPath.selectedDepthMm,
+          selectedReliabilityByCol: virtualLowerSupportPath.selectedReliabilityByCol,
+          scoreGapByCol: virtualLowerSupportPath.scoreGapByCol,
+          unstableMask: virtualLowerSupportPath.pathStability.unstableMask,
+          envelopeHalfWidthMmByCol: virtualLowerSupportPath.supportEnvelopeHalfWidthMmByCol,
+          ambiguousGapThreshold: 0.055,
+          lowConfidenceThreshold: 0.58,
+        },
+      });
+      panoV2GeometryDiagnostics.nonCrossingColumnFraction = Math.max(
+        panoV2GeometryDiagnostics.nonCrossingColumnFraction,
+        panoWidth > 0 ? nonCrossingViolations / panoWidth : 0
+      );
+      const panoV2StraightenedVolume = buildPanoV2StraightenedVolume({
+        panoWidth,
+        panoHeight,
+        effectiveVerticalHalfMm,
+        vertStepMm,
+        rowHalfSpanMm: 12.5,
+        depthSampleCount: 9,
+        frames: Array.from({ length: panoWidth }, (_, col) => ({
+          position: frames[col].position,
+          slabDir: slabDirs[col],
+          mipSlabDir: slabDirs[col],
+          verticalDir: verticalDirs[col] || effectiveVerticalDir,
+          columnVerticalCenterOffsetMm: Number(localCenterOffsetsMm[col] ?? 0),
+        })),
+        sampleWorldIntensity: sampleWorldIntensityForVirtualPano,
+        upperArch: {
+          label: 'upperArch',
+          anchorRow: bandAnchorRows[0],
+          centerDepthMmByCol: virtualUpperSupportPath.selectedDepthMm,
+          envelopeHalfWidthMmByCol: virtualUpperSupportPath.supportEnvelopeHalfWidthMmByCol,
+        },
+        lowerArch: {
+          label: 'lowerArch',
+          anchorRow: bandAnchorRows[1],
+          centerDepthMmByCol: virtualLowerSupportPath.selectedDepthMm,
+          envelopeHalfWidthMmByCol: virtualLowerSupportPath.supportEnvelopeHalfWidthMmByCol,
+        },
+      });
+      panoV2VolumeDiagnostics = buildPanoV2StraightenedVolumeDiagnostics(
+        panoV2StraightenedVolume
+      );
+      const panoV2LayerRenderResult = buildPanoV2LayerRenderResult(panoV2StraightenedVolume);
+      const panoV2FullPlaneLayerImages = buildPanoV2FullPlaneLayerImages({
+        result: panoV2LayerRenderResult,
+        panoWidth,
+        panoHeight,
+      });
+      panoV2LayerDiagnostics = toPanoV2LayerRenderDiagnostics(panoV2LayerRenderResult);
+      const panoV2FusionResult = buildPanoV2FusionResult({
+        panoWidth,
+        panoHeight,
+        layerRender: panoV2LayerRenderResult,
+        fullPlaneLayerImages: panoV2FullPlaneLayerImages,
+      });
+      panoV2FusionDiagnostics = panoV2FusionResult.diagnostics;
+      panoV2FusionPixelData = panoV2FusionResult.pixelData;
+      finalDebugMaps = {
+        panoV2FusionImageMap: new Float32Array(panoV2FusionResult.pixelData),
+        panoV2UpperLayer1Map: panoV2FullPlaneLayerImages.upperArch[0],
+        panoV2UpperLayer2Map: panoV2FullPlaneLayerImages.upperArch[1],
+        panoV2UpperLayer3Map: panoV2FullPlaneLayerImages.upperArch[2],
+        panoV2LowerLayer1Map: panoV2FullPlaneLayerImages.lowerArch[0],
+        panoV2LowerLayer2Map: panoV2FullPlaneLayerImages.lowerArch[1],
+        panoV2LowerLayer3Map: panoV2FullPlaneLayerImages.lowerArch[2],
+      };
     }
 
-    // Preserve raw inter-band geometry; do not smooth the band paths after solving.
-
-    const virtualMergedDepthMm = new Float32Array(panoWidth);
+    virtualMergedDepthMm = new Float32Array(panoWidth);
     for (let col = 0; col < panoWidth; col++) {
       virtualMergedDepthMm[col] =
         0.5 *
@@ -7520,15 +12502,18 @@ function generatePanorama(
       }
     }
     const interBandDeltaMeanMm =
-      interBandDeltaCount > 0 ? interBandDeltaSum / interBandDeltaCount : 0;
-    const mergedSelectedReliabilitySummary = summarizeFiniteFloat32Buffer(
-      new Float32Array(
-        Array.from({ length: panoWidth }, (_, col) =>
-          0.5 *
-          (Number(virtualUpperSupportPath.selectedReliabilityByCol[col]) +
-            Number(virtualLowerSupportPath.selectedReliabilityByCol[col]))
-        )
+      interBandDeltaCount > 0
+        ? interBandDeltaSum / interBandDeltaCount
+        : separatedBandDepths.interBandDeltaMeanMm;
+    virtualMergedSelectedReliabilityByCol = new Float32Array(
+      Array.from({ length: panoWidth }, (_, col) =>
+        0.5 *
+        (Number(virtualUpperSupportPath.selectedReliabilityByCol[col]) +
+          Number(virtualLowerSupportPath.selectedReliabilityByCol[col]))
       )
+    );
+    const mergedSelectedReliabilitySummary = summarizeFiniteFloat32Buffer(
+      virtualMergedSelectedReliabilityByCol
     );
     const mergedBestCandidateReliabilitySummary = summarizeFiniteFloat32Buffer(
       new Float32Array(
@@ -7540,16 +12525,15 @@ function generatePanorama(
       )
     );
     const mergedBestCandidateDepthSummary = summarizeFiniteFloat32Buffer(virtualMergedDepthMm);
-    const mergedScoreGapSummary = summarizeFiniteFloat32Buffer(
-      new Float32Array(
-        Array.from({ length: panoWidth }, (_, col) =>
-          Math.min(
-            Number(virtualUpperSupportPath.scoreGapByCol[col]),
-            Number(virtualLowerSupportPath.scoreGapByCol[col])
-          )
+    virtualMergedScoreGapByCol = new Float32Array(
+      Array.from({ length: panoWidth }, (_, col) =>
+        Math.min(
+          Number(virtualUpperSupportPath.scoreGapByCol[col]),
+          Number(virtualLowerSupportPath.scoreGapByCol[col])
         )
       )
     );
+    const mergedScoreGapSummary = summarizeFiniteFloat32Buffer(virtualMergedScoreGapByCol);
 
     virtualPanoPhase12Diagnostics = {
       enabled: true,
@@ -7572,8 +12556,8 @@ function generatePanorama(
         gradCapMedian: percentile(Array.from(virtualGradCapByCol), 0.5),
       },
       renderModel: {
-        preferred: 'dualArchDirectProjection',
-        supportPathFallbackAvailable: allowLegacyFallback,
+        preferred: 'rowConditionedOpticalDensityProjection',
+        directProjectionFallbackAvailable: true,
       },
       supportSurface: {
         depthMinMm: Math.min(virtualUpperSupportPath.depthMinMm, virtualLowerSupportPath.depthMinMm),
@@ -7743,60 +12727,107 @@ function generatePanorama(
     };
 
     if (enableVirtualPanoRender) {
-      const directVirtualRender = renderDualArchToothProjectionPano({
-        virtualPanoStack,
-        panoWidth,
-        panoHeight,
-        planeSize: virtualPanoPlaneSize,
-        panoCenterRow,
-        adaptiveToothCenterRow,
-        centerRowByCol,
-        halfHeightByCol,
-        virtualPanoDepthOffsetsMm,
-        selectedDepthMm: virtualMergedDepthMm,
-        upperSupportDepthMm: virtualUpperSupportPath.selectedDepthMm,
-        lowerSupportDepthMm: virtualLowerSupportPath.selectedDepthMm,
-        upperSupportAnchorRow: bandAnchorRows[0],
-        lowerSupportAnchorRow: bandAnchorRows[1],
-        upperSupportReliabilityByCol: virtualUpperSupportPath.selectedReliabilityByCol,
-        lowerSupportReliabilityByCol: virtualLowerSupportPath.selectedReliabilityByCol,
-        softThresholdByCol: virtualSoftThresholdByCol,
-        hardThresholdByCol: virtualHardThresholdByCol,
-        supportTiltMmByCol: virtualSupportTiltByCol,
-        virtualPanoDepthHalfRangeMm,
-      });
-      const virtualRender = directVirtualRender;
-
-      virtualPanoRenderDiagnostics = {
-        enabled: true,
-        analysisCenterRow: adaptiveToothCenterRow,
-        rendererVariant: 'dual-arch-tooth-projection',
-        preferredRendererVariant: 'dual-arch-tooth-projection',
-        fallbackRendererVariant: null,
-        usedAsOutput: virtualRender.diagnostics.usedAsOutput,
-        supportDepthClampFraction: virtualRender.summary.supportDepthClampFraction,
-        lowerBandBrightFraction: virtualRender.summary.lowerBandBrightFraction,
-        lowerBandMean: virtualRender.summary.lowerBandMean,
-        toothBandMean: virtualRender.summary.toothBandMean,
-        toothBandContrastRange:
-          virtualRender.summary.toothBandP90 - virtualRender.summary.toothBandP10,
-        range: virtualRender.summary.range,
-        minValue: virtualRender.summary.minValue,
-        maxValue: virtualRender.summary.maxValue,
-        ...virtualRender.diagnostics,
-      };
-
-      const keepRejectedVirtualPanoOutput = !virtualRender.diagnostics.usedAsOutput && !allowLegacyFallback;
-
-      if (virtualRender.diagnostics.usedAsOutput || keepRejectedVirtualPanoOutput) {
-        virtualPanoAcceptedByGate = virtualRender.diagnostics.usedAsOutput;
+      if (options?.usesPanoV2Bridge && panoV2FusionPixelData && panoV2FusionDiagnostics) {
+        const panoV2FusionRejectReasons: string[] = [];
+        if (panoV2FusionDiagnostics.ghostingRisk === 'high') {
+          panoV2FusionRejectReasons.push('pano-v2-fusion-ghosting-risk-too-high');
+        }
+        const panoV2FusionAccepted = panoV2FusionRejectReasons.length === 0;
+        virtualPanoAcceptedByGate = panoV2FusionAccepted;
         virtualPanoSelectedForOutput = true;
         selectedReconstructionMode = 'virtualPano';
-        pixelData.set(virtualRender.pixelData);
-        finalDebugMaps = virtualRender.debugMaps;
+        pixelData.set(panoV2FusionPixelData);
+        virtualPanoRenderDiagnostics = {
+          enabled: true,
+          analysisCenterRow: adaptiveToothCenterRow,
+          rendererVariant: 'pano-v2-fusion',
+          rendererFamilyName: 'pano-v2-fusion',
+          pipelineVariant: 'panoV2Fusion',
+          preferredRendererVariant: 'pano-v2-fusion',
+          renderSupportMode: 'panoV2Fusion',
+          fallbackRendererVariant: null,
+          usedAsOutput: true,
+          workerQcAccepted: panoV2FusionAccepted,
+          workerQcStage: 'fusion',
+          rejectReasonsStage: 'fusion',
+          rejectReasons: panoV2FusionRejectReasons,
+          acceptedByLowerBandTolerance: false,
+          acceptedByToothBandTolerance: false,
+          supportPathConfidenceP50:
+            (virtualPanoPhase12Diagnostics as {
+              supportSurface?: { selectedReliabilityP50?: unknown };
+            }).supportSurface?.selectedReliabilityP50 ?? null,
+          supportDepthClampFraction:
+            (virtualPanoPhase12Diagnostics as {
+              supportSurface?: { supportDepthClampFraction?: unknown };
+            }).supportSurface?.supportDepthClampFraction ?? 0,
+          outputCoverageFraction: panoV2FusionDiagnostics.outputCoverageFraction,
+          overlapFraction: panoV2FusionDiagnostics.overlapFraction,
+          ghostingRisk: panoV2FusionDiagnostics.ghostingRisk,
+          renderBypass: panoV2FusionDiagnostics.renderBypass,
+          normalizationHuWindow: panoV2FusionDiagnostics.normalizationHuWindow,
+          outputRange: panoV2FusionDiagnostics.outputRange,
+        };
         const virtualRange = computeArrayMinMax(pixelData);
         minValue = virtualRange.minValue;
         maxValue = virtualRange.maxValue;
+      } else {
+        const supportPathVirtualRender = renderVirtualPanoramicRadiograph({
+          virtualPanoStack,
+          panoWidth,
+          panoHeight,
+          planeSize: virtualPanoPlaneSize,
+          panoCenterRow,
+          virtualPanoDepthOffsetsMm,
+          selectedDepthMm: virtualMergedDepthMm,
+          upperSupportDepthMm: virtualUpperSupportPath.selectedDepthMm,
+          lowerSupportDepthMm: virtualLowerSupportPath.selectedDepthMm,
+          upperSupportAnchorRow: bandAnchorRows[0],
+          lowerSupportAnchorRow: bandAnchorRows[1],
+          upperSupportReliabilityByCol: virtualUpperSupportPath.selectedReliabilityByCol,
+          lowerSupportReliabilityByCol: virtualLowerSupportPath.selectedReliabilityByCol,
+          supportScoreGapByCol: virtualMergedScoreGapByCol,
+          upperSupportScoreGapByCol: virtualUpperSupportPath.scoreGapByCol,
+          lowerSupportScoreGapByCol: virtualLowerSupportPath.scoreGapByCol,
+          softThresholdByCol: virtualSoftThresholdByCol,
+          hardThresholdByCol: virtualHardThresholdByCol,
+          supportTiltMmByCol: virtualSupportTiltByCol,
+          virtualPanoDepthHalfRangeMm,
+        });
+        const virtualRender = supportPathVirtualRender;
+
+        virtualPanoRenderDiagnostics = {
+          enabled: true,
+          analysisCenterRow: adaptiveToothCenterRow,
+          rendererVariant: 'virtual-panoramic-radiograph',
+          preferredRendererVariant: 'virtual-panoramic-radiograph',
+          fallbackRendererVariant: null,
+          usedAsOutput: virtualRender.diagnostics.usedAsOutput,
+          supportDepthClampFraction: virtualRender.summary.supportDepthClampFraction,
+          lowerBandBrightFraction: virtualRender.summary.lowerBandBrightFraction,
+          lowerBandMean: virtualRender.summary.lowerBandMean,
+          toothBandMean: virtualRender.summary.toothBandMean,
+          toothBandContrastRange:
+            virtualRender.summary.toothBandP90 - virtualRender.summary.toothBandP10,
+          range: virtualRender.summary.range,
+          minValue: virtualRender.summary.minValue,
+          maxValue: virtualRender.summary.maxValue,
+          ...virtualRender.diagnostics,
+        };
+
+        const keepRejectedVirtualPanoOutput =
+          !virtualRender.diagnostics.usedAsOutput && !allowLegacyFallback;
+
+        if (virtualRender.diagnostics.usedAsOutput || keepRejectedVirtualPanoOutput) {
+          virtualPanoAcceptedByGate = virtualRender.diagnostics.usedAsOutput;
+          virtualPanoSelectedForOutput = true;
+          selectedReconstructionMode = 'virtualPano';
+          pixelData.set(virtualRender.pixelData);
+          finalDebugMaps = virtualRender.debugMaps;
+          const virtualRange = computeArrayMinMax(pixelData);
+          minValue = virtualRange.minValue;
+          maxValue = virtualRange.maxValue;
+        }
       }
     }
   } else {
@@ -7814,16 +12845,24 @@ function generatePanorama(
   }).rendererVariant;
   const shouldSkipDualArchPostDenoise =
     activeDualArchRendererVariant === 'dual-arch-tooth-projection' ||
-    activeDualArchRendererVariant === 'arch-guided-dual-layer';
-  // The direct dual-arch path still needs lower-band cleanup; keep this suppression on.
-  const shouldApplyAdaptiveBackgroundSuppression = true;
+    activeDualArchRendererVariant === 'arch-guided-dual-layer' ||
+    activeDualArchRendererVariant === 'support-path-virtual-pano' ||
+    activeDualArchRendererVariant === 'virtual-panoramic-radiograph' ||
+    activeDualArchRendererVariant === 'pano-v2-fusion';
+  const shouldApplyAdaptiveBackgroundSuppression =
+    activeDualArchRendererVariant !== 'virtual-panoramic-radiograph' &&
+    activeDualArchRendererVariant !== 'pano-v2-fusion';
   const backgroundSuppressionResult = shouldApplyAdaptiveBackgroundSuppression
     ? suppressLowerBackground(
         pixelData,
         panoWidth,
         panoHeight,
         vertStepMm,
-        lowerArchAnchorRowForBackgroundSuppression
+        lowerArchAnchorRowForBackgroundSuppression,
+        typeof virtualMergedScoreGapByCol !== 'undefined' ? virtualMergedScoreGapByCol : undefined,
+        typeof virtualMergedSelectedReliabilityByCol !== 'undefined'
+          ? virtualMergedSelectedReliabilityByCol
+          : undefined
       )
     : {
         suppressionWeights: new Float32Array(pixelData.length),
@@ -7883,8 +12922,102 @@ function generatePanorama(
   const finalRange = computeArrayMinMax(pixelData);
   minValue = finalRange.minValue;
   maxValue = finalRange.maxValue;
-  const windowWidth = maxValue - minValue;
-  const windowCenter = minValue + windowWidth / 2;
+  if (
+    activeDualArchRendererVariant === 'virtual-panoramic-radiograph' &&
+    virtualMergedDepthMm &&
+    typeof virtualPanoDepthHalfRangeMm === 'number' &&
+    finalDebugMaps?.selectedSupportHypothesisMap &&
+    finalDebugMaps?.focalTroughSharpnessMap &&
+    finalDebugMaps?.outOfTroughSuppressionMap &&
+    finalDebugMaps?.rawProjectedAttenuationMap
+  ) {
+    const backgroundAttenuationMap =
+      finalDebugMaps.contextHuMap ?? finalDebugMaps.rawProjectedAttenuationMap;
+    const finalDisplayStage = computeVirtualPanoramicRadiographStageMetrics({
+      stage: 'finalDisplay',
+      pixelData,
+      panoWidth,
+      panoHeight,
+      panoCenterRow,
+      upperSupportAnchorRow:
+        (virtualPanoPhase12Diagnostics as { supportModel?: { bands?: Array<{ anchorRow?: number }> } })
+          .supportModel?.bands?.[0]?.anchorRow,
+      lowerSupportAnchorRow:
+        (virtualPanoPhase12Diagnostics as { supportModel?: { bands?: Array<{ anchorRow?: number }> } })
+          .supportModel?.bands?.[1]?.anchorRow,
+      selectedDepthMm: virtualMergedDepthMm,
+      virtualPanoDepthHalfRangeMm,
+      selectedSupportHypothesisMap: finalDebugMaps.selectedSupportHypothesisMap,
+      focalTroughSharpnessMap: finalDebugMaps.focalTroughSharpnessMap,
+      outOfTroughSuppressionMap: finalDebugMaps.outOfTroughSuppressionMap,
+      rawProjectedAttenuationMap: finalDebugMaps.rawProjectedAttenuationMap,
+      backgroundAttenuationMap,
+      preNormalizeCompositeOdMap:
+        finalDebugMaps.preNormalizeCompositeOdMap ?? finalDebugMaps.rawProjectedAttenuationMap,
+      postNormalizeDisplayMap:
+        finalDebugMaps.postNormalizeDisplayMap ?? finalDebugMaps.rawProjectedAttenuationMap,
+      finalCompositeDisplayMap:
+        finalDebugMaps.finalCompositeDisplayMap ??
+        finalDebugMaps.postNormalizeDisplayMap ??
+        finalDebugMaps.rawProjectedAttenuationMap,
+      backgroundPresentationMap:
+        finalDebugMaps.backgroundPresentationMap ?? finalDebugMaps.rawProjectedAttenuationMap,
+      contextContributionMap:
+        finalDebugMaps.contextContributionMap ?? finalDebugMaps.rawProjectedAttenuationMap,
+      backgroundFillContributionMap:
+        finalDebugMaps.backgroundFillContributionMap ?? finalDebugMaps.rawProjectedAttenuationMap,
+      outputHuFloor: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuFloor,
+      outputHuCeiling: CPU_VIRTUAL_PANO_MODEL_PARAMS.radiographOutputHuCeiling,
+    });
+    const finalDisplayDecision =
+      evaluateVirtualPanoramicRadiographStageQuality(finalDisplayStage);
+    virtualPanoAcceptedByGate = finalDisplayDecision.usedAsOutput;
+    Object.assign(virtualPanoRenderDiagnostics, {
+      usedAsOutput: finalDisplayDecision.usedAsOutput,
+      workerQcAccepted: finalDisplayDecision.usedAsOutput,
+      workerQcStage: 'finalDisplay',
+      rejectReasonsStage: 'finalDisplay',
+      rejectReasons: finalDisplayDecision.rejectReasons,
+      acceptedByLowerBandTolerance: finalDisplayDecision.acceptedByLowerBandTolerance,
+      acceptedByToothBandTolerance: finalDisplayDecision.acceptedByToothBandTolerance,
+      lowerBandBrightFraction: finalDisplayStage.lowerBandBrightFraction,
+      lowerBandMean: finalDisplayStage.lowerBandMean,
+      toothBandMean: finalDisplayStage.toothBandMean,
+      toothBandContrastRange: finalDisplayStage.toothBandContrastRange,
+      finalDisplayStage,
+      localizedReadout: finalDisplayStage.localizedReadout,
+    });
+  }
+  let windowWidth = maxValue - minValue;
+  let windowCenter = minValue + windowWidth / 2;
+  if (
+    activeDualArchRendererVariant === 'pano-v2-fusion' &&
+    (virtualPanoRenderDiagnostics as { renderBypass?: unknown }).renderBypass === true
+  ) {
+    windowWidth = 3500;
+    windowCenter = 700;
+  } else if (activeDualArchRendererVariant === 'virtual-panoramic-radiograph') {
+    const radiographWindowSamples: number[] = [];
+    const sampleStep = Math.max(1, Math.floor(pixelData.length / 20000));
+    for (let index = 0; index < pixelData.length; index += sampleStep) {
+      const value = Number(pixelData[index]);
+      if (Number.isFinite(value) && value > 0) {
+        radiographWindowSamples.push(value);
+      }
+    }
+    if (radiographWindowSamples.length >= 32) {
+      const lower = percentile(radiographWindowSamples, 0.02);
+      const upper = percentile(radiographWindowSamples, 0.98);
+      if (Number.isFinite(lower) && Number.isFinite(upper) && upper > lower) {
+        windowWidth = Math.max(1, Math.min(2600, upper - lower));
+        windowCenter = lower + windowWidth / 2;
+      }
+    } else {
+      const autoWindow = computeAutoDisplayWindow(pixelData);
+      windowWidth = autoWindow.windowWidth;
+      windowCenter = autoWindow.windowCenter;
+    }
+  }
   const virtualPanoRejectReasons = Array.isArray(
     (virtualPanoRenderDiagnostics as { rejectReasons?: unknown }).rejectReasons
   )
@@ -7895,6 +13028,15 @@ function generatePanorama(
   const acceptedByLowerBandTolerance =
     (virtualPanoRenderDiagnostics as { acceptedByLowerBandTolerance?: unknown })
       .acceptedByLowerBandTolerance === true;
+  const acceptedByToothBandTolerance =
+    (virtualPanoRenderDiagnostics as { acceptedByToothBandTolerance?: unknown })
+      .acceptedByToothBandTolerance === true;
+  const workerQcStage =
+    ((virtualPanoRenderDiagnostics as { workerQcStage?: unknown }).workerQcStage as
+      | 'postSuppression'
+      | 'finalDisplay'
+      | 'fusion'
+      | undefined) ?? 'postSuppression';
   const virtualPanoAttempted = enableVirtualPanoRender;
   const virtualPanoRejected = virtualPanoAttempted && !virtualPanoAcceptedByGate;
   const gpuFallbackCause = options?.gpuFallbackCause ?? null;
@@ -7935,7 +13077,11 @@ function generatePanorama(
     virtualPanoAccepted: virtualPanoAcceptedByGate,
     virtualPanoRejected,
     virtualPanoSelectedForOutput,
+    workerBranchSelected: virtualPanoSelectedForOutput,
+    workerQcAccepted: virtualPanoAcceptedByGate,
+    workerQcStage,
     acceptedByLowerBandTolerance,
+    acceptedByToothBandTolerance,
     legacyFallbackAllowed: allowLegacyFallback,
     rejectReasons: virtualPanoRejectReasons,
     fallbackReason,
@@ -7976,7 +13122,9 @@ function generatePanorama(
         : 'cpu-direct';
   const rendererFamily =
     selectedReconstructionMode === 'virtualPano'
-      ? 'true-virtual-pano'
+      ? activeDualArchRendererVariant === 'virtual-panoramic-radiograph'
+        ? 'virtual-panoramic-radiograph'
+        : 'true-virtual-pano'
       : 'cpu-legacy-panorama';
   const diagnosticPayload = {
     renderBackend: 'cpu',
@@ -8079,7 +13227,11 @@ function generatePanorama(
       reduction: shouldSkipDualArchPostDenoise
         ? activeDualArchRendererVariant === 'arch-guided-dual-layer'
           ? 'arch-guided-dual-layer'
-          : 'dual-arch-direct-weighted-high-band'
+          : activeDualArchRendererVariant === 'support-path-virtual-pano'
+            ? 'support-path-trough-weighted'
+            : activeDualArchRendererVariant === 'pano-v2-fusion'
+              ? 'pano-v2-fusion'
+            : 'dual-arch-direct-weighted-high-band'
         : isMeanAggregation
           ? 'winsorized-weighted-mean'
           : 'weighted-high-band-mean',
@@ -8105,6 +13257,10 @@ function generatePanorama(
       windowWidth,
       windowCenter,
     },
+    panoV2Geometry: panoV2GeometryDiagnostics,
+    panoV2Volume: panoV2VolumeDiagnostics,
+    panoV2Layers: panoV2LayerDiagnostics,
+    panoV2Fusion: panoV2FusionDiagnostics,
     virtualPanoPhase12: virtualPanoPhase12Diagnostics,
     virtualPanoRender: virtualPanoRenderDiagnostics,
     backgroundSuppressionMode: shouldApplyAdaptiveBackgroundSuppression
@@ -8133,6 +13289,16 @@ function generatePanorama(
     fallbackReason,
     legacyFallbackAllowed: allowLegacyFallback,
   };
+  const panoV2LogContext =
+    options?.usesPanoV2Bridge
+      ? {
+          ...cpuLogContext,
+          requestedReconstructionMode: 'virtualPanoV2',
+          reconstructionMode: 'virtualPanoV2',
+          candidateReconstructionMode: 'virtualPanoV2',
+          pipelineMode: 'virtualPanoV2',
+        }
+      : cpuLogContext;
   console.log(
     '[CPR-SUPPORT-SURFACE-JSON]',
     JSON.stringify(
@@ -8149,6 +13315,62 @@ function generatePanorama(
         }
     )
   );
+  if (panoV2GeometryDiagnostics) {
+    console.log(
+      '[CPR-PANOV2-GEOMETRY-JSON]',
+      JSON.stringify({
+        ...panoV2LogContext,
+        ...panoV2GeometryDiagnostics,
+      })
+    );
+  }
+  if (panoV2VolumeDiagnostics) {
+    console.log(
+      '[CPR-PANOV2-VOLUME-JSON]',
+      JSON.stringify({
+        ...panoV2LogContext,
+        ...panoV2VolumeDiagnostics,
+      })
+    );
+  }
+  if (panoV2LayerDiagnostics) {
+    console.log(
+      '[CPR-PANOV2-LAYERS-JSON]',
+      JSON.stringify({
+        ...panoV2LogContext,
+        ...panoV2LayerDiagnostics,
+      })
+    );
+    console.log(
+      '[CPR-PANOV2-MIP-JSON]',
+      JSON.stringify({
+        ...panoV2LogContext,
+        phase: panoV2LayerDiagnostics.phase,
+        model: 'thick-slab-mip-render',
+        ...panoV2LayerDiagnostics.mip,
+      })
+    );
+  }
+  if (panoV2FusionDiagnostics) {
+    console.log(
+      '[CPR-PANOV2-FUSION-JSON]',
+      JSON.stringify({
+        ...panoV2LogContext,
+        ...panoV2FusionDiagnostics,
+      })
+    );
+    console.log(
+      '[CPR-PANOV2-FUSION-COVERAGE-JSON]',
+      JSON.stringify({
+        ...panoV2LogContext,
+        phase: panoV2FusionDiagnostics.phase,
+        model: panoV2FusionDiagnostics.model,
+        implementationVersion: panoV2FusionDiagnostics.implementationVersion,
+        gapCenterRow: panoV2FusionDiagnostics.gapCenterRow,
+        rowCoverageByRow: panoV2FusionDiagnostics.rowCoverageByRow,
+      })
+    );
+  }
   console.log(
     '[CPR-DRR-JSON]',
     JSON.stringify(
@@ -8194,7 +13416,14 @@ function generatePanorama(
           .map(([name]) => name)
         : [],
       attachedByteLength: finalDebugMaps
-        ? (finalDebugMaps.rawSupportDepthMap?.byteLength ?? 0) +
+        ? (finalDebugMaps.panoV2FusionImageMap?.byteLength ?? 0) +
+        (finalDebugMaps.panoV2UpperLayer1Map?.byteLength ?? 0) +
+        (finalDebugMaps.panoV2UpperLayer2Map?.byteLength ?? 0) +
+        (finalDebugMaps.panoV2UpperLayer3Map?.byteLength ?? 0) +
+        (finalDebugMaps.panoV2LowerLayer1Map?.byteLength ?? 0) +
+        (finalDebugMaps.panoV2LowerLayer2Map?.byteLength ?? 0) +
+        (finalDebugMaps.panoV2LowerLayer3Map?.byteLength ?? 0) +
+        (finalDebugMaps.rawSupportDepthMap?.byteLength ?? 0) +
         (finalDebugMaps.rawSupportConfidenceMap?.byteLength ?? 0) +
         (finalDebugMaps.rawSupportSpreadMap?.byteLength ?? 0) +
         (finalDebugMaps.rawSupportDensityMap?.byteLength ?? 0) +
@@ -8240,6 +13469,9 @@ function generatePanorama(
         (finalDebugMaps.supportSpreadMap?.byteLength ?? 0) +
         (finalDebugMaps.supportDensityMap?.byteLength ?? 0) +
         (finalDebugMaps.totalAttenuationMap?.byteLength ?? 0) +
+        (finalDebugMaps.rawProjectedAttenuationMap?.byteLength ?? 0) +
+        (finalDebugMaps.upperProjectedAttenuationMap?.byteLength ?? 0) +
+        (finalDebugMaps.lowerProjectedAttenuationMap?.byteLength ?? 0) +
         (finalDebugMaps.fogAttenuationMap?.byteLength ?? 0) +
         (finalDebugMaps.lowerPenaltyMap?.byteLength ?? 0) +
         (finalDebugMaps.participatingSampleCountMap?.byteLength ?? 0) +
@@ -8311,6 +13543,8 @@ function buildRenderInput(
     highBit: cached.highBit,
     pixelRepresentation: cached.pixelRepresentation,
     isPreScaled: cached.isPreScaled,
+    observedRawMin: cached.observedRawMin,
+    observedRawMax: cached.observedRawMax,
     verticalDir: render.verticalDir,
     frames: render.frames,
     panoWidth: render.panoWidth,
@@ -8421,7 +13655,9 @@ self.addEventListener('unhandledrejection', event => {
   emitWorkerLifecycle('worker-unhandled-rejection-event', reason);
 });
 
-emitWorkerLifecycle('worker-implementation-script-loaded');
+emitWorkerLifecycle('worker-implementation-script-loaded', {
+  implementationVersion: CPR_WORKER_IMPLEMENTATION_VERSION,
+});
 
 // eslint-disable-next-line no-restricted-globals
 self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
@@ -8464,6 +13700,7 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
       emitWorkerLifecycle('init-volume-received', {
         requestId,
         sessionKey: input.sessionKey,
+        implementationVersion: CPR_WORKER_IMPLEMENTATION_VERSION,
         scalarType:
           input.scalarData && input.scalarData.constructor
             ? input.scalarData.constructor.name
@@ -8518,6 +13755,8 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
             ? policy.safePixelRepresentation
             : input.pixelRepresentation,
         isPreScaled: policy.effectiveIsPreScaled,
+        observedRawMin: policy.observedRawMin,
+        observedRawMax: policy.observedRawMax,
         storedValueNormalizationApplied: policy.shouldNormalizeStoredValues,
         unsignedPackedArtifactDetected: policy.unsignedPackedArtifactDetected,
         normalizationSignature: policy.normalizationSignature,
@@ -8527,6 +13766,7 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
         type: 'INIT_SUCCESS',
         requestId,
         sessionKey: input.sessionKey,
+        implementationVersion: CPR_WORKER_IMPLEMENTATION_VERSION,
       };
       postWorkerMessage(initResponse);
       emitWorkerLifecycle('init-success-sent', {
@@ -8554,7 +13794,9 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
       throw new Error('Received empty frames array.');
     }
     const renderBackend = renderInput.renderBackend === 'cpu' ? 'cpu' : 'gpu';
-    const requestedReconstructionMode = resolveReconstructionMode(renderInput.reconstructionMode);
+    const workerRouteDecision = resolvePanoV2WorkerRoute(renderInput.reconstructionMode);
+    const requestedReconstructionMode = workerRouteDecision.requestedReconstructionMode;
+    const delegatedReconstructionMode = workerRouteDecision.delegatedReconstructionMode;
     type OptionalGpuDiagnosticMaps = {
       meanMap?: Float32Array;
       maxMap?: Float32Array;
@@ -8580,7 +13822,20 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
         OptionalGpuDiagnosticMaps)
       | undefined;
 
-    if (shouldRouteRequestedReconstructionToTrueVirtualPano(renderInput)) {
+    if (
+      shouldRouteRequestedReconstructionToTrueVirtualPano({
+        renderBackend,
+        reconstructionMode: delegatedReconstructionMode,
+      })
+    ) {
+      const baseRendererFamily =
+        delegatedReconstructionMode === 'virtualPano'
+          ? 'true-virtual-pano'
+          : 'virtual-pano-phase1-analysis';
+      const baseRouteReason =
+        delegatedReconstructionMode === 'virtualPano'
+          ? 'gpu-request-routed-to-true-virtual-pano-renderer'
+          : 'gpu-request-routed-to-virtual-pano-phase1-analysis';
       logWorkerRouteDecision({
         runId: renderInput.debugRunId ?? null,
         attemptLabel: renderInput.attemptLabel ?? null,
@@ -8588,15 +13843,22 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
         requestedBackend: renderBackend,
         requestedReconstructionMode,
         actualRendererBackend: 'cpu',
-        actualRendererFamily:
-          requestedReconstructionMode === 'virtualPano'
-            ? 'true-virtual-pano'
-            : 'virtual-pano-phase1-analysis',
-        routeReason: 'gpu-request-routed-to-true-virtual-pano-renderer',
+        actualRendererFamily: getPanoV2WorkerRendererFamily(
+          baseRendererFamily,
+          workerRouteDecision
+        ),
+        routeReason: getPanoV2WorkerRouteReason(baseRouteReason, workerRouteDecision),
       });
-      renderResult = generatePanorama(renderInput, {
-        requestedReconstructionMode,
-      });
+      renderResult = generatePanorama(
+        {
+          ...renderInput,
+          reconstructionMode: delegatedReconstructionMode,
+        },
+        {
+          requestedReconstructionMode: delegatedReconstructionMode,
+          usesPanoV2Bridge: workerRouteDecision.usesPanoV2Bridge,
+        }
+      );
     } else if (renderBackend === 'gpu') {
       logWorkerRouteDecision({
         runId: renderInput.debugRunId ?? null,
@@ -8605,8 +13867,14 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
         requestedBackend: renderBackend,
         requestedReconstructionMode,
         actualRendererBackend: 'gpu',
-        actualRendererFamily: 'legacy-gpu-panorama',
-        routeReason: 'gpu-legacy-direct-render',
+        actualRendererFamily: getPanoV2WorkerRendererFamily(
+          'legacy-gpu-panorama',
+          workerRouteDecision
+        ),
+        routeReason: getPanoV2WorkerRouteReason(
+          'gpu-legacy-direct-render',
+          workerRouteDecision
+        ),
       });
       let lastGpuError: unknown = null;
       let gpuFallbackCause: 'gpu-render-failed' | 'gpu-phase2-gate-failed' | null = null;
@@ -8668,8 +13936,14 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
           requestedBackend: renderBackend,
           requestedReconstructionMode,
           actualRendererBackend: 'cpu',
-          actualRendererFamily: 'true-virtual-pano',
-          routeReason: 'gpu-fallback-to-true-virtual-pano-renderer',
+          actualRendererFamily: getPanoV2WorkerRendererFamily(
+            'true-virtual-pano',
+            workerRouteDecision
+          ),
+          routeReason: getPanoV2WorkerRouteReason(
+            'gpu-fallback-to-true-virtual-pano-renderer',
+            workerRouteDecision
+          ),
           gpuFallbackCause,
         });
         console.log(
@@ -8694,12 +13968,25 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
             reconstructionMode: cpuFallbackReconstructionMode,
           },
           {
-            requestedReconstructionMode,
+            requestedReconstructionMode: cpuFallbackReconstructionMode,
             gpuFallbackCause,
+            usesPanoV2Bridge: workerRouteDecision.usesPanoV2Bridge,
           }
         );
       }
     } else {
+      const baseRendererFamily =
+        delegatedReconstructionMode === 'virtualPano'
+          ? 'true-virtual-pano'
+          : delegatedReconstructionMode === 'virtualPanoPhase1'
+            ? 'virtual-pano-phase1-analysis'
+            : 'cpu-legacy-panorama';
+      const baseRouteReason =
+        delegatedReconstructionMode === 'legacy'
+          ? 'cpu-direct-legacy-render'
+          : delegatedReconstructionMode === 'virtualPanoPhase1'
+            ? 'cpu-direct-virtual-pano-phase1-analysis'
+            : 'cpu-direct-true-virtual-pano-render';
       logWorkerRouteDecision({
         runId: renderInput.debugRunId ?? null,
         attemptLabel: renderInput.attemptLabel ?? null,
@@ -8707,37 +13994,38 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
         requestedBackend: renderBackend,
         requestedReconstructionMode,
         actualRendererBackend: 'cpu',
-        actualRendererFamily:
-          requestedReconstructionMode === 'virtualPano'
-            ? 'true-virtual-pano'
-            : requestedReconstructionMode === 'virtualPanoPhase1'
-              ? 'virtual-pano-phase1-analysis'
-              : 'cpu-legacy-panorama',
-        routeReason:
-          requestedReconstructionMode === 'legacy'
-            ? 'cpu-direct-legacy-render'
-            : 'cpu-direct-true-virtual-pano-render',
+        actualRendererFamily: getPanoV2WorkerRendererFamily(
+          baseRendererFamily,
+          workerRouteDecision
+        ),
+        routeReason: getPanoV2WorkerRouteReason(baseRouteReason, workerRouteDecision),
       });
-      renderResult = generatePanorama(renderInput);
+      renderResult = generatePanorama({
+        ...renderInput,
+        reconstructionMode: delegatedReconstructionMode,
+      }, {
+        usesPanoV2Bridge: workerRouteDecision.usesPanoV2Bridge,
+      });
     }
 
-    const {
-      pixelData,
-      meanMap,
-      maxMap,
-      sampleCountMap,
-      debugMaps,
-      minValue,
-      maxValue,
-      windowWidth,
-      windowCenter,
-      modalityLutApplied,
-      requestedModalityLutApplied,
-      storedValueNormalizationApplied,
-      unsignedPackedArtifactDetected,
-      diagnosticPayload,
-      outputSignature,
-    } = renderResult;
+    const pixelData = renderResult.pixelData;
+    const meanMap = renderResult.meanMap;
+    const maxMap = renderResult.maxMap;
+    const sampleCountMap = renderResult.sampleCountMap;
+    const debugMaps = renderResult.debugMaps;
+    const minValue = renderResult.minValue;
+    const maxValue = renderResult.maxValue;
+    const windowWidth = renderResult.windowWidth;
+    const windowCenter = renderResult.windowCenter;
+    const modalityLutApplied = renderResult.modalityLutApplied;
+    const requestedModalityLutApplied = renderResult.requestedModalityLutApplied;
+    const storedValueNormalizationApplied = renderResult.storedValueNormalizationApplied;
+    const unsignedPackedArtifactDetected = renderResult.unsignedPackedArtifactDetected;
+    const diagnosticPayload = applyPanoV2WorkerRouteDiagnostic(
+      renderResult.diagnosticPayload,
+      workerRouteDecision
+    );
+    const outputSignature = renderResult.outputSignature;
     const storedValueNormalizationAppliedForOutput =
       !!cachedVolumeState?.storedValueNormalizationApplied || storedValueNormalizationApplied;
     const unsignedPackedArtifactDetectedForOutput =
@@ -8787,6 +14075,38 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
     pushTransferBuffer(meanMap);
     pushTransferBuffer(maxMap);
     pushTransferBuffer(sampleCountMap);
+    pushTransferBuffer(debugMaps?.renderBranchMap);
+    pushTransferBuffer(debugMaps?.panoV2FusionImageMap);
+    pushTransferBuffer(debugMaps?.panoV2UpperLayer1Map);
+    pushTransferBuffer(debugMaps?.panoV2UpperLayer2Map);
+    pushTransferBuffer(debugMaps?.panoV2UpperLayer3Map);
+    pushTransferBuffer(debugMaps?.panoV2LowerLayer1Map);
+    pushTransferBuffer(debugMaps?.panoV2LowerLayer2Map);
+    pushTransferBuffer(debugMaps?.panoV2LowerLayer3Map);
+    pushTransferBuffer(debugMaps?.selectedSupportHypothesisMap);
+    pushTransferBuffer(debugMaps?.focalTroughSharpnessMap);
+    pushTransferBuffer(debugMaps?.outOfTroughSuppressionMap);
+    pushTransferBuffer(debugMaps?.rawProjectedAttenuationMap);
+    pushTransferBuffer(debugMaps?.upperProjectedAttenuationMap);
+    pushTransferBuffer(debugMaps?.lowerProjectedAttenuationMap);
+    pushTransferBuffer(debugMaps?.upperBandRawOdMap);
+    pushTransferBuffer(debugMaps?.lowerBandRawOdMap);
+    pushTransferBuffer(debugMaps?.gapBandRawOdMap);
+    pushTransferBuffer(debugMaps?.outsideRowsRawOdMap);
+    pushTransferBuffer(debugMaps?.displayBackgroundOdMap);
+    pushTransferBuffer(debugMaps?.bandMaskUpperMap);
+    pushTransferBuffer(debugMaps?.bandMaskGapMap);
+    pushTransferBuffer(debugMaps?.bandMaskLowerMap);
+    pushTransferBuffer(debugMaps?.bandMaskOutsideMap);
+    pushTransferBuffer(debugMaps?.normalizationEligibleMaskMap);
+    pushTransferBuffer(debugMaps?.preNormalizeCompositeOdMap);
+    pushTransferBuffer(debugMaps?.postNormalizeDisplayMap);
+    pushTransferBuffer(debugMaps?.displayAnatomyMap);
+    pushTransferBuffer(debugMaps?.backgroundPresentationMap);
+    pushTransferBuffer(debugMaps?.finalCompositeDisplayMap);
+    pushTransferBuffer(debugMaps?.contextContributionMap);
+    pushTransferBuffer(debugMaps?.backgroundFillContributionMap);
+    pushTransferBuffer(debugMaps?.finalDisplayImageMap);
     pushTransferBuffer(debugMaps?.rawSupportDepthMap);
     pushTransferBuffer(debugMaps?.rawSupportConfidenceMap);
     pushTransferBuffer(debugMaps?.rawSupportSpreadMap);

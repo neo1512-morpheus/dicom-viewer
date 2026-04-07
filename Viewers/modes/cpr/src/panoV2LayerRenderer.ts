@@ -3,16 +3,28 @@ import type { PanoV2StraightenedVolume, PanoV2StraightenedVolumeBand } from './p
 
 export const PANO_V2_LAYER_COUNT_PER_ARCH = 3;
 
-const LAYER_OFFSET_FACTORS = [-0.45, 0, 0.45] as const;
+const LAYER_OFFSET_FACTORS = [-0.82, 0, 0.82] as const;
 const REGION_POSTERIOR_CUTOFF = 0.22;
 const REGION_ANTERIOR_MIN = 0.35;
 const REGION_ANTERIOR_MAX = 0.65;
 const REGION_RIGHT_POSTERIOR_MIN = 0.78;
 const TOOTH_ROW_BAND_ROW_RADIUS = 18;
-const PANO_V2_MIP_SLAB_HALF_WIDTH_MM = 10;
+export const PANO_V2_MIP_SLAB_HALF_WIDTH_MM = 10;
 const PANO_V2_MIP_DEPTH_STEP_MM = 0.3;
+const PANO_V2_BYPASS_AIR_AS_MISSING_HU = -950;
 const PANO_V2_GAP_ANALYSIS_DENSE_HU_THRESHOLD = 500;
 const PANO_V2_GAP_ANALYSIS_SAMPLE_STRIDE_COLUMNS = 10;
+const PANO_V2_CROSS_ARCH_RESCUE_LOW_SIGNAL_HU = 650;
+const PANO_V2_CROSS_ARCH_RESCUE_DENSE_NEIGHBOR_HU = 1400;
+const PANO_V2_CROSS_ARCH_RESCUE_NEIGHBOR_COUNT = 4;
+const PANO_V2_CROSS_ARCH_RESCUE_MIN_HU = 1000;
+const PANO_V2_CROSS_ARCH_RESCUE_MARGIN_HU = 500;
+const PANO_V2_CROSS_ARCH_RESCUE_RATIO = 2.2;
+const PANO_V2_BYPASS_COLUMN_DENSE_HU = 900;
+const PANO_V2_BYPASS_COLUMN_STRONG_HU = 1400;
+const PANO_V2_BYPASS_COLUMN_SUPPORT_BASE_HU = 250;
+const PANO_V2_BYPASS_COLUMN_MIN_DENSE_ROWS = 2;
+const PANO_V2_BYPASS_TARGET_SMOOTHING_RADIUS = 4;
 
 interface PanoV2LayerProbeRow {
   localRow: number;
@@ -103,6 +115,7 @@ export interface PanoV2LayerRenderResult {
     depthStepMm: number;
     sampledColumnCount: number;
     mipVoiOverride: true;
+    layerRowConstraintsApplied: true;
     verticalHalfMmUsed: number;
     verticalCenterOffsetMm: number;
     slabDirectionColumn: number;
@@ -125,6 +138,7 @@ export interface PanoV2LayerRenderDiagnostics {
     depthStepMm: number;
     sampledColumnCount: number;
     mipVoiOverride: true;
+    layerRowConstraintsApplied: true;
     verticalHalfMmUsed: number;
     verticalCenterOffsetMm: number;
     slabDirectionColumn: number;
@@ -145,6 +159,8 @@ export interface PanoV2FullPlaneLayerImages {
 export interface PanoV2BypassCompositeImages {
   upperArch: Float32Array;
   lowerArch: Float32Array;
+  upperTargetOffsetMmByCol: Float32Array;
+  lowerTargetOffsetMmByCol: Float32Array;
 }
 
 export interface PanoV2GapBoundarySample {
@@ -162,6 +178,105 @@ export interface PanoV2GapBoundaryAnalysis {
   sampledColumns: PanoV2GapBoundarySample[];
 }
 
+export interface PanoV2MipRaySample {
+  localDepthOffsetMm: number;
+  sampleHu: number | null;
+}
+
+export interface PanoV2DarkPocketPoint {
+  col: number;
+  row: number;
+  finalHu: number;
+  upperBypassHu: number | null;
+  lowerBypassHu: number | null;
+  selectedSource: 'upper-arch-bypass' | 'lower-arch-bypass';
+  surroundingMedianHu: number;
+  surroundingMaxHu: number;
+  darknessScore: number;
+  upperRayWinnerHu: number | null;
+  upperRayWinnerDepthOffsetMm: number | null;
+  lowerRayWinnerHu: number | null;
+  lowerRayWinnerDepthOffsetMm: number | null;
+  upperRaySamples: PanoV2MipRaySample[];
+  lowerRaySamples: PanoV2MipRaySample[];
+}
+
+export interface PanoV2DarkPocketDiagnostics {
+  searchRegion: {
+    colStart: number;
+    colEnd: number;
+    rowStart: number;
+    rowEnd: number;
+    gapCenterRow: number;
+    upperAnchorRow: number;
+    topBorderExclusionRows: number;
+    denseBandCenterRow: number | null;
+    denseRowThresholdHu: number;
+  };
+  candidateCountBeforeSuppression: number;
+  darkestPockets: PanoV2DarkPocketPoint[];
+}
+
+export interface PanoV2GeometryRayDebugPoint {
+  col: number;
+  row: number;
+  arch: PanoV2TrackLabel;
+  splineCenterWorld: [number, number, number];
+  rowBaseWorld: [number, number, number];
+  rayStartWorld: [number, number, number];
+  rayMidWorld: [number, number, number];
+  rayEndWorld: [number, number, number];
+  slabDir: [number, number, number];
+  verticalDir: [number, number, number];
+  depthHalfRangeMm: number;
+  mipSlabHalfWidthMm: number;
+  centerDepthMm: number;
+  targetOffsetMm: number;
+  rayMidDepthMm: number;
+  rayStartDepthMm: number;
+  rayEndDepthMm: number;
+  columnVerticalCenterOffsetMm: number;
+  rowOffsetMm: number;
+  upperBypassHu: number | null;
+  lowerBypassHu: number | null;
+  rayWinnerHu: number | null;
+  rayWinnerDepthOffsetMm: number | null;
+}
+
+export interface PanoV2GeometryRayComparisonDiagnostics {
+  row: number;
+  gapCenterRow: number;
+  arch: PanoV2TrackLabel;
+  failing: PanoV2GeometryRayDebugPoint;
+  reference: PanoV2GeometryRayDebugPoint;
+  comparison: {
+    slabDirDot: number;
+    slabDirAngleDeg: number;
+    verticalDirDot: number;
+    verticalDirAngleDeg: number;
+    splineCenterDistanceMm: number;
+    rowBaseDistanceMm: number;
+    rayStartDistanceMm: number;
+    rayMidDistanceMm: number;
+    rayEndDistanceMm: number;
+    centerDepthDeltaMm: number;
+    targetOffsetDeltaMm: number;
+    rayMidDepthDeltaMm: number;
+    columnVerticalCenterOffsetDeltaMm: number;
+    rowOffsetDeltaMm: number;
+    failingWinnerNearSlabEdge: boolean;
+    referenceWinnerNearSlabEdge: boolean;
+    anomalyKind:
+      | 'vector-flip-or-rotation'
+      | 'vertical-shift-discontinuity'
+      | 'depth-center-jump'
+      | 'insufficient-depth-window'
+      | 'smooth-geometry-wrong-depth'
+      | 'no-clear-geometry-anomaly';
+    anomalyReason: string;
+  };
+}
+
 function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -172,6 +287,44 @@ function roundTo(value: number, decimals = 3): number {
   }
   const scale = 10 ** decimals;
   return Math.round(value * scale) / scale;
+}
+
+function roundVector3(value: [number, number, number]): [number, number, number] {
+  return [roundTo(value[0]), roundTo(value[1]), roundTo(value[2])];
+}
+
+function dot3(
+  left: [number, number, number],
+  right: [number, number, number]
+): number {
+  return left[0] * right[0] + left[1] * right[1] + left[2] * right[2];
+}
+
+function length3(value: [number, number, number]): number {
+  return Math.sqrt(dot3(value, value));
+}
+
+function distance3(
+  left: [number, number, number],
+  right: [number, number, number]
+): number {
+  const dx = left[0] - right[0];
+  const dy = left[1] - right[1];
+  const dz = left[2] - right[2];
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function angleBetweenUnitLikeVectorsDeg(
+  left: [number, number, number],
+  right: [number, number, number]
+): number {
+  const leftLength = length3(left);
+  const rightLength = length3(right);
+  if (!(leftLength > 1e-6 && rightLength > 1e-6)) {
+    return 0;
+  }
+  const cosine = clampNumber(dot3(left, right) / (leftLength * rightLength), -1, 1);
+  return roundTo((Math.acos(cosine) * 180) / Math.PI);
 }
 
 function percentile(values: number[], ratio: number): number {
@@ -297,12 +450,24 @@ function buildFullPlaneMipImage(params: {
   volume: PanoV2StraightenedVolume;
   centerDepthMmByCol: Float32Array;
   targetOffsetMmByCol: Float32Array;
+  rowStartInclusive: number;
+  rowEndExclusive: number;
+  outsideAssignedRangeHu?: number;
 }): Float32Array {
-  const { volume, centerDepthMmByCol, targetOffsetMmByCol } = params;
+  const {
+    volume,
+    centerDepthMmByCol,
+    targetOffsetMmByCol,
+    rowStartInclusive,
+    rowEndExclusive,
+    outsideAssignedRangeHu = 150,
+  } = params;
   const width = volume.panoWidth;
   const height = volume.panoHeight;
   const image = new Float32Array(Math.max(1, width * height));
   image.fill(Number.NaN);
+  const safeRowStartInclusive = clampNumber(Math.floor(rowStartInclusive), 0, Math.max(0, height));
+  const safeRowEndExclusive = clampNumber(Math.ceil(rowEndExclusive), 0, Math.max(0, height));
 
   for (let col = 0; col < width; col++) {
     const frame = volume.frames[col];
@@ -317,6 +482,10 @@ function buildFullPlaneMipImage(params: {
     const columnVerticalCenterOffsetMm = Number(frame.columnVerticalCenterOffsetMm ?? 0);
 
     for (let row = 0; row < height; row++) {
+      if (row < safeRowStartInclusive || row >= safeRowEndExclusive) {
+        image[row * width + col] = outsideAssignedRangeHu;
+        continue;
+      }
       const rowOffsetMm = volume.effectiveVerticalHalfMm - row * volume.vertStepMm;
       const verticalOffsetMm = columnVerticalCenterOffsetMm + rowOffsetMm;
       const bx = px + verticalOffsetMm * vertDirX;
@@ -338,13 +507,453 @@ function buildFullPlaneMipImage(params: {
           mipHu = sample;
         }
       }
-      if (Number.isFinite(mipHu)) {
+      if (Number.isFinite(mipHu) && mipHu > PANO_V2_BYPASS_AIR_AS_MISSING_HU) {
         image[row * width + col] = mipHu;
       }
     }
   }
 
   return image;
+}
+
+function samplePanoV2MipWinner(params: {
+  volume: PanoV2StraightenedVolume;
+  centerDepthMmByCol: Float32Array;
+  targetOffsetMmByCol: Float32Array;
+  col: number;
+  row: number;
+}): {
+  winnerHu: number | null;
+  winnerDepthOffsetMm: number | null;
+} {
+  const { volume, centerDepthMmByCol, targetOffsetMmByCol, col, row } = params;
+  const frame = volume.frames[col];
+  if (!frame || row < 0 || row >= volume.panoHeight) {
+    return {
+      winnerHu: null,
+      winnerDepthOffsetMm: null,
+    };
+  }
+  const [px, py, pz] = frame.position;
+  const [slabDirX, slabDirY, slabDirZ] = frame.mipSlabDir ?? frame.slabDir;
+  const [vertDirX, vertDirY, vertDirZ] = frame.verticalDir;
+  const centerDepthMm = Number(centerDepthMmByCol[col] ?? 0);
+  const targetOffsetMm = Number(targetOffsetMmByCol[col] ?? 0);
+  const columnVerticalCenterOffsetMm = Number(frame.columnVerticalCenterOffsetMm ?? 0);
+  const rowOffsetMm = volume.effectiveVerticalHalfMm - row * volume.vertStepMm;
+  const verticalOffsetMm = columnVerticalCenterOffsetMm + rowOffsetMm;
+  const bx = px + verticalOffsetMm * vertDirX;
+  const by = py + verticalOffsetMm * vertDirY;
+  const bz = pz + verticalOffsetMm * vertDirZ;
+  let winnerHu = Number.NEGATIVE_INFINITY;
+  let winnerDepthOffsetMm = Number.NaN;
+
+  for (
+    let localDepthOffsetMm = -PANO_V2_MIP_SLAB_HALF_WIDTH_MM;
+    localDepthOffsetMm <= PANO_V2_MIP_SLAB_HALF_WIDTH_MM + 1e-6;
+    localDepthOffsetMm += PANO_V2_MIP_DEPTH_STEP_MM
+  ) {
+    const localDepthMm = centerDepthMm + targetOffsetMm + localDepthOffsetMm;
+    const sample = volume.sampleWorldIntensity(
+      bx + localDepthMm * slabDirX,
+      by + localDepthMm * slabDirY,
+      bz + localDepthMm * slabDirZ
+    );
+    if (Number.isFinite(sample) && sample > winnerHu) {
+      winnerHu = sample;
+      winnerDepthOffsetMm = localDepthOffsetMm;
+    }
+  }
+
+  return {
+    winnerHu: Number.isFinite(winnerHu) ? roundTo(winnerHu) : null,
+    winnerDepthOffsetMm: Number.isFinite(winnerDepthOffsetMm) ? roundTo(winnerDepthOffsetMm) : null,
+  };
+}
+
+function samplePanoV2MipRay(params: {
+  volume: PanoV2StraightenedVolume;
+  centerDepthMmByCol: Float32Array;
+  targetOffsetMmByCol: Float32Array;
+  col: number;
+  row: number;
+}): {
+  winnerHu: number | null;
+  winnerDepthOffsetMm: number | null;
+  samples: PanoV2MipRaySample[];
+} {
+  const { volume, centerDepthMmByCol, targetOffsetMmByCol, col, row } = params;
+  const frame = volume.frames[col];
+  if (!frame || row < 0 || row >= volume.panoHeight) {
+    return {
+      winnerHu: null,
+      winnerDepthOffsetMm: null,
+      samples: [],
+    };
+  }
+  const [px, py, pz] = frame.position;
+  const [slabDirX, slabDirY, slabDirZ] = frame.mipSlabDir ?? frame.slabDir;
+  const [vertDirX, vertDirY, vertDirZ] = frame.verticalDir;
+  const centerDepthMm = Number(centerDepthMmByCol[col] ?? 0);
+  const targetOffsetMm = Number(targetOffsetMmByCol[col] ?? 0);
+  const columnVerticalCenterOffsetMm = Number(frame.columnVerticalCenterOffsetMm ?? 0);
+  const rowOffsetMm = volume.effectiveVerticalHalfMm - row * volume.vertStepMm;
+  const verticalOffsetMm = columnVerticalCenterOffsetMm + rowOffsetMm;
+  const bx = px + verticalOffsetMm * vertDirX;
+  const by = py + verticalOffsetMm * vertDirY;
+  const bz = pz + verticalOffsetMm * vertDirZ;
+  const samples: PanoV2MipRaySample[] = [];
+  let winnerHu = Number.NEGATIVE_INFINITY;
+  let winnerDepthOffsetMm = Number.NaN;
+
+  for (
+    let localDepthOffsetMm = -PANO_V2_MIP_SLAB_HALF_WIDTH_MM;
+    localDepthOffsetMm <= PANO_V2_MIP_SLAB_HALF_WIDTH_MM + 1e-6;
+    localDepthOffsetMm += PANO_V2_MIP_DEPTH_STEP_MM
+  ) {
+    const localDepthMm = centerDepthMm + targetOffsetMm + localDepthOffsetMm;
+    const sample = volume.sampleWorldIntensity(
+      bx + localDepthMm * slabDirX,
+      by + localDepthMm * slabDirY,
+      bz + localDepthMm * slabDirZ
+    );
+    const finiteSample = Number.isFinite(sample) ? Number(sample) : Number.NaN;
+    samples.push({
+      localDepthOffsetMm: roundTo(localDepthOffsetMm),
+      sampleHu: Number.isFinite(finiteSample) ? roundTo(finiteSample) : null,
+    });
+    if (Number.isFinite(finiteSample) && finiteSample > winnerHu) {
+      winnerHu = finiteSample;
+      winnerDepthOffsetMm = localDepthOffsetMm;
+    }
+  }
+
+  return {
+    winnerHu: Number.isFinite(winnerHu) ? roundTo(winnerHu) : null,
+    winnerDepthOffsetMm: Number.isFinite(winnerDepthOffsetMm) ? roundTo(winnerDepthOffsetMm) : null,
+    samples,
+  };
+}
+
+function hasDenseAssignedNeighborhood(params: {
+  image: Float32Array;
+  width: number;
+  height: number;
+  row: number;
+  col: number;
+  rowStartInclusive: number;
+  rowEndExclusive: number;
+}): boolean {
+  const { image, width, height, row, col, rowStartInclusive, rowEndExclusive } = params;
+  let denseNeighborCount = 0;
+  for (let sampleRow = row - 2; sampleRow <= row + 2; sampleRow++) {
+    if (sampleRow < rowStartInclusive || sampleRow >= rowEndExclusive || sampleRow < 0 || sampleRow >= height) {
+      continue;
+    }
+    for (let sampleCol = col - 2; sampleCol <= col + 2; sampleCol++) {
+      if (sampleCol < 0 || sampleCol >= width || (sampleCol === col && sampleRow === row)) {
+        continue;
+      }
+      const sampleValue = Number(image[sampleRow * width + sampleCol]);
+      if (Number.isFinite(sampleValue) && sampleValue >= PANO_V2_CROSS_ARCH_RESCUE_DENSE_NEIGHBOR_HU) {
+        denseNeighborCount++;
+        if (denseNeighborCount >= PANO_V2_CROSS_ARCH_RESCUE_NEIGHBOR_COUNT) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function applyCrossArchBypassRescue(params: {
+  volume: PanoV2StraightenedVolume;
+  targetImage: Float32Array;
+  oppositeCenterDepthMmByCol: Float32Array;
+  oppositeTargetOffsetMmByCol: Float32Array;
+  rowStartInclusive: number;
+  rowEndExclusive: number;
+}): void {
+  const {
+    volume,
+    targetImage,
+    oppositeCenterDepthMmByCol,
+    oppositeTargetOffsetMmByCol,
+    rowStartInclusive,
+    rowEndExclusive,
+  } = params;
+  const width = volume.panoWidth;
+  const height = volume.panoHeight;
+  const safeRowStartInclusive = clampNumber(Math.floor(rowStartInclusive), 0, Math.max(0, height));
+  const safeRowEndExclusive = clampNumber(Math.ceil(rowEndExclusive), safeRowStartInclusive, Math.max(0, height));
+
+  for (let row = safeRowStartInclusive; row < safeRowEndExclusive; row++) {
+    for (let col = 0; col < width; col++) {
+      const index = row * width + col;
+      const currentValue = Number(targetImage[index]);
+      if (Number.isFinite(currentValue) && currentValue >= PANO_V2_CROSS_ARCH_RESCUE_LOW_SIGNAL_HU) {
+        continue;
+      }
+      if (
+        !hasDenseAssignedNeighborhood({
+          image: targetImage,
+          width,
+          height,
+          row,
+          col,
+          rowStartInclusive: safeRowStartInclusive,
+          rowEndExclusive: safeRowEndExclusive,
+        })
+      ) {
+        continue;
+      }
+      const oppositeWinner = samplePanoV2MipWinner({
+        volume,
+        centerDepthMmByCol: oppositeCenterDepthMmByCol,
+        targetOffsetMmByCol: oppositeTargetOffsetMmByCol,
+        col,
+        row,
+      }).winnerHu;
+      if (
+        !Number.isFinite(oppositeWinner) ||
+        oppositeWinner < PANO_V2_CROSS_ARCH_RESCUE_MIN_HU ||
+        (Number.isFinite(currentValue) &&
+          (oppositeWinner < currentValue + PANO_V2_CROSS_ARCH_RESCUE_MARGIN_HU ||
+            oppositeWinner < currentValue * PANO_V2_CROSS_ARCH_RESCUE_RATIO))
+      ) {
+        continue;
+      }
+      targetImage[index] = oppositeWinner;
+    }
+  }
+}
+
+function buildPanoV2GeometryRayDebugPoint(params: {
+  volume: PanoV2StraightenedVolume;
+  band: PanoV2StraightenedVolumeBand;
+  targetOffsetMmByCol: Float32Array;
+  upperBypassImage: Float32Array;
+  lowerBypassImage: Float32Array;
+  col: number;
+  row: number;
+}): PanoV2GeometryRayDebugPoint | null {
+  const { volume, band, targetOffsetMmByCol, upperBypassImage, lowerBypassImage, col, row } = params;
+  const safeCol = clampNumber(Math.round(col), 0, Math.max(0, volume.panoWidth - 1));
+  const safeRow = clampNumber(Math.round(row), 0, Math.max(0, volume.panoHeight - 1));
+  const frame = volume.frames[safeCol];
+  if (!frame) {
+    return null;
+  }
+
+  const slabDir = (frame.mipSlabDir ?? frame.slabDir) as [number, number, number];
+  const verticalDir = frame.verticalDir as [number, number, number];
+  const splineCenterWorld = frame.position as [number, number, number];
+  const centerDepthMm = Number(band.centerDepthMmByCol[safeCol] ?? 0);
+  const targetOffsetMm = Number(targetOffsetMmByCol[safeCol] ?? 0);
+  const rayMidDepthMm = centerDepthMm + targetOffsetMm;
+  const rayStartDepthMm = rayMidDepthMm - PANO_V2_MIP_SLAB_HALF_WIDTH_MM;
+  const rayEndDepthMm = rayMidDepthMm + PANO_V2_MIP_SLAB_HALF_WIDTH_MM;
+  const columnVerticalCenterOffsetMm = Number(frame.columnVerticalCenterOffsetMm ?? 0);
+  const rowOffsetMm = volume.effectiveVerticalHalfMm - safeRow * volume.vertStepMm;
+  const verticalOffsetMm = columnVerticalCenterOffsetMm + rowOffsetMm;
+  const rowBaseWorld: [number, number, number] = [
+    splineCenterWorld[0] + verticalOffsetMm * verticalDir[0],
+    splineCenterWorld[1] + verticalOffsetMm * verticalDir[1],
+    splineCenterWorld[2] + verticalOffsetMm * verticalDir[2],
+  ];
+  const rayStartWorld: [number, number, number] = [
+    rowBaseWorld[0] + rayStartDepthMm * slabDir[0],
+    rowBaseWorld[1] + rayStartDepthMm * slabDir[1],
+    rowBaseWorld[2] + rayStartDepthMm * slabDir[2],
+  ];
+  const rayMidWorld: [number, number, number] = [
+    rowBaseWorld[0] + rayMidDepthMm * slabDir[0],
+    rowBaseWorld[1] + rayMidDepthMm * slabDir[1],
+    rowBaseWorld[2] + rayMidDepthMm * slabDir[2],
+  ];
+  const rayEndWorld: [number, number, number] = [
+    rowBaseWorld[0] + rayEndDepthMm * slabDir[0],
+    rowBaseWorld[1] + rayEndDepthMm * slabDir[1],
+    rowBaseWorld[2] + rayEndDepthMm * slabDir[2],
+  ];
+  const rayDebug = samplePanoV2MipRay({
+    volume,
+    centerDepthMmByCol: band.centerDepthMmByCol,
+    targetOffsetMmByCol,
+    col: safeCol,
+    row: safeRow,
+  });
+
+  return {
+    col: safeCol,
+    row: safeRow,
+    arch: band.label,
+    splineCenterWorld: roundVector3(splineCenterWorld),
+    rowBaseWorld: roundVector3(rowBaseWorld),
+    rayStartWorld: roundVector3(rayStartWorld),
+    rayMidWorld: roundVector3(rayMidWorld),
+    rayEndWorld: roundVector3(rayEndWorld),
+    slabDir: roundVector3(slabDir),
+    verticalDir: roundVector3(verticalDir),
+    depthHalfRangeMm: roundTo(band.depthHalfRangeMm),
+    mipSlabHalfWidthMm: roundTo(PANO_V2_MIP_SLAB_HALF_WIDTH_MM),
+    centerDepthMm: roundTo(centerDepthMm),
+    targetOffsetMm: roundTo(targetOffsetMm),
+    rayMidDepthMm: roundTo(rayMidDepthMm),
+    rayStartDepthMm: roundTo(rayStartDepthMm),
+    rayEndDepthMm: roundTo(rayEndDepthMm),
+    columnVerticalCenterOffsetMm: roundTo(columnVerticalCenterOffsetMm),
+    rowOffsetMm: roundTo(rowOffsetMm),
+    upperBypassHu: Number.isFinite(Number(upperBypassImage[safeRow * volume.panoWidth + safeCol]))
+      ? roundTo(Number(upperBypassImage[safeRow * volume.panoWidth + safeCol]))
+      : null,
+    lowerBypassHu: Number.isFinite(Number(lowerBypassImage[safeRow * volume.panoWidth + safeCol]))
+      ? roundTo(Number(lowerBypassImage[safeRow * volume.panoWidth + safeCol]))
+      : null,
+    rayWinnerHu: rayDebug.winnerHu,
+    rayWinnerDepthOffsetMm: rayDebug.winnerDepthOffsetMm,
+  };
+}
+
+export function buildPanoV2GeometryRayComparisonDiagnostics(params: {
+  volume: PanoV2StraightenedVolume;
+  layerRender: PanoV2LayerRenderResult;
+  bypassCompositeImages: PanoV2BypassCompositeImages;
+  row: number;
+  failingCol: number;
+  referenceCol: number;
+}): PanoV2GeometryRayComparisonDiagnostics | null {
+  const { volume, layerRender, bypassCompositeImages, row, failingCol, referenceCol } = params;
+  const gapCenterRow = computePanoV2GapCenterRow(layerRender);
+  const archLabel: PanoV2TrackLabel = row < gapCenterRow ? 'upperArch' : 'lowerArch';
+  const band = archLabel === 'upperArch' ? volume.upperArch : volume.lowerArch;
+  const targetOffsetMmByCol =
+    archLabel === 'upperArch'
+      ? bypassCompositeImages.upperTargetOffsetMmByCol
+      : bypassCompositeImages.lowerTargetOffsetMmByCol;
+
+  const failing = buildPanoV2GeometryRayDebugPoint({
+    volume,
+    band,
+    targetOffsetMmByCol,
+    upperBypassImage: bypassCompositeImages.upperArch,
+    lowerBypassImage: bypassCompositeImages.lowerArch,
+    col: failingCol,
+    row,
+  });
+  const reference = buildPanoV2GeometryRayDebugPoint({
+    volume,
+    band,
+    targetOffsetMmByCol,
+    upperBypassImage: bypassCompositeImages.upperArch,
+    lowerBypassImage: bypassCompositeImages.lowerArch,
+    col: referenceCol,
+    row,
+  });
+  if (!failing || !reference) {
+    return null;
+  }
+
+  const slabDirDot = roundTo(dot3(failing.slabDir, reference.slabDir), 4);
+  const slabDirAngleDeg = angleBetweenUnitLikeVectorsDeg(failing.slabDir, reference.slabDir);
+  const verticalDirDot = roundTo(dot3(failing.verticalDir, reference.verticalDir), 4);
+  const verticalDirAngleDeg = angleBetweenUnitLikeVectorsDeg(
+    failing.verticalDir,
+    reference.verticalDir
+  );
+  const splineCenterDistanceMm = roundTo(
+    distance3(failing.splineCenterWorld, reference.splineCenterWorld)
+  );
+  const rowBaseDistanceMm = roundTo(distance3(failing.rowBaseWorld, reference.rowBaseWorld));
+  const rayStartDistanceMm = roundTo(distance3(failing.rayStartWorld, reference.rayStartWorld));
+  const rayMidDistanceMm = roundTo(distance3(failing.rayMidWorld, reference.rayMidWorld));
+  const rayEndDistanceMm = roundTo(distance3(failing.rayEndWorld, reference.rayEndWorld));
+  const centerDepthDeltaMm = roundTo(failing.centerDepthMm - reference.centerDepthMm);
+  const targetOffsetDeltaMm = roundTo(failing.targetOffsetMm - reference.targetOffsetMm);
+  const rayMidDepthDeltaMm = roundTo(failing.rayMidDepthMm - reference.rayMidDepthMm);
+  const columnVerticalCenterOffsetDeltaMm = roundTo(
+    failing.columnVerticalCenterOffsetMm - reference.columnVerticalCenterOffsetMm
+  );
+  const rowOffsetDeltaMm = roundTo(failing.rowOffsetMm - reference.rowOffsetMm);
+  const failingWinnerNearSlabEdge =
+    Number.isFinite(failing.rayWinnerDepthOffsetMm) &&
+    Math.abs(Number(failing.rayWinnerDepthOffsetMm)) >= PANO_V2_MIP_SLAB_HALF_WIDTH_MM - 1.5;
+  const referenceWinnerNearSlabEdge =
+    Number.isFinite(reference.rayWinnerDepthOffsetMm) &&
+    Math.abs(Number(reference.rayWinnerDepthOffsetMm)) >= PANO_V2_MIP_SLAB_HALF_WIDTH_MM - 1.5;
+
+  let anomalyKind: PanoV2GeometryRayComparisonDiagnostics['comparison']['anomalyKind'] =
+    'no-clear-geometry-anomaly';
+  let anomalyReason =
+    'No sharp vector flip, vertical shift break, or depth-center jump was detected between the two columns.';
+  const badLowSignal = !(Number.isFinite(failing.rayWinnerHu) && Number(failing.rayWinnerHu) >= 300);
+  const referenceStrongSignal =
+    Number.isFinite(reference.rayWinnerHu) && Number(reference.rayWinnerHu) >= 1000;
+
+  if (slabDirAngleDeg >= 35 || verticalDirAngleDeg >= 35 || slabDirDot < 0.82 || verticalDirDot < 0.82) {
+    anomalyKind = 'vector-flip-or-rotation';
+    anomalyReason =
+      'Neighboring columns diverge in slab/vertical direction, indicating a geometric vector rotation or flip rather than a pure depth miss.';
+  } else if (
+    Math.abs(columnVerticalCenterOffsetDeltaMm) >= 1.5 ||
+    rowBaseDistanceMm >= splineCenterDistanceMm + 1.5
+  ) {
+    anomalyKind = 'vertical-shift-discontinuity';
+    anomalyReason =
+      'The row-adjusted ray base jumps more than the spline centerline itself, indicating a vertical center-offset discontinuity.';
+  } else if (
+    Math.abs(centerDepthDeltaMm) >= 1.5 ||
+    Math.abs(targetOffsetDeltaMm) >= 1.25 ||
+    Math.abs(rayMidDepthDeltaMm) >= 1.75 ||
+    rayMidDistanceMm >= splineCenterDistanceMm + 1.75
+  ) {
+    anomalyKind = 'depth-center-jump';
+    anomalyReason =
+      'The ray midpoint shifts materially between neighboring columns, indicating a depth-center or target-offset discontinuity.';
+  } else if (badLowSignal && referenceStrongSignal && referenceWinnerNearSlabEdge) {
+    anomalyKind = 'insufficient-depth-window';
+    anomalyReason =
+      'The reference column finds dense anatomy only near the slab boundary while the failing column stays low-signal, indicating the sampling window is too shallow or depth-centered incorrectly.';
+  } else if (badLowSignal) {
+    anomalyKind = 'smooth-geometry-wrong-depth';
+    anomalyReason =
+      'The neighboring columns remain directionally smooth, but the failing ray is centered on low-HU tissue instead of dense anatomy. That points to a smooth but wrong depth placement rather than a vector flip.';
+  }
+
+  return {
+    row,
+    gapCenterRow,
+    arch: archLabel,
+    failing,
+    reference,
+    comparison: {
+      slabDirDot,
+      slabDirAngleDeg,
+      verticalDirDot,
+      verticalDirAngleDeg,
+      splineCenterDistanceMm,
+      rowBaseDistanceMm,
+      rayStartDistanceMm,
+      rayMidDistanceMm,
+      rayEndDistanceMm,
+      centerDepthDeltaMm,
+      targetOffsetDeltaMm,
+      rayMidDepthDeltaMm,
+      columnVerticalCenterOffsetDeltaMm,
+      rowOffsetDeltaMm,
+      failingWinnerNearSlabEdge,
+      referenceWinnerNearSlabEdge,
+      anomalyKind,
+      anomalyReason,
+    },
+  };
+}
+
+export function computePanoV2GapCenterRow(result: {
+  upperArch: { anchorRow: number };
+  lowerArch: { anchorRow: number };
+}): number {
+  return Math.round((result.upperArch.anchorRow + result.lowerArch.anchorRow) * 0.5);
 }
 
 function resolveTradeoffLabel(
@@ -643,6 +1252,7 @@ export function buildPanoV2LayerRenderResult(
       depthStepMm: PANO_V2_MIP_DEPTH_STEP_MM,
       sampledColumnCount: volume.panoWidth,
       mipVoiOverride: true,
+      layerRowConstraintsApplied: true,
       verticalHalfMmUsed: roundTo(volume.effectiveVerticalHalfMm),
       verticalCenterOffsetMm: roundTo(verticalCenterOffsetMmUsed),
       slabDirectionColumn,
@@ -728,7 +1338,7 @@ function resolveBypassLayerIndexFromId(
   return resolvePreferredBypassLayerIndex(band);
 }
 
-function buildBypassTargetOffsetMmByCol(
+function buildRegionalBypassTargetOffsetMmByCol(
   band: PanoV2BandLayerRenderResult,
   width: number
 ): Float32Array {
@@ -770,6 +1380,111 @@ function buildBypassTargetOffsetMmByCol(
   return targetOffsetMmByCol;
 }
 
+function buildBypassTargetOffsetMmByCol(
+  band: PanoV2BandLayerRenderResult,
+  width: number
+): Float32Array {
+  const safeWidth = Math.max(1, width);
+  const regionalTargetOffsetMmByCol = buildRegionalBypassTargetOffsetMmByCol(band, safeWidth);
+  const layerTargetOffsetsMm = band.layers.map(layer =>
+    Number(layer.diagnostic.targetOffsetMm ?? 0)
+  );
+  const selectedTargetOffsetMmByCol = new Float32Array(safeWidth);
+  const trustByCol = new Uint8Array(safeWidth);
+
+  for (let col = 0; col < safeWidth; col++) {
+    let bestLayerIndex = -1;
+    let bestStrongRowCount = -1;
+    let bestDenseRowCount = -1;
+    let bestPeakHu = Number.NEGATIVE_INFINITY;
+    let bestSupportScore = Number.NEGATIVE_INFINITY;
+
+    for (let layerIndex = 0; layerIndex < band.layers.length; layerIndex++) {
+      const image = band.layers[layerIndex]?.image;
+      if (!image) {
+        continue;
+      }
+      let peakHu = Number.NEGATIVE_INFINITY;
+      let denseRowCount = 0;
+      let strongRowCount = 0;
+      let supportScore = 0;
+      for (let rowIndex = 0; rowIndex < band.rowCount; rowIndex++) {
+        const value = Number(image[rowIndex * safeWidth + col]);
+        if (!Number.isFinite(value)) {
+          continue;
+        }
+        if (value > peakHu) {
+          peakHu = value;
+        }
+        if (value >= PANO_V2_BYPASS_COLUMN_DENSE_HU) {
+          denseRowCount++;
+        }
+        if (value >= PANO_V2_BYPASS_COLUMN_STRONG_HU) {
+          strongRowCount++;
+        }
+        if (value > PANO_V2_BYPASS_COLUMN_SUPPORT_BASE_HU) {
+          supportScore += value - PANO_V2_BYPASS_COLUMN_SUPPORT_BASE_HU;
+        }
+      }
+
+      const isBetterCandidate =
+        strongRowCount > bestStrongRowCount ||
+        (strongRowCount === bestStrongRowCount && denseRowCount > bestDenseRowCount) ||
+        (strongRowCount === bestStrongRowCount &&
+          denseRowCount === bestDenseRowCount &&
+          peakHu > bestPeakHu) ||
+        (strongRowCount === bestStrongRowCount &&
+          denseRowCount === bestDenseRowCount &&
+          peakHu === bestPeakHu &&
+          supportScore > bestSupportScore);
+      if (isBetterCandidate) {
+        bestLayerIndex = layerIndex;
+        bestStrongRowCount = strongRowCount;
+        bestDenseRowCount = denseRowCount;
+        bestPeakHu = peakHu;
+        bestSupportScore = supportScore;
+      }
+    }
+
+    const hasTrustedColumnSelection =
+      bestLayerIndex >= 0 &&
+      Number.isFinite(bestPeakHu) &&
+      bestPeakHu >= PANO_V2_BYPASS_COLUMN_DENSE_HU &&
+      (bestDenseRowCount >= PANO_V2_BYPASS_COLUMN_MIN_DENSE_ROWS || bestStrongRowCount > 0);
+    selectedTargetOffsetMmByCol[col] = hasTrustedColumnSelection
+      ? Number(layerTargetOffsetsMm[bestLayerIndex] ?? regionalTargetOffsetMmByCol[col] ?? 0)
+      : regionalTargetOffsetMmByCol[col];
+    trustByCol[col] = hasTrustedColumnSelection ? 1 : 0;
+  }
+
+  const smoothedTargetOffsetMmByCol = new Float32Array(safeWidth);
+  for (let col = 0; col < safeWidth; col++) {
+    let weightedSum = 0;
+    let totalWeight = 0;
+    let trustedNeighborCount = 0;
+    const windowStart = Math.max(0, col - PANO_V2_BYPASS_TARGET_SMOOTHING_RADIUS);
+    const windowEnd = Math.min(safeWidth - 1, col + PANO_V2_BYPASS_TARGET_SMOOTHING_RADIUS);
+    for (let sampleCol = windowStart; sampleCol <= windowEnd; sampleCol++) {
+      const distance = Math.abs(sampleCol - col);
+      const baseWeight = PANO_V2_BYPASS_TARGET_SMOOTHING_RADIUS + 1 - distance;
+      const isTrusted = trustByCol[sampleCol] === 1;
+      if (isTrusted) {
+        trustedNeighborCount++;
+      }
+      const trustWeight = isTrusted ? 2.5 : 0.35;
+      const weight = baseWeight * trustWeight;
+      weightedSum += Number(selectedTargetOffsetMmByCol[sampleCol] ?? regionalTargetOffsetMmByCol[col]) * weight;
+      totalWeight += weight;
+    }
+    smoothedTargetOffsetMmByCol[col] =
+      trustedNeighborCount > 0 && totalWeight > 0
+        ? weightedSum / totalWeight
+        : regionalTargetOffsetMmByCol[col];
+  }
+
+  return smoothedTargetOffsetMmByCol;
+}
+
 export function buildPanoV2FullPlaneLayerImages(params: {
   result: PanoV2LayerRenderResult;
   panoWidth: number;
@@ -793,6 +1508,7 @@ export function buildPanoV2BypassCompositeImages(params: {
   result: PanoV2LayerRenderResult;
   volume: PanoV2StraightenedVolume;
 }): PanoV2BypassCompositeImages {
+  const gapCenterRow = computePanoV2GapCenterRow(params.result);
   const upperTargetOffsetMmByCol = buildBypassTargetOffsetMmByCol(
     params.result.upperArch,
     params.volume.panoWidth
@@ -801,18 +1517,43 @@ export function buildPanoV2BypassCompositeImages(params: {
     params.result.lowerArch,
     params.volume.panoWidth
   );
+  const upperArch = buildFullPlaneMipImage({
+    volume: params.volume,
+    centerDepthMmByCol: params.volume.upperArch.centerDepthMmByCol,
+    targetOffsetMmByCol: upperTargetOffsetMmByCol,
+    rowStartInclusive: 0,
+    rowEndExclusive: gapCenterRow,
+  });
+  const lowerArch = buildFullPlaneMipImage({
+    volume: params.volume,
+    centerDepthMmByCol: params.volume.lowerArch.centerDepthMmByCol,
+    targetOffsetMmByCol: lowerTargetOffsetMmByCol,
+    rowStartInclusive: gapCenterRow,
+    rowEndExclusive: params.volume.panoHeight,
+  });
+
+  applyCrossArchBypassRescue({
+    volume: params.volume,
+    targetImage: upperArch,
+    oppositeCenterDepthMmByCol: params.volume.lowerArch.centerDepthMmByCol,
+    oppositeTargetOffsetMmByCol: lowerTargetOffsetMmByCol,
+    rowStartInclusive: 0,
+    rowEndExclusive: gapCenterRow,
+  });
+  applyCrossArchBypassRescue({
+    volume: params.volume,
+    targetImage: lowerArch,
+    oppositeCenterDepthMmByCol: params.volume.upperArch.centerDepthMmByCol,
+    oppositeTargetOffsetMmByCol: upperTargetOffsetMmByCol,
+    rowStartInclusive: gapCenterRow,
+    rowEndExclusive: params.volume.panoHeight,
+  });
 
   return {
-    upperArch: buildFullPlaneMipImage({
-      volume: params.volume,
-      centerDepthMmByCol: params.volume.upperArch.centerDepthMmByCol,
-      targetOffsetMmByCol: upperTargetOffsetMmByCol,
-    }),
-    lowerArch: buildFullPlaneMipImage({
-      volume: params.volume,
-      centerDepthMmByCol: params.volume.lowerArch.centerDepthMmByCol,
-      targetOffsetMmByCol: lowerTargetOffsetMmByCol,
-    }),
+    upperArch,
+    lowerArch,
+    upperTargetOffsetMmByCol,
+    lowerTargetOffsetMmByCol,
   };
 }
 
@@ -884,5 +1625,185 @@ export function buildPanoV2GapBoundaryAnalysis(params: {
     upperLastDenseRowByCol,
     lowerFirstDenseRowByCol,
     sampledColumns,
+  };
+}
+
+export function buildPanoV2DarkPocketDiagnostics(params: {
+  volume: PanoV2StraightenedVolume;
+  layerRender: PanoV2LayerRenderResult;
+  bypassCompositeImages: PanoV2BypassCompositeImages;
+  finalPixelData: Float32Array;
+}): PanoV2DarkPocketDiagnostics {
+  const { volume, layerRender, bypassCompositeImages, finalPixelData } = params;
+  const gapCenterRow = computePanoV2GapCenterRow(layerRender);
+  const upperAnchorRow = Math.round(layerRender.upperArch.anchorRow);
+  const panoWidth = volume.panoWidth;
+  const panoHeight = volume.panoHeight;
+  const colStart = Math.min(Math.max(6, 0), Math.max(0, panoWidth - 1));
+  const colEnd = Math.max(colStart, panoWidth - 7);
+  const denseRowThresholdHu = 1800;
+  const topBorderExclusionRows = clampNumber(
+    Math.round(gapCenterRow * 0.18),
+    24,
+    Math.min(80, Math.max(24, gapCenterRow - 1))
+  );
+  let denseBandCenterRow: number | null = null;
+  let densestRowBrightCount = -1;
+  const denseRowSearchStart = Math.min(topBorderExclusionRows, Math.max(0, gapCenterRow - 1));
+  const denseRowSearchEnd = Math.max(denseRowSearchStart, Math.max(0, gapCenterRow - 1));
+  for (let row = denseRowSearchStart; row <= denseRowSearchEnd; row++) {
+    let brightCount = 0;
+    for (let col = colStart; col <= colEnd; col++) {
+      const value = Number(finalPixelData[row * panoWidth + col]);
+      if (Number.isFinite(value) && value >= denseRowThresholdHu) {
+        brightCount++;
+      }
+    }
+    if (brightCount > densestRowBrightCount) {
+      densestRowBrightCount = brightCount;
+      denseBandCenterRow = row;
+    }
+  }
+  const searchBandHalfHeight = 54;
+  const rowStart = denseBandCenterRow === null
+    ? denseRowSearchStart
+    : clampNumber(denseBandCenterRow - searchBandHalfHeight, denseRowSearchStart, denseRowSearchEnd);
+  const rowEnd = denseBandCenterRow === null
+    ? denseRowSearchEnd
+    : clampNumber(denseBandCenterRow + searchBandHalfHeight, rowStart, denseRowSearchEnd);
+  const neighborhoodRadius = 6;
+  const rawCandidates: Array<{
+    col: number;
+    row: number;
+    finalHu: number;
+    surroundingMedianHu: number;
+    surroundingMaxHu: number;
+    darknessScore: number;
+  }> = [];
+
+  for (let row = rowStart; row <= rowEnd; row++) {
+    for (let col = colStart; col <= colEnd; col++) {
+      const index = row * panoWidth + col;
+      const finalHu = Number(finalPixelData[index]);
+      if (!Number.isFinite(finalHu) || finalHu > 1200) {
+        continue;
+      }
+      const neighborhoodValues: number[] = [];
+      let neighborhoodMaxHu = Number.NEGATIVE_INFINITY;
+      for (let sampleRow = row - neighborhoodRadius; sampleRow <= row + neighborhoodRadius; sampleRow++) {
+        if (sampleRow < rowStart || sampleRow > rowEnd) {
+          continue;
+        }
+        for (let sampleCol = col - neighborhoodRadius; sampleCol <= col + neighborhoodRadius; sampleCol++) {
+          if (sampleCol < colStart || sampleCol > colEnd) {
+            continue;
+          }
+          const isPerimeter =
+            sampleRow === row - neighborhoodRadius ||
+            sampleRow === row + neighborhoodRadius ||
+            sampleCol === col - neighborhoodRadius ||
+            sampleCol === col + neighborhoodRadius;
+          if (!isPerimeter) {
+            continue;
+          }
+          const sampleValue = Number(finalPixelData[sampleRow * panoWidth + sampleCol]);
+          if (!Number.isFinite(sampleValue)) {
+            continue;
+          }
+          neighborhoodValues.push(sampleValue);
+          if (sampleValue > neighborhoodMaxHu) {
+            neighborhoodMaxHu = sampleValue;
+          }
+        }
+      }
+      if (neighborhoodValues.length < 12 || !Number.isFinite(neighborhoodMaxHu)) {
+        continue;
+      }
+      const surroundingMedianHu = percentile(neighborhoodValues, 0.5);
+      if (surroundingMedianHu <= finalHu + 250 || neighborhoodMaxHu <= 1600) {
+        continue;
+      }
+      rawCandidates.push({
+        col,
+        row,
+        finalHu: roundTo(finalHu),
+        surroundingMedianHu: roundTo(surroundingMedianHu),
+        surroundingMaxHu: roundTo(neighborhoodMaxHu),
+        darknessScore: roundTo((surroundingMedianHu - finalHu) + (neighborhoodMaxHu - finalHu) * 0.2),
+      });
+    }
+  }
+
+  rawCandidates.sort((left, right) => {
+    if (right.darknessScore !== left.darknessScore) {
+      return right.darknessScore - left.darknessScore;
+    }
+    return left.finalHu - right.finalHu;
+  });
+
+  const darkestPockets: PanoV2DarkPocketPoint[] = [];
+  for (let candidateIndex = 0; candidateIndex < rawCandidates.length; candidateIndex++) {
+    const candidate = rawCandidates[candidateIndex];
+    const tooCloseToExisting = darkestPockets.some(
+      pocket =>
+        Math.abs(pocket.col - candidate.col) <= 12 &&
+        Math.abs(pocket.row - candidate.row) <= 12
+    );
+    if (tooCloseToExisting) {
+      continue;
+    }
+    const index = candidate.row * panoWidth + candidate.col;
+    const upperBypassHu = Number(bypassCompositeImages.upperArch[index]);
+    const lowerBypassHu = Number(bypassCompositeImages.lowerArch[index]);
+    const upperRay = samplePanoV2MipRay({
+      volume,
+      centerDepthMmByCol: volume.upperArch.centerDepthMmByCol,
+      targetOffsetMmByCol: bypassCompositeImages.upperTargetOffsetMmByCol,
+      col: candidate.col,
+      row: candidate.row,
+    });
+    const lowerRay = samplePanoV2MipRay({
+      volume,
+      centerDepthMmByCol: volume.lowerArch.centerDepthMmByCol,
+      targetOffsetMmByCol: bypassCompositeImages.lowerTargetOffsetMmByCol,
+      col: candidate.col,
+      row: candidate.row,
+    });
+    darkestPockets.push({
+      col: candidate.col,
+      row: candidate.row,
+      finalHu: candidate.finalHu,
+      upperBypassHu: Number.isFinite(upperBypassHu) ? roundTo(upperBypassHu) : null,
+      lowerBypassHu: Number.isFinite(lowerBypassHu) ? roundTo(lowerBypassHu) : null,
+      selectedSource: candidate.row < gapCenterRow ? 'upper-arch-bypass' : 'lower-arch-bypass',
+      surroundingMedianHu: candidate.surroundingMedianHu,
+      surroundingMaxHu: candidate.surroundingMaxHu,
+      darknessScore: candidate.darknessScore,
+      upperRayWinnerHu: upperRay.winnerHu,
+      upperRayWinnerDepthOffsetMm: upperRay.winnerDepthOffsetMm,
+      lowerRayWinnerHu: lowerRay.winnerHu,
+      lowerRayWinnerDepthOffsetMm: lowerRay.winnerDepthOffsetMm,
+      upperRaySamples: upperRay.samples,
+      lowerRaySamples: lowerRay.samples,
+    });
+    if (darkestPockets.length >= 6) {
+      break;
+    }
+  }
+
+  return {
+    searchRegion: {
+      colStart,
+      colEnd,
+      rowStart,
+      rowEnd,
+      gapCenterRow,
+      upperAnchorRow,
+      topBorderExclusionRows,
+      denseBandCenterRow,
+      denseRowThresholdHu,
+    },
+    candidateCountBeforeSuppression: rawCandidates.length,
+    darkestPockets,
   };
 }

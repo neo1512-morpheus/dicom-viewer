@@ -13,6 +13,7 @@ export interface PanoV2StraightenedTrack {
   anchorRow: number;
   centerDepthMmByCol: Float32Array;
   envelopeHalfWidthMmByCol?: Float32Array | null;
+  searchDepthHalfRangeMm?: number;
 }
 
 export interface PanoV2StraightenedVolumeInput {
@@ -166,11 +167,26 @@ function summarizeFinite(values: ArrayLike<number>): PanoV2NumericSummary {
 
 function buildDepthOffsetsMm(
   envelopeHalfWidthMmByCol: Float32Array | null | undefined,
-  depthSampleCount: number
+  depthSampleCount: number,
+  searchDepthHalfRangeMm?: number
 ): { depthHalfRangeMm: number; depthOffsetsMm: Float32Array } {
   const envelopeSummary = summarizeFinite(envelopeHalfWidthMmByCol ?? []);
   const envelopeP90 = envelopeSummary.p90 > 0 ? envelopeSummary.p90 : 1.35;
-  const depthHalfRangeMm = clampNumber(envelopeP90 * 1.1 + 0.45, 1.35, 2.45);
+  const envelopeP50 = envelopeSummary.p50 > 0 ? envelopeSummary.p50 : envelopeP90;
+  const envelopeMax = envelopeSummary.max > 0 ? envelopeSummary.max : envelopeP90;
+  const preferredSearchHalfRangeMm = Number.isFinite(searchDepthHalfRangeMm)
+    ? Math.max(1.5, Number(searchDepthHalfRangeMm))
+    : Math.max(envelopeMax * 1.2, envelopeP90 * 1.35, 2.45);
+  const envelopeDrivenHalfRangeMm = Math.max(
+    envelopeP90 * 1.45 + envelopeP50 * 0.25,
+    envelopeMax * 1.12 + 0.35,
+    preferredSearchHalfRangeMm * 0.55
+  );
+  const depthHalfRangeMm = clampNumber(
+    envelopeDrivenHalfRangeMm,
+    Math.min(preferredSearchHalfRangeMm, Math.max(1.35, preferredSearchHalfRangeMm * 0.24)),
+    preferredSearchHalfRangeMm
+  );
   const safeDepthSampleCount = Math.max(3, depthSampleCount | 0);
   const depthOffsetsMm = new Float32Array(safeDepthSampleCount);
   const denominator = Math.max(1, safeDepthSampleCount - 1);
@@ -286,7 +302,11 @@ function buildStraightenedBand(params: {
     rowOffsetsMm[rowIndex] = effectiveVerticalHalfMm - panoRow * vertStepMm;
   }
 
-  const depthDefinition = buildDepthOffsetsMm(track.envelopeHalfWidthMmByCol, depthSampleCount);
+  const depthDefinition = buildDepthOffsetsMm(
+    track.envelopeHalfWidthMmByCol,
+    depthSampleCount,
+    track.searchDepthHalfRangeMm
+  );
   const valuesHu = new Float32Array(Math.max(1, panoWidth * rowCount * depthDefinition.depthOffsetsMm.length));
   valuesHu.fill(Number.NaN);
   let finiteSampleCount = 0;

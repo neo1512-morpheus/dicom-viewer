@@ -112,8 +112,6 @@ export interface PanoV2TrackRefinementResult extends PanoV2TrackInput {
   };
 }
 
-const PANO_V2_REFINEMENT_MIN_SEARCH_HALF_WIDTH_MM = 0.68;
-const PANO_V2_REFINEMENT_MAX_SEARCH_HALF_WIDTH_MM = 1.32;
 const PANO_V2_REFINEMENT_PRIOR_PENALTY_PER_MM = 0.26;
 const PANO_V2_REFINEMENT_TRANSITION_PENALTY_PER_MM = 0.34;
 const PANO_V2_REFINEMENT_EDGE_MARGIN_MM = 0.3;
@@ -307,7 +305,28 @@ function localRefinementScore(params: {
   );
 }
 
+function resolveRefinementSearchHalfWidthBounds(depthHalfRangeMm: number): {
+  minHalfWidthMm: number;
+  maxHalfWidthMm: number;
+} {
+  const safeDepthHalfRangeMm = Math.max(1.5, depthHalfRangeMm);
+  const minHalfWidthMm = Math.max(0.68, safeDepthHalfRangeMm * 0.18);
+  const maxHalfWidthMm = Math.max(1.32, safeDepthHalfRangeMm * 0.58);
+  return {
+    minHalfWidthMm,
+    maxHalfWidthMm: Math.max(minHalfWidthMm + 0.35, maxHalfWidthMm),
+  };
+}
+
 function buildNarrowedSearchHalfWidthMm(input: PanoV2TrackRefinementInput): Float32Array {
+  const depthHalfRangeMm = Math.max(
+    0.5,
+    Math.max(
+      Math.abs(Number(input.depthOffsetsMm[0] ?? 0)),
+      Math.abs(Number(input.depthOffsetsMm[input.depthOffsetsMm.length - 1] ?? 0))
+    )
+  );
+  const bounds = resolveRefinementSearchHalfWidthBounds(depthHalfRangeMm);
   const widths = new Float32Array(input.panoWidth);
   for (let col = 0; col < input.panoWidth; col++) {
     const baseWidth = Number(input.baseEnvelopeHalfWidthMmByCol?.[col] ?? 1.35);
@@ -316,12 +335,12 @@ function buildNarrowedSearchHalfWidthMm(input: PanoV2TrackRefinementInput): Floa
     const unstable = Number(input.baseUnstableMask[col]) > 0;
     const weakBase = unstable || baseReliability < 0.82 || baseScoreGap < 0.085;
     const narrowedWidth = weakBase
-      ? baseWidth * 0.82 + 0.08
-      : baseWidth * 0.68 + 0.05;
+      ? baseWidth * 0.94 + depthHalfRangeMm * 0.08
+      : baseWidth * 0.84 + depthHalfRangeMm * 0.04;
     widths[col] = clampNumber(
       narrowedWidth,
-      PANO_V2_REFINEMENT_MIN_SEARCH_HALF_WIDTH_MM,
-      PANO_V2_REFINEMENT_MAX_SEARCH_HALF_WIDTH_MM
+      bounds.minHalfWidthMm,
+      bounds.maxHalfWidthMm
     );
   }
   return widths;
@@ -659,6 +678,7 @@ export function refinePanoV2TrackFromScores(
   const scoreGapByCol = new Float32Array(width);
   const unstableMask = new Uint8Array(width);
   const envelopeHalfWidthMmByCol = new Float32Array(width);
+  const refinementBounds = resolveRefinementSearchHalfWidthBounds(depthHalfRangeMm);
   const jumpsMm: number[] = [];
   let ambiguousColumnCount = 0;
   let depthMinMm = Number.POSITIVE_INFINITY;
@@ -733,9 +753,10 @@ export function refinePanoV2TrackFromScores(
     );
     scoreGapByCol[col] = Math.max(0, scoreGap);
     envelopeHalfWidthMmByCol[col] = clampNumber(
-      Number(narrowedSearchHalfWidthMm[col] ?? 1) * (repaired ? 0.9 : unstable ? 0.94 : 0.84),
-      0.62,
-      1.18
+      Number(narrowedSearchHalfWidthMm[col] ?? refinementBounds.minHalfWidthMm) *
+        (repaired ? 1.04 : unstable ? 1.08 : 0.96),
+      refinementBounds.minHalfWidthMm,
+      refinementBounds.maxHalfWidthMm
     );
     unstableMask[col] = unstable ? 1 : 0;
     if (ambiguous && !neighborhoodStable) {

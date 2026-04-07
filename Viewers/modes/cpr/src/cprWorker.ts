@@ -23,9 +23,12 @@ import {
   buildPanoV2StraightenedVolumeDiagnostics,
 } from './panoV2Volume';
 import {
+  buildPanoV2DarkPocketDiagnostics,
   buildPanoV2BypassCompositeImages,
   buildPanoV2FullPlaneLayerImages,
+  buildPanoV2GeometryRayComparisonDiagnostics,
   buildPanoV2LayerRenderResult,
+  PANO_V2_MIP_SLAB_HALF_WIDTH_MM,
   toPanoV2LayerRenderDiagnostics,
 } from './panoV2LayerRenderer';
 import { buildPanoV2FusionResult } from './panoV2Fusion';
@@ -35,6 +38,9 @@ type GpuRendererModule = typeof import('./cprGpuRenderer');
 let gpuRendererModule: GpuRendererModule | null = null;
 let gpuRendererModulePromise: Promise<GpuRendererModule> | null = null;
 const CPR_WORKER_IMPLEMENTATION_VERSION = '2026-04-06-worker-fingerprint-1';
+const PANO_V2_GEOMETRY_DEBUG_ROW = 88;
+const PANO_V2_GEOMETRY_DEBUG_FAILING_COL = 327;
+const PANO_V2_GEOMETRY_DEBUG_REFERENCE_COL = 320;
 
 // Avoid blocking worker bootstrap on the large GPU renderer module.
 async function loadGpuRendererModule(): Promise<GpuRendererModule> {
@@ -430,6 +436,25 @@ function summarizeAuditValues(values: number[], threshold: number): AuditHistogr
     p90: percentile(values, 0.9),
     max: Number.isFinite(max) ? max : null,
     fractionAboveThreshold: aboveThresholdCount / Math.max(1, values.length),
+  };
+}
+
+function resolveDynamicSupportEnvelopeBounds(depthHalfRangeMm: number): {
+  minHalfWidthMm: number;
+  maxHalfWidthMm: number;
+} {
+  const safeDepthHalfRangeMm = Math.max(1.5, depthHalfRangeMm);
+  const minHalfWidthMm = Math.max(
+    CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMinMm,
+    safeDepthHalfRangeMm * 0.18
+  );
+  const maxHalfWidthMm = Math.max(
+    CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMaxMm,
+    safeDepthHalfRangeMm * 0.58
+  );
+  return {
+    minHalfWidthMm,
+    maxHalfWidthMm: Math.max(minHalfWidthMm + 0.35, maxHalfWidthMm),
   };
 }
 
@@ -8438,6 +8463,7 @@ function buildSupportDepthEnvelope(params: {
   const halfWidthMmByCol = new Float32Array(width);
   const anchorMask = new Uint8Array(width);
   const minAnchorCount = Math.max(8, Math.min(width, Math.round(width * 0.08)));
+  const dynamicEnvelopeBounds = resolveDynamicSupportEnvelopeBounds(depthHalfRangeMm);
 
   const applyAnchorThresholds = (reliabilityThreshold: number, scoreGapThreshold: number): number => {
     anchorMask.fill(0);
@@ -8537,13 +8563,13 @@ function buildSupportDepthEnvelope(params: {
     const relaxedWidthBoost = usedRelaxedAnchors ? 0.14 : 0;
     const anchorWidthBias = anchorMask[col] ? -0.08 : 0.08;
     halfWidthMmByCol[col] = clampNumber(
-      CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMaxMm -
+      dynamicEnvelopeBounds.maxHalfWidthMm -
         reliability * 0.16 -
         gapConfidence * 0.34 +
         relaxedWidthBoost +
         anchorWidthBias,
-      CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMinMm,
-      CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMaxMm
+      dynamicEnvelopeBounds.minHalfWidthMm,
+      dynamicEnvelopeBounds.maxHalfWidthMm
     );
   }
 
@@ -8590,13 +8616,14 @@ function buildSoftSeededSupportDepthPath(params: {
     depthHalfRangeMm,
     smoothScratch,
   });
+  const dynamicEnvelopeBounds = resolveDynamicSupportEnvelopeBounds(depthHalfRangeMm);
   const relaxedEnvelopeHalfWidthMmByCol = new Float32Array(baseEnvelope.halfWidthMmByCol.length);
   for (let col = 0; col < baseEnvelope.halfWidthMmByCol.length; col++) {
     relaxedEnvelopeHalfWidthMmByCol[col] = clampNumber(
       Number(baseEnvelope.halfWidthMmByCol[col]) +
         CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSeedEnvelopeRelaxationMm,
-      CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMinMm,
-      CPU_VIRTUAL_PANO_MODEL_PARAMS.supportEnvelopeHalfWidthMaxMm +
+      dynamicEnvelopeBounds.minHalfWidthMm,
+      dynamicEnvelopeBounds.maxHalfWidthMm +
         CPU_VIRTUAL_PANO_MODEL_PARAMS.supportSeedEnvelopeRelaxationMm
     );
   }
@@ -11658,9 +11685,14 @@ function generatePanorama(
   let panoV2LayerDiagnostics: ReturnType<typeof toPanoV2LayerRenderDiagnostics> | null = null;
   let panoV2FusionDiagnostics: ReturnType<typeof buildPanoV2FusionResult>['diagnostics'] | null =
     null;
+  let panoV2DarkPocketDiagnostics: ReturnType<typeof buildPanoV2DarkPocketDiagnostics> | null =
+    null;
+  let panoV2GeometryRayComparisonDiagnostics: ReturnType<
+    typeof buildPanoV2GeometryRayComparisonDiagnostics
+  > | null = null;
   let panoV2FusionPixelData: Float32Array | null = null;
   if (shouldComputeVirtualPano) {
-    virtualPanoDepthHalfRangeMm = 5.5;
+    virtualPanoDepthHalfRangeMm = Math.max(5.5, PANO_V2_MIP_SLAB_HALF_WIDTH_MM);
     const virtualPanoDepthStepMm = 0.25;
     const virtualPanoDepthSamples =
       Math.max(3, Math.round((virtualPanoDepthHalfRangeMm * 2) / virtualPanoDepthStepMm) + 1) | 0;
@@ -12460,12 +12492,14 @@ function generatePanorama(
           anchorRow: bandAnchorRows[0],
           centerDepthMmByCol: virtualUpperSupportPath.selectedDepthMm,
           envelopeHalfWidthMmByCol: virtualUpperSupportPath.supportEnvelopeHalfWidthMmByCol,
+          searchDepthHalfRangeMm: virtualPanoDepthHalfRangeMm,
         },
         lowerArch: {
           label: 'lowerArch',
           anchorRow: bandAnchorRows[1],
           centerDepthMmByCol: virtualLowerSupportPath.selectedDepthMm,
           envelopeHalfWidthMmByCol: virtualLowerSupportPath.supportEnvelopeHalfWidthMmByCol,
+          searchDepthHalfRangeMm: virtualPanoDepthHalfRangeMm,
         },
       });
       panoV2VolumeDiagnostics = buildPanoV2StraightenedVolumeDiagnostics(
@@ -12491,6 +12525,20 @@ function generatePanorama(
       });
       panoV2FusionDiagnostics = panoV2FusionResult.diagnostics;
       panoV2FusionPixelData = panoV2FusionResult.pixelData;
+      panoV2DarkPocketDiagnostics = buildPanoV2DarkPocketDiagnostics({
+        volume: panoV2StraightenedVolume,
+        layerRender: panoV2LayerRenderResult,
+        bypassCompositeImages: panoV2BypassCompositeImages,
+        finalPixelData: panoV2FusionResult.pixelData,
+      });
+      panoV2GeometryRayComparisonDiagnostics = buildPanoV2GeometryRayComparisonDiagnostics({
+        volume: panoV2StraightenedVolume,
+        layerRender: panoV2LayerRenderResult,
+        bypassCompositeImages: panoV2BypassCompositeImages,
+        row: PANO_V2_GEOMETRY_DEBUG_ROW,
+        failingCol: PANO_V2_GEOMETRY_DEBUG_FAILING_COL,
+        referenceCol: PANO_V2_GEOMETRY_DEBUG_REFERENCE_COL,
+      });
       finalDebugMaps = {
         panoV2FusionImageMap: new Float32Array(panoV2FusionResult.pixelData),
         panoV2UpperLayer1Map: panoV2FullPlaneLayerImages.upperArch[0],
@@ -13433,6 +13481,52 @@ function generatePanorama(
         })
       );
     }
+    if (panoV2FusionDiagnostics.gapFillAnalysis) {
+      console.log(
+        '[CPR-PANOV2-GAPFILL-JSON]',
+        JSON.stringify({
+          ...panoV2LogContext,
+          phase: panoV2FusionDiagnostics.phase,
+          model: panoV2FusionDiagnostics.model,
+          implementationVersion: panoV2FusionDiagnostics.implementationVersion,
+          renderBypass: panoV2FusionDiagnostics.renderBypass,
+          gapCenterRow: panoV2FusionDiagnostics.gapCenterRow,
+          ...panoV2FusionDiagnostics.gapFillAnalysis,
+        })
+      );
+    }
+    if (panoV2FusionDiagnostics.toneMappingAnalysis) {
+      console.log(
+        '[CPR-PANOV2-TONEMAPPING-JSON]',
+        JSON.stringify({
+          ...panoV2LogContext,
+          phase: panoV2FusionDiagnostics.phase,
+          model: panoV2FusionDiagnostics.model,
+          implementationVersion: panoV2FusionDiagnostics.implementationVersion,
+          renderBypass: panoV2FusionDiagnostics.renderBypass,
+          gapCenterRow: panoV2FusionDiagnostics.gapCenterRow,
+          ...panoV2FusionDiagnostics.toneMappingAnalysis,
+        })
+      );
+    }
+  }
+  if (panoV2DarkPocketDiagnostics) {
+    console.log(
+      '[CPR-PANOV2-DARKPOCKET-JSON]',
+      JSON.stringify({
+        ...panoV2LogContext,
+        ...panoV2DarkPocketDiagnostics,
+      })
+    );
+  }
+  if (panoV2GeometryRayComparisonDiagnostics) {
+    console.log(
+      '[CPR-PANOV2-GEOMETRY-RAY-JSON]',
+      JSON.stringify({
+        ...panoV2LogContext,
+        ...panoV2GeometryRayComparisonDiagnostics,
+      })
+    );
   }
   console.log(
     '[CPR-DRR-JSON]',

@@ -7,7 +7,7 @@ import type {
   PanoV2LayerRenderResult,
   PanoV2RenderedLayer,
 } from './panoV2LayerRenderer';
-import { buildPanoV2GapBoundaryAnalysis } from './panoV2LayerRenderer';
+import { buildPanoV2GapBoundaryAnalysis, computePanoV2GapCenterRow } from './panoV2LayerRenderer';
 
 const COLUMN_SCORE_ROW_RADIUS = 18;
 const COLUMN_SWITCH_PENALTY = 92;
@@ -29,6 +29,9 @@ const COVERAGE_WEIGHT_SOFT_START = 0.025;
 const COVERAGE_WEIGHT_FULL = 0.2;
 const ANATOMY_WEIGHT_LOW_HU = -520;
 const ANATOMY_WEIGHT_HIGH_HU = 660;
+const BYPASS_LOW_SIGNAL_HU = 300;
+const BYPASS_SAME_ARCH_RESCUE_MIN_HU = 700;
+const BYPASS_SAME_ARCH_RESCUE_MARGIN_HU = 250;
 
 interface PanoV2FusionLayerScore {
   layerId: string;
@@ -85,6 +88,8 @@ export interface PanoV2FusionDiagnostics {
   outputRange: PanoV2NumericSummary;
   rowCoverageByRow: PanoV2FusionRowCoverage[];
   gapAnalysis: PanoV2GapAnalysisDiagnostics | null;
+  gapFillAnalysis: PanoV2GapFillDiagnostics | null;
+  toneMappingAnalysis: PanoV2ToneMappingDiagnostics | null;
   upperArch: PanoV2FusionBandDiagnostics;
   lowerArch: PanoV2FusionBandDiagnostics;
 }
@@ -135,6 +140,379 @@ export interface PanoV2GapAnalysisDiagnostics {
     colEnd: number;
   };
   patchPoints: PanoV2GapPatchPoint[];
+}
+
+export interface PanoV2GapFillDiagnostics {
+  totalPixelsFilled: number;
+  largestHolePx: number;
+  largestHoleCol: number | null;
+  upperZonePixelsFilled: number;
+  lowerZonePixelsFilled: number;
+}
+
+export interface PanoV2ToneMappingDiagnostics {
+  pixelsRemapped: number;
+  preRemapMedianInRange: number | null;
+  postRemapMedianInRange: number | null;
+}
+
+function fillColumnHolesInZone(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  col: number;
+  rowStartInclusive: number;
+  rowEndExclusive: number;
+  holeThresholdHu?: number;
+  denseThresholdHu?: number;
+  maxFillHu?: number;
+}): {
+  pixelsFilled: number;
+  largestHolePx: number;
+} {
+  const {
+    pixelData,
+    panoWidth,
+    col,
+    rowStartInclusive,
+    rowEndExclusive,
+    holeThresholdHu = -200,
+    denseThresholdHu = 200,
+    maxFillHu = 300,
+  } = params;
+  let row = rowStartInclusive;
+  let pixelsFilled = 0;
+  let largestHolePx = 0;
+
+  while (row < rowEndExclusive) {
+    const value = Number(pixelData[row * panoWidth + col]);
+    if (!Number.isFinite(value) || value >= holeThresholdHu) {
+      row++;
+      continue;
+    }
+    const holeStart = row;
+    while (row < rowEndExclusive) {
+      const holeValue = Number(pixelData[row * panoWidth + col]);
+      if (!Number.isFinite(holeValue) || holeValue < holeThresholdHu) {
+        row++;
+        continue;
+      }
+      break;
+    }
+    const holeEndExclusive = row;
+
+    let denseAboveRow = holeStart - 1;
+    while (denseAboveRow >= rowStartInclusive) {
+      const denseAboveValue = Number(pixelData[denseAboveRow * panoWidth + col]);
+      if (Number.isFinite(denseAboveValue) && denseAboveValue > denseThresholdHu) {
+        break;
+      }
+      denseAboveRow--;
+    }
+
+    let denseBelowRow = holeEndExclusive;
+    while (denseBelowRow < rowEndExclusive) {
+      const denseBelowValue = Number(pixelData[denseBelowRow * panoWidth + col]);
+      if (Number.isFinite(denseBelowValue) && denseBelowValue > denseThresholdHu) {
+        break;
+      }
+      denseBelowRow++;
+    }
+
+    if (denseAboveRow < rowStartInclusive || denseBelowRow >= rowEndExclusive) {
+      continue;
+    }
+
+    const denseAboveValue = Number(pixelData[denseAboveRow * panoWidth + col]);
+    const denseBelowValue = Number(pixelData[denseBelowRow * panoWidth + col]);
+    if (!(denseAboveValue > denseThresholdHu && denseBelowValue > denseThresholdHu)) {
+      continue;
+    }
+
+    const holeLength = holeEndExclusive - holeStart;
+    largestHolePx = Math.max(largestHolePx, holeLength);
+    for (let fillRow = holeStart; fillRow < holeEndExclusive; fillRow++) {
+      const blend =
+        (fillRow - denseAboveRow) / Math.max(1, denseBelowRow - denseAboveRow);
+      const interpolatedValue = denseAboveValue * (1 - blend) + denseBelowValue * blend;
+      pixelData[fillRow * panoWidth + col] = Math.min(maxFillHu, interpolatedValue);
+      pixelsFilled++;
+    }
+  }
+
+  return {
+    pixelsFilled,
+    largestHolePx,
+  };
+}
+
+function applyBypassGapFill(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  gapCenterRow: number;
+}): PanoV2GapFillDiagnostics {
+  const { pixelData, panoWidth, panoHeight, gapCenterRow } = params;
+  let upperZonePixelsFilled = 0;
+  let lowerZonePixelsFilled = 0;
+  let largestHolePx = 0;
+  let largestHoleCol: number | null = null;
+
+  for (let col = 0; col < panoWidth; col++) {
+    const upperResult = fillColumnHolesInZone({
+      pixelData,
+      panoWidth,
+      col,
+      rowStartInclusive: 0,
+      rowEndExclusive: clampNumber(gapCenterRow, 0, panoHeight),
+    });
+    upperZonePixelsFilled += upperResult.pixelsFilled;
+    if (upperResult.largestHolePx > largestHolePx) {
+      largestHolePx = upperResult.largestHolePx;
+      largestHoleCol = col;
+    }
+
+    const lowerResult = fillColumnHolesInZone({
+      pixelData,
+      panoWidth,
+      col,
+      rowStartInclusive: clampNumber(gapCenterRow, 0, panoHeight),
+      rowEndExclusive: panoHeight,
+    });
+    lowerZonePixelsFilled += lowerResult.pixelsFilled;
+    if (lowerResult.largestHolePx > largestHolePx) {
+      largestHolePx = lowerResult.largestHolePx;
+      largestHoleCol = col;
+    }
+  }
+
+  return {
+    totalPixelsFilled: upperZonePixelsFilled + lowerZonePixelsFilled,
+    largestHolePx,
+    largestHoleCol,
+    upperZonePixelsFilled,
+    lowerZonePixelsFilled,
+  };
+}
+
+function applyBypassToneMapping(pixelData: Float32Array): PanoV2ToneMappingDiagnostics {
+  const preRemapValues: number[] = [];
+  const postRemapValues: number[] = [];
+
+  for (let index = 0; index < pixelData.length; index++) {
+    const value = Number(pixelData[index]);
+    if (!Number.isFinite(value) || value < -500 || value >= 600) {
+      continue;
+    }
+    preRemapValues.push(value);
+    const remappedValue = 400 + ((value + 500) / 1100) * 200;
+    pixelData[index] = remappedValue;
+    postRemapValues.push(remappedValue);
+  }
+
+  return {
+    pixelsRemapped: preRemapValues.length,
+    preRemapMedianInRange:
+      preRemapValues.length > 0 ? roundTo(percentile(preRemapValues, 0.5)) : null,
+    postRemapMedianInRange:
+      postRemapValues.length > 0 ? roundTo(percentile(postRemapValues, 0.5)) : null,
+  };
+}
+
+function estimateBypassInteriorFillHu(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  row: number;
+  col: number;
+  rowStartInclusive: number;
+  rowEndExclusive: number;
+}): number | null {
+  const { pixelData, panoWidth, panoHeight, row, col, rowStartInclusive, rowEndExclusive } = params;
+  const preferredValues: number[] = [];
+  const fallbackValues: number[] = [];
+
+  for (let radius = 1; radius <= 18; radius++) {
+    const rowMin = Math.max(rowStartInclusive, row - radius);
+    const rowMax = Math.min(rowEndExclusive - 1, row + radius);
+    const colMin = Math.max(0, col - radius);
+    const colMax = Math.min(panoWidth - 1, col + radius);
+
+    for (let sampleRow = rowMin; sampleRow <= rowMax; sampleRow++) {
+      for (let sampleCol = colMin; sampleCol <= colMax; sampleCol++) {
+        const isPerimeter =
+          sampleRow === rowMin ||
+          sampleRow === rowMax ||
+          sampleCol === colMin ||
+          sampleCol === colMax;
+        if (!isPerimeter) {
+          continue;
+        }
+        const sampleValue = Number(pixelData[sampleRow * panoWidth + sampleCol]);
+        if (!Number.isFinite(sampleValue) || sampleValue <= -950) {
+          continue;
+        }
+        fallbackValues.push(sampleValue);
+        if (sampleValue > 600 && sampleValue < 3200) {
+          preferredValues.push(sampleValue);
+        }
+      }
+    }
+
+    if (preferredValues.length >= 8 || fallbackValues.length >= 20) {
+      break;
+    }
+  }
+
+  const sourceValues =
+    preferredValues.length >= 4 ? preferredValues : fallbackValues.length > 0 ? fallbackValues : null;
+  if (!sourceValues || sourceValues.length === 0) {
+    return null;
+  }
+
+  const estimatedValue =
+    sourceValues.length >= 5
+      ? percentile(sourceValues, preferredValues.length >= 4 ? 0.35 : 0.5)
+      : sourceValues.reduce((sum, value) => sum + value, 0) / sourceValues.length;
+
+  return clampNumber(estimatedValue, 700, 2200);
+}
+
+function repairBypassUnresolvedPixels(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  gapCenterRow: number;
+}): void {
+  const { pixelData, panoWidth, panoHeight, gapCenterRow } = params;
+  const zoneRanges: Array<[number, number]> = [
+    [0, clampNumber(gapCenterRow, 0, panoHeight)],
+    [clampNumber(gapCenterRow, 0, panoHeight), panoHeight],
+  ];
+
+  for (let zoneIndex = 0; zoneIndex < zoneRanges.length; zoneIndex++) {
+    const [rowStartInclusive, rowEndExclusive] = zoneRanges[zoneIndex];
+    if (rowEndExclusive <= rowStartInclusive) {
+      continue;
+    }
+
+    for (let row = rowStartInclusive; row < rowEndExclusive; row++) {
+      let col = 0;
+      while (col < panoWidth) {
+        const index = row * panoWidth + col;
+        if (Number.isFinite(pixelData[index])) {
+          col++;
+          continue;
+        }
+        const holeStart = col;
+        while (col < panoWidth && !Number.isFinite(pixelData[row * panoWidth + col])) {
+          col++;
+        }
+        const holeEndExclusive = col;
+        const leftCol = holeStart - 1;
+        const rightCol = holeEndExclusive;
+        if (leftCol < 0 || rightCol >= panoWidth) {
+          continue;
+        }
+        const leftValue = Number(pixelData[row * panoWidth + leftCol]);
+        const rightValue = Number(pixelData[row * panoWidth + rightCol]);
+        if (!Number.isFinite(leftValue) || !Number.isFinite(rightValue)) {
+          continue;
+        }
+        for (let fillCol = holeStart; fillCol < holeEndExclusive; fillCol++) {
+          const blend = (fillCol - leftCol) / Math.max(1, rightCol - leftCol);
+          pixelData[row * panoWidth + fillCol] = leftValue * (1 - blend) + rightValue * blend;
+        }
+      }
+    }
+
+    for (let col = 0; col < panoWidth; col++) {
+      let row = rowStartInclusive;
+      while (row < rowEndExclusive) {
+        const index = row * panoWidth + col;
+        if (Number.isFinite(pixelData[index])) {
+          row++;
+          continue;
+        }
+        const holeStart = row;
+        while (row < rowEndExclusive && !Number.isFinite(pixelData[row * panoWidth + col])) {
+          row++;
+        }
+        const holeEndExclusive = row;
+        const upperRow = holeStart - 1;
+        const lowerRow = holeEndExclusive;
+        if (upperRow < rowStartInclusive || lowerRow >= rowEndExclusive) {
+          continue;
+        }
+        const upperValue = Number(pixelData[upperRow * panoWidth + col]);
+        const lowerValue = Number(pixelData[lowerRow * panoWidth + col]);
+        if (!Number.isFinite(upperValue) || !Number.isFinite(lowerValue)) {
+          continue;
+        }
+        for (let fillRow = holeStart; fillRow < holeEndExclusive; fillRow++) {
+          const blend = (fillRow - upperRow) / Math.max(1, lowerRow - upperRow);
+          pixelData[fillRow * panoWidth + col] = upperValue * (1 - blend) + lowerValue * blend;
+        }
+      }
+    }
+
+    const repairedSnapshot = new Float32Array(pixelData);
+    for (let row = rowStartInclusive + 1; row < rowEndExclusive - 1; row++) {
+      for (let col = 1; col < panoWidth - 1; col++) {
+        const index = row * panoWidth + col;
+        if (Number.isFinite(repairedSnapshot[index])) {
+          continue;
+        }
+        let sum = 0;
+        let count = 0;
+        for (let rowOffset = -1; rowOffset <= 1; rowOffset++) {
+          for (let colOffset = -1; colOffset <= 1; colOffset++) {
+            if (rowOffset === 0 && colOffset === 0) {
+              continue;
+            }
+            const sampleValue = Number(
+              repairedSnapshot[(row + rowOffset) * panoWidth + (col + colOffset)]
+            );
+            if (!Number.isFinite(sampleValue)) {
+              continue;
+            }
+            sum += sampleValue;
+            count++;
+          }
+        }
+        if (count >= 3) {
+          pixelData[index] = sum / count;
+        }
+      }
+    }
+  }
+
+  for (let zoneIndex = 0; zoneIndex < zoneRanges.length; zoneIndex++) {
+    const [rowStartInclusive, rowEndExclusive] = zoneRanges[zoneIndex];
+    for (let row = rowStartInclusive; row < rowEndExclusive; row++) {
+      for (let col = 0; col < panoWidth; col++) {
+        const index = row * panoWidth + col;
+        if (Number.isFinite(pixelData[index])) {
+          continue;
+        }
+        const isOuterImageBorder =
+          row <= 0 || row >= panoHeight - 1 || col <= 0 || col >= panoWidth - 1;
+        if (isOuterImageBorder) {
+          pixelData[index] = -1000;
+          continue;
+        }
+        const estimatedFillHu = estimateBypassInteriorFillHu({
+          pixelData,
+          panoWidth,
+          panoHeight,
+          row,
+          col,
+          rowStartInclusive,
+          rowEndExclusive,
+        });
+        pixelData[index] = estimatedFillHu ?? 900;
+      }
+    }
+  }
 }
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -1023,14 +1401,22 @@ export function buildPanoV2FusionResult(params: {
   if (layerRender.model === 'thick-slab-mip-render' && bypassCompositeImages) {
     const planeSize = Math.max(1, panoWidth * panoHeight);
     const pixelData = new Float32Array(planeSize);
-    const finalValues: number[] = [];
-    const sourceImages = [bypassCompositeImages.upperArch, bypassCompositeImages.lowerArch];
-    const fallbackImages = fullPlaneLayerImages
-      ? [...fullPlaneLayerImages.upperArch, ...fullPlaneLayerImages.lowerArch]
-      : [];
+    const gapCenterRow = computePanoV2GapCenterRow(layerRender);
     for (let index = 0; index < planeSize; index++) {
+      const row = Math.floor(index / Math.max(1, panoWidth));
+      const useUpperArch = row < gapCenterRow;
+      const sourceImages = useUpperArch
+        ? [bypassCompositeImages.upperArch]
+        : [bypassCompositeImages.lowerArch];
+      const fallbackImages = fullPlaneLayerImages
+        ? useUpperArch
+          ? fullPlaneLayerImages.upperArch
+          : fullPlaneLayerImages.lowerArch
+        : [];
       let selectedValue = Number.NEGATIVE_INFINITY;
       let hasFiniteValue = false;
+      let strongestFallbackValue = Number.NEGATIVE_INFINITY;
+      let hasStrongFallbackValue = false;
       for (let imageIndex = 0; imageIndex < sourceImages.length; imageIndex++) {
         const value = Number(sourceImages[imageIndex]?.[index]);
         if (!Number.isFinite(value)) {
@@ -1041,22 +1427,47 @@ export function buildPanoV2FusionResult(params: {
           hasFiniteValue = true;
         }
       }
-      if (!hasFiniteValue && fallbackImages.length > 0) {
+      if (fallbackImages.length > 0) {
         for (let imageIndex = 0; imageIndex < fallbackImages.length; imageIndex++) {
           const value = Number(fallbackImages[imageIndex]?.[index]);
           if (!Number.isFinite(value) || value <= -950) {
             continue;
           }
-          if (!hasFiniteValue || value > selectedValue) {
+          if (value > strongestFallbackValue) {
+            strongestFallbackValue = value;
+            hasStrongFallbackValue = true;
+          }
+          if (!hasFiniteValue && value > selectedValue) {
             selectedValue = value;
             hasFiniteValue = true;
           }
         }
       }
-      const clampedValue = clampNumber(hasFiniteValue ? selectedValue : -1000, -1000, 3500);
-      pixelData[index] = clampedValue;
-      finalValues.push(clampedValue);
+      if (
+        hasFiniteValue &&
+        selectedValue < BYPASS_LOW_SIGNAL_HU &&
+        hasStrongFallbackValue &&
+        strongestFallbackValue >= BYPASS_SAME_ARCH_RESCUE_MIN_HU &&
+        strongestFallbackValue >= selectedValue + BYPASS_SAME_ARCH_RESCUE_MARGIN_HU
+      ) {
+        selectedValue = strongestFallbackValue;
+      }
+      pixelData[index] = hasFiniteValue ? clampNumber(selectedValue, -1000, 3500) : Number.NaN;
     }
+    repairBypassUnresolvedPixels({
+      pixelData,
+      panoWidth,
+      panoHeight,
+      gapCenterRow,
+    });
+    const gapFillAnalysis = applyBypassGapFill({
+      pixelData,
+      panoWidth,
+      panoHeight,
+      gapCenterRow,
+    });
+    const toneMappingAnalysis = applyBypassToneMapping(pixelData);
+    const finalValues = Array.from(pixelData);
 
     const rowCoverageByRow: PanoV2FusionRowCoverage[] = Array.from(
       { length: panoHeight },
@@ -1091,7 +1502,7 @@ export function buildPanoV2FusionResult(params: {
         renderBypass: true,
         outputCoverageFraction: 1,
         overlapFraction: 0,
-        gapCenterRow: Math.round((layerRender.upperArch.anchorRow + layerRender.lowerArch.anchorRow) * 0.5),
+        gapCenterRow,
         ghostingRisk: 'low',
         normalizationHuWindow: {
           lower: -1000,
@@ -1100,6 +1511,8 @@ export function buildPanoV2FusionResult(params: {
         outputRange: summarize(finalValues),
         rowCoverageByRow,
         gapAnalysis,
+        gapFillAnalysis,
+        toneMappingAnalysis,
         upperArch: {
           label: layerRender.upperArch.label,
           switchCount: 0,
@@ -1260,6 +1673,8 @@ export function buildPanoV2FusionResult(params: {
       outputRange: summarize(finalValues),
       rowCoverageByRow,
       gapAnalysis: null,
+      gapFillAnalysis: null,
+      toneMappingAnalysis: null,
       upperArch: upperBand.diagnostic,
       lowerArch: lowerBand.diagnostic,
     },

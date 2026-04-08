@@ -161,6 +161,8 @@ export interface PanoV2BypassCompositeImages {
   lowerArch: Float32Array;
   upperTargetOffsetMmByCol: Float32Array;
   lowerTargetOffsetMmByCol: Float32Array;
+  upperTargetOffsetMmMap: Float32Array;
+  lowerTargetOffsetMmMap: Float32Array;
 }
 
 export interface PanoV2GapBoundarySample {
@@ -380,6 +382,328 @@ function buildEvenlySpacedIndices(length: number, targetCount: number): number[]
   return Array.from(indices).sort((left, right) => left - right);
 }
 
+function bandValueIndex(
+  band: PanoV2StraightenedVolumeBand,
+  col: number,
+  rowIndex: number,
+  depthIndex: number
+): number {
+  return ((col * band.rowCount + rowIndex) * band.depthCount + depthIndex) | 0;
+}
+
+function sampleBandValue(
+  band: PanoV2StraightenedVolumeBand,
+  col: number,
+  rowIndex: number,
+  depthIndex: number
+): number {
+  return Number(band.valuesHu[bandValueIndex(band, col, rowIndex, depthIndex)]);
+}
+
+function resolveNearestDepthIndex(depthOffsetsMm: Float32Array, targetDepthMm: number): number {
+  if (depthOffsetsMm.length <= 0) {
+    return 0;
+  }
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < depthOffsetsMm.length; index++) {
+    const distance = Math.abs(Number(depthOffsetsMm[index] ?? 0) - targetDepthMm);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function sampleBandDepthSignal(
+  band: PanoV2StraightenedVolumeBand,
+  col: number,
+  rowIndex: number,
+  depthIndex: number
+): number {
+  let weightedSum = 0;
+  let totalWeight = 0;
+  for (let sampleRow = rowIndex - 1; sampleRow <= rowIndex + 1; sampleRow++) {
+    if (sampleRow < 0 || sampleRow >= band.rowCount) {
+      continue;
+    }
+    const weight = sampleRow === rowIndex ? 1 : 0.6;
+    const value = sampleBandValue(band, col, sampleRow, depthIndex);
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    weightedSum += value * weight;
+    totalWeight += weight;
+  }
+  if (!(totalWeight > 0)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  return weightedSum / totalWeight;
+}
+
+function buildRowAdaptiveTargetOffsetPlan(params: {
+  band: PanoV2StraightenedVolumeBand;
+  panoWidth: number;
+  panoHeight: number;
+  assignedRowStartInclusive: number;
+  assignedRowEndExclusive: number;
+  columnTargetOffsetMmByCol: Float32Array;
+}): {
+  targetOffsetMmByCol: Float32Array;
+  targetOffsetMmMap: Float32Array;
+} {
+  const {
+    band,
+    panoWidth,
+    panoHeight,
+    assignedRowStartInclusive,
+    assignedRowEndExclusive,
+    columnTargetOffsetMmByCol,
+  } = params;
+  const width = Math.max(1, panoWidth);
+  const localSize = Math.max(1, width * band.rowCount);
+  const localOffsetMm = new Float32Array(localSize);
+  const localSignalHu = new Float32Array(localSize);
+  localOffsetMm.fill(0);
+  localSignalHu.fill(Number.NEGATIVE_INFINITY);
+
+  const anchorRowIndex = clampNumber(band.localAnchorRow, 0, Math.max(0, band.rowCount - 1));
+  const continuityPenaltyPerMm = Math.max(
+    40,
+    (band.valueRangeHu.p90 - band.valueRangeHu.p50) * 0.08
+  );
+  const anchorPenaltyPerMm = Math.max(28, continuityPenaltyPerMm * 0.5);
+
+  for (let col = 0; col < width; col++) {
+    const regionalTargetOffsetMm = Number(columnTargetOffsetMmByCol[col] ?? 0);
+    const regionalDepthIndex = resolveNearestDepthIndex(band.depthOffsetsMm, regionalTargetOffsetMm);
+    let bestAnchorDepthIndex = regionalDepthIndex;
+    let bestAnchorScore = Number.NEGATIVE_INFINITY;
+
+    for (let depthIndex = 0; depthIndex < band.depthCount; depthIndex++) {
+      const signalHu = sampleBandDepthSignal(band, col, anchorRowIndex, depthIndex);
+      if (!Number.isFinite(signalHu)) {
+        continue;
+      }
+      const depthOffsetMm = Number(band.depthOffsetsMm[depthIndex] ?? 0);
+      const candidateScore =
+        signalHu - Math.abs(depthOffsetMm - regionalTargetOffsetMm) * anchorPenaltyPerMm;
+      if (candidateScore > bestAnchorScore) {
+        bestAnchorScore = candidateScore;
+        bestAnchorDepthIndex = depthIndex;
+      }
+    }
+
+    const writeLocalSelection = (rowIndex: number, depthIndex: number): void => {
+      const localIndex = rowIndex * width + col;
+      localOffsetMm[localIndex] = Number(band.depthOffsetsMm[depthIndex] ?? 0);
+      localSignalHu[localIndex] = sampleBandDepthSignal(band, col, rowIndex, depthIndex);
+    };
+
+    writeLocalSelection(anchorRowIndex, bestAnchorDepthIndex);
+
+    for (let rowIndex = anchorRowIndex - 1; rowIndex >= 0; rowIndex--) {
+      const previousDepthOffsetMm = Number(localOffsetMm[(rowIndex + 1) * width + col] ?? 0);
+      let bestDepthIndex = bestAnchorDepthIndex;
+      let bestScore = Number.NEGATIVE_INFINITY;
+      for (let depthIndex = 0; depthIndex < band.depthCount; depthIndex++) {
+        const signalHu = sampleBandDepthSignal(band, col, rowIndex, depthIndex);
+        if (!Number.isFinite(signalHu)) {
+          continue;
+        }
+        const depthOffsetMm = Number(band.depthOffsetsMm[depthIndex] ?? 0);
+        const continuityPenalty =
+          Math.abs(depthOffsetMm - previousDepthOffsetMm) * continuityPenaltyPerMm;
+        const regionalPenalty =
+          Math.abs(depthOffsetMm - regionalTargetOffsetMm) * (anchorPenaltyPerMm * 0.25);
+        const candidateScore = signalHu - continuityPenalty - regionalPenalty;
+        if (candidateScore > bestScore) {
+          bestScore = candidateScore;
+          bestDepthIndex = depthIndex;
+        }
+      }
+      writeLocalSelection(rowIndex, bestDepthIndex);
+    }
+
+    for (let rowIndex = anchorRowIndex + 1; rowIndex < band.rowCount; rowIndex++) {
+      const previousDepthOffsetMm = Number(localOffsetMm[(rowIndex - 1) * width + col] ?? 0);
+      let bestDepthIndex = bestAnchorDepthIndex;
+      let bestScore = Number.NEGATIVE_INFINITY;
+      for (let depthIndex = 0; depthIndex < band.depthCount; depthIndex++) {
+        const signalHu = sampleBandDepthSignal(band, col, rowIndex, depthIndex);
+        if (!Number.isFinite(signalHu)) {
+          continue;
+        }
+        const depthOffsetMm = Number(band.depthOffsetsMm[depthIndex] ?? 0);
+        const continuityPenalty =
+          Math.abs(depthOffsetMm - previousDepthOffsetMm) * continuityPenaltyPerMm;
+        const regionalPenalty =
+          Math.abs(depthOffsetMm - regionalTargetOffsetMm) * (anchorPenaltyPerMm * 0.25);
+        const candidateScore = signalHu - continuityPenalty - regionalPenalty;
+        if (candidateScore > bestScore) {
+          bestScore = candidateScore;
+          bestDepthIndex = depthIndex;
+        }
+      }
+      writeLocalSelection(rowIndex, bestDepthIndex);
+    }
+  }
+
+  const horizontallySmoothedLocalOffsetMm = new Float32Array(localSize);
+  for (let rowIndex = 0; rowIndex < band.rowCount; rowIndex++) {
+    const rowSignals: number[] = [];
+    for (let col = 0; col < width; col++) {
+      const signalHu = Number(localSignalHu[rowIndex * width + col]);
+      if (Number.isFinite(signalHu)) {
+        rowSignals.push(signalHu);
+      }
+    }
+    const rowSignalMedianHu = rowSignals.length > 0 ? percentile(rowSignals, 0.5) : 0;
+    const rowSignalP90Hu = rowSignals.length > 0 ? percentile(rowSignals, 0.9) : rowSignalMedianHu;
+    const rowSignalScaleHu = Math.max(1, rowSignalP90Hu - rowSignalMedianHu);
+
+    for (let col = 0; col < width; col++) {
+      let weightedOffsetSum = 0;
+      let totalWeight = 0;
+      for (let sampleCol = Math.max(0, col - 3); sampleCol <= Math.min(width - 1, col + 3); sampleCol++) {
+        const distance = Math.abs(sampleCol - col);
+        const baseWeight = distance === 0 ? 4 : distance === 1 ? 3 : distance === 2 ? 2 : 1;
+        const signalHu = Number(localSignalHu[rowIndex * width + sampleCol]);
+        const signalWeight =
+          Number.isFinite(signalHu) && signalHu > rowSignalMedianHu
+            ? 1 + (signalHu - rowSignalMedianHu) / rowSignalScaleHu
+            : 0.6;
+        const centerWeightBoost = sampleCol === col ? 1.75 : 1;
+        const weight = baseWeight * signalWeight * centerWeightBoost;
+        weightedOffsetSum += Number(localOffsetMm[rowIndex * width + sampleCol]) * weight;
+        totalWeight += weight;
+      }
+      horizontallySmoothedLocalOffsetMm[rowIndex * width + col] =
+        totalWeight > 0
+          ? weightedOffsetSum / totalWeight
+          : Number(localOffsetMm[rowIndex * width + col]);
+    }
+  }
+
+  const regularizedLocalOffsetMm = new Float32Array(localSize);
+  const depthStepMm =
+    band.depthCount > 1
+      ? Math.abs(Number(band.depthOffsetsMm[1] ?? 0) - Number(band.depthOffsetsMm[0] ?? 0))
+      : Math.max(0.25, band.depthHalfRangeMm / 12);
+  const baseMaxColumnDeltaMm = Math.max(
+    depthStepMm * 3.5,
+    band.depthHalfRangeMm / Math.max(14, width * 0.06)
+  );
+
+  for (let rowIndex = 0; rowIndex < band.rowCount; rowIndex++) {
+    const rowSignals: number[] = [];
+    for (let col = 0; col < width; col++) {
+      const signalHu = Number(localSignalHu[rowIndex * width + col]);
+      if (Number.isFinite(signalHu)) {
+        rowSignals.push(signalHu);
+      }
+    }
+    const rowSignalMedianHu = rowSignals.length > 0 ? percentile(rowSignals, 0.5) : 0;
+    const rowSignalP90Hu = rowSignals.length > 0 ? percentile(rowSignals, 0.9) : rowSignalMedianHu;
+    const rowSignalScaleHu = Math.max(1, rowSignalP90Hu - rowSignalMedianHu);
+    const forward = new Float32Array(width);
+    const backward = new Float32Array(width);
+
+    forward[0] = Number(horizontallySmoothedLocalOffsetMm[rowIndex * width]);
+    for (let col = 1; col < width; col++) {
+      const index = rowIndex * width + col;
+      const desiredOffsetMm = Number(horizontallySmoothedLocalOffsetMm[index]);
+      const signalHu = Number(localSignalHu[index]);
+      const signalBoost =
+        Number.isFinite(signalHu) && signalHu > rowSignalMedianHu
+          ? Math.min(1.25, (signalHu - rowSignalMedianHu) / rowSignalScaleHu)
+          : 0;
+      const maxColumnDeltaMm = baseMaxColumnDeltaMm * (1 + signalBoost * 0.7);
+      const previousOffsetMm = Number(forward[col - 1]);
+      forward[col] = clampNumber(
+        desiredOffsetMm,
+        previousOffsetMm - maxColumnDeltaMm,
+        previousOffsetMm + maxColumnDeltaMm
+      );
+    }
+
+    backward[width - 1] = Number(horizontallySmoothedLocalOffsetMm[rowIndex * width + width - 1]);
+    for (let col = width - 2; col >= 0; col--) {
+      const index = rowIndex * width + col;
+      const desiredOffsetMm = Number(horizontallySmoothedLocalOffsetMm[index]);
+      const signalHu = Number(localSignalHu[index]);
+      const signalBoost =
+        Number.isFinite(signalHu) && signalHu > rowSignalMedianHu
+          ? Math.min(1.25, (signalHu - rowSignalMedianHu) / rowSignalScaleHu)
+          : 0;
+      const maxColumnDeltaMm = baseMaxColumnDeltaMm * (1 + signalBoost * 0.7);
+      const nextOffsetMm = Number(backward[col + 1]);
+      backward[col] = clampNumber(
+        desiredOffsetMm,
+        nextOffsetMm - maxColumnDeltaMm,
+        nextOffsetMm + maxColumnDeltaMm
+      );
+    }
+
+    for (let col = 0; col < width; col++) {
+      regularizedLocalOffsetMm[rowIndex * width + col] =
+        (Number(forward[col]) + Number(backward[col])) * 0.5;
+    }
+  }
+
+  const finalLocalOffsetMm = new Float32Array(localSize);
+  for (let rowIndex = 0; rowIndex < band.rowCount; rowIndex++) {
+    for (let col = 0; col < width; col++) {
+      let weightedOffsetSum = Number(regularizedLocalOffsetMm[rowIndex * width + col]) * 1.7;
+      let totalWeight = 1.7;
+      if (rowIndex > 0) {
+        weightedOffsetSum += Number(regularizedLocalOffsetMm[(rowIndex - 1) * width + col]) * 0.45;
+        totalWeight += 0.45;
+      }
+      if (rowIndex + 1 < band.rowCount) {
+        weightedOffsetSum += Number(regularizedLocalOffsetMm[(rowIndex + 1) * width + col]) * 0.45;
+        totalWeight += 0.45;
+      }
+      finalLocalOffsetMm[rowIndex * width + col] =
+        totalWeight > 0
+          ? weightedOffsetSum / totalWeight
+          : Number(regularizedLocalOffsetMm[rowIndex * width + col]);
+    }
+  }
+
+  const planeSize = Math.max(1, panoWidth * panoHeight);
+  const targetOffsetMmMap = new Float32Array(planeSize);
+  targetOffsetMmMap.fill(Number.NaN);
+  const representativeTargetOffsetMmByCol = new Float32Array(width);
+  const representativeLocalRow = clampNumber(anchorRowIndex, 0, Math.max(0, band.rowCount - 1));
+
+  for (let col = 0; col < width; col++) {
+    representativeTargetOffsetMmByCol[col] = Number(
+      finalLocalOffsetMm[representativeLocalRow * width + col] ??
+        columnTargetOffsetMmByCol[col] ??
+        0
+    );
+    for (
+      let row = Math.max(0, assignedRowStartInclusive);
+      row < Math.min(panoHeight, assignedRowEndExclusive);
+      row++
+    ) {
+      // Extend the nearest band-edge offset beyond the sampled support rows so the
+      // bypass renderer does not switch depth-selection modes at the band boundary.
+      const localRow = clampNumber(row - band.rowStart, 0, Math.max(0, band.rowCount - 1));
+      const localIndex = localRow * width + col;
+      const planeIndex = row * width + col;
+      targetOffsetMmMap[planeIndex] = Number(finalLocalOffsetMm[localIndex]);
+    }
+  }
+
+  return {
+    targetOffsetMmByCol: representativeTargetOffsetMmByCol,
+    targetOffsetMmMap,
+  };
+}
+
 function buildMipBandImage(
   volume: PanoV2StraightenedVolume,
   band: PanoV2StraightenedVolumeBand,
@@ -450,6 +774,7 @@ function buildFullPlaneMipImage(params: {
   volume: PanoV2StraightenedVolume;
   centerDepthMmByCol: Float32Array;
   targetOffsetMmByCol: Float32Array;
+  targetOffsetMmMap?: Float32Array | null;
   rowStartInclusive: number;
   rowEndExclusive: number;
   outsideAssignedRangeHu?: number;
@@ -458,6 +783,7 @@ function buildFullPlaneMipImage(params: {
     volume,
     centerDepthMmByCol,
     targetOffsetMmByCol,
+    targetOffsetMmMap,
     rowStartInclusive,
     rowEndExclusive,
     outsideAssignedRangeHu = 150,
@@ -486,18 +812,23 @@ function buildFullPlaneMipImage(params: {
         image[row * width + col] = outsideAssignedRangeHu;
         continue;
       }
+      const planeIndex = row * width + col;
       const rowOffsetMm = volume.effectiveVerticalHalfMm - row * volume.vertStepMm;
       const verticalOffsetMm = columnVerticalCenterOffsetMm + rowOffsetMm;
       const bx = px + verticalOffsetMm * vertDirX;
       const by = py + verticalOffsetMm * vertDirY;
       const bz = pz + verticalOffsetMm * vertDirZ;
+      const rowTargetOffsetMm = Number(targetOffsetMmMap?.[planeIndex]);
+      const targetOffsetMmForPixel = Number.isFinite(rowTargetOffsetMm)
+        ? rowTargetOffsetMm
+        : targetOffsetMm;
       let mipHu = Number.NEGATIVE_INFINITY;
       for (
         let localDepthOffsetMm = -PANO_V2_MIP_SLAB_HALF_WIDTH_MM;
         localDepthOffsetMm <= PANO_V2_MIP_SLAB_HALF_WIDTH_MM + 1e-6;
         localDepthOffsetMm += PANO_V2_MIP_DEPTH_STEP_MM
       ) {
-        const localDepthMm = centerDepthMm + targetOffsetMm + localDepthOffsetMm;
+        const localDepthMm = centerDepthMm + targetOffsetMmForPixel + localDepthOffsetMm;
         const sample = volume.sampleWorldIntensity(
           bx + localDepthMm * slabDirX,
           by + localDepthMm * slabDirY,
@@ -520,13 +851,14 @@ function samplePanoV2MipWinner(params: {
   volume: PanoV2StraightenedVolume;
   centerDepthMmByCol: Float32Array;
   targetOffsetMmByCol: Float32Array;
+  targetOffsetMmMap?: Float32Array | null;
   col: number;
   row: number;
 }): {
   winnerHu: number | null;
   winnerDepthOffsetMm: number | null;
 } {
-  const { volume, centerDepthMmByCol, targetOffsetMmByCol, col, row } = params;
+  const { volume, centerDepthMmByCol, targetOffsetMmByCol, targetOffsetMmMap, col, row } = params;
   const frame = volume.frames[col];
   if (!frame || row < 0 || row >= volume.panoHeight) {
     return {
@@ -538,7 +870,10 @@ function samplePanoV2MipWinner(params: {
   const [slabDirX, slabDirY, slabDirZ] = frame.mipSlabDir ?? frame.slabDir;
   const [vertDirX, vertDirY, vertDirZ] = frame.verticalDir;
   const centerDepthMm = Number(centerDepthMmByCol[col] ?? 0);
-  const targetOffsetMm = Number(targetOffsetMmByCol[col] ?? 0);
+  const rowTargetOffsetMm = Number(targetOffsetMmMap?.[row * volume.panoWidth + col]);
+  const targetOffsetMm = Number.isFinite(rowTargetOffsetMm)
+    ? rowTargetOffsetMm
+    : Number(targetOffsetMmByCol[col] ?? 0);
   const columnVerticalCenterOffsetMm = Number(frame.columnVerticalCenterOffsetMm ?? 0);
   const rowOffsetMm = volume.effectiveVerticalHalfMm - row * volume.vertStepMm;
   const verticalOffsetMm = columnVerticalCenterOffsetMm + rowOffsetMm;
@@ -575,6 +910,7 @@ function samplePanoV2MipRay(params: {
   volume: PanoV2StraightenedVolume;
   centerDepthMmByCol: Float32Array;
   targetOffsetMmByCol: Float32Array;
+  targetOffsetMmMap?: Float32Array | null;
   col: number;
   row: number;
 }): {
@@ -582,7 +918,7 @@ function samplePanoV2MipRay(params: {
   winnerDepthOffsetMm: number | null;
   samples: PanoV2MipRaySample[];
 } {
-  const { volume, centerDepthMmByCol, targetOffsetMmByCol, col, row } = params;
+  const { volume, centerDepthMmByCol, targetOffsetMmByCol, targetOffsetMmMap, col, row } = params;
   const frame = volume.frames[col];
   if (!frame || row < 0 || row >= volume.panoHeight) {
     return {
@@ -595,7 +931,10 @@ function samplePanoV2MipRay(params: {
   const [slabDirX, slabDirY, slabDirZ] = frame.mipSlabDir ?? frame.slabDir;
   const [vertDirX, vertDirY, vertDirZ] = frame.verticalDir;
   const centerDepthMm = Number(centerDepthMmByCol[col] ?? 0);
-  const targetOffsetMm = Number(targetOffsetMmByCol[col] ?? 0);
+  const rowTargetOffsetMm = Number(targetOffsetMmMap?.[row * volume.panoWidth + col]);
+  const targetOffsetMm = Number.isFinite(rowTargetOffsetMm)
+    ? rowTargetOffsetMm
+    : Number(targetOffsetMmByCol[col] ?? 0);
   const columnVerticalCenterOffsetMm = Number(frame.columnVerticalCenterOffsetMm ?? 0);
   const rowOffsetMm = volume.effectiveVerticalHalfMm - row * volume.vertStepMm;
   const verticalOffsetMm = columnVerticalCenterOffsetMm + rowOffsetMm;
@@ -671,6 +1010,7 @@ function applyCrossArchBypassRescue(params: {
   targetImage: Float32Array;
   oppositeCenterDepthMmByCol: Float32Array;
   oppositeTargetOffsetMmByCol: Float32Array;
+  oppositeTargetOffsetMmMap?: Float32Array | null;
   rowStartInclusive: number;
   rowEndExclusive: number;
 }): void {
@@ -679,6 +1019,7 @@ function applyCrossArchBypassRescue(params: {
     targetImage,
     oppositeCenterDepthMmByCol,
     oppositeTargetOffsetMmByCol,
+    oppositeTargetOffsetMmMap,
     rowStartInclusive,
     rowEndExclusive,
   } = params;
@@ -711,6 +1052,7 @@ function applyCrossArchBypassRescue(params: {
         volume,
         centerDepthMmByCol: oppositeCenterDepthMmByCol,
         targetOffsetMmByCol: oppositeTargetOffsetMmByCol,
+        targetOffsetMmMap: oppositeTargetOffsetMmMap,
         col,
         row,
       }).winnerHu;
@@ -732,12 +1074,22 @@ function buildPanoV2GeometryRayDebugPoint(params: {
   volume: PanoV2StraightenedVolume;
   band: PanoV2StraightenedVolumeBand;
   targetOffsetMmByCol: Float32Array;
+  targetOffsetMmMap?: Float32Array | null;
   upperBypassImage: Float32Array;
   lowerBypassImage: Float32Array;
   col: number;
   row: number;
 }): PanoV2GeometryRayDebugPoint | null {
-  const { volume, band, targetOffsetMmByCol, upperBypassImage, lowerBypassImage, col, row } = params;
+  const {
+    volume,
+    band,
+    targetOffsetMmByCol,
+    targetOffsetMmMap,
+    upperBypassImage,
+    lowerBypassImage,
+    col,
+    row,
+  } = params;
   const safeCol = clampNumber(Math.round(col), 0, Math.max(0, volume.panoWidth - 1));
   const safeRow = clampNumber(Math.round(row), 0, Math.max(0, volume.panoHeight - 1));
   const frame = volume.frames[safeCol];
@@ -749,7 +1101,10 @@ function buildPanoV2GeometryRayDebugPoint(params: {
   const verticalDir = frame.verticalDir as [number, number, number];
   const splineCenterWorld = frame.position as [number, number, number];
   const centerDepthMm = Number(band.centerDepthMmByCol[safeCol] ?? 0);
-  const targetOffsetMm = Number(targetOffsetMmByCol[safeCol] ?? 0);
+  const rowTargetOffsetMm = Number(targetOffsetMmMap?.[safeRow * volume.panoWidth + safeCol]);
+  const targetOffsetMm = Number.isFinite(rowTargetOffsetMm)
+    ? rowTargetOffsetMm
+    : Number(targetOffsetMmByCol[safeCol] ?? 0);
   const rayMidDepthMm = centerDepthMm + targetOffsetMm;
   const rayStartDepthMm = rayMidDepthMm - PANO_V2_MIP_SLAB_HALF_WIDTH_MM;
   const rayEndDepthMm = rayMidDepthMm + PANO_V2_MIP_SLAB_HALF_WIDTH_MM;
@@ -780,6 +1135,7 @@ function buildPanoV2GeometryRayDebugPoint(params: {
     volume,
     centerDepthMmByCol: band.centerDepthMmByCol,
     targetOffsetMmByCol,
+    targetOffsetMmMap,
     col: safeCol,
     row: safeRow,
   });
@@ -831,11 +1187,16 @@ export function buildPanoV2GeometryRayComparisonDiagnostics(params: {
     archLabel === 'upperArch'
       ? bypassCompositeImages.upperTargetOffsetMmByCol
       : bypassCompositeImages.lowerTargetOffsetMmByCol;
+  const targetOffsetMmMap =
+    archLabel === 'upperArch'
+      ? bypassCompositeImages.upperTargetOffsetMmMap
+      : bypassCompositeImages.lowerTargetOffsetMmMap;
 
   const failing = buildPanoV2GeometryRayDebugPoint({
     volume,
     band,
     targetOffsetMmByCol,
+    targetOffsetMmMap,
     upperBypassImage: bypassCompositeImages.upperArch,
     lowerBypassImage: bypassCompositeImages.lowerArch,
     col: failingCol,
@@ -845,6 +1206,7 @@ export function buildPanoV2GeometryRayComparisonDiagnostics(params: {
     volume,
     band,
     targetOffsetMmByCol,
+    targetOffsetMmMap,
     upperBypassImage: bypassCompositeImages.upperArch,
     lowerBypassImage: bypassCompositeImages.lowerArch,
     col: referenceCol,
@@ -1509,25 +1871,43 @@ export function buildPanoV2BypassCompositeImages(params: {
   volume: PanoV2StraightenedVolume;
 }): PanoV2BypassCompositeImages {
   const gapCenterRow = computePanoV2GapCenterRow(params.result);
-  const upperTargetOffsetMmByCol = buildBypassTargetOffsetMmByCol(
+  const upperColumnTargetOffsetMmByCol = buildBypassTargetOffsetMmByCol(
     params.result.upperArch,
     params.volume.panoWidth
   );
-  const lowerTargetOffsetMmByCol = buildBypassTargetOffsetMmByCol(
+  const lowerColumnTargetOffsetMmByCol = buildBypassTargetOffsetMmByCol(
     params.result.lowerArch,
     params.volume.panoWidth
   );
+  const upperTargetPlan = buildRowAdaptiveTargetOffsetPlan({
+    band: params.volume.upperArch,
+    panoWidth: params.volume.panoWidth,
+    panoHeight: params.volume.panoHeight,
+    assignedRowStartInclusive: 0,
+    assignedRowEndExclusive: gapCenterRow,
+    columnTargetOffsetMmByCol: upperColumnTargetOffsetMmByCol,
+  });
+  const lowerTargetPlan = buildRowAdaptiveTargetOffsetPlan({
+    band: params.volume.lowerArch,
+    panoWidth: params.volume.panoWidth,
+    panoHeight: params.volume.panoHeight,
+    assignedRowStartInclusive: gapCenterRow,
+    assignedRowEndExclusive: params.volume.panoHeight,
+    columnTargetOffsetMmByCol: lowerColumnTargetOffsetMmByCol,
+  });
   const upperArch = buildFullPlaneMipImage({
     volume: params.volume,
     centerDepthMmByCol: params.volume.upperArch.centerDepthMmByCol,
-    targetOffsetMmByCol: upperTargetOffsetMmByCol,
+    targetOffsetMmByCol: upperTargetPlan.targetOffsetMmByCol,
+    targetOffsetMmMap: upperTargetPlan.targetOffsetMmMap,
     rowStartInclusive: 0,
     rowEndExclusive: gapCenterRow,
   });
   const lowerArch = buildFullPlaneMipImage({
     volume: params.volume,
     centerDepthMmByCol: params.volume.lowerArch.centerDepthMmByCol,
-    targetOffsetMmByCol: lowerTargetOffsetMmByCol,
+    targetOffsetMmByCol: lowerTargetPlan.targetOffsetMmByCol,
+    targetOffsetMmMap: lowerTargetPlan.targetOffsetMmMap,
     rowStartInclusive: gapCenterRow,
     rowEndExclusive: params.volume.panoHeight,
   });
@@ -1536,7 +1916,8 @@ export function buildPanoV2BypassCompositeImages(params: {
     volume: params.volume,
     targetImage: upperArch,
     oppositeCenterDepthMmByCol: params.volume.lowerArch.centerDepthMmByCol,
-    oppositeTargetOffsetMmByCol: lowerTargetOffsetMmByCol,
+    oppositeTargetOffsetMmByCol: lowerTargetPlan.targetOffsetMmByCol,
+    oppositeTargetOffsetMmMap: lowerTargetPlan.targetOffsetMmMap,
     rowStartInclusive: 0,
     rowEndExclusive: gapCenterRow,
   });
@@ -1544,7 +1925,8 @@ export function buildPanoV2BypassCompositeImages(params: {
     volume: params.volume,
     targetImage: lowerArch,
     oppositeCenterDepthMmByCol: params.volume.upperArch.centerDepthMmByCol,
-    oppositeTargetOffsetMmByCol: upperTargetOffsetMmByCol,
+    oppositeTargetOffsetMmByCol: upperTargetPlan.targetOffsetMmByCol,
+    oppositeTargetOffsetMmMap: upperTargetPlan.targetOffsetMmMap,
     rowStartInclusive: gapCenterRow,
     rowEndExclusive: params.volume.panoHeight,
   });
@@ -1552,8 +1934,10 @@ export function buildPanoV2BypassCompositeImages(params: {
   return {
     upperArch,
     lowerArch,
-    upperTargetOffsetMmByCol,
-    lowerTargetOffsetMmByCol,
+    upperTargetOffsetMmByCol: upperTargetPlan.targetOffsetMmByCol,
+    lowerTargetOffsetMmByCol: lowerTargetPlan.targetOffsetMmByCol,
+    upperTargetOffsetMmMap: upperTargetPlan.targetOffsetMmMap,
+    lowerTargetOffsetMmMap: lowerTargetPlan.targetOffsetMmMap,
   };
 }
 
@@ -1759,6 +2143,7 @@ export function buildPanoV2DarkPocketDiagnostics(params: {
       volume,
       centerDepthMmByCol: volume.upperArch.centerDepthMmByCol,
       targetOffsetMmByCol: bypassCompositeImages.upperTargetOffsetMmByCol,
+      targetOffsetMmMap: bypassCompositeImages.upperTargetOffsetMmMap,
       col: candidate.col,
       row: candidate.row,
     });
@@ -1766,6 +2151,7 @@ export function buildPanoV2DarkPocketDiagnostics(params: {
       volume,
       centerDepthMmByCol: volume.lowerArch.centerDepthMmByCol,
       targetOffsetMmByCol: bypassCompositeImages.lowerTargetOffsetMmByCol,
+      targetOffsetMmMap: bypassCompositeImages.lowerTargetOffsetMmMap,
       col: candidate.col,
       row: candidate.row,
     });

@@ -3977,6 +3977,7 @@ function summarizeFloatBufferForDebug(
   let detailBandHorizontalEdgeCount = 0;
   let detailBandVerticalEdgeAccum = 0;
   let detailBandVerticalEdgeCount = 0;
+  const panoV2BypassMissMaskMap = debugMaps?.panoV2BypassMissMaskMap;
   const toneResponseMap = debugMaps?.toneResponseMap;
   const supportConfidenceMap = debugMaps?.supportConfidenceMap;
   const lowerPenaltyMap = debugMaps?.lowerPenaltyMap;
@@ -4015,8 +4016,16 @@ function summarizeFloatBufferForDebug(
     middle: { samples: [], outlierCount05: 0, outlierCount10: 0, toneMax: 0 },
     bottom: { samples: [], outlierCount05: 0, outlierCount10: 0, toneMax: 0 },
   };
+  const isExcludedBypassMissPixel = (index: number): boolean =>
+    !!panoV2BypassMissMaskMap &&
+    index >= 0 &&
+    index < panoV2BypassMissMaskMap.length &&
+    Number(panoV2BypassMissMaskMap[index]) > 0.5;
 
   for (let i = 0; i < buffer.length; i += step) {
+    if (isExcludedBypassMissPixel(i)) {
+      continue;
+    }
     const value = Number(buffer[i]);
     if (!Number.isFinite(value)) {
       continue;
@@ -4176,6 +4185,9 @@ function summarizeFloatBufferForDebug(
     for (let row = 0; row < safeHeight; row += rowStep) {
       for (let col = 0; col < safeWidth; col += colStep) {
         const index = row * safeWidth + col;
+        if (isExcludedBypassMissPixel(index)) {
+          continue;
+        }
         const value = Number(buffer[index]);
         if (!Number.isFinite(value)) {
           continue;
@@ -4819,6 +4831,13 @@ function computeAdaptivePanoVoi(
   const windowCenter = adaptiveLower + windowWidth / 2;
   const looksLikeHU =
     !isNativeDisplayPanoRenderMode(renderSupportMode) && isHuLikeRange(lower, upper);
+
+  if (renderSupportMode === 'panoV2Fusion' && summary) {
+    const panoV2FusionVoi = createPanoVoiForPanoV2FusionOutput(summary, lower, upper);
+    if (panoV2FusionVoi) {
+      return panoV2FusionVoi;
+    }
+  }
 
   if (isDualArchProjection) {
     const dataRangeWidth =
@@ -5686,7 +5705,8 @@ type BufferedCPRWorkerEvent =
 
 let activeCPRWorkerSession: CPRWorkerSession | null = null;
 let cprWorkerRequestCounter = 0;
-const CPR_WORKER_ENTRY_SPECIFIER = './cprWorker.ts';
+const CPR_WORKER_ENTRY_SPECIFIER =
+  './cprWorker.ts?cprWorkerBundleVersion=2026-04-07-worker-cache-key-1';
 
 function isCPRWorkerInitializationRequestType(requestType: string): boolean {
   return requestType === 'BOOTSTRAP_CHECK' || requestType === 'INIT_VOLUME';
@@ -5832,7 +5852,10 @@ function createCPRWorkerRequestId(): string {
 function resolveBundledCPRWorkerEntryUrl(): string {
   // Keep the worker specifier inline so webpack's worker transform can rewrite it
   // to a served bundle URL instead of leaving it as a raw source-file URL.
-  return new URL('./cprWorker.ts', import.meta.url).toString();
+  return new URL(
+    './cprWorker.ts?cprWorkerBundleVersion=2026-04-07-worker-cache-key-1',
+    import.meta.url
+  ).toString();
 }
 
 function createInstrumentedCPRWorker(params: {
@@ -5869,9 +5892,15 @@ function createInstrumentedCPRWorker(params: {
   );
 
   try {
-    const worker = new Worker(new URL('./cprWorker.ts', import.meta.url), {
+    const worker = new Worker(
+      new URL(
+        './cprWorker.ts?cprWorkerBundleVersion=2026-04-07-worker-cache-key-1',
+        import.meta.url
+      ),
+      {
       type: 'module',
-    });
+      }
+    );
     const bufferedEvents: BufferedCPRWorkerEvent[] = [];
     let handoffHandlers:
       | {
@@ -7954,6 +7983,53 @@ function createPanoVoiForMipBypassOutput(
   const windowCenter = Math.max(0, Math.min(4000, (minValue + maxValue) / 2));
   const windowWidth = Math.max(1000, Math.min(8000, maxValue - minValue + 200));
   return createPanoVoiFromWindowLevel(windowWidth, windowCenter);
+}
+
+function createPanoVoiForPanoV2FusionOutput(
+  summary: FloatBufferDebugSummary,
+  minValue: number,
+  maxValue: number
+): PanoVoiSettings | null {
+  const toothP10 = toFiniteNumber(summary.toothBandP10);
+  const toothP90 = toFiniteNumber(summary.toothBandP90);
+  const lowerBandP50 = toFiniteNumber(summary.lowerBandP50);
+  const p50 = toFiniteNumber(summary.p50);
+  const p99 = toFiniteNumber(summary.p99);
+  const safeMax = toFiniteNumber(maxValue);
+
+  if (toothP10 == null || toothP90 == null || toothP90 <= toothP10) {
+    return null;
+  }
+
+  const toothSpan = Math.max(240, toothP90 - toothP10);
+  let lower = Math.min(
+    toothP10 - Math.max(260, toothSpan * 0.22),
+    (lowerBandP50 ?? toothP10) - Math.max(220, toothSpan * 0.18)
+  );
+  let upper = Math.max(
+    toothP90 + Math.max(120, toothSpan * 0.08),
+    p99 ?? toothP90,
+    safeMax ?? toothP90
+  );
+
+  lower = Math.max(700, Math.min(lower, toothP10 - 80));
+  upper = Math.min(4000, Math.max(upper, lower + 1200));
+
+  const preferredCenter = p50 ?? (lower + upper) / 2;
+  let windowWidth = upper - lower;
+  if (windowWidth < 1450) {
+    lower = Math.max(700, upper - 1450);
+    windowWidth = upper - lower;
+  } else if (windowWidth > 2600) {
+    windowWidth = 2600;
+    lower = Math.max(700, preferredCenter - windowWidth / 2);
+    upper = lower + windowWidth;
+  }
+
+  return createPanoVoiFromRange({
+    lower,
+    upper,
+  });
 }
 
 function computeWindowLevelToolHuPerPixel(dynamicRange: number | null | undefined): number | null {

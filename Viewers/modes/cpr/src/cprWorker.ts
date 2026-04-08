@@ -37,7 +37,7 @@ type GpuRendererModule = typeof import('./cprGpuRenderer');
 
 let gpuRendererModule: GpuRendererModule | null = null;
 let gpuRendererModulePromise: Promise<GpuRendererModule> | null = null;
-const CPR_WORKER_IMPLEMENTATION_VERSION = '2026-04-06-worker-fingerprint-1';
+const CPR_WORKER_IMPLEMENTATION_VERSION = '2026-04-07-worker-cache-key-1';
 const PANO_V2_GEOMETRY_DEBUG_ROW = 88;
 const PANO_V2_GEOMETRY_DEBUG_FAILING_COL = 327;
 const PANO_V2_GEOMETRY_DEBUG_REFERENCE_COL = 320;
@@ -362,6 +362,72 @@ function cross3(
   return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 }
 
+function smoothUnitVectorSeries(
+  vectors: Array<[number, number, number]>
+): Array<[number, number, number]> {
+  if (vectors.length <= 1) {
+    return vectors.map(vector => normalize3(vector));
+  }
+
+  const alignVectorSeries = (
+    sourceVectors: Array<[number, number, number]>
+  ): Array<[number, number, number]> => {
+    const alignedVectors: Array<[number, number, number]> = new Array(sourceVectors.length);
+    let previousVector: [number, number, number] | null = null;
+    for (let index = 0; index < sourceVectors.length; index++) {
+      let currentVector = normalize3(sourceVectors[index]);
+      if (previousVector && dot3(previousVector, currentVector) < 0) {
+        currentVector = [-currentVector[0], -currentVector[1], -currentVector[2]];
+      }
+      alignedVectors[index] = currentVector;
+      previousVector = currentVector;
+    }
+    return alignedVectors;
+  };
+
+  const blurVectorSeries = (
+    sourceVectors: Array<[number, number, number]>
+  ): Array<[number, number, number]> => {
+    const radius = 2;
+    const kernel = [1, 2, 3, 2, 1] as const;
+    const blurredVectors: Array<[number, number, number]> = new Array(sourceVectors.length);
+
+    for (let index = 0; index < sourceVectors.length; index++) {
+      const referenceVector = sourceVectors[index];
+      let sumX = 0;
+      let sumY = 0;
+      let sumZ = 0;
+      let totalWeight = 0;
+      for (
+        let sampleIndex = Math.max(0, index - radius);
+        sampleIndex <= Math.min(sourceVectors.length - 1, index + radius);
+        sampleIndex++
+      ) {
+        let sampleVector = sourceVectors[sampleIndex];
+        if (dot3(referenceVector, sampleVector) < 0) {
+          sampleVector = [-sampleVector[0], -sampleVector[1], -sampleVector[2]];
+        }
+        const weight = kernel[sampleIndex - index + radius];
+        sumX += sampleVector[0] * weight;
+        sumY += sampleVector[1] * weight;
+        sumZ += sampleVector[2] * weight;
+        totalWeight += weight;
+      }
+      blurredVectors[index] = normalize3([
+        totalWeight > 0 ? sumX / totalWeight : referenceVector[0],
+        totalWeight > 0 ? sumY / totalWeight : referenceVector[1],
+        totalWeight > 0 ? sumZ / totalWeight : referenceVector[2],
+      ]);
+    }
+
+    return alignVectorSeries(blurredVectors);
+  };
+
+  const alignedVectors = alignVectorSeries(vectors);
+  const blurredOnce = blurVectorSeries(alignedVectors);
+  return blurVectorSeries(blurredOnce);
+}
+
 function percentile(values: number[], q: number): number {
   if (!values.length) {
     return NaN;
@@ -375,6 +441,286 @@ function percentile(values: number[], q: number): number {
   }
   const t = index - low;
   return sorted[low] * (1 - t) + sorted[high] * t;
+}
+
+interface PanoV2ArtifactTracePoint {
+  col: number;
+  row: number;
+  arch: 'upperArch' | 'lowerArch';
+  finalHu: number;
+  missMaskValue: number | null;
+  upperBypassHu: number | null;
+  lowerBypassHu: number | null;
+  upperLayer1Hu: number | null;
+  upperLayer2Hu: number | null;
+  upperLayer3Hu: number | null;
+  lowerLayer1Hu: number | null;
+  lowerLayer2Hu: number | null;
+  lowerLayer3Hu: number | null;
+  sameArchBypassHu: number | null;
+  sameArchLayerMedianHu: number | null;
+  sameArchLayerMaxHu: number | null;
+  oppositeBypassHu: number | null;
+  denseNeighborCount: number;
+  denseNeighborMedianHu: number;
+  denseNeighborMaxHu: number;
+  darknessScore: number;
+  inferredFirstWrongStage:
+    | 'same-arch-bypass-composite'
+    | 'fusion-post-bypass'
+    | 'upstream-layer-or-sampling'
+    | 'residual-bypass-repair'
+    | 'unclear';
+  inferredReason: string;
+}
+
+interface PanoV2ArtifactTraceDiagnostics {
+  searchRegion: {
+    colStart: number;
+    colEnd: number;
+    rowStart: number;
+    rowEnd: number;
+    gapCenterRow: number;
+    denseNeighborThresholdHu: number;
+  };
+  candidateCountBeforeSuppression: number;
+  inferredStageCounts: Record<string, number>;
+  topCandidates: PanoV2ArtifactTracePoint[];
+}
+
+function roundTraceValue(value: number | null): number | null {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+  return Math.round(Number(value) * 1000) / 1000;
+}
+
+function finiteTraceValue(buffer: Float32Array | undefined | null, index: number): number | null {
+  if (!buffer || index < 0 || index >= buffer.length) {
+    return null;
+  }
+  const value = Number(buffer[index]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function summarizeTraceLayerValues(values: Array<number | null>): {
+  median: number | null;
+  max: number | null;
+} {
+  const finiteValues = values.filter((value): value is number => Number.isFinite(value));
+  if (!finiteValues.length) {
+    return {
+      median: null,
+      max: null,
+    };
+  }
+  return {
+    median: percentile(finiteValues, 0.5),
+    max: finiteValues.reduce((currentMax, value) => Math.max(currentMax, value), Number.NEGATIVE_INFINITY),
+  };
+}
+
+function buildPanoV2ArtifactTraceDiagnostics(params: {
+  panoWidth: number;
+  panoHeight: number;
+  gapCenterRow: number;
+  fullPlaneLayerImages: ReturnType<typeof buildPanoV2FullPlaneLayerImages>;
+  bypassCompositeImages: ReturnType<typeof buildPanoV2BypassCompositeImages>;
+  finalPixelData: Float32Array;
+  bypassMissMask?: Float32Array | null;
+}): PanoV2ArtifactTraceDiagnostics | null {
+  const {
+    panoWidth,
+    panoHeight,
+    gapCenterRow,
+    fullPlaneLayerImages,
+    bypassCompositeImages,
+    finalPixelData,
+    bypassMissMask,
+  } = params;
+  const colStart = Math.min(Math.max(6, 0), Math.max(0, panoWidth - 1));
+  const colEnd = Math.max(colStart, panoWidth - 7);
+  const rowStart = clampNumber(Math.round(gapCenterRow * 0.08), 12, Math.max(12, gapCenterRow - 1));
+  const rowEnd = clampNumber(gapCenterRow - 18, rowStart, Math.max(rowStart, gapCenterRow - 1));
+  const neighborhoodRadius = 5;
+  const candidateMaxHu = 2200;
+  const denseNeighborThresholdHu = 2800;
+  const rawCandidates: Array<PanoV2ArtifactTracePoint & { score: number }> = [];
+
+  for (let row = rowStart; row <= rowEnd; row++) {
+    for (let col = colStart; col <= colEnd; col++) {
+      const index = row * panoWidth + col;
+      const finalHu = finiteTraceValue(finalPixelData, index);
+      if (!Number.isFinite(finalHu) || Number(finalHu) > candidateMaxHu) {
+        continue;
+      }
+
+      const denseNeighborValues: number[] = [];
+      let denseNeighborMaxHu = Number.NEGATIVE_INFINITY;
+      for (let sampleRow = row - neighborhoodRadius; sampleRow <= row + neighborhoodRadius; sampleRow++) {
+        if (sampleRow < rowStart || sampleRow > rowEnd) {
+          continue;
+        }
+        for (let sampleCol = col - neighborhoodRadius; sampleCol <= col + neighborhoodRadius; sampleCol++) {
+          if (sampleCol < colStart || sampleCol > colEnd) {
+            continue;
+          }
+          const isPerimeter =
+            sampleRow === row - neighborhoodRadius ||
+            sampleRow === row + neighborhoodRadius ||
+            sampleCol === col - neighborhoodRadius ||
+            sampleCol === col + neighborhoodRadius;
+          if (!isPerimeter) {
+            continue;
+          }
+          const sampleValue = finiteTraceValue(finalPixelData, sampleRow * panoWidth + sampleCol);
+          if (!Number.isFinite(sampleValue) || Number(sampleValue) < denseNeighborThresholdHu) {
+            continue;
+          }
+          denseNeighborValues.push(Number(sampleValue));
+          denseNeighborMaxHu = Math.max(denseNeighborMaxHu, Number(sampleValue));
+        }
+      }
+
+      if (denseNeighborValues.length < 10) {
+        continue;
+      }
+      const denseNeighborMedianHu = percentile(denseNeighborValues, 0.5);
+      if (!Number.isFinite(denseNeighborMedianHu) || denseNeighborMedianHu <= Number(finalHu) + 250) {
+        continue;
+      }
+
+      const arch = row < gapCenterRow ? 'upperArch' : 'lowerArch';
+      const upperBypassHu = finiteTraceValue(bypassCompositeImages.upperArch, index);
+      const lowerBypassHu = finiteTraceValue(bypassCompositeImages.lowerArch, index);
+      const upperLayer1Hu = finiteTraceValue(fullPlaneLayerImages.upperArch[0], index);
+      const upperLayer2Hu = finiteTraceValue(fullPlaneLayerImages.upperArch[1], index);
+      const upperLayer3Hu = finiteTraceValue(fullPlaneLayerImages.upperArch[2], index);
+      const lowerLayer1Hu = finiteTraceValue(fullPlaneLayerImages.lowerArch[0], index);
+      const lowerLayer2Hu = finiteTraceValue(fullPlaneLayerImages.lowerArch[1], index);
+      const lowerLayer3Hu = finiteTraceValue(fullPlaneLayerImages.lowerArch[2], index);
+      const sameArchBypassHu = arch === 'upperArch' ? upperBypassHu : lowerBypassHu;
+      const oppositeBypassHu = arch === 'upperArch' ? lowerBypassHu : upperBypassHu;
+      const sameArchLayerSummary = summarizeTraceLayerValues(
+        arch === 'upperArch'
+          ? [upperLayer1Hu, upperLayer2Hu, upperLayer3Hu]
+          : [lowerLayer1Hu, lowerLayer2Hu, lowerLayer3Hu]
+      );
+      const missMaskValue = finiteTraceValue(bypassMissMask ?? undefined, index);
+
+      let inferredFirstWrongStage: PanoV2ArtifactTracePoint['inferredFirstWrongStage'] = 'unclear';
+      let inferredReason =
+        'The current pixel stays dark, but the compared buffers do not isolate a single upstream stage confidently.';
+      if (
+        (sameArchBypassHu === null || sameArchBypassHu <= 2200) &&
+        sameArchLayerSummary.max !== null &&
+        sameArchLayerSummary.max >= 2600 &&
+        (sameArchBypassHu === null || sameArchLayerSummary.max >= sameArchBypassHu + 400)
+      ) {
+        inferredFirstWrongStage = 'same-arch-bypass-composite';
+        inferredReason =
+          'The selected bypass image is already dark here while same-arch full-plane layer images still carry strong anatomy.';
+      } else if (
+        sameArchBypassHu !== null &&
+        finalHu !== null &&
+        sameArchBypassHu >= 900 &&
+        finalHu <= sameArchBypassHu - 180
+      ) {
+        inferredFirstWrongStage = 'fusion-post-bypass';
+        inferredReason =
+          'The selected bypass image is materially brighter than the final fused output, so the darkening happens after bypass selection.';
+      } else if (missMaskValue !== null && missMaskValue > 0.5) {
+        inferredFirstWrongStage = 'residual-bypass-repair';
+        inferredReason =
+          'This pixel is still marked by the bypass miss mask after the current repair stack, so the rescue path is incomplete here.';
+      } else if (
+        (sameArchBypassHu === null || sameArchBypassHu <= 2200) &&
+        (sameArchLayerSummary.max === null || sameArchLayerSummary.max < 2600)
+      ) {
+        inferredFirstWrongStage = 'upstream-layer-or-sampling';
+        inferredReason =
+          'Both the selected bypass image and the same-arch full-plane layers are dark here, so the flaw predates final fusion.';
+      }
+
+      const darknessScore =
+        (denseNeighborMedianHu - Number(finalHu)) +
+        (denseNeighborMaxHu - Number(finalHu)) * 0.2 +
+        denseNeighborValues.length * 18;
+
+      rawCandidates.push({
+        col,
+        row,
+        arch,
+        finalHu: roundTraceValue(finalHu) ?? 0,
+        missMaskValue: roundTraceValue(missMaskValue),
+        upperBypassHu: roundTraceValue(upperBypassHu),
+        lowerBypassHu: roundTraceValue(lowerBypassHu),
+        upperLayer1Hu: roundTraceValue(upperLayer1Hu),
+        upperLayer2Hu: roundTraceValue(upperLayer2Hu),
+        upperLayer3Hu: roundTraceValue(upperLayer3Hu),
+        lowerLayer1Hu: roundTraceValue(lowerLayer1Hu),
+        lowerLayer2Hu: roundTraceValue(lowerLayer2Hu),
+        lowerLayer3Hu: roundTraceValue(lowerLayer3Hu),
+        sameArchBypassHu: roundTraceValue(sameArchBypassHu),
+        sameArchLayerMedianHu: roundTraceValue(sameArchLayerSummary.median),
+        sameArchLayerMaxHu: roundTraceValue(sameArchLayerSummary.max),
+        oppositeBypassHu: roundTraceValue(oppositeBypassHu),
+        denseNeighborCount: denseNeighborValues.length,
+        denseNeighborMedianHu: roundTraceValue(denseNeighborMedianHu) ?? 0,
+        denseNeighborMaxHu: roundTraceValue(denseNeighborMaxHu) ?? 0,
+        darknessScore: roundTraceValue(darknessScore) ?? 0,
+        inferredFirstWrongStage,
+        inferredReason,
+        score: darknessScore,
+      });
+    }
+  }
+
+  rawCandidates.sort((left, right) => {
+    if (right.score !== left.score) {
+      return right.score - left.score;
+    }
+    return left.finalHu - right.finalHu;
+  });
+
+  const topCandidates: PanoV2ArtifactTracePoint[] = [];
+  const inferredStageCounts: Record<string, number> = {};
+  for (let candidateIndex = 0; candidateIndex < rawCandidates.length; candidateIndex++) {
+    const candidate = rawCandidates[candidateIndex];
+    inferredStageCounts[candidate.inferredFirstWrongStage] =
+      (inferredStageCounts[candidate.inferredFirstWrongStage] ?? 0) + 1;
+    const tooCloseToExisting = topCandidates.some(
+      existing =>
+        Math.abs(existing.col - candidate.col) <= 12 &&
+        Math.abs(existing.row - candidate.row) <= 12
+    );
+    if (tooCloseToExisting) {
+      continue;
+    }
+    const { score: _score, ...candidateWithoutScore } = candidate;
+    topCandidates.push(candidateWithoutScore);
+    if (topCandidates.length >= 8) {
+      break;
+    }
+  }
+
+  if (!rawCandidates.length) {
+    return null;
+  }
+
+  return {
+    searchRegion: {
+      colStart,
+      colEnd,
+      rowStart,
+      rowEnd,
+      gapCenterRow,
+      denseNeighborThresholdHu,
+    },
+    candidateCountBeforeSuppression: rawCandidates.length,
+    inferredStageCounts,
+    topCandidates,
+  };
 }
 
 interface AuditHistogramSummary {
@@ -10410,7 +10756,12 @@ function generatePanorama(
   ) {
     clampedFittedVerticalCenterOffsetMm = 0;
   }
-  let verticalCenterOffsetMm = clampedRequestedCenterOffsetMm + clampedFittedVerticalCenterOffsetMm;
+  const appliedFittedVerticalCenterOffsetMm =
+    rigidVerticalSliceMode || hasExplicitRequestedCenterOffset
+      ? 0
+      : clampedFittedVerticalCenterOffsetMm;
+  let verticalCenterOffsetMm =
+    clampedRequestedCenterOffsetMm + appliedFittedVerticalCenterOffsetMm;
   verticalCenterOffsetMm = Math.max(
     -baseCenterOffsetLimitMm,
     Math.min(baseCenterOffsetLimitMm, verticalCenterOffsetMm)
@@ -10428,6 +10779,10 @@ function generatePanorama(
       }
       slabDirs[col] = slabDir;
       previousSlabDir = slabDir;
+    }
+    const smoothedSlabDirs = smoothUnitVectorSeries(slabDirs);
+    for (let col = 0; col < panoWidth; col++) {
+      slabDirs[col] = smoothedSlabDirs[col];
     }
   }
 
@@ -11687,6 +12042,7 @@ function generatePanorama(
     null;
   let panoV2DarkPocketDiagnostics: ReturnType<typeof buildPanoV2DarkPocketDiagnostics> | null =
     null;
+  let panoV2ArtifactTraceDiagnostics: PanoV2ArtifactTraceDiagnostics | null = null;
   let panoV2GeometryRayComparisonDiagnostics: ReturnType<
     typeof buildPanoV2GeometryRayComparisonDiagnostics
   > | null = null;
@@ -12531,6 +12887,15 @@ function generatePanorama(
         bypassCompositeImages: panoV2BypassCompositeImages,
         finalPixelData: panoV2FusionResult.pixelData,
       });
+      panoV2ArtifactTraceDiagnostics = buildPanoV2ArtifactTraceDiagnostics({
+        panoWidth,
+        panoHeight,
+        gapCenterRow: panoV2FusionResult.diagnostics.gapCenterRow,
+        fullPlaneLayerImages: panoV2FullPlaneLayerImages,
+        bypassCompositeImages: panoV2BypassCompositeImages,
+        finalPixelData: panoV2FusionResult.pixelData,
+        bypassMissMask: panoV2FusionResult.bypassMissMask,
+      });
       panoV2GeometryRayComparisonDiagnostics = buildPanoV2GeometryRayComparisonDiagnostics({
         volume: panoV2StraightenedVolume,
         layerRender: panoV2LayerRenderResult,
@@ -12541,6 +12906,7 @@ function generatePanorama(
       });
       finalDebugMaps = {
         panoV2FusionImageMap: new Float32Array(panoV2FusionResult.pixelData),
+        panoV2BypassMissMaskMap: panoV2FusionResult.bypassMissMask ?? undefined,
         panoV2UpperLayer1Map: panoV2FullPlaneLayerImages.upperArch[0],
         panoV2UpperLayer2Map: panoV2FullPlaneLayerImages.upperArch[1],
         panoV2UpperLayer3Map: panoV2FullPlaneLayerImages.upperArch[2],
@@ -13254,14 +13620,14 @@ function generatePanorama(
       ? 'rigid-spline-slice-window'
       : 'local-column-adaptive-window',
     verticalHalfMm: effectiveVerticalHalfMm,
-    globalVerticalCenterOffsetMm: clampedFittedVerticalCenterOffsetMm,
+    globalVerticalCenterOffsetMm: appliedFittedVerticalCenterOffsetMm,
     baseVerticalCenterOffsetMm: verticalCenterOffsetMm,
     verticalCenterOffsetMm: meanLocalCenterOffsetMm,
     rigidSliceMode: {
       enabled: rigidVerticalSliceMode,
       projectedSplinePlaneLocked: rigidVerticalSliceMode,
       requestedCenterOffsetMm: clampedRequestedCenterOffsetMm,
-      fittedCenterOffsetAppliedMm: clampedFittedVerticalCenterOffsetMm,
+      fittedCenterOffsetAppliedMm: appliedFittedVerticalCenterOffsetMm,
       localOffsetsLocked: rigidVerticalSliceMode,
     },
     localCenterOffsetMmStats: {
@@ -13278,7 +13644,7 @@ function generatePanorama(
       ).map(value => Math.round(Number(value) * 1000) / 1000),
     },
     requestedVerticalCenterOffsetMm: clampedRequestedCenterOffsetMm,
-    fittedVerticalCenterOffsetMm: clampedFittedVerticalCenterOffsetMm,
+    fittedVerticalCenterOffsetMm: appliedFittedVerticalCenterOffsetMm,
     adaptiveVerticalSearch: {
       enabled: !rigidVerticalSliceMode,
       mode: rigidVerticalSliceMode ? 'disabled-rigid-slice' : 'local-adaptive-search',
@@ -13437,6 +13803,23 @@ function generatePanorama(
         ...panoV2LogContext,
         phase: panoV2LayerDiagnostics.phase,
         model: 'thick-slab-mip-render',
+        verticalCenterOffsetMmRequested: (() => {
+          const value = Number(
+            (virtualPanoPhase12Diagnostics as { requestedVerticalCenterOffsetMm?: unknown })
+              ?.requestedVerticalCenterOffsetMm ?? 0
+          );
+          return Number.isFinite(value) ? Math.round(value * 1000) / 1000 : 0;
+        })(),
+        verticalCenterOffsetMmApplied: (() => {
+          const value = Number(
+            (virtualPanoPhase12Diagnostics as { baseVerticalCenterOffsetMm?: unknown })
+              ?.baseVerticalCenterOffsetMm ??
+              (virtualPanoPhase12Diagnostics as { verticalCenterOffsetMm?: unknown })
+                ?.verticalCenterOffsetMm ??
+              0
+          );
+          return Number.isFinite(value) ? Math.round(value * 1000) / 1000 : 0;
+        })(),
         verticalCenterOffsetMm: (() => {
           const value = Number(
             (virtualPanoPhase12Diagnostics as { verticalCenterOffsetMm?: unknown })
@@ -13516,6 +13899,15 @@ function generatePanorama(
       JSON.stringify({
         ...panoV2LogContext,
         ...panoV2DarkPocketDiagnostics,
+      })
+    );
+  }
+  if (panoV2ArtifactTraceDiagnostics) {
+    console.log(
+      '[CPR-PANOV2-ARTIFACT-TRACE-JSON]',
+      JSON.stringify({
+        ...panoV2LogContext,
+        ...panoV2ArtifactTraceDiagnostics,
       })
     );
   }
@@ -14234,6 +14626,7 @@ self.onmessage = async function (event: MessageEvent<CPRWorkerMessage>) {
     pushTransferBuffer(sampleCountMap);
     pushTransferBuffer(debugMaps?.renderBranchMap);
     pushTransferBuffer(debugMaps?.panoV2FusionImageMap);
+    pushTransferBuffer(debugMaps?.panoV2BypassMissMaskMap);
     pushTransferBuffer(debugMaps?.panoV2UpperLayer1Map);
     pushTransferBuffer(debugMaps?.panoV2UpperLayer2Map);
     pushTransferBuffer(debugMaps?.panoV2UpperLayer3Map);

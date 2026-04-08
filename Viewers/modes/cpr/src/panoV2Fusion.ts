@@ -32,6 +32,51 @@ const ANATOMY_WEIGHT_HIGH_HU = 660;
 const BYPASS_LOW_SIGNAL_HU = 300;
 const BYPASS_SAME_ARCH_RESCUE_MIN_HU = 700;
 const BYPASS_SAME_ARCH_RESCUE_MARGIN_HU = 250;
+const BYPASS_MISS_NEIGHBOR_RADIUS = 2;
+const BYPASS_MISS_MIN_NEIGHBOR_COUNT = 8;
+const BYPASS_MISS_MIN_DENSE_NEIGHBOR_COUNT = 5;
+const BYPASS_MISS_DENSE_NEIGHBOR_HU = 1800;
+const BYPASS_MISS_REPAIR_BLEND = 0.88;
+const BYPASS_MISS_EDGE_BLEND = 0.32;
+const BYPASS_DARK_POCKET_MAX_HU = 1200;
+const BYPASS_DARK_POCKET_NEIGHBOR_RADIUS = 6;
+const BYPASS_DARK_POCKET_MIN_DENSE_NEIGHBOR_COUNT = 12;
+const BYPASS_DARK_POCKET_MIN_MEDIAN_HU = 2400;
+const BYPASS_DARK_POCKET_MIN_REPAIR_GAIN_HU = 120;
+const BYPASS_DARK_CLUSTER_MAX_HU = 2200;
+const BYPASS_DARK_CLUSTER_MAX_PIXELS = 900;
+const BYPASS_DARK_CLUSTER_MIN_PERIMETER_SAMPLES = 20;
+const BYPASS_DARK_CLUSTER_MIN_MEDIAN_HU = 2200;
+const BYPASS_DARK_CLUSTER_MIN_MAX_HU = 3000;
+const BYPASS_DARK_CLUSTER_MIN_GAIN_HU = 120;
+const BYPASS_DARK_CLUSTER_BLEND_WEIGHT = 0.5;
+const BYPASS_PERITOOTH_MAX_HU = 2200;
+const BYPASS_PERITOOTH_TOOTH_NEIGHBOR_HU = 3000;
+const BYPASS_PERITOOTH_MIN_TOOTH_NEIGHBOR_COUNT = 6;
+const BYPASS_PERITOOTH_MIN_SUPPORT_SAMPLE_COUNT = 8;
+const BYPASS_PERITOOTH_MIN_GAIN_HU = 90;
+const BYPASS_PERITOOTH_REPAIR_BLEND = 0.78;
+const BYPASS_UNSUPPORTED_CONTEXT_MIN_HU = 1400;
+const BYPASS_UNSUPPORTED_DENSE_HU = 2800;
+const BYPASS_UNSUPPORTED_MIN_CONTEXT_SAMPLE_COUNT = 8;
+const BYPASS_UNSUPPORTED_MIN_DENSE_SAMPLE_COUNT = 10;
+const BYPASS_UNSUPPORTED_MAX_SEARCH_RADIUS = 24;
+const BYPASS_UNSUPPORTED_MIN_OUTPUT_HU = 2100;
+const BYPASS_UNSUPPORTED_MAX_OUTPUT_HU = 2850;
+const BYPASS_SEAM_TONE_CORE_HALF_SPAN_ROWS = 12;
+const BYPASS_SEAM_TONE_FEATHER_HALF_SPAN_ROWS = 28;
+const BYPASS_SEAM_TONE_INPUT_LOW_HU = 700;
+const BYPASS_SEAM_TONE_INPUT_HIGH_HU = 1600;
+const BYPASS_SEAM_TONE_OUTPUT_LOW_HU = 2200;
+const BYPASS_SEAM_TONE_OUTPUT_HIGH_HU = 2800;
+const LOWER_BACKGROUND_TRIM_MIN_SIGNAL_HU = 280;
+const LOWER_BACKGROUND_TRIM_MIN_COLUMN_PEAK_HU = 650;
+const LOWER_BACKGROUND_TRIM_RELATIVE_SIGNAL = 0.16;
+const LOWER_BACKGROUND_TRIM_MIN_LOW_RUN_ROWS = 6;
+const LOWER_BACKGROUND_TRIM_BOUNDARY_MARGIN_ROWS = 6;
+const LOWER_BACKGROUND_TRIM_FEATHER_ROWS = 18;
+const LOWER_BACKGROUND_TRIM_SMOOTH_RADIUS_COLS = 4;
+const LOWER_BACKGROUND_TRIM_MAX_ADJACENT_DELTA_ROWS = 6;
 
 interface PanoV2FusionLayerScore {
   layerId: string;
@@ -90,6 +135,7 @@ export interface PanoV2FusionDiagnostics {
   gapAnalysis: PanoV2GapAnalysisDiagnostics | null;
   gapFillAnalysis: PanoV2GapFillDiagnostics | null;
   toneMappingAnalysis: PanoV2ToneMappingDiagnostics | null;
+  bypassMissRepairAnalysis: PanoV2BypassMissRepairAnalysis | null;
   upperArch: PanoV2FusionBandDiagnostics;
   lowerArch: PanoV2FusionBandDiagnostics;
 }
@@ -97,6 +143,7 @@ export interface PanoV2FusionDiagnostics {
 export interface PanoV2FusionResult {
   pixelData: Float32Array;
   diagnostics: PanoV2FusionDiagnostics;
+  bypassMissMask: Float32Array | null;
 }
 
 interface PanoV2BandFusionResult {
@@ -154,6 +201,26 @@ export interface PanoV2ToneMappingDiagnostics {
   pixelsRemapped: number;
   preRemapMedianInRange: number | null;
   postRemapMedianInRange: number | null;
+  seamBandPixelsLifted: number;
+  seamBandPreLiftMedian: number | null;
+  seamBandPostLiftMedian: number | null;
+  seamBandRowStart: number;
+  seamBandRowEnd: number;
+}
+
+export interface PanoV2BypassMissRepairAnalysis {
+  unresolvedPixelCount: number;
+  unresolvedToothEdgeFillCount: number;
+  unresolvedUnsupportedBandFillCount: number;
+  lowOutlierPixelCount: number;
+  repairedPixelCount: number;
+  darkPocketRepairCount: number;
+  darkClusterRepairPixelCount: number;
+  darkClusterRepairComponentCount: number;
+  darkClusterBlendPixelCount: number;
+  periToothRepairPixelCount: number;
+  blendedPixelCount: number;
+  excludedPixelCount: number;
 }
 
 function fillColumnHolesInZone(params: {
@@ -294,19 +361,82 @@ function applyBypassGapFill(params: {
   };
 }
 
-function applyBypassToneMapping(pixelData: Float32Array): PanoV2ToneMappingDiagnostics {
+function applyBypassToneMapping(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  gapCenterRow: number;
+}): PanoV2ToneMappingDiagnostics {
+  const { pixelData, panoWidth, panoHeight, gapCenterRow } = params;
   const preRemapValues: number[] = [];
   const postRemapValues: number[] = [];
+  const seamBandPreLiftValues: number[] = [];
+  const seamBandPostLiftValues: number[] = [];
+  const seamBandRowStart = clampNumber(
+    gapCenterRow - BYPASS_SEAM_TONE_FEATHER_HALF_SPAN_ROWS,
+    0,
+    Math.max(0, panoHeight - 1)
+  );
+  const seamBandRowEnd = clampNumber(
+    gapCenterRow + BYPASS_SEAM_TONE_FEATHER_HALF_SPAN_ROWS,
+    0,
+    Math.max(0, panoHeight - 1)
+  );
 
-  for (let index = 0; index < pixelData.length; index++) {
-    const value = Number(pixelData[index]);
-    if (!Number.isFinite(value) || value < -500 || value >= 600) {
-      continue;
+  for (let row = 0; row < panoHeight; row++) {
+    const rowDistance = Math.abs(row - gapCenterRow);
+    let seamLiftWeight = 0;
+    if (rowDistance <= BYPASS_SEAM_TONE_CORE_HALF_SPAN_ROWS) {
+      seamLiftWeight = 1;
+    } else if (rowDistance <= BYPASS_SEAM_TONE_FEATHER_HALF_SPAN_ROWS) {
+      seamLiftWeight =
+        1 -
+        (rowDistance - BYPASS_SEAM_TONE_CORE_HALF_SPAN_ROWS) /
+          Math.max(
+            1,
+            BYPASS_SEAM_TONE_FEATHER_HALF_SPAN_ROWS - BYPASS_SEAM_TONE_CORE_HALF_SPAN_ROWS
+          );
     }
-    preRemapValues.push(value);
-    const remappedValue = 400 + ((value + 500) / 1100) * 200;
-    pixelData[index] = remappedValue;
-    postRemapValues.push(remappedValue);
+
+    for (let col = 0; col < panoWidth; col++) {
+      const index = row * panoWidth + col;
+      const value = Number(pixelData[index]);
+      if (!Number.isFinite(value)) {
+        continue;
+      }
+
+      let remappedValue = value;
+      if (value >= -500 && value < 600) {
+        preRemapValues.push(value);
+        remappedValue = 800 + ((value + 500) / 1100) * 400;
+        postRemapValues.push(remappedValue);
+      }
+
+      if (
+        seamLiftWeight > 0 &&
+        remappedValue >= BYPASS_SEAM_TONE_INPUT_LOW_HU &&
+        remappedValue < BYPASS_SEAM_TONE_INPUT_HIGH_HU
+      ) {
+        const normalizedValue =
+          (remappedValue - BYPASS_SEAM_TONE_INPUT_LOW_HU) /
+          Math.max(1, BYPASS_SEAM_TONE_INPUT_HIGH_HU - BYPASS_SEAM_TONE_INPUT_LOW_HU);
+        const liftedTarget =
+          BYPASS_SEAM_TONE_OUTPUT_LOW_HU +
+          clampNumber(normalizedValue, 0, 1) *
+            (BYPASS_SEAM_TONE_OUTPUT_HIGH_HU - BYPASS_SEAM_TONE_OUTPUT_LOW_HU);
+        const liftedValue =
+          remappedValue * (1 - seamLiftWeight) + liftedTarget * seamLiftWeight;
+        if (liftedValue > remappedValue + 1) {
+          seamBandPreLiftValues.push(remappedValue);
+          seamBandPostLiftValues.push(liftedValue);
+          remappedValue = liftedValue;
+        }
+      }
+
+      if (remappedValue !== value) {
+        pixelData[index] = remappedValue;
+      }
+    }
   }
 
   return {
@@ -315,6 +445,13 @@ function applyBypassToneMapping(pixelData: Float32Array): PanoV2ToneMappingDiagn
       preRemapValues.length > 0 ? roundTo(percentile(preRemapValues, 0.5)) : null,
     postRemapMedianInRange:
       postRemapValues.length > 0 ? roundTo(percentile(postRemapValues, 0.5)) : null,
+    seamBandPixelsLifted: seamBandPreLiftValues.length,
+    seamBandPreLiftMedian:
+      seamBandPreLiftValues.length > 0 ? roundTo(percentile(seamBandPreLiftValues, 0.5)) : null,
+    seamBandPostLiftMedian:
+      seamBandPostLiftValues.length > 0 ? roundTo(percentile(seamBandPostLiftValues, 0.5)) : null,
+    seamBandRowStart,
+    seamBandRowEnd,
   };
 }
 
@@ -377,17 +514,199 @@ function estimateBypassInteriorFillHu(params: {
   return clampNumber(estimatedValue, 700, 2200);
 }
 
+function estimateBypassToothEdgeFillHu(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  row: number;
+  col: number;
+  rowStartInclusive: number;
+  rowEndExclusive: number;
+}): number | null {
+  const { pixelData, panoWidth, panoHeight, row, col, rowStartInclusive, rowEndExclusive } = params;
+  const contextValues: number[] = [];
+  const denseValues: number[] = [];
+
+  for (let radius = 2; radius <= 14; radius++) {
+    const rowMin = Math.max(rowStartInclusive, row - radius);
+    const rowMax = Math.min(rowEndExclusive - 1, row + radius);
+    const colMin = Math.max(0, col - radius);
+    const colMax = Math.min(panoWidth - 1, col + radius);
+
+    for (let sampleRow = rowMin; sampleRow <= rowMax; sampleRow++) {
+      if (sampleRow < 0 || sampleRow >= panoHeight) {
+        continue;
+      }
+      for (let sampleCol = colMin; sampleCol <= colMax; sampleCol++) {
+        const isPerimeter =
+          sampleRow === rowMin ||
+          sampleRow === rowMax ||
+          sampleCol === colMin ||
+          sampleCol === colMax;
+        if (!isPerimeter) {
+          continue;
+        }
+        const sampleValue = Number(pixelData[sampleRow * panoWidth + sampleCol]);
+        if (!Number.isFinite(sampleValue) || sampleValue <= -950) {
+          continue;
+        }
+        if (sampleValue >= 2800) {
+          denseValues.push(sampleValue);
+        } else if (sampleValue >= 900 && sampleValue < 2800) {
+          contextValues.push(sampleValue);
+        }
+      }
+    }
+
+    if (contextValues.length >= 6 || denseValues.length >= 12) {
+      break;
+    }
+  }
+
+  if (contextValues.length >= 6) {
+    return clampNumber(percentile(contextValues, 0.45), 1600, 2600);
+  }
+
+  if (denseValues.length >= 12) {
+    const denseReference =
+      denseValues.length >= 5 ? percentile(denseValues, 0.35) : percentile(denseValues, 0.5);
+    return clampNumber(denseReference * 0.68, 1800, 2600);
+  }
+
+  return null;
+}
+
+function estimateBypassUnsupportedFillHu(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  row: number;
+  col: number;
+  rowStartInclusive: number;
+  rowEndExclusive: number;
+  supportRowStart: number;
+  supportRowEnd: number;
+}): number | null {
+  const {
+    pixelData,
+    panoWidth,
+    panoHeight,
+    row,
+    col,
+    rowStartInclusive,
+    rowEndExclusive,
+    supportRowStart,
+    supportRowEnd,
+  } = params;
+  const outsideSupportDistance =
+    row < supportRowStart ? supportRowStart - row : row > supportRowEnd ? row - supportRowEnd : 0;
+  if (outsideSupportDistance <= 0) {
+    return null;
+  }
+
+  const contextValues: number[] = [];
+  const denseValues: number[] = [];
+  const maxRadius = Math.max(
+    10,
+    Math.min(
+      BYPASS_UNSUPPORTED_MAX_SEARCH_RADIUS,
+      Math.max(1, outsideSupportDistance) + 10
+    )
+  );
+
+  for (let radius = 4; radius <= maxRadius; radius++) {
+    const rowMin = Math.max(rowStartInclusive, row - radius);
+    const rowMax = Math.min(rowEndExclusive - 1, row + radius);
+    const colMin = Math.max(0, col - radius);
+    const colMax = Math.min(panoWidth - 1, col + radius);
+
+    for (let sampleRow = rowMin; sampleRow <= rowMax; sampleRow++) {
+      if (sampleRow < 0 || sampleRow >= panoHeight) {
+        continue;
+      }
+      for (let sampleCol = colMin; sampleCol <= colMax; sampleCol++) {
+        const isPerimeter =
+          sampleRow === rowMin ||
+          sampleRow === rowMax ||
+          sampleCol === colMin ||
+          sampleCol === colMax;
+        if (!isPerimeter) {
+          continue;
+        }
+        const sampleValue = Number(pixelData[sampleRow * panoWidth + sampleCol]);
+        if (!Number.isFinite(sampleValue) || sampleValue <= -950) {
+          continue;
+        }
+        if (sampleValue >= BYPASS_UNSUPPORTED_DENSE_HU) {
+          denseValues.push(sampleValue);
+        } else if (sampleValue >= BYPASS_UNSUPPORTED_CONTEXT_MIN_HU) {
+          contextValues.push(sampleValue);
+        }
+      }
+    }
+
+    if (
+      contextValues.length >= BYPASS_UNSUPPORTED_MIN_CONTEXT_SAMPLE_COUNT ||
+      denseValues.length >= BYPASS_UNSUPPORTED_MIN_DENSE_SAMPLE_COUNT
+    ) {
+      break;
+    }
+  }
+
+  if (contextValues.length >= BYPASS_UNSUPPORTED_MIN_CONTEXT_SAMPLE_COUNT) {
+    return clampNumber(
+      percentile(contextValues, 0.35),
+      1900,
+      BYPASS_UNSUPPORTED_MAX_OUTPUT_HU
+    );
+  }
+
+  if (denseValues.length >= BYPASS_UNSUPPORTED_MIN_DENSE_SAMPLE_COUNT) {
+    const denseReference =
+      denseValues.length >= 5 ? percentile(denseValues, 0.25) : percentile(denseValues, 0.5);
+    return clampNumber(
+      denseReference * 0.72,
+      BYPASS_UNSUPPORTED_MIN_OUTPUT_HU,
+      BYPASS_UNSUPPORTED_MAX_OUTPUT_HU
+    );
+  }
+
+  return null;
+}
+
 function repairBypassUnresolvedPixels(params: {
   pixelData: Float32Array;
   panoWidth: number;
   panoHeight: number;
   gapCenterRow: number;
-}): void {
-  const { pixelData, panoWidth, panoHeight, gapCenterRow } = params;
+  upperBandRowStart?: number;
+  upperBandRowEnd?: number;
+  lowerBandRowStart?: number;
+  lowerBandRowEnd?: number;
+  missMask?: Float32Array | null;
+}): {
+  repairedPixelCount: number;
+  toothEdgeFillCount: number;
+  unsupportedBandFillCount: number;
+} {
+  const {
+    pixelData,
+    panoWidth,
+    panoHeight,
+    gapCenterRow,
+    upperBandRowStart = 0,
+    upperBandRowEnd = Math.max(0, gapCenterRow - 1),
+    lowerBandRowStart = clampNumber(gapCenterRow, 0, Math.max(0, panoHeight - 1)),
+    lowerBandRowEnd = Math.max(0, panoHeight - 1),
+    missMask = null,
+  } = params;
   const zoneRanges: Array<[number, number]> = [
     [0, clampNumber(gapCenterRow, 0, panoHeight)],
     [clampNumber(gapCenterRow, 0, panoHeight), panoHeight],
   ];
+  let repairedPixelCount = 0;
+  let toothEdgeFillCount = 0;
+  let unsupportedBandFillCount = 0;
 
   for (let zoneIndex = 0; zoneIndex < zoneRanges.length; zoneIndex++) {
     const [rowStartInclusive, rowEndExclusive] = zoneRanges[zoneIndex];
@@ -420,7 +739,12 @@ function repairBypassUnresolvedPixels(params: {
         }
         for (let fillCol = holeStart; fillCol < holeEndExclusive; fillCol++) {
           const blend = (fillCol - leftCol) / Math.max(1, rightCol - leftCol);
-          pixelData[row * panoWidth + fillCol] = leftValue * (1 - blend) + rightValue * blend;
+          const fillIndex = row * panoWidth + fillCol;
+          pixelData[fillIndex] = leftValue * (1 - blend) + rightValue * blend;
+          if (missMask) {
+            missMask[fillIndex] = 1;
+          }
+          repairedPixelCount++;
         }
       }
     }
@@ -450,7 +774,12 @@ function repairBypassUnresolvedPixels(params: {
         }
         for (let fillRow = holeStart; fillRow < holeEndExclusive; fillRow++) {
           const blend = (fillRow - upperRow) / Math.max(1, lowerRow - upperRow);
-          pixelData[fillRow * panoWidth + col] = upperValue * (1 - blend) + lowerValue * blend;
+          const fillIndex = fillRow * panoWidth + col;
+          pixelData[fillIndex] = upperValue * (1 - blend) + lowerValue * blend;
+          if (missMask) {
+            missMask[fillIndex] = 1;
+          }
+          repairedPixelCount++;
         }
       }
     }
@@ -481,6 +810,10 @@ function repairBypassUnresolvedPixels(params: {
         }
         if (count >= 3) {
           pixelData[index] = sum / count;
+          if (missMask) {
+            missMask[index] = 1;
+          }
+          repairedPixelCount++;
         }
       }
     }
@@ -498,6 +831,10 @@ function repairBypassUnresolvedPixels(params: {
           row <= 0 || row >= panoHeight - 1 || col <= 0 || col >= panoWidth - 1;
         if (isOuterImageBorder) {
           pixelData[index] = -1000;
+          if (missMask) {
+            missMask[index] = 1;
+          }
+          repairedPixelCount++;
           continue;
         }
         const estimatedFillHu = estimateBypassInteriorFillHu({
@@ -509,7 +846,846 @@ function repairBypassUnresolvedPixels(params: {
           rowStartInclusive,
           rowEndExclusive,
         });
-        pixelData[index] = estimatedFillHu ?? 900;
+        const toothEdgeFillHu =
+          estimatedFillHu == null
+            ? estimateBypassToothEdgeFillHu({
+                pixelData,
+                panoWidth,
+                panoHeight,
+                row,
+                col,
+                rowStartInclusive,
+                rowEndExclusive,
+              })
+            : null;
+        const unsupportedBandFillHu =
+          estimatedFillHu == null && toothEdgeFillHu == null
+            ? estimateBypassUnsupportedFillHu({
+                pixelData,
+                panoWidth,
+                panoHeight,
+                row,
+                col,
+                rowStartInclusive,
+                rowEndExclusive,
+                supportRowStart: zoneIndex === 0 ? upperBandRowStart : lowerBandRowStart,
+                supportRowEnd: zoneIndex === 0 ? upperBandRowEnd : lowerBandRowEnd,
+              })
+            : null;
+        pixelData[index] = estimatedFillHu ?? toothEdgeFillHu ?? unsupportedBandFillHu ?? 900;
+        if (toothEdgeFillHu != null) {
+          toothEdgeFillCount++;
+        }
+        if (unsupportedBandFillHu != null) {
+          unsupportedBandFillCount++;
+        }
+        if (missMask) {
+          missMask[index] = 1;
+        }
+        repairedPixelCount++;
+      }
+    }
+  }
+
+  return {
+    repairedPixelCount,
+    toothEdgeFillCount,
+    unsupportedBandFillCount,
+  };
+}
+
+interface PanoV2BypassNeighborhoodStats {
+  count: number;
+  denseCount: number;
+  median: number;
+  p10: number;
+  p90: number;
+}
+
+interface PanoV2PeriToothNeighborhoodStats {
+  toothNeighborCount: number;
+  supportCount: number;
+  supportMedian: number;
+  supportP10: number;
+  supportP90: number;
+}
+
+function summarizeBypassNeighborhood(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  row: number;
+  col: number;
+  radius: number;
+  missMask?: Float32Array | null;
+}): PanoV2BypassNeighborhoodStats | null {
+  const { pixelData, panoWidth, panoHeight, row, col, radius, missMask = null } = params;
+  const values: number[] = [];
+  let denseCount = 0;
+
+  for (let rowOffset = -radius; rowOffset <= radius; rowOffset++) {
+    const sampleRow = row + rowOffset;
+    if (sampleRow < 0 || sampleRow >= panoHeight) {
+      continue;
+    }
+    for (let colOffset = -radius; colOffset <= radius; colOffset++) {
+      const sampleCol = col + colOffset;
+      if (
+        sampleCol < 0 ||
+        sampleCol >= panoWidth ||
+        (rowOffset === 0 && colOffset === 0)
+      ) {
+        continue;
+      }
+      const sampleIndex = sampleRow * panoWidth + sampleCol;
+      if (missMask && Number(missMask[sampleIndex]) > 0.5) {
+        continue;
+      }
+      const sampleValue = Number(pixelData[sampleIndex]);
+      if (!Number.isFinite(sampleValue) || sampleValue <= -950) {
+        continue;
+      }
+      values.push(sampleValue);
+      if (sampleValue >= BYPASS_MISS_DENSE_NEIGHBOR_HU) {
+        denseCount++;
+      }
+    }
+  }
+
+  if (values.length < BYPASS_MISS_MIN_NEIGHBOR_COUNT) {
+    return null;
+  }
+
+  return {
+    count: values.length,
+    denseCount,
+    median: percentile(values, 0.5),
+    p10: percentile(values, 0.1),
+    p90: percentile(values, 0.9),
+  };
+}
+
+function summarizePeriToothNeighborhood(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  row: number;
+  col: number;
+  radius: number;
+}): PanoV2PeriToothNeighborhoodStats | null {
+  const { pixelData, panoWidth, panoHeight, row, col, radius } = params;
+  const supportValues: number[] = [];
+  let toothNeighborCount = 0;
+
+  for (let rowOffset = -radius; rowOffset <= radius; rowOffset++) {
+    const sampleRow = row + rowOffset;
+    if (sampleRow < 0 || sampleRow >= panoHeight) {
+      continue;
+    }
+    for (let colOffset = -radius; colOffset <= radius; colOffset++) {
+      const sampleCol = col + colOffset;
+      if (
+        sampleCol < 0 ||
+        sampleCol >= panoWidth ||
+        (rowOffset === 0 && colOffset === 0)
+      ) {
+        continue;
+      }
+      const sampleValue = Number(pixelData[sampleRow * panoWidth + sampleCol]);
+      if (!Number.isFinite(sampleValue) || sampleValue <= -950) {
+        continue;
+      }
+      if (sampleValue >= BYPASS_PERITOOTH_TOOTH_NEIGHBOR_HU) {
+        toothNeighborCount++;
+      } else if (sampleValue >= 900) {
+        supportValues.push(sampleValue);
+      }
+    }
+  }
+
+  if (
+    toothNeighborCount < BYPASS_PERITOOTH_MIN_TOOTH_NEIGHBOR_COUNT ||
+    supportValues.length < BYPASS_PERITOOTH_MIN_SUPPORT_SAMPLE_COUNT
+  ) {
+    return null;
+  }
+
+  return {
+    toothNeighborCount,
+    supportCount: supportValues.length,
+    supportMedian: percentile(supportValues, 0.5),
+    supportP10: percentile(supportValues, 0.1),
+    supportP90: percentile(supportValues, 0.9),
+  };
+}
+
+function estimateSameArchBypassBaseline(params: {
+  fullPlaneLayerImages: Float32Array[] | null | undefined;
+  index: number;
+}): number | null {
+  const { fullPlaneLayerImages, index } = params;
+  if (!fullPlaneLayerImages || fullPlaneLayerImages.length === 0) {
+    return null;
+  }
+
+  const layerValues: number[] = [];
+  for (let imageIndex = 0; imageIndex < fullPlaneLayerImages.length; imageIndex++) {
+    const value = Number(fullPlaneLayerImages[imageIndex]?.[index]);
+    if (!Number.isFinite(value) || value <= -950) {
+      continue;
+    }
+    layerValues.push(value);
+  }
+
+  if (!layerValues.length) {
+    return null;
+  }
+
+  return percentile(layerValues, layerValues.length >= 3 ? 0.7 : 0.5);
+}
+
+function blendRepairedBypassMissPixels(params: {
+  pixelData: Float32Array;
+  missMask: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+}): number {
+  const { pixelData, missMask, panoWidth, panoHeight } = params;
+  const snapshot = new Float32Array(pixelData);
+  let blendedPixelCount = 0;
+
+  for (let row = 1; row < panoHeight - 1; row++) {
+    for (let col = 1; col < panoWidth - 1; col++) {
+      const index = row * panoWidth + col;
+      if (Number(missMask[index]) <= 0.5) {
+        continue;
+      }
+      const neighborhood = summarizeBypassNeighborhood({
+        pixelData: snapshot,
+        panoWidth,
+        panoHeight,
+        row,
+        col,
+        radius: 1,
+        missMask: null,
+      });
+      if (!neighborhood) {
+        continue;
+      }
+      pixelData[index] =
+        snapshot[index] * (1 - BYPASS_MISS_EDGE_BLEND) +
+        neighborhood.median * BYPASS_MISS_EDGE_BLEND;
+      blendedPixelCount++;
+    }
+  }
+
+  return blendedPixelCount;
+}
+
+function repairBypassMissPixels(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  gapCenterRow: number;
+  fullPlaneLayerImages?: PanoV2FullPlaneLayerImages | null;
+  missMask: Float32Array;
+}): PanoV2BypassMissRepairAnalysis {
+  const {
+    pixelData,
+    panoWidth,
+    panoHeight,
+    gapCenterRow,
+    fullPlaneLayerImages = null,
+    missMask,
+  } = params;
+  const snapshot = new Float32Array(pixelData);
+  let lowOutlierPixelCount = 0;
+  let repairedPixelCount = 0;
+
+  for (let row = 1; row < panoHeight - 1; row++) {
+    const sameArchLayerImages =
+      row < gapCenterRow ? fullPlaneLayerImages?.upperArch : fullPlaneLayerImages?.lowerArch;
+    for (let col = 1; col < panoWidth - 1; col++) {
+      const index = row * panoWidth + col;
+      if (Number(missMask[index]) > 0.5) {
+        continue;
+      }
+      const currentValue = Number(snapshot[index]);
+      if (!Number.isFinite(currentValue)) {
+        continue;
+      }
+      const neighborhood = summarizeBypassNeighborhood({
+        pixelData: snapshot,
+        panoWidth,
+        panoHeight,
+        row,
+        col,
+        radius: BYPASS_MISS_NEIGHBOR_RADIUS,
+        missMask,
+      });
+      if (
+        !neighborhood ||
+        neighborhood.denseCount < BYPASS_MISS_MIN_DENSE_NEIGHBOR_COUNT
+      ) {
+        continue;
+      }
+
+      const dropMargin = neighborhood.median - currentValue;
+      const relativeDrop =
+        neighborhood.median > 1 ? currentValue / neighborhood.median : Number.POSITIVE_INFINITY;
+      const isStructuralSink =
+        dropMargin >= Math.max(420, (neighborhood.median - neighborhood.p10) * 0.72) &&
+        relativeDrop <= 0.74;
+      if (!isStructuralSink) {
+        continue;
+      }
+
+      lowOutlierPixelCount++;
+      const sameArchBaseline = estimateSameArchBypassBaseline({
+        fullPlaneLayerImages: sameArchLayerImages,
+        index,
+      });
+      let repairTarget = neighborhood.median;
+      if (sameArchBaseline != null) {
+        const baselineWeight =
+          sameArchBaseline >= neighborhood.median * 0.92
+            ? 0.52
+            : sameArchBaseline >= neighborhood.p10
+              ? 0.34
+              : 0.18;
+        repairTarget =
+          neighborhood.median * (1 - baselineWeight) + sameArchBaseline * baselineWeight;
+      }
+      repairTarget = clampNumber(
+        repairTarget,
+        Math.max(900, neighborhood.p10),
+        Math.max(neighborhood.p90, neighborhood.median)
+      );
+      const repairedValue =
+        currentValue * (1 - BYPASS_MISS_REPAIR_BLEND) + repairTarget * BYPASS_MISS_REPAIR_BLEND;
+      if (repairedValue <= currentValue + 60) {
+        continue;
+      }
+      pixelData[index] = repairedValue;
+      missMask[index] = 1;
+      repairedPixelCount++;
+    }
+  }
+
+  const darkPocketSnapshot = new Float32Array(pixelData);
+  let darkPocketRepairCount = 0;
+
+  for (let row = 1; row < panoHeight - 1; row++) {
+    const sameArchLayerImages =
+      row < gapCenterRow ? fullPlaneLayerImages?.upperArch : fullPlaneLayerImages?.lowerArch;
+    for (let col = 1; col < panoWidth - 1; col++) {
+      const index = row * panoWidth + col;
+      const currentValue = Number(darkPocketSnapshot[index]);
+      if (!Number.isFinite(currentValue) || currentValue > BYPASS_DARK_POCKET_MAX_HU) {
+        continue;
+      }
+
+      const neighborhood = summarizeBypassNeighborhood({
+        pixelData: darkPocketSnapshot,
+        panoWidth,
+        panoHeight,
+        row,
+        col,
+        radius: BYPASS_DARK_POCKET_NEIGHBOR_RADIUS,
+        missMask: null,
+      });
+      if (
+        !neighborhood ||
+        neighborhood.denseCount < BYPASS_DARK_POCKET_MIN_DENSE_NEIGHBOR_COUNT ||
+        neighborhood.median < BYPASS_DARK_POCKET_MIN_MEDIAN_HU
+      ) {
+        continue;
+      }
+
+      const dropMargin = neighborhood.median - currentValue;
+      if (
+        dropMargin < Math.max(250, (neighborhood.median - neighborhood.p10) * 0.24) ||
+        neighborhood.p90 <= neighborhood.median * 0.72
+      ) {
+        continue;
+      }
+
+      const sameArchBaseline = estimateSameArchBypassBaseline({
+        fullPlaneLayerImages: sameArchLayerImages,
+        index,
+      });
+      let repairTarget = neighborhood.median;
+      if (sameArchBaseline != null) {
+        const baselineWeight =
+          sameArchBaseline >= neighborhood.median * 0.92
+            ? 0.5
+            : sameArchBaseline >= neighborhood.p10
+              ? 0.32
+              : 0.16;
+        repairTarget =
+          neighborhood.median * (1 - baselineWeight) + sameArchBaseline * baselineWeight;
+      }
+      repairTarget = clampNumber(
+        repairTarget,
+        Math.max(1800, neighborhood.p10),
+        Math.max(neighborhood.median, neighborhood.p90)
+      );
+      const repairedValue =
+        currentValue * (1 - BYPASS_MISS_REPAIR_BLEND) + repairTarget * BYPASS_MISS_REPAIR_BLEND;
+      if (repairedValue <= currentValue + BYPASS_DARK_POCKET_MIN_REPAIR_GAIN_HU) {
+        continue;
+      }
+
+      pixelData[index] = repairedValue;
+      missMask[index] = 1;
+      darkPocketRepairCount++;
+    }
+  }
+
+  const darkClusterSnapshot = new Float32Array(pixelData);
+  const visited = new Uint8Array(pixelData.length);
+  const darkClusterMask = new Float32Array(pixelData.length);
+  let darkClusterRepairPixelCount = 0;
+  let darkClusterRepairComponentCount = 0;
+  let darkClusterBlendPixelCount = 0;
+  let periToothRepairPixelCount = 0;
+  const neighborOffsets = [
+    -1, 0, 1,
+  ];
+
+  for (let row = 1; row < panoHeight - 1; row++) {
+    const sameArchLayerImages =
+      row < gapCenterRow ? fullPlaneLayerImages?.upperArch : fullPlaneLayerImages?.lowerArch;
+    for (let col = 1; col < panoWidth - 1; col++) {
+      const startIndex = row * panoWidth + col;
+      if (visited[startIndex]) {
+        continue;
+      }
+      visited[startIndex] = 1;
+      const startValue = Number(darkClusterSnapshot[startIndex]);
+      if (!Number.isFinite(startValue) || startValue > BYPASS_DARK_CLUSTER_MAX_HU) {
+        continue;
+      }
+
+      const componentRows: number[] = [];
+      const componentCols: number[] = [];
+      const componentIndices: number[] = [];
+      const queueRows = [row];
+      const queueCols = [col];
+      let queueIndex = 0;
+      let componentSum = 0;
+
+      while (queueIndex < queueRows.length && componentIndices.length <= BYPASS_DARK_CLUSTER_MAX_PIXELS) {
+        const currentRow = queueRows[queueIndex];
+        const currentCol = queueCols[queueIndex];
+        queueIndex++;
+        const currentIndex = currentRow * panoWidth + currentCol;
+        const currentValue = Number(darkClusterSnapshot[currentIndex]);
+        if (!Number.isFinite(currentValue) || currentValue > BYPASS_DARK_CLUSTER_MAX_HU) {
+          continue;
+        }
+        componentRows.push(currentRow);
+        componentCols.push(currentCol);
+        componentIndices.push(currentIndex);
+        componentSum += currentValue;
+
+        for (let rowOffsetIndex = 0; rowOffsetIndex < neighborOffsets.length; rowOffsetIndex++) {
+          const rowOffset = neighborOffsets[rowOffsetIndex];
+          for (let colOffsetIndex = 0; colOffsetIndex < neighborOffsets.length; colOffsetIndex++) {
+            const colOffset = neighborOffsets[colOffsetIndex];
+            if (rowOffset === 0 && colOffset === 0) {
+              continue;
+            }
+            const nextRow = currentRow + rowOffset;
+            const nextCol = currentCol + colOffset;
+            if (nextRow <= 0 || nextRow >= panoHeight - 1 || nextCol <= 0 || nextCol >= panoWidth - 1) {
+              continue;
+            }
+            const nextIndex = nextRow * panoWidth + nextCol;
+            if (visited[nextIndex]) {
+              continue;
+            }
+            visited[nextIndex] = 1;
+            const nextValue = Number(darkClusterSnapshot[nextIndex]);
+            if (!Number.isFinite(nextValue) || nextValue > BYPASS_DARK_CLUSTER_MAX_HU) {
+              continue;
+            }
+            queueRows.push(nextRow);
+            queueCols.push(nextCol);
+          }
+        }
+      }
+
+      if (
+        componentIndices.length === 0 ||
+        componentIndices.length > BYPASS_DARK_CLUSTER_MAX_PIXELS
+      ) {
+        continue;
+      }
+
+      const componentIndexSet = new Set(componentIndices);
+      const perimeterValues: number[] = [];
+      let perimeterMax = Number.NEGATIVE_INFINITY;
+
+      for (let componentPointIndex = 0; componentPointIndex < componentIndices.length; componentPointIndex++) {
+        const currentRow = componentRows[componentPointIndex];
+        const currentCol = componentCols[componentPointIndex];
+        for (let rowOffsetIndex = 0; rowOffsetIndex < neighborOffsets.length; rowOffsetIndex++) {
+          const rowOffset = neighborOffsets[rowOffsetIndex];
+          for (let colOffsetIndex = 0; colOffsetIndex < neighborOffsets.length; colOffsetIndex++) {
+            const colOffset = neighborOffsets[colOffsetIndex];
+            if (rowOffset === 0 && colOffset === 0) {
+              continue;
+            }
+            const sampleRow = currentRow + rowOffset;
+            const sampleCol = currentCol + colOffset;
+            if (sampleRow < 0 || sampleRow >= panoHeight || sampleCol < 0 || sampleCol >= panoWidth) {
+              continue;
+            }
+            const sampleIndex = sampleRow * panoWidth + sampleCol;
+            if (componentIndexSet.has(sampleIndex)) {
+              continue;
+            }
+            const sampleValue = Number(darkClusterSnapshot[sampleIndex]);
+            if (!Number.isFinite(sampleValue) || sampleValue <= -950) {
+              continue;
+            }
+            perimeterValues.push(sampleValue);
+            if (sampleValue > perimeterMax) {
+              perimeterMax = sampleValue;
+            }
+          }
+        }
+      }
+
+      if (
+        perimeterValues.length < BYPASS_DARK_CLUSTER_MIN_PERIMETER_SAMPLES ||
+        !Number.isFinite(perimeterMax)
+      ) {
+        continue;
+      }
+
+      const perimeterMedian = percentile(perimeterValues, 0.5);
+      if (
+        perimeterMedian < BYPASS_DARK_CLUSTER_MIN_MEDIAN_HU ||
+        perimeterMax < BYPASS_DARK_CLUSTER_MIN_MAX_HU
+      ) {
+        continue;
+      }
+
+      let sameArchBaselineSum = 0;
+      let sameArchBaselineCount = 0;
+      for (let componentPointIndex = 0; componentPointIndex < componentIndices.length; componentPointIndex++) {
+        const baseline = estimateSameArchBypassBaseline({
+          fullPlaneLayerImages: sameArchLayerImages,
+          index: componentIndices[componentPointIndex],
+        });
+        if (baseline == null) {
+          continue;
+        }
+        sameArchBaselineSum += baseline;
+        sameArchBaselineCount++;
+      }
+      const sameArchBaseline =
+        sameArchBaselineCount > 0 ? sameArchBaselineSum / sameArchBaselineCount : null;
+      let repairTarget = perimeterMedian;
+      if (sameArchBaseline != null) {
+        const baselineWeight =
+          sameArchBaseline >= perimeterMedian * 0.92
+            ? 0.48
+            : sameArchBaseline >= perimeterMedian * 0.75
+              ? 0.3
+              : 0.15;
+        repairTarget = perimeterMedian * (1 - baselineWeight) + sameArchBaseline * baselineWeight;
+      }
+      repairTarget = clampNumber(
+        repairTarget,
+        Math.max(1800, percentile(perimeterValues, 0.1)),
+        Math.max(perimeterMedian, percentile(perimeterValues, 0.9))
+      );
+
+      const componentMean = componentSum / Math.max(1, componentIndices.length);
+      if (repairTarget <= componentMean + BYPASS_DARK_CLUSTER_MIN_GAIN_HU) {
+        continue;
+      }
+
+      let repairedPixelsThisComponent = 0;
+      for (let componentPointIndex = 0; componentPointIndex < componentIndices.length; componentPointIndex++) {
+        const currentIndex = componentIndices[componentPointIndex];
+        const currentValue = Number(pixelData[currentIndex]);
+        const repairedValue =
+          currentValue * (1 - BYPASS_MISS_REPAIR_BLEND) + repairTarget * BYPASS_MISS_REPAIR_BLEND;
+        if (repairedValue <= currentValue + BYPASS_DARK_CLUSTER_MIN_GAIN_HU * 0.5) {
+          continue;
+        }
+        pixelData[currentIndex] = repairedValue;
+        missMask[currentIndex] = 1;
+        darkClusterMask[currentIndex] = 1;
+        darkClusterRepairPixelCount++;
+        repairedPixelsThisComponent++;
+      }
+
+      if (repairedPixelsThisComponent > 0) {
+        darkClusterRepairComponentCount++;
+      }
+    }
+  }
+
+  if (darkClusterRepairPixelCount > 0) {
+    const clusterBlendSnapshot = new Float32Array(pixelData);
+    for (let row = 2; row < panoHeight - 2; row++) {
+      for (let col = 2; col < panoWidth - 2; col++) {
+        const index = row * panoWidth + col;
+        if (Number(darkClusterMask[index]) <= 0.5) {
+          continue;
+        }
+        const neighborhood = summarizeBypassNeighborhood({
+          pixelData: clusterBlendSnapshot,
+          panoWidth,
+          panoHeight,
+          row,
+          col,
+          radius: 2,
+          missMask: null,
+        });
+        if (!neighborhood || neighborhood.median < BYPASS_DARK_CLUSTER_MIN_MEDIAN_HU) {
+          continue;
+        }
+        pixelData[index] =
+          clusterBlendSnapshot[index] * (1 - BYPASS_DARK_CLUSTER_BLEND_WEIGHT) +
+          neighborhood.median * BYPASS_DARK_CLUSTER_BLEND_WEIGHT;
+        darkClusterBlendPixelCount++;
+      }
+    }
+  }
+
+  const periToothSnapshot = new Float32Array(pixelData);
+  for (let row = 1; row < panoHeight - 1; row++) {
+    for (let col = 1; col < panoWidth - 1; col++) {
+      const index = row * panoWidth + col;
+      if (Number(missMask[index]) > 0.5) {
+        continue;
+      }
+      const currentValue = Number(periToothSnapshot[index]);
+      if (!Number.isFinite(currentValue) || currentValue > BYPASS_PERITOOTH_MAX_HU) {
+        continue;
+      }
+      const neighborhood = summarizePeriToothNeighborhood({
+        pixelData: periToothSnapshot,
+        panoWidth,
+        panoHeight,
+        row,
+        col,
+        radius: 2,
+      });
+      if (!neighborhood) {
+        continue;
+      }
+      const repairTarget = clampNumber(
+        Math.max(2200, neighborhood.supportMedian),
+        Math.max(1800, neighborhood.supportP10),
+        Math.max(neighborhood.supportMedian, neighborhood.supportP90)
+      );
+      const repairedValue =
+        currentValue * (1 - BYPASS_PERITOOTH_REPAIR_BLEND) +
+        repairTarget * BYPASS_PERITOOTH_REPAIR_BLEND;
+      if (repairedValue <= currentValue + BYPASS_PERITOOTH_MIN_GAIN_HU) {
+        continue;
+      }
+      pixelData[index] = repairedValue;
+      missMask[index] = 1;
+      periToothRepairPixelCount++;
+    }
+  }
+
+  const blendedPixelCount =
+    repairedPixelCount > 0 ||
+    darkPocketRepairCount > 0 ||
+    darkClusterRepairPixelCount > 0 ||
+    periToothRepairPixelCount > 0
+      ? blendRepairedBypassMissPixels({
+          pixelData,
+          missMask,
+          panoWidth,
+          panoHeight,
+        })
+      : 0;
+  let excludedPixelCount = 0;
+  for (let index = 0; index < missMask.length; index++) {
+    if (Number(missMask[index]) > 0.5) {
+      excludedPixelCount++;
+    }
+  }
+
+  return {
+    unresolvedPixelCount: 0,
+    unresolvedToothEdgeFillCount: 0,
+    unresolvedUnsupportedBandFillCount: 0,
+    lowOutlierPixelCount,
+    repairedPixelCount,
+    darkPocketRepairCount,
+    darkClusterRepairPixelCount,
+    darkClusterRepairComponentCount,
+    darkClusterBlendPixelCount,
+    periToothRepairPixelCount,
+    blendedPixelCount,
+    excludedPixelCount,
+  };
+}
+
+function suppressLowerBackgroundTail(params: {
+  pixelData: Float32Array;
+  panoWidth: number;
+  panoHeight: number;
+  gapCenterRow: number;
+  layerRender: PanoV2LayerRenderResult;
+  fullPlaneLayerImages?: PanoV2FullPlaneLayerImages | null;
+  exclusionMask?: Float32Array | null;
+}): void {
+  const {
+    pixelData,
+    panoWidth,
+    panoHeight,
+    gapCenterRow,
+    layerRender,
+    fullPlaneLayerImages = null,
+    exclusionMask = null,
+  } = params;
+  const lowerLayers = fullPlaneLayerImages?.lowerArch;
+  if (!lowerLayers || lowerLayers.length === 0 || panoWidth <= 0 || panoHeight <= 0) {
+    return;
+  }
+
+  const lowerAnchorRow = clampNumber(
+    Math.round(layerRender.lowerArch.anchorRow),
+    clampNumber(gapCenterRow, 0, Math.max(0, panoHeight - 1)),
+    Math.max(0, panoHeight - 1)
+  );
+  const lowerRowEnd = clampNumber(
+    Math.round(layerRender.lowerArch.rowEnd),
+    lowerAnchorRow,
+    Math.max(0, panoHeight - 1)
+  );
+  const rawBoundaryByCol = new Int16Array(Math.max(1, panoWidth));
+  const smoothedBoundaryByCol = new Int16Array(Math.max(1, panoWidth));
+  const baselineFloor = Math.min(
+    Math.max(0, panoHeight - 1),
+    lowerRowEnd + LOWER_BACKGROUND_TRIM_BOUNDARY_MARGIN_ROWS
+  );
+
+  for (let col = 0; col < panoWidth; col++) {
+    const baselineValues: number[] = [];
+    let peakBaseline = Number.NEGATIVE_INFINITY;
+
+    for (let row = lowerAnchorRow; row <= lowerRowEnd; row++) {
+      const baseline = estimateSameArchBypassBaseline({
+        fullPlaneLayerImages: lowerLayers,
+        index: row * panoWidth + col,
+      });
+      if (!Number.isFinite(baseline ?? Number.NaN)) {
+        continue;
+      }
+      const finiteBaseline = Number(baseline);
+      baselineValues.push(finiteBaseline);
+      if (finiteBaseline > peakBaseline) {
+        peakBaseline = finiteBaseline;
+      }
+    }
+
+    if (peakBaseline < LOWER_BACKGROUND_TRIM_MIN_COLUMN_PEAK_HU || baselineValues.length === 0) {
+      rawBoundaryByCol[col] = baselineFloor;
+      continue;
+    }
+
+    const anatomyThreshold = clampNumber(
+      Math.max(
+        LOWER_BACKGROUND_TRIM_MIN_SIGNAL_HU,
+        peakBaseline * LOWER_BACKGROUND_TRIM_RELATIVE_SIGNAL
+      ),
+      LOWER_BACKGROUND_TRIM_MIN_SIGNAL_HU,
+      950
+    );
+    let lastSupportedRow = lowerAnchorRow;
+    let lowRunLength = 0;
+
+    for (let row = lowerAnchorRow; row <= lowerRowEnd; row++) {
+      const baseline = estimateSameArchBypassBaseline({
+        fullPlaneLayerImages: lowerLayers,
+        index: row * panoWidth + col,
+      });
+      if (baseline != null && baseline >= anatomyThreshold) {
+        lastSupportedRow = row;
+        lowRunLength = 0;
+        continue;
+      }
+
+      lowRunLength++;
+      if (lowRunLength >= LOWER_BACKGROUND_TRIM_MIN_LOW_RUN_ROWS && row > lastSupportedRow + 2) {
+        break;
+      }
+    }
+
+    rawBoundaryByCol[col] = clampNumber(
+      lastSupportedRow + LOWER_BACKGROUND_TRIM_BOUNDARY_MARGIN_ROWS,
+      lowerAnchorRow,
+      Math.max(lowerAnchorRow, panoHeight - 1)
+    );
+  }
+
+  for (let col = 0; col < panoWidth; col++) {
+    const neighborhood: number[] = [];
+    for (
+      let sampleCol = Math.max(0, col - LOWER_BACKGROUND_TRIM_SMOOTH_RADIUS_COLS);
+      sampleCol <= Math.min(panoWidth - 1, col + LOWER_BACKGROUND_TRIM_SMOOTH_RADIUS_COLS);
+      sampleCol++
+    ) {
+      neighborhood.push(Number(rawBoundaryByCol[sampleCol]));
+    }
+    smoothedBoundaryByCol[col] = clampNumber(
+      Math.round(percentile(neighborhood, 0.5)),
+      lowerAnchorRow,
+      Math.max(lowerAnchorRow, panoHeight - 1)
+    );
+  }
+
+  for (let col = 1; col < panoWidth; col++) {
+    const previous = Number(smoothedBoundaryByCol[col - 1]);
+    smoothedBoundaryByCol[col] = clampNumber(
+      Number(smoothedBoundaryByCol[col]),
+      previous - LOWER_BACKGROUND_TRIM_MAX_ADJACENT_DELTA_ROWS,
+      previous + LOWER_BACKGROUND_TRIM_MAX_ADJACENT_DELTA_ROWS
+    );
+  }
+  for (let col = panoWidth - 2; col >= 0; col--) {
+    const next = Number(smoothedBoundaryByCol[col + 1]);
+    smoothedBoundaryByCol[col] = clampNumber(
+      Number(smoothedBoundaryByCol[col]),
+      next - LOWER_BACKGROUND_TRIM_MAX_ADJACENT_DELTA_ROWS,
+      next + LOWER_BACKGROUND_TRIM_MAX_ADJACENT_DELTA_ROWS
+    );
+  }
+
+  for (let col = 0; col < panoWidth; col++) {
+    const boundaryRow = Number(smoothedBoundaryByCol[col]);
+    for (let row = boundaryRow + 1; row < panoHeight; row++) {
+      const index = row * panoWidth + col;
+      const currentValue = Number(pixelData[index]);
+      if (!Number.isFinite(currentValue)) {
+        continue;
+      }
+
+      const distance = row - boundaryRow;
+      if (distance <= LOWER_BACKGROUND_TRIM_FEATHER_ROWS) {
+        const blendWeight = smoothstepUnit(
+          distance / Math.max(1, LOWER_BACKGROUND_TRIM_FEATHER_ROWS)
+        );
+        pixelData[index] = currentValue * (1 - blendWeight) + -1000 * blendWeight;
+      } else {
+        pixelData[index] = -1000;
+      }
+
+      if (exclusionMask) {
+        exclusionMask[index] = 1;
       }
     }
   }
@@ -1401,22 +2577,16 @@ export function buildPanoV2FusionResult(params: {
   if (layerRender.model === 'thick-slab-mip-render' && bypassCompositeImages) {
     const planeSize = Math.max(1, panoWidth * panoHeight);
     const pixelData = new Float32Array(planeSize);
+    const bypassMissMask = new Float32Array(planeSize);
     const gapCenterRow = computePanoV2GapCenterRow(layerRender);
     for (let index = 0; index < planeSize; index++) {
       const row = Math.floor(index / Math.max(1, panoWidth));
       const useUpperArch = row < gapCenterRow;
+      let selectedValue = Number.NEGATIVE_INFINITY;
+      let hasFiniteValue = false;
       const sourceImages = useUpperArch
         ? [bypassCompositeImages.upperArch]
         : [bypassCompositeImages.lowerArch];
-      const fallbackImages = fullPlaneLayerImages
-        ? useUpperArch
-          ? fullPlaneLayerImages.upperArch
-          : fullPlaneLayerImages.lowerArch
-        : [];
-      let selectedValue = Number.NEGATIVE_INFINITY;
-      let hasFiniteValue = false;
-      let strongestFallbackValue = Number.NEGATIVE_INFINITY;
-      let hasStrongFallbackValue = false;
       for (let imageIndex = 0; imageIndex < sourceImages.length; imageIndex++) {
         const value = Number(sourceImages[imageIndex]?.[index]);
         if (!Number.isFinite(value)) {
@@ -1427,6 +2597,13 @@ export function buildPanoV2FusionResult(params: {
           hasFiniteValue = true;
         }
       }
+      const fallbackImages = fullPlaneLayerImages
+        ? useUpperArch
+          ? fullPlaneLayerImages.upperArch
+          : fullPlaneLayerImages.lowerArch
+        : [];
+      let strongestFallbackValue = Number.NEGATIVE_INFINITY;
+      let hasStrongFallbackValue = false;
       if (fallbackImages.length > 0) {
         for (let imageIndex = 0; imageIndex < fallbackImages.length; imageIndex++) {
           const value = Number(fallbackImages[imageIndex]?.[index]);
@@ -1454,11 +2631,16 @@ export function buildPanoV2FusionResult(params: {
       }
       pixelData[index] = hasFiniteValue ? clampNumber(selectedValue, -1000, 3500) : Number.NaN;
     }
-    repairBypassUnresolvedPixels({
+    const unresolvedRepairAnalysis = repairBypassUnresolvedPixels({
       pixelData,
       panoWidth,
       panoHeight,
       gapCenterRow,
+      upperBandRowStart: layerRender.upperArch.rowStart,
+      upperBandRowEnd: layerRender.upperArch.rowEnd,
+      lowerBandRowStart: layerRender.lowerArch.rowStart,
+      lowerBandRowEnd: layerRender.lowerArch.rowEnd,
+      missMask: bypassMissMask,
     });
     const gapFillAnalysis = applyBypassGapFill({
       pixelData,
@@ -1466,7 +2648,34 @@ export function buildPanoV2FusionResult(params: {
       panoHeight,
       gapCenterRow,
     });
-    const toneMappingAnalysis = applyBypassToneMapping(pixelData);
+    const bypassMissRepairAnalysis = repairBypassMissPixels({
+      pixelData,
+      panoWidth,
+      panoHeight,
+      gapCenterRow,
+      fullPlaneLayerImages,
+      missMask: bypassMissMask,
+    });
+    bypassMissRepairAnalysis.unresolvedPixelCount = unresolvedRepairAnalysis.repairedPixelCount;
+    bypassMissRepairAnalysis.unresolvedToothEdgeFillCount =
+      unresolvedRepairAnalysis.toothEdgeFillCount;
+    bypassMissRepairAnalysis.unresolvedUnsupportedBandFillCount =
+      unresolvedRepairAnalysis.unsupportedBandFillCount;
+    const toneMappingAnalysis = applyBypassToneMapping({
+      pixelData,
+      panoWidth,
+      panoHeight,
+      gapCenterRow,
+    });
+    suppressLowerBackgroundTail({
+      pixelData,
+      panoWidth,
+      panoHeight,
+      gapCenterRow,
+      layerRender,
+      fullPlaneLayerImages,
+      exclusionMask: bypassMissMask,
+    });
     const finalValues = Array.from(pixelData);
 
     const rowCoverageByRow: PanoV2FusionRowCoverage[] = Array.from(
@@ -1498,7 +2707,7 @@ export function buildPanoV2FusionResult(params: {
         enabled: true,
         phase: 4,
         model: 'fusion-and-roi-composition',
-        implementationVersion: '2026-04-06-fusion-hu-cache-bust-1',
+        implementationVersion: '2026-04-07-fusion-band-support-fallback-6',
         renderBypass: true,
         outputCoverageFraction: 1,
         overlapFraction: 0,
@@ -1513,6 +2722,7 @@ export function buildPanoV2FusionResult(params: {
         gapAnalysis,
         gapFillAnalysis,
         toneMappingAnalysis,
+        bypassMissRepairAnalysis,
         upperArch: {
           label: layerRender.upperArch.label,
           switchCount: 0,
@@ -1536,6 +2746,7 @@ export function buildPanoV2FusionResult(params: {
           sampledColumns: [],
         },
       },
+      bypassMissMask,
     };
   }
   const upperBand = buildBandFusionResult(layerRender.upperArch);
@@ -1675,8 +2886,10 @@ export function buildPanoV2FusionResult(params: {
       gapAnalysis: null,
       gapFillAnalysis: null,
       toneMappingAnalysis: null,
+      bypassMissRepairAnalysis: null,
       upperArch: upperBand.diagnostic,
       lowerArch: lowerBand.diagnostic,
     },
+    bypassMissMask: null,
   };
 }

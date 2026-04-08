@@ -41,6 +41,7 @@ export interface GpuPanoInput {
 export interface GpuPanoDebugMaps {
   renderBranchMap?: Float32Array;
   panoV2FusionImageMap?: Float32Array;
+  panoV2BypassMissMaskMap?: Float32Array;
   panoV2UpperLayer1Map?: Float32Array;
   panoV2UpperLayer2Map?: Float32Array;
   panoV2UpperLayer3Map?: Float32Array;

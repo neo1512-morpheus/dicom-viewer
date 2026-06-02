@@ -86,7 +86,9 @@ docker run --env-file ../.env -p 3001:3001 oroscan-dicom-worker
 
 ## Screenshots
 
-[Screenshot: CPR viewport showing dental CBCT scan]
+![CPR panoramic reconstruction from a dental CBCT scan](docs/assets/cpr-panoramic-reconstruction.jpg)
+
+CPR panoramic reconstruction generated from dental CBCT volume data.
 
 ## Contributing
 

@@ -49,6 +49,11 @@ export interface IViewportService {
    */
   disableElement(viewportId: string): void;
   /**
+   * Disables all currently registered viewport elements to release live
+   * render-target resources before a heavy layout switch.
+   */
+  disableAllElements(): number;
+  /**
    * Uses the renderingEngine to enable the element for the given viewport index
    * and sets the displaySet data to the viewport
    * @param {*} displaySet

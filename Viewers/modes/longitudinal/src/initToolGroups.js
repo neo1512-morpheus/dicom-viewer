@@ -303,7 +303,7 @@ function initCPRPanoToolGroup(extensionManager, toolGroupService) {
   const tools = {
     active: [
       {
-        toolName: toolNames.CPRCursor,
+        toolName: toolNames.WindowLevel,
         bindings: [{ mouseButton: Enums.MouseBindings.Primary }],
       },
       {
@@ -314,12 +314,9 @@ function initCPRPanoToolGroup(extensionManager, toolGroupService) {
         toolName: toolNames.Zoom,
         bindings: [{ mouseButton: Enums.MouseBindings.Secondary }],
       },
-      { toolName: toolNames.StackScrollMouseWheel, bindings: [] },
     ],
     passive: [
-      { toolName: toolNames.StackScroll },
-      // Keep CPRCursor as default primary tool, but allow activating WL from toolbar.
-      { toolName: toolNames.WindowLevel },
+      { toolName: toolNames.CPRCursor },
     ],
   };
 
@@ -339,12 +336,12 @@ function initCPRCrossSectionToolGroup(extensionManager, toolGroupService) {
         toolName: toolNames.WindowLevel,
         bindings: [{ mouseButton: Enums.MouseBindings.Primary }],
       },
+      { toolName: toolNames.StackScrollMouseWheel, bindings: [] },
     ],
     disabled: [
       { toolName: toolNames.Pan },
       { toolName: toolNames.Zoom },
       { toolName: toolNames.StackScroll },
-      { toolName: toolNames.StackScrollMouseWheel },
       { toolName: toolNames.Crosshairs },
       { toolName: toolNames.SegmentationDisplay },
     ],

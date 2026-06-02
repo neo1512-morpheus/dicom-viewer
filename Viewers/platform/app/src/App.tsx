@@ -14,6 +14,7 @@ import {
 } from '@ohif/core';
 import {
   DialogProvider,
+  LoadingIndicatorProgress,
   Modal,
   ModalProvider,
   SnackbarProvider,
@@ -48,7 +49,17 @@ function App({ config, defaultExtensions, defaultModes }) {
   }, []);
 
   if (!init) {
-    return null;
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-black">
+        <div className="flex flex-col items-center justify-center gap-4 px-6 text-center">
+          <LoadingIndicatorProgress className={'h-28 w-28 bg-black'} />
+          <div className="space-y-1">
+            <p className="text-lg font-medium text-white">Initializing viewer</p>
+            <p className="text-sm text-blue-300">Loading the application shell and viewer assets.</p>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   // Set above for named export

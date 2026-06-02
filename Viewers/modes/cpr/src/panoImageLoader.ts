@@ -1,12 +1,46 @@
 import * as cornerstone from '@cornerstonejs/core';
+import type { GpuPanoDebugMaps } from './cprGpuRenderer';
+
+import {
+  SyntheticCprIntensityDomain,
+  getFallbackSyntheticCprVoi,
+} from './cprSyntheticDisplay';
+
+export type PanoQualityStatus = 'accepted' | 'degraded';
 
 export interface PanoImagePayload {
-  pixelData: Float32Array;
+  pixelData: Float32Array | Uint16Array;
+  meanMap?: Float32Array;
+  maxMap?: Float32Array;
+  sampleCountMap?: Float32Array;
+  debugMaps?: GpuPanoDebugMaps;
+  probeContext?: {
+    runId?: string | null;
+    displayedPath?: string | null;
+    backend?: string | null;
+    requestedBackend?: string | null;
+    pipelineMode?: string | null;
+    reconstructionMode?: string | null;
+    qualityStatus?: PanoQualityStatus | null;
+    qualityGateRejectReasons?: string[];
+    qualityGateSelectionReason?: string | null;
+    qualityGateMessage?: string | null;
+    holeMetricBlackClipThreshold?: number | null;
+    holeMetricRetainedWeightMax?: number | null;
+    holeMetricPreToneThreshold?: number | null;
+    holeMetricLeakMin?: number | null;
+  };
   width: number;
   height: number;
   minValue: number;
   maxValue: number;
+  qualityGatePassed?: boolean;
+  qualityStatus?: PanoQualityStatus;
+  qualityGateRejectReasons?: string[];
+  qualityGateSelectionReason?: string | null;
+  qualityGateMessage?: string | null;
   huDomain?: boolean;
+  intensityDomain?: SyntheticCprIntensityDomain;
   columnPixelSpacing?: number;
   rowPixelSpacing?: number;
   windowWidth?: number;
@@ -17,13 +51,11 @@ export interface PanoImagePayload {
 
 const panoImageCache = new Map<string, PanoImagePayload>();
 let latestPanoImageId: string | null = null;
-let panoImageCounter = 0;
 const PANO_FRAME_OF_REFERENCE_UID = 'CPR_PANO_FRAME_OF_REFERENCE';
 const PANO_SERIES_INSTANCE_UID = 'CPR_PANO_SERIES_INSTANCE';
 const PANO_STUDY_INSTANCE_UID = 'CPR_PANO_STUDY_INSTANCE';
-const DEFAULT_PANO_WINDOW_WIDTH = 3000;
-const DEFAULT_PANO_WINDOW_CENTER = 600;
-
+export const PANO_IMAGE_ID = 'pano://current';
+let panoImageSequence = 0;
 interface PanoDisplayMetadata {
   minValue: number;
   maxValue: number;
@@ -36,55 +68,63 @@ interface PanoDisplayMetadata {
 function getPanoDisplayMetadata(payload: PanoImagePayload | null): PanoDisplayMetadata {
   const safeMin = Number.isFinite(payload?.minValue) ? Number(payload?.minValue) : -1000;
   const safeMax = Number.isFinite(payload?.maxValue) ? Number(payload?.maxValue) : 3000;
-  const isHuDomain = payload?.huDomain === true;
-  const payloadSlope =
-    Number.isFinite(payload?.slope) && Math.abs(Number(payload?.slope)) > 1e-8
-      ? Number(payload?.slope)
-      : 1;
+  const payloadSlope = Number.isFinite(payload?.slope) && Math.abs(Number(payload?.slope)) > 1e-8
+    ? Number(payload?.slope)
+    : 1;
   const payloadIntercept = Number.isFinite(payload?.intercept) ? Number(payload?.intercept) : 0;
-  const hasNonIdentityRescale =
-    Math.abs(payloadSlope - 1) > 1e-6 || Math.abs(payloadIntercept) > 1e-6;
 
-  // Worker output for pano:// is expected to already be in HU space.
-  // Always expose identity rescale metadata to avoid accidental double-LUT.
-  if (hasNonIdentityRescale) {
-    console.warn(
-      '[panoImageLoader] Ignoring non-identity pano payload rescale and exposing identity modality LUT.',
-      {
-        payloadSlope,
-        payloadIntercept,
-      }
-    );
-  }
-  const safeSlope = 1;
-  const safeIntercept = 0;
-
-  const modalityMin = safeMin;
-  const modalityMax = safeMax;
-  const dynamicRange = Math.max(1, modalityMax - modalityMin);
-  const looksLikeHU = isHuDomain && modalityMin >= -5000 && modalityMax <= 7000 && dynamicRange >= 250;
+  const derivedVoi = getFallbackSyntheticCprVoi();
 
   const windowWidth =
     Number.isFinite(payload?.windowWidth) && Number(payload?.windowWidth) > 1
       ? Number(payload?.windowWidth)
-      : looksLikeHU
-        ? DEFAULT_PANO_WINDOW_WIDTH
-        : dynamicRange;
+      : derivedVoi.windowWidth;
 
   const windowCenter = Number.isFinite(payload?.windowCenter)
     ? Number(payload?.windowCenter)
-    : looksLikeHU
-      ? DEFAULT_PANO_WINDOW_CENTER
-      : modalityMin + dynamicRange / 2;
+    : derivedVoi.windowCenter;
 
   return {
     minValue: safeMin,
     maxValue: safeMax,
     windowWidth,
     windowCenter,
-    slope: safeSlope,
-    intercept: safeIntercept,
+    slope: payloadSlope,
+    intercept: payloadIntercept,
   };
+}
+
+function getPanoStoredPixelRange(
+  pixelData: Float32Array | Uint16Array
+): {
+  minValue: number;
+  maxValue: number;
+} {
+  if (!pixelData.length) {
+    return { minValue: 0, maxValue: 0 };
+  }
+
+  let minValue = Infinity;
+  let maxValue = -Infinity;
+
+  for (let i = 0; i < pixelData.length; i++) {
+    const value = Number(pixelData[i]);
+    if (!Number.isFinite(value)) {
+      continue;
+    }
+    if (value < minValue) {
+      minValue = value;
+    }
+    if (value > maxValue) {
+      maxValue = value;
+    }
+  }
+
+  if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+    return { minValue: 0, maxValue: 0 };
+  }
+
+  return { minValue, maxValue };
 }
 
 function getPanoPixelSpacing(payload: PanoImagePayload | null): {
@@ -107,33 +147,44 @@ function getPanoPixelSpacing(payload: PanoImagePayload | null): {
 }
 
 export function createPanoImageId(): string {
-  panoImageCounter += 1;
-  return `pano://current/${Date.now()}-${panoImageCounter}`;
+  panoImageSequence += 1;
+  return `pano://render-${Date.now()}-${panoImageSequence}`;
+}
+
+function evictCachedPanoImage(imageId: string | null | undefined): void {
+  if (!imageId) {
+    return;
+  }
+
+  try {
+    const imageLoadObject = cornerstone.cache.getImageLoadObject(imageId);
+    if (imageLoadObject) {
+      cornerstone.cache.removeImageLoadObject(imageId);
+    }
+  } catch (error) {
+    console.warn('[panoImageLoader] Failed to evict cached pano image.', {
+      imageId,
+      error,
+    });
+  }
 }
 
 export function setPanoImagePayload(imageId: string, payload: PanoImagePayload): void {
+  evictCachedPanoImage(imageId);
   panoImageCache.set(imageId, payload);
   latestPanoImageId = imageId;
-  console.log('[CPR-LOADER-PAYLOAD-JSON]', JSON.stringify({
-    imageId,
-    width: payload.width,
-    height: payload.height,
-    minValue: payload.minValue,
-    maxValue: payload.maxValue,
-    huDomain: payload.huDomain === true,
-    windowWidth: payload.windowWidth ?? null,
-    windowCenter: payload.windowCenter ?? null,
-    slope: payload.slope ?? null,
-    intercept: payload.intercept ?? null,
-    rowPixelSpacing: payload.rowPixelSpacing ?? null,
-    columnPixelSpacing: payload.columnPixelSpacing ?? null,
-    first8: Array.from(payload.pixelData.subarray(0, Math.min(8, payload.pixelData.length))).map(
-      value => Math.round(Number(value) * 1000) / 1000
-    ),
-  }));
 }
 
 export function clearPanoImageCache(): void {
+  const imageIdsToEvict = new Set<string>();
+  for (const imageId of panoImageCache.keys()) {
+    imageIdsToEvict.add(imageId);
+  }
+  if (latestPanoImageId) {
+    imageIdsToEvict.add(latestPanoImageId);
+  }
+
+  imageIdsToEvict.forEach(imageId => evictCachedPanoImage(imageId));
   panoImageCache.clear();
   latestPanoImageId = null;
 }
@@ -142,19 +193,12 @@ function createImageObject(imageId: string, payload: PanoImagePayload): cornerst
   const { pixelData, width, height } = payload;
   const display = getPanoDisplayMetadata(payload);
   const spacing = getPanoPixelSpacing(payload);
-  console.log('[CPR-LOADER-IMAGE-JSON]', JSON.stringify({
-    imageId,
-    width,
-    height,
-    display,
-    spacing,
-    huDomain: payload.huDomain === true,
-  }));
+  const storedRange = getPanoStoredPixelRange(pixelData);
 
   const image: cornerstone.Types.IImage = {
     imageId,
-    minPixelValue: display.minValue,
-    maxPixelValue: display.maxValue,
+    minPixelValue: storedRange.minValue,
+    maxPixelValue: storedRange.maxValue,
     slope: display.slope,
     intercept: display.intercept,
     windowCenter: display.windowCenter,
@@ -175,6 +219,7 @@ function createImageObject(imageId: string, payload: PanoImagePayload): cornerst
     rowPixelSpacing: spacing.rowPixelSpacing,
     sizeInBytes: pixelData.byteLength,
     invert: false,
+    modalityLUT: undefined,
   };
 
   return image;
@@ -188,7 +233,6 @@ function panoImageLoader(imageId: string): {
     const payload = panoImageCache.get(imageId);
 
     if (!payload) {
-      console.error('[CPR-LOADER-MISS-JSON]', JSON.stringify({ imageId, latestPanoImageId }));
       reject(
         new Error(
           `[panoImageLoader] No panoramic image cached for imageId: "${imageId}". ` +
@@ -198,7 +242,21 @@ function panoImageLoader(imageId: string): {
       return;
     }
 
-    resolve(createImageObject(imageId, payload));
+    const image = createImageObject(imageId, payload);
+    console.log('[PANO-LOADER-METADATA]', {
+      minPixelValue: image.minPixelValue,
+      maxPixelValue: image.maxPixelValue,
+      windowWidth: image.windowWidth,
+      windowCenter: image.windowCenter,
+      slope: image.slope,
+      intercept: image.intercept,
+      invert: image.invert,
+      qualityGatePassed: payload.qualityGatePassed ?? null,
+      qualityStatus: payload.qualityStatus ?? null,
+      qualityGateRejectReasons: payload.qualityGateRejectReasons ?? [],
+      qualityGateSelectionReason: payload.qualityGateSelectionReason ?? null,
+    });
+    resolve(image);
   });
 
   return { promise };
@@ -222,13 +280,25 @@ function getPanoPayloadForMetadata(imageId: string): PanoImagePayload | null {
   return null;
 }
 
+export function getPanoImagePayload(imageId?: string | null): PanoImagePayload | null {
+  if (typeof imageId === 'string' && imageId.length > 0) {
+    return getPanoPayloadForMetadata(imageId);
+  }
+
+  if (latestPanoImageId) {
+    return getPanoPayloadForMetadata(latestPanoImageId);
+  }
+
+  return null;
+}
+
 function panoMetadataProvider(type: string, imageId: string) {
   if (typeof imageId !== 'string' || !imageId.startsWith('pano://')) {
     return;
   }
 
   const payload = getPanoPayloadForMetadata(imageId);
-  const isHuDomain = payload?.huDomain === true;
+  const isHuDomain = payload?.intensityDomain === 'hu' || payload?.huDomain === true;
   const width = payload?.width ?? 1;
   const height = payload?.height ?? 1;
   const display = getPanoDisplayMetadata(payload);
@@ -250,6 +320,17 @@ function panoMetadataProvider(type: string, imageId: string) {
   }
 
   if (type === 'imagePixelModule') {
+    if (payload?.pixelData instanceof Uint16Array) {
+      return {
+        samplesPerPixel: 1,
+        photometricInterpretation: 'MONOCHROME2',
+        bitsAllocated: 16,
+        bitsStored: 16,
+        highBit: 15,
+        pixelRepresentation: 0,
+      };
+    }
+
     return {
       samplesPerPixel: 1,
       photometricInterpretation: 'MONOCHROME2',
@@ -331,7 +412,5 @@ export function registerPanoImageLoader(): void {
     panoMetadataRegistered = true;
   }
 }
-
-export const PANO_IMAGE_ID = 'pano://current';
 
 export { panoImageLoader };

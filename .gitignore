@@ -27,3 +27,10 @@ dist-ssr
 # DICOM Worker
 dicom-worker/node_modules
 dicom-worker/.env
+
+# Generated viewer bundles and local agent scratch
+public/viewer/
+public/viewer/*.js
+public/viewer/*.js.map
+public/viewer/*.ts
+agent-debug-help

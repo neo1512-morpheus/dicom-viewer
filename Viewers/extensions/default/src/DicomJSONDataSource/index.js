@@ -3,6 +3,7 @@ import OHIF from '@ohif/core';
 
 import getImageId from '../DicomWebDataSource/utils/getImageId';
 import getDirectURL from '../utils/getDirectURL';
+import { createManifestSession, createSeriesKey } from './manifestSession';
 
 const metadataProvider = OHIF.classes.MetadataProvider;
 
@@ -13,23 +14,13 @@ const mappings = {
 
 let _store = {
   urls: [],
-  studyInstanceUIDMap: new Map(), // map of urls to array of study instance UIDs
-  // {
-  //   url: url1
-  //   studies: [Study1, Study2], // if multiple studies
-  // }
-  // {
-  //   url: url2
-  //   studies: [Study1],
-  // }
-  // }
+  studyInstanceUIDMap: new Map(),
 };
 
 function wrapSequences(obj) {
   return Object.keys(obj).reduce(
     (acc, key) => {
       if (typeof obj[key] === 'object' && obj[key] !== null) {
-        // Recursively wrap sequences for nested objects
         acc[key] = wrapSequences(obj[key]);
       } else {
         acc[key] = obj[key];
@@ -42,14 +33,15 @@ function wrapSequences(obj) {
     Array.isArray(obj) ? [] : {}
   );
 }
+
 const getMetaDataByURL = url => {
   return _store.urls.find(metaData => metaData.url === url);
 };
 
 const findStudies = (key, value) => {
-  let studies = [];
-  _store.urls.map(metaData => {
-    metaData.studies.map(aStudy => {
+  const studies = [];
+  _store.urls.forEach(metaData => {
+    metaData.studies.forEach(aStudy => {
       if (aStudy[key] === value) {
         studies.push(aStudy);
       }
@@ -58,89 +50,242 @@ const findStudies = (key, value) => {
   return studies;
 };
 
-function createDicomJSONApi(dicomJsonConfig) {
-  const { wadoRoot } = dicomJsonConfig;
+function createWorkerSession() {
+  if (typeof Worker === 'undefined') {
+    return createManifestSession();
+  }
 
+  let worker;
+  try {
+    worker = new Worker(new URL('./manifestWorker.js', import.meta.url), { type: 'module' });
+  } catch (error) {
+    console.warn('[DicomJSON] Falling back to main-thread manifest loading.', error);
+    return createManifestSession();
+  }
+
+  const pendingRequests = new Map();
+  let nextRequestId = 0;
+
+  const rejectAll = error => {
+    pendingRequests.forEach(({ reject }) => reject(error));
+    pendingRequests.clear();
+  };
+
+  worker.onmessage = event => {
+    const { requestId, payload, error } = event.data || {};
+    const pendingRequest = pendingRequests.get(requestId);
+
+    if (!pendingRequest) {
+      return;
+    }
+
+    pendingRequests.delete(requestId);
+
+    if (error) {
+      pendingRequest.reject(new Error(error));
+      return;
+    }
+
+    pendingRequest.resolve(payload);
+  };
+
+  worker.onerror = event => {
+    rejectAll(new Error(`[DicomJSON Worker] ${event.message || 'Worker error'}`));
+    worker.terminate();
+  };
+
+  return {
+    request(type, payload) {
+      const requestId = nextRequestId++;
+      return new Promise((resolve, reject) => {
+        pendingRequests.set(requestId, { resolve, reject });
+        worker.postMessage({ requestId, type, payload });
+      });
+    },
+    terminate() {
+      rejectAll(new Error('[DicomJSON Worker] Worker session terminated.'));
+      worker.terminate();
+    },
+  };
+}
+
+function createDeferredSeriesLoad(metadata, processFunction) {
+  let internalPromise;
+  let startResolve;
+  let startReject;
+  const startCompletionPromise = new Promise((resolve, reject) => {
+    startResolve = resolve;
+    startReject = reject;
+  });
+  const pendingThenCalls = [];
+  const pendingCatchCalls = [];
+  const pendingFinallyCalls = [];
+
+  const flushPendingHandlers = () => {
+    pendingThenCalls.forEach(([onFulfilled, onRejected]) => {
+      internalPromise.then(onFulfilled, onRejected);
+    });
+    pendingCatchCalls.forEach(onRejected => {
+      internalPromise.catch(onRejected);
+    });
+    pendingFinallyCalls.forEach(onFinally => {
+      internalPromise.finally(onFinally);
+    });
+  };
+
+  return {
+    metadata,
+    getCompletionPromise() {
+      return startCompletionPromise;
+    },
+    start() {
+      if (!internalPromise) {
+        internalPromise = processFunction();
+        internalPromise.then(startResolve, startReject);
+        flushPendingHandlers();
+      }
+
+      return internalPromise;
+    },
+    then(onFulfilled, onRejected) {
+      if (internalPromise) {
+        return internalPromise.then(onFulfilled, onRejected);
+      }
+
+      pendingThenCalls.push([onFulfilled, onRejected]);
+    },
+    catch(onRejected) {
+      if (internalPromise) {
+        return internalPromise.catch(onRejected);
+      }
+
+      pendingCatchCalls.push(onRejected);
+    },
+    finally(onFinally) {
+      if (internalPromise) {
+        return internalPromise.finally(onFinally);
+      }
+
+      pendingFinallyCalls.push(onFinally);
+    },
+  };
+}
+
+function addImageIdMapping({ imageId, StudyInstanceUID, SeriesInstanceUID, naturalizedDicom }) {
+  const TransferSyntaxUID =
+    naturalizedDicom.TransferSyntaxUID || naturalizedDicom['00020010']?.Value?.[0];
+
+  metadataProvider.addImageIdToUIDs(imageId, {
+    StudyInstanceUID,
+    SeriesInstanceUID,
+    SOPInstanceUID: naturalizedDicom.SOPInstanceUID,
+    TransferSyntaxUID,
+  });
+}
+
+function processSeriesInstances({ study, seriesSummary, instances, madeInClient }) {
+  const seenSOPInstanceUIDs = new Set();
+  const naturalizedInstances = [];
+  let duplicateCount = 0;
+
+  instances.forEach(instance => {
+    if (!instance?.url || !instance?.metadata) {
+      return;
+    }
+
+    const sopUID = instance.metadata.SOPInstanceUID;
+    if (sopUID && seenSOPInstanceUIDs.has(sopUID)) {
+      duplicateCount += 1;
+      return;
+    }
+
+    if (sopUID) {
+      seenSOPInstanceUIDs.add(sopUID);
+    }
+
+    const modifiedMetadata = wrapSequences(instance.metadata);
+    const imageId = instance.url;
+
+    addImageIdMapping({
+      imageId,
+      StudyInstanceUID: study.StudyInstanceUID,
+      SeriesInstanceUID: seriesSummary.SeriesInstanceUID,
+      naturalizedDicom: modifiedMetadata,
+    });
+
+    const naturalizedInstance = {
+      ...modifiedMetadata,
+      url: imageId,
+      imageId,
+      ...seriesSummary,
+      ...study,
+    };
+
+    delete naturalizedInstance.instances;
+    delete naturalizedInstance.series;
+
+    naturalizedInstances.push(naturalizedInstance);
+  });
+
+  if (duplicateCount > 0) {
+    console.warn(
+      `[DicomJSON] Skipped ${duplicateCount} duplicate instances in series ${seriesSummary.SeriesInstanceUID}`
+    );
+  }
+
+  if (naturalizedInstances.length > 0) {
+    DicomMetadataStore.addInstances(naturalizedInstances, madeInClient);
+  }
+
+  return naturalizedInstances;
+}
+
+function setStudyLoadedFlag(StudyInstanceUID, madeInClient = false) {
+  const study = DicomMetadataStore.getStudy(StudyInstanceUID, madeInClient);
+  if (study) {
+    study.isLoaded = true;
+  }
+}
+
+function createDicomJSONApi(dicomJsonConfig) {
   const implementation = {
     initialize: async ({ query, url }) => {
       if (!url) {
         url = query.get('url');
       }
-      let metaData = getMetaDataByURL(url);
 
-      // if we have already cached the data from this specific url
-      // We are only handling one StudyInstanceUID to run; however,
-      // all studies for patientID will be put in the correct tab
-      if (metaData) {
-        return metaData.studies.map(aStudy => {
-          return aStudy.StudyInstanceUID;
-        });
+      const cachedMetaData = getMetaDataByURL(url);
+      if (cachedMetaData) {
+        return cachedMetaData.studies.map(aStudy => aStudy.StudyInstanceUID);
       }
 
-      console.time('[DIAG] Manifest Fetch');
-      const response = await fetch(url);
-      const data = await response.json();
-      console.timeEnd('[DIAG] Manifest Fetch');
+      const workerSession = createWorkerSession();
 
-      console.time('[DIAG] Metadata Processing');
-      let StudyInstanceUID;
-      let SeriesInstanceUID;
+      console.time('[DIAG] Manifest Bootstrap');
+      const bootstrapData = await workerSession.request('bootstrap', { url });
+      console.timeEnd('[DIAG] Manifest Bootstrap');
 
-      // Track seen instances to prevent duplicates (fixes 732/600 slice issue)
-      const seenSOPInstanceUIDs = new Set();
-      let instanceCount = 0;
-
-      data.studies.forEach(study => {
-        StudyInstanceUID = study.StudyInstanceUID;
-
-        study.series.forEach(series => {
-          SeriesInstanceUID = series.SeriesInstanceUID;
-
-          series.instances.forEach(instance => {
-            const { url: imageId, metadata: naturalizedDicom } = instance;
-
-            // Deduplicate: Skip if we've already processed this instance
-            const sopUID = naturalizedDicom.SOPInstanceUID;
-            if (seenSOPInstanceUIDs.has(sopUID)) {
-              console.warn(`[DicomJSON] Skipping duplicate instance: ${sopUID}`);
-              return;
-            }
-            seenSOPInstanceUIDs.add(sopUID);
-            instanceCount++;
-
-            // FIX: Extract TransferSyntaxUID safely for correct decoder selection
-            const TransferSyntaxUID = naturalizedDicom.TransferSyntaxUID || naturalizedDicom['00020010']?.Value?.[0];
-
-            // Add imageId specific mapping to this data as the URL isn't necessarliy WADO-URI.
-            metadataProvider.addImageIdToUIDs(imageId, {
-              StudyInstanceUID,
-              SeriesInstanceUID,
-              SOPInstanceUID: naturalizedDicom.SOPInstanceUID,
-              TransferSyntaxUID: TransferSyntaxUID,
-            });
-          });
-        });
-      });
-      console.timeEnd('[DIAG] Metadata Processing');
-      console.log(`[DIAG] Processed ${instanceCount} instances`);
-
-      _store.urls.push({
+      const metaData = {
         url,
-        studies: [...data.studies],
-      });
+        studies: bootstrapData.studies || [],
+        workerSession,
+        seriesLoadPromises: new Map(),
+      };
+
+      _store.urls.push(metaData);
       _store.studyInstanceUIDMap.set(
         url,
-        data.studies.map(study => study.StudyInstanceUID)
+        bootstrapData.studyInstanceUIDs || metaData.studies.map(study => study.StudyInstanceUID)
       );
+
+      return _store.studyInstanceUIDMap.get(url);
     },
     query: {
       studies: {
-        mapParams: () => { },
+        mapParams: () => {},
         search: async param => {
           const [key, value] = Object.entries(param)[0];
           const mappedParam = mappings[key];
-
-          // todo: should fetch from dicomMetadataStore
           const studies = findStudies(mappedParam, value);
 
           return studies.map(aStudy => {
@@ -163,7 +308,6 @@ function createDicomJSONApi(dicomJsonConfig) {
         },
       },
       series: {
-        // mapParams: mapParams.bind(),
         search: () => {
           console.warn(' DICOMJson QUERY SERIES SEARCH not implemented');
         },
@@ -175,83 +319,101 @@ function createDicomJSONApi(dicomJsonConfig) {
       },
     },
     retrieve: {
-      /**
-       * Generates a URL that can be used for direct retrieve of the bulkdata
-       *
-       * @param {object} params
-       * @param {string} params.tag is the tag name of the URL to retrieve
-       * @param {string} params.defaultPath path for the pixel data url
-       * @param {object} params.instance is the instance object that the tag is in
-       * @param {string} params.defaultType is the mime type of the response
-       * @param {string} params.singlepart is the type of the part to retrieve
-       * @param {string} params.fetchPart unknown?
-       * @returns an absolute URL to the resource, if the absolute URL can be retrieved as singlepart,
-       *    or is already retrieved, or a promise to a URL for such use if a BulkDataURI
-       */
       directURL: params => {
         return getDirectURL(dicomJsonConfig, params);
       },
       series: {
-        metadata: async ({ StudyInstanceUID, madeInClient = false, customSort } = {}) => {
+        metadata: async ({
+          StudyInstanceUID,
+          madeInClient = false,
+          customSort,
+          returnPromises = false,
+        } = {}) => {
           if (!StudyInstanceUID) {
             throw new Error('Unable to query for SeriesMetadata without StudyInstanceUID');
           }
 
           const study = findStudies('StudyInstanceUID', StudyInstanceUID)[0];
-          let series;
-
-          if (customSort) {
-            series = customSort(study.series);
-          } else {
-            series = study.series;
+          if (!study) {
+            throw new Error(`Unable to find study ${StudyInstanceUID} in the cached DICOM JSON data.`);
           }
 
-          const seriesSummaryMetadata = series.map(series => {
-            const seriesSummary = {
-              StudyInstanceUID: study.StudyInstanceUID,
-              ...series,
-            };
-            delete seriesSummary.instances;
-            return seriesSummary;
+          const metaData = _store.urls.find(entry => {
+            return entry.studies.some(aStudy => aStudy.StudyInstanceUID === StudyInstanceUID);
           });
 
-          // Async load series, store as retrieved
-          function storeInstances(naturalizedInstances) {
-            DicomMetadataStore.addInstances(naturalizedInstances, madeInClient);
+          if (!metaData) {
+            throw new Error(`Unable to find the backing manifest for study ${StudyInstanceUID}.`);
           }
+
+          const series = customSort ? customSort([...study.series]) : [...study.series];
+          const seriesSummaryMetadata = series.map(seriesEntry => {
+            return {
+              StudyInstanceUID: study.StudyInstanceUID,
+              ...seriesEntry,
+            };
+          });
 
           DicomMetadataStore.addSeriesMetadata(seriesSummaryMetadata, madeInClient);
 
-          function setSuccessFlag() {
-            const study = DicomMetadataStore.getStudy(StudyInstanceUID, madeInClient);
-            study.isLoaded = true;
+          const loadSeriesMetadata = async seriesSummary => {
+            const seriesKey = createSeriesKey(StudyInstanceUID, seriesSummary.SeriesInstanceUID);
+            if (metaData.seriesLoadPromises.has(seriesKey)) {
+              return metaData.seriesLoadPromises.get(seriesKey);
+            }
+
+            const seriesLoadPromise = metaData.workerSession
+              .request('seriesMetadata', {
+                url: metaData.url,
+                StudyInstanceUID,
+                SeriesInstanceUID: seriesSummary.SeriesInstanceUID,
+              })
+              .then(seriesPayload => {
+                const payloadStudy = {
+                  ...study,
+                  ...(seriesPayload.study || {}),
+                };
+                const payloadSeries = {
+                  ...seriesSummary,
+                  ...(seriesPayload.series || {}),
+                };
+
+                return processSeriesInstances({
+                  study: payloadStudy,
+                  seriesSummary: payloadSeries,
+                  instances: seriesPayload.instances || [],
+                  madeInClient,
+                });
+              })
+              .catch(error => {
+                metaData.seriesLoadPromises.delete(seriesKey);
+                throw error;
+              });
+
+            metaData.seriesLoadPromises.set(seriesKey, seriesLoadPromise);
+            return seriesLoadPromise;
+          };
+
+          const deferredSeriesPromises = seriesSummaryMetadata.map(seriesSummary => {
+            return createDeferredSeriesLoad(seriesSummary, async () => {
+              return loadSeriesMetadata(seriesSummary);
+            });
+          });
+
+          Promise.all(deferredSeriesPromises.map(promise => promise.getCompletionPromise()))
+            .then(() => {
+              setStudyLoadedFlag(StudyInstanceUID, madeInClient);
+            })
+            .catch(() => {});
+
+          if (returnPromises) {
+            return deferredSeriesPromises;
           }
 
-          const numberOfSeries = series.length;
-          series.forEach((series, index) => {
-            const instances = series.instances.map(instance => {
-              // for instance.metadata if the key ends with sequence then
-              // we need to add a proxy to the first item in the sequence
-              // so that we can access the value of the sequence
-              // by using sequenceName.value
-              const modifiedMetadata = wrapSequences(instance.metadata);
+          await Promise.all(deferredSeriesPromises.map(promise => promise.start()));
+          setStudyLoadedFlag(StudyInstanceUID, madeInClient);
 
-              const obj = {
-                ...modifiedMetadata,
-                url: instance.url,
-                imageId: instance.url,
-                ...series,
-                ...study,
-              };
-              delete obj.instances;
-              delete obj.series;
-              return obj;
-            });
-            storeInstances(instances);
-            if (index === numberOfSeries - 1) {
-              setSuccessFlag();
-            }
-          });
+          return seriesSummaryMetadata;
         },
       },
     },
@@ -289,14 +451,14 @@ function createDicomJSONApi(dicomJsonConfig) {
       return imageIds;
     },
     getImageIdsForInstance({ instance, frame }) {
-      const imageIds = getImageId({ instance, frame });
-      return imageIds;
+      return getImageId({ instance, frame });
     },
-    getStudyInstanceUIDs: ({ params, query }) => {
+    getStudyInstanceUIDs: ({ query }) => {
       const url = query.get('url');
       return _store.studyInstanceUIDMap.get(url);
     },
   };
+
   return IWebApiDataSource.create(implementation);
 }
 

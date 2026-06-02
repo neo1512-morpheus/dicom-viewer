@@ -135,6 +135,55 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // (see MEASUREMENT_UPDATED subscriber with renderingEngine.render() call)
   }
 
+  private getLogicalViewportId(viewportId: string): string | null {
+    const { viewportGridService } = this.servicesManager.services || {};
+    const viewportMap = viewportGridService?.getState?.()?.viewports;
+
+    if (!viewportMap) {
+      return null;
+    }
+
+    if (typeof viewportMap.get === 'function') {
+      return viewportMap.get(viewportId)?.viewportOptions?.viewportId ?? null;
+    }
+
+    return viewportMap[viewportId]?.viewportOptions?.viewportId ?? null;
+  }
+
+  private isCPRCrossSectionViewport(viewportId: string): boolean {
+    return (
+      viewportId === 'cpr-crosssection' ||
+      this.getLogicalViewportId(viewportId) === 'cpr-crosssection'
+    );
+  }
+
+  private isCPRPanoViewport(viewportId: string): boolean {
+    return viewportId === 'cpr-pano' || this.getLogicalViewportId(viewportId) === 'cpr-pano';
+  }
+
+  private viewportMatchesType(
+    viewport: Types.IViewport | null | undefined,
+    viewportType: csEnums.ViewportType
+  ): boolean {
+    if (!viewport) {
+      return false;
+    }
+
+    if (viewportType === csEnums.ViewportType.STACK) {
+      return viewport instanceof StackViewport;
+    }
+
+    if (viewportType === csEnums.ViewportType.VOLUME_3D) {
+      return viewport instanceof VolumeViewport3D;
+    }
+
+    if (viewportType === csEnums.ViewportType.ORTHOGRAPHIC) {
+      return viewport instanceof BaseVolumeViewport && !(viewport instanceof VolumeViewport3D);
+    }
+
+    return false;
+  }
+
   private isWebGLUnavailableError(error: unknown): boolean {
     const message =
       (typeof error === 'object' && error && 'message' in error
@@ -265,6 +314,16 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     this.viewportsDisplaySets.delete(viewportId);
   }
 
+  public disableAllElements(): number {
+    const viewportIds = this.getViewportIds();
+
+    viewportIds.forEach(viewportId => {
+      this.disableElement(viewportId);
+    });
+
+    return viewportIds.length;
+  }
+
   /**
    * Sets the presentations for a given viewport. Presentations is an object
    * that can define the lut or position for a viewport.
@@ -301,7 +360,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       }
     }
 
-    if (positionPresentation) {
+    if (positionPresentation && !this.isCPRCrossSectionViewport(viewportId)) {
       const { viewPlaneNormal, viewUp, zoom, pan } = positionPresentation.presentation;
       viewport.setCamera({ viewPlaneNormal, viewUp });
 
@@ -324,6 +383,10 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
   public getPositionPresentation(viewportId: string): PositionPresentation {
     const viewportInfo = this.viewportsById.get(viewportId);
     if (!viewportInfo) {
+      return;
+    }
+
+    if (this.isCPRCrossSectionViewport(viewportId)) {
       return;
     }
 
@@ -460,8 +523,8 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       stateSyncService.getState();
 
     const { lutPresentation, positionPresentation } = presentations;
-    const { id: positionPresentationId } = positionPresentation;
-    const { id: lutPresentationId } = lutPresentation;
+    const positionPresentationId = positionPresentation?.id;
+    const lutPresentationId = lutPresentation?.id;
 
     const updateStore = (store, id, value) => ({ ...store, [id]: value });
 
@@ -534,6 +597,17 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     // and we would lose the presentation.
     this.storePresentation({ viewportId: viewportInfo.getViewportId() });
 
+    const previousViewportType = viewportInfo.getViewportType();
+    let existingViewport: Types.IViewport | null = null;
+    try {
+      existingViewport = renderingEngine.getViewport(viewportId) ?? null;
+    } catch (error) {
+      console.warn(
+        `[CornerstoneViewportService] Failed to inspect current viewport ${viewportId} before update`,
+        error
+      );
+    }
+
     // override the viewportOptions and displaySetOptions with the public ones
     // since those are the newly set ones, we set them here so that it handles defaults
     const displaySetOptions = viewportInfo.setPublicDisplaySetOptions(publicDisplaySetOptions);
@@ -544,6 +618,36 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     const background = viewportInfo.getBackground();
     const orientation = viewportInfo.getOrientation();
     const displayArea = viewportInfo.getDisplayArea();
+    const requestedViewportType = viewportInfo.getViewportType();
+    const viewportTypeChanged = previousViewportType !== requestedViewportType;
+    const runtimeViewportMismatch =
+      !!existingViewport && !this.viewportMatchesType(existingViewport, requestedViewportType);
+
+    if (viewportTypeChanged || runtimeViewportMismatch) {
+      console.log(
+        `[CornerstoneViewportService] Recreating viewport ${viewportId} for type sync`,
+        {
+          previousViewportType,
+          requestedViewportType,
+          runtimeViewportType: existingViewport?.constructor?.name || 'none',
+          viewportTypeChanged,
+          runtimeViewportMismatch,
+        }
+      );
+
+      try {
+        renderingEngine.disableElement(viewportId);
+      } catch (disableError) {
+        if (!this.isWebGLUnavailableError(disableError)) {
+          console.warn(
+            `[CornerstoneViewportService] Failed to disable viewport ${viewportId} before type recreation`,
+            disableError
+          );
+        }
+      }
+
+      this.viewportsDisplaySets.delete(viewportId);
+    }
 
     const viewportInput: Types.PublicViewportInput = {
       viewportId,
@@ -614,6 +718,20 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
           `[CornerstoneViewportService] Discarding LUT presentation due to type mismatch: ${presentations.lutPresentation.viewportType} !== ${currentViewportType}`
         );
         presentations.lutPresentation = undefined;
+      }
+    }
+
+    if (presentations?.positionPresentation) {
+      const currentViewportType = viewportInfo.getViewportType();
+
+      if (
+        presentations.positionPresentation.viewportType &&
+        presentations.positionPresentation.viewportType !== currentViewportType
+      ) {
+        console.log(
+          `[CornerstoneViewportService] Discarding position presentation due to type mismatch: ${presentations.positionPresentation.viewportType} !== ${currentViewportType}`
+        );
+        presentations.positionPresentation = undefined;
       }
     }
 
@@ -807,7 +925,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     this._handleOverlays(viewport);
 
     console.log('[DEBUG] _setStackViewport called, setting stack with', imageIds.length, 'images');
-    const isCPRPanoViewport = viewport.id === 'cpr-pano';
+    const isCPRPanoViewport = this.isCPRPanoViewport(viewport.id);
     if (isCPRPanoViewport) {
       console.log('[CPR-TRACE] CornerstoneViewportService entering _setStackViewport for cpr-pano', {
         initialImageIndexToUse,
@@ -818,7 +936,7 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
       });
     }
 
-    // Avoid #2d parallel cache rewriting on cpr-pano to reduce duplicate decode churn.
+    // Avoid #2d parallel cache rewriting on synthetic CPR stacks to keep their custom schemes intact.
     const shouldUseParallel2dCache = !isCPRPanoViewport;
     const stackImageIds = shouldUseParallel2dCache
       ? imageIds.map((imageId: string) => {
@@ -834,12 +952,13 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         `[GEMINI FIX] Parallel Cache: Using #2d suffixed imageIds (${stackImageIds.length} images)`
       );
     } else {
-      console.log('[CPR-TRACE] cpr-pano using original stack imageIds (no #2d suffix)', {
+      console.log('[CPR-TRACE] synthetic CPR stack using original imageIds (no #2d suffix)', {
         firstStackImageId: stackImageIds?.[0],
+        viewportId: viewport.id,
       });
     }
 
-    if (viewport.id === 'cpr-pano') {
+    if (isCPRPanoViewport) {
       const firstImageId = stackImageIds?.[0] ?? '';
       if (!firstImageId.startsWith('pano://')) {
         console.log(
@@ -1017,6 +1136,26 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
     viewportInfo: ViewportInfo,
     presentations: Presentations = {}
   ): Promise<void> {
+    if (this.isCPRPanoViewport(viewport.id)) {
+      const displaySetInstanceUIDs = viewportData.data.map(data => data.displaySetInstanceUID);
+      this.viewportsDisplaySets.set(viewport.id, displaySetInstanceUIDs);
+
+      requestAnimationFrame(() => {
+        try {
+          viewport.render();
+        } catch (renderError) {
+          if (!this.isWebGLUnavailableError(renderError)) {
+            console.warn(
+              `[CornerstoneViewportService] Failed empty render for custom CPR pano viewport ${viewport.id}`,
+              renderError
+            );
+          }
+        }
+      });
+
+      return Promise.resolve();
+    }
+
     // TODO: We need to overhaul the way data sources work so requests can be made
     // async. I think we should follow the image loader pattern which is async and
     // has a cache behind it.
@@ -1104,6 +1243,10 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
 
     const viewportInfo = this.getViewportInfo(viewport.id);
     const viewportId = viewport.id;
+
+    if (this.isCPRCrossSectionViewport(viewportId)) {
+      return;
+    }
 
     const displaySetOptions = viewportInfo.getDisplaySetOptions();
     const displaySetUIDs = viewportGridService.getDisplaySetsUIDsForViewport(viewport.id);
@@ -1529,10 +1672,18 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         return;
       }
 
+      this.beforeResizePositionPresentations.clear();
+
       // Store the current position presentations for each viewport.
       viewports.forEach(({ id }) => {
+        if (this.isCPRCrossSectionViewport(id)) {
+          return;
+        }
+
         const presentation = this.getPositionPresentation(id);
-        this.beforeResizePositionPresentations.set(id, presentation);
+        if (presentation) {
+          this.beforeResizePositionPresentations.set(id, presentation);
+        }
       });
 
       // Use requestAnimationFrame to move heavy render operations off main thread
@@ -1549,7 +1700,9 @@ class CornerstoneViewportService extends PubSubService implements IViewportServi
         // Reset the camera for viewports that should reset their camera on resize,
         // which means only those viewports that have a zoom level of 1.
         this.beforeResizePositionPresentations.forEach((positionPresentation, viewportId) => {
-          this.setPresentations(viewportId, { positionPresentation });
+          if (positionPresentation) {
+            this.setPresentations(viewportId, { positionPresentation });
+          }
         });
 
         // Single render after resize and presentation updates

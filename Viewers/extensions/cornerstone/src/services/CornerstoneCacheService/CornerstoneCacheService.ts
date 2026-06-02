@@ -32,6 +32,18 @@ class CornerstoneCacheService {
     return cs3DCache.getBytesAvailable();
   }
 
+  public destroy(): void {
+    console.log(
+      `[CS-CACHE-CLEANUP] trackedStacks=${this.stackImageIds.size} ` +
+        `trackedVolumes=${this.volumeImageIds.size} inFlight=${this.volumePromises.size} ` +
+        `cacheSizeBytes=${this.getCacheSize()} cacheFreeBytes=${this.getCacheFreeSpace()}`
+    );
+
+    this.stackImageIds.clear();
+    this.volumeImageIds.clear();
+    this.volumePromises.clear();
+  }
+
   public async createViewportData(
     displaySets: unknown[],
     viewportOptions: Record<string, unknown>,
@@ -290,8 +302,30 @@ class CornerstoneCacheService {
     return dataSource.getImageIdsForDisplaySet(displaySet);
   }
 
+  private _isCPRProtocolActive(): boolean {
+    const { hangingProtocolService } = this.servicesManager.services;
+    const stateProtocolId = hangingProtocolService?.getState?.()?.protocolId;
+    const activeProtocol = hangingProtocolService?.getActiveProtocol?.();
+    const activeProtocolId =
+      activeProtocol?.protocol?.id || activeProtocol?.id || stateProtocolId || null;
+
+    return activeProtocolId === 'cpr';
+  }
+
+  private _shouldPreserveFullResolutionVolume(displaySet): boolean {
+    return this._isCPRProtocolActive() || displaySet?.isReconstructable === true;
+  }
+
   private _getCornerstoneVolumeImageIds(displaySet, dataSource): string[] {
     const stackImageIds = this._getCornerstoneStackImageIds(displaySet, dataSource);
+    const shouldPreserveFullResolution = this._shouldPreserveFullResolutionVolume(displaySet);
+
+    if (stackImageIds.length > 400 && shouldPreserveFullResolution) {
+      console.warn(
+        `[CPR] Preserving full-resolution source volume (${stackImageIds.length} slices) for display set ${displaySet?.displaySetInstanceUID}.`
+      );
+      return stackImageIds;
+    }
 
     // GPU Safety decimation: If volume is too large for browser/GPU
     // we use every 2nd slice to ensure stability while maintaining 3D integrity.

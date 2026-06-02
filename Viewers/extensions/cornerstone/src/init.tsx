@@ -150,6 +150,12 @@ export default async function init({
   stateSyncService.register('toggleOneUpViewportGridStore', {
     clearOnModeExit: true,
   });
+  stateSyncService.register('toggleCprOneUpViewportGridStore', {
+    clearOnModeExit: true,
+  });
+  stateSyncService.register('cprOneUpPanoStore', {
+    clearOnModeExit: true,
+  });
 
   const labelmapRepresentation = cornerstoneTools.Enums.SegmentationRepresentations.Labelmap;
   const contourRepresentation = cornerstoneTools.Enums.SegmentationRepresentations.Contour;
@@ -243,6 +249,7 @@ export default async function init({
   initDoubleClick({
     customizationService,
     commandsManager,
+    viewportGridService,
   });
 
   /**

@@ -71,6 +71,7 @@ app.post('/webhook', async (req, res) => {
         zip.extractAllTo(extractPath, true);
 
         const files = fs.readdirSync(extractPath);
+        let seriesMetadataFileCounter = 0;
 
         // Manifest Initialization
         const studyStruct = {
@@ -80,8 +81,11 @@ app.post('/webhook', async (req, res) => {
             StudyTime: '120000',
             PatientName: 'Anonymous',
             PatientID: 'Unknown',
+            NumInstances: 0,
+            Modalities: [],
             series: {}
         };
+        const seriesMetadataPayloads = {};
 
         for (const file of files) {
             const input = path.join(extractPath, file);
@@ -114,12 +118,27 @@ app.post('/webhook', async (req, res) => {
                 // 3. Populate Series & Instance
                 const seriesUID = dataset.SeriesInstanceUID || 'unknown-series';
                 if (!studyStruct.series[seriesUID]) {
+                    seriesMetadataFileCounter += 1;
+                    const metadataRelativePath = `metadata/series-${String(seriesMetadataFileCounter).padStart(4, '0')}.json`;
                     studyStruct.series[seriesUID] = {
                         SeriesInstanceUID: seriesUID,
                         SeriesDescription: dataset.SeriesDescription || 'Series',
                         SeriesNumber: dataset.SeriesNumber || 0,
                         Modality: dataset.Modality || 'CT',
-                        instances: []
+                        NumInstances: 0,
+                        metadataUrl: `${publicBaseUrl}/${metadataRelativePath}`
+                    };
+                    seriesMetadataPayloads[seriesUID] = {
+                        manifestFormatVersion: 2,
+                        series: {
+                            SeriesInstanceUID: seriesUID,
+                            SeriesDescription: dataset.SeriesDescription || 'Series',
+                            SeriesNumber: dataset.SeriesNumber || 0,
+                            Modality: dataset.Modality || 'CT',
+                            NumInstances: 0
+                        },
+                        instances: [],
+                        metadataRelativePath
                     };
                 }
 
@@ -167,8 +186,17 @@ app.post('/webhook', async (req, res) => {
                 // Free disk immediately — compressed slice already uploaded
                 fs.unlinkSync(output);
 
-                // 6. Add to Manifest with FORCE-INJECTED TransferSyntaxUID
-                studyStruct.series[seriesUID].instances.push({
+                // 6. Add to per-series metadata payload with FORCE-INJECTED TransferSyntaxUID
+                studyStruct.series[seriesUID].NumInstances += 1;
+                studyStruct.NumInstances += 1;
+                const modality = studyStruct.series[seriesUID].Modality;
+                if (modality && !studyStruct.Modalities.includes(modality)) {
+                    studyStruct.Modalities.push(modality);
+                }
+
+                seriesMetadataPayloads[seriesUID].series.NumInstances =
+                    studyStruct.series[seriesUID].NumInstances;
+                seriesMetadataPayloads[seriesUID].instances.push({
                     metadata: {
                         ...dataset,
                         TransferSyntaxUID: '1.2.840.10008.1.2.4.91'
@@ -183,6 +211,7 @@ app.post('/webhook', async (req, res) => {
         // Finalize Manifest
         const finalSeries = Object.values(studyStruct.series);
         const manifest = {
+            manifestFormatVersion: 2,
             studies: [
                 {
                     ...studyStruct,
@@ -190,6 +219,38 @@ app.post('/webhook', async (req, res) => {
                 }
             ]
         };
+
+        // Upload per-series metadata sidecars for lazy dicomjson loading
+        for (const [seriesUID, payload] of Object.entries(seriesMetadataPayloads)) {
+            const metadataPath = filename.replace('.zip', '') + `/${payload.metadataRelativePath}`;
+            const sidecarPayload = {
+                manifestFormatVersion: 2,
+                study: {
+                    StudyInstanceUID: studyStruct.StudyInstanceUID,
+                    StudyDescription: studyStruct.StudyDescription,
+                    StudyDate: studyStruct.StudyDate,
+                    StudyTime: studyStruct.StudyTime,
+                    PatientID: studyStruct.PatientID,
+                    PatientName: studyStruct.PatientName,
+                    NumInstances: studyStruct.NumInstances,
+                    Modalities: studyStruct.Modalities
+                },
+                series: payload.series,
+                instances: payload.instances
+            };
+
+            try {
+                await s3Client.send(new PutObjectCommand({
+                    Bucket: process.env.R2_BUCKET_NAME,
+                    Key: `compressed/${metadataPath}`,
+                    Body: JSON.stringify(sidecarPayload),
+                    ContentType: 'application/json'
+                }));
+            } catch (uploadError) {
+                console.error(`❌ R2 series metadata upload failed for ${seriesUID}:`, uploadError.message);
+                throw uploadError;
+            }
+        }
 
         // Upload Manifest to R2
         const manifestPath = filename.replace('.zip', '') + '/dicom_manifest.json';

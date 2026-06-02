@@ -138,8 +138,13 @@ function orthonormalizeFrame(
   N = normalize(cross(S, T), N);
 
   // Keep frame orientation continuous to prevent 180-degree flips.
-  const continuityScore = dot(N, previousN) + dot(S, previousS);
-  if (continuityScore < 0) {
+  // Use S (vertical/binormal) as the stability anchor — on horizontal dental
+  // arches S starts as [0,0,1] and should remain stable throughout.
+  // N_camera legitimately rotates ~180° on U-shaped arches as T follows the
+  // curve, so using N in this check would falsely trigger a flip that corrupts
+  // the vertical direction, causing cross-section mirror-flips and panoramic
+  // sampling distortion.
+  if (dot(S, previousS) < 0) {
     N = negate(N);
     S = negate(S);
   }
@@ -147,18 +152,19 @@ function orthonormalizeFrame(
   return { N, S };
 }
 
-function toSlabNormal(nCamera: Point3, s: Point3): Point3 {
-  const zZeroedN: Point3 = [nCamera[0], nCamera[1], 0];
-  if (norm(zZeroedN) >= EPS) {
-    return normalize(zZeroedN, [1, 0, 0]);
+function computeRigidSlabNormal(tangent: Point3, verticalDir: Point3 | null): Point3 {
+  const T = normalize(tangent, [1, 0, 0]);
+  const referenceVertical: Point3 = verticalDir
+    ? normalize(verticalDir, [0, 0, 1])
+    : [0, 0, 1];
+  const fallback = pickStablePerpendicular(T);
+  const slabNormal = projectPerpendicular(cross(T, referenceVertical), T);
+
+  if (norm(slabNormal) < EPS) {
+    return fallback;
   }
 
-  const zZeroedS: Point3 = [s[0], s[1], 0];
-  if (norm(zZeroedS) >= EPS) {
-    return normalize(zZeroedS, [1, 0, 0]);
-  }
-
-  return [1, 0, 0];
+  return normalize(slabNormal, fallback);
 }
 
 function coercePoint3(v: Point3): Point3 {
@@ -185,30 +191,30 @@ export function buildRMFFrames(
   const count = positions.length;
   const frames: CPRFrame[] = new Array(count);
   const normalizedVerticalDir = verticalDir ? normalize(coercePoint3(verticalDir), [0, 0, 1]) : null;
+  const normalizedPositions = positions.map(coercePoint3);
 
   const T0 = normalize(coercePoint3(tangents[0]), [1, 0, 0]);
-  const initialN = chooseInitialNormal(T0);
-  const initialS = normalize(cross(T0, initialN), pickStablePerpendicular(T0));
+  const initialProjectedVertical = normalizedVerticalDir
+    ? projectPerpendicular(normalizedVerticalDir, T0)
+    : null;
+  const initialS =
+    initialProjectedVertical && norm(initialProjectedVertical) >= EPS
+      ? normalize(initialProjectedVertical, pickStablePerpendicular(T0))
+      : normalize(cross(T0, chooseInitialNormal(T0)), pickStablePerpendicular(T0));
+  const initialN =
+    initialProjectedVertical && norm(initialProjectedVertical) >= EPS
+      ? normalize(cross(T0, initialS), chooseInitialNormal(T0))
+      : chooseInitialNormal(T0);
   const initialBasis = orthonormalizeFrame(T0, initialN, initialS, initialN, initialS);
   let N = initialBasis.N;
   let S = initialBasis.S;
 
   let prevT = T0;
-  let prevNslab = projectPerpendicular(toSlabNormal(N, S), T0);
-  if (normalizedVerticalDir) {
-    const initialU = projectPerpendicular(normalizedVerticalDir, T0);
-    if (norm(initialU) >= EPS) {
-      prevNslab = normalize(cross(T0, normalize(initialU, S)), prevNslab);
-    }
-  }
-  if (norm(prevNslab) < EPS) {
-    prevNslab = pickStablePerpendicular(T0);
-  }
-  prevNslab = normalize(prevNslab, toSlabNormal(N, S));
+  const prevNslab = computeRigidSlabNormal(T0, normalizedVerticalDir);
 
   frames[0] = {
     index: 0,
-    position: coercePoint3(positions[0]),
+    position: normalizedPositions[0],
     T: T0,
     N_camera: N,
     N_slab: prevNslab,
@@ -223,47 +229,25 @@ export function buildRMFFrames(
 
     let transportedN = N;
     let transportedS = S;
-    let transportedNslab = prevNslab;
-
     if (axisLen >= EPS) {
       const angle = Math.atan2(axisLen, tangentDot);
       transportedN = rotateAroundAxis(N, axis, angle);
       transportedS = rotateAroundAxis(S, axis, angle);
-      transportedNslab = rotateAroundAxis(prevNslab, axis, angle);
     } else if (tangentDot < -0.9999) {
       const halfTurnAxis = pickStablePerpendicular(prevT);
       transportedN = rotateAroundAxis(N, halfTurnAxis, Math.PI);
       transportedS = rotateAroundAxis(S, halfTurnAxis, Math.PI);
-      transportedNslab = rotateAroundAxis(prevNslab, halfTurnAxis, Math.PI);
     }
 
     const basis = orthonormalizeFrame(T, transportedN, transportedS, N, S);
     const Ni = basis.N;
     const Si = basis.S;
 
-    let Nslab = projectPerpendicular(transportedNslab, T);
-    if (norm(Nslab) < EPS) {
-      Nslab = projectPerpendicular(toSlabNormal(Ni, Si), T);
-    }
-    if (normalizedVerticalDir) {
-      const targetU = projectPerpendicular(normalizedVerticalDir, T);
-      if (norm(targetU) >= EPS) {
-        const normalizedTargetU = normalize(targetU, Si);
-        const currentU = normalize(cross(Nslab, T), normalizedTargetU);
-        const blendedU = normalize(
-          add(scale(currentU, 0.95), scale(normalizedTargetU, 0.05)),
-          normalizedTargetU
-        );
-        Nslab = normalize(cross(T, blendedU), Nslab);
-      }
-    }
-    if (dot(Nslab, prevNslab) < 0) {
-      Nslab = negate(Nslab);
-    }
+    const Nslab = computeRigidSlabNormal(T, normalizedVerticalDir);
 
     frames[i] = {
       index: i,
-      position: coercePoint3(positions[i]),
+      position: normalizedPositions[i],
       T,
       N_camera: Ni,
       N_slab: Nslab,
@@ -273,7 +257,6 @@ export function buildRMFFrames(
     prevT = T;
     N = Ni;
     S = Si;
-    prevNslab = Nslab;
   }
 
   return frames;

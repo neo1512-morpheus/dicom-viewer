@@ -118,6 +118,38 @@ function CustomizableViewportOverlay({
     [viewportData, viewportId, imageIndex, cornerstoneViewportService]
   );
 
+  const syncVoiFromViewportProperties = useCallback(() => {
+    if (viewportId !== 'cpr-pano') {
+      return;
+    }
+
+    const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
+    if (!viewport) {
+      return;
+    }
+
+    try {
+      const actorUID = viewport.getActors?.()?.[0]?.uid;
+      const properties =
+        (actorUID
+          ? viewport.getProperties?.(actorUID) || viewport.getProperties?.()
+          : viewport.getProperties?.()) || {};
+      const lower = Number(properties?.voiRange?.lower);
+      const upper = Number(properties?.voiRange?.upper);
+
+      if (!Number.isFinite(lower) || !Number.isFinite(upper) || upper <= lower) {
+        return;
+      }
+
+      const { windowWidth, windowCenter } = utilities.windowLevel.toWindowLevel(lower, upper);
+      setVOI({ windowCenter, windowWidth });
+    } catch (error) {
+      if (!isKnownWebGLUnavailableError(error)) {
+        console.warn('[CustomizableViewportOverlay] Failed to read cpr-pano VOI from viewport properties', error);
+      }
+    }
+  }, [cornerstoneViewportService, viewportId]);
+
   /**
    * Updating the VOI when the viewport changes its voi
    */
@@ -126,6 +158,7 @@ function CustomizableViewportOverlay({
       const { range } = eventDetail.detail;
 
       if (!range) {
+        syncVoiFromViewportProperties();
         return;
       }
 
@@ -136,11 +169,12 @@ function CustomizableViewportOverlay({
     };
 
     element.addEventListener(Enums.Events.VOI_MODIFIED, updateVOI);
+    syncVoiFromViewportProperties();
 
     return () => {
       element.removeEventListener(Enums.Events.VOI_MODIFIED, updateVOI);
     };
-  }, [viewportId, viewportData, voi, element]);
+  }, [viewportId, viewportData, element, syncVoiFromViewportProperties]);
 
   /**
    * Updating the scale when the viewport changes its zoom
@@ -460,7 +494,7 @@ function _getInstanceNumberFromVolume(
     const imageId = imageIds[imageIndex];
 
     if (!imageId) {
-      return {};
+      return null;
     }
 
     const { instanceNumber } = metaData.get('generalImageModule', imageId) || {};

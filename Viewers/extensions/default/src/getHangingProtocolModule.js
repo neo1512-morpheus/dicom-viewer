@@ -395,6 +395,7 @@ const hpCPR = {
             viewportId: 'cpr-pano',
             toolGroupId: 'cprPano',
             viewportType: 'stack',
+            orientation: 'axial',
             allowUnmatchedView: true,
           },
           displaySets: [
@@ -410,14 +411,17 @@ const hpCPR = {
             viewportId: 'cpr-crosssection',
             toolGroupId: 'cprCrossSection',
             viewportType: 'volume',
-            orientation: 'coronal',
-            initialImageOptions: {
-              preset: 'middle',
-            },
+            orientation: 'axial',
+            allowUnmatchedView: true,
           },
           displaySets: [
             {
               id: 'activeDisplaySet',
+              options: {
+                blendMode: 'avg',
+                slabThickness: 1.5,
+                voiInverted: false,
+              },
             },
           ],
         },

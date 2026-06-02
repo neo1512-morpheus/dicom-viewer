@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useCallback, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useCallback, useState } from 'react';
 import ReactResizeDetector from 'react-resize-detector';
 import PropTypes from 'prop-types';
 import * as cs3DTools from '@cornerstonejs/tools';
@@ -24,7 +24,9 @@ import { Types } from '@ohif/core';
 import OHIFViewportActionCorners from '../components/OHIFViewportActionCorners';
 import { getWindowLevelActionMenu } from '../components/WindowLevelActionMenu/getWindowLevelActionMenu';
 import { useAppConfig } from '@state';
-import { useCPROrchestrator } from '../../../../modes/cpr/src/useCPROrchestrator';
+import { cprStateService } from '../../../../modes/cpr/src/CPRStateService';
+import { emitCPRCrossSectionSync } from '../../../../modes/cpr/src/cprEvents';
+import { useCPROrchestratorContext } from '../../../../modes/cpr/src/CPROrchestratorContext';
 
 import { LutPresentation, PositionPresentation } from '../types/Presentation';
 
@@ -52,16 +54,12 @@ const isKnownWebGLUnavailableError = (error: unknown) => {
 };
 
 function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
-  const { onDone, onRedraw, isGenerating, error } = useCPROrchestrator({
-    servicesManager,
-    commandsManager,
-    sourceViewportId: viewportId,
-    panoWidth: 800,
-    panoHeight: 400,
-    slabHalfThicknessMm: 2,
-    slabSamples: 7,
-    aggregation: 'MEAN',
-  });
+  const orchestrator = useCPROrchestratorContext();
+  const onDone = orchestrator?.onDone;
+  const onRedraw = orchestrator?.onRedraw;
+  const isGenerating = orchestrator?.isGenerating ?? false;
+  const error = orchestrator?.error ?? null;
+  const warning = orchestrator?.warning ?? null;
   const [hasSpline, setHasSpline] = useState(false);
 
   const setActiveAxialViewport = useCallback(() => {
@@ -117,7 +115,7 @@ function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
   }, [commandsManager, setActiveAxialViewport]);
 
   const onRedrawClick = useCallback(() => {
-    void onRedraw();
+    void onRedraw?.();
   }, [onRedraw]);
 
   const onDoneMouseDown = useCallback(
@@ -165,14 +163,17 @@ function CPRDoneAction({ servicesManager, commandsManager, viewportId }) {
           className="rounded border border-white/40 px-2 py-1 text-xs disabled:opacity-50"
           onMouseDown={onDoneMouseDown}
           onClick={() => {
-            void onDone();
+            void onDone?.();
           }}
-          disabled={isGenerating || !hasSpline}
+          disabled={isGenerating || !hasSpline || !onDone}
         >
           {isGenerating ? 'Generating...' : 'Done'}
         </button>
       </div>
       {error ? <span className="max-w-[300px] truncate text-[11px] text-red-300">{error}</span> : null}
+      {!error && warning ? (
+        <span className="max-w-[300px] truncate text-[11px] text-amber-200">{warning}</span>
+      ) : null}
     </div>
   );
 }
@@ -308,9 +309,9 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     throw new Error('Viewport ID is required');
   }
 
-  // Preserve explicit stack viewports (e.g. CPR pano) and only auto-promote when not pinned.
+  // Preserve explicit stack viewports and only auto-promote when not pinned.
   const hasDynamicReconstructable = displaySets.some(ds => ds.isDynamicVolume && ds.isReconstructable);
-  const isExplicitStackViewport = viewportOptions.viewportType === 'stack' || viewportId === 'cpr-pano';
+  const isExplicitStackViewport = viewportOptions.viewportType === 'stack';
   viewportOptions.viewportType =
     hasDynamicReconstructable && !isExplicitStackViewport
       ? 'volume'
@@ -333,6 +334,12 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
     stateSyncService,
     viewportActionCornersService,
   } = servicesManager.services;
+  const logicalViewportId =
+    cornerstoneViewportService.getViewportInfo(viewportId)?.viewportOptions?.viewportId || viewportId;
+  const isAxialCprViewport = logicalViewportId === 'cpr-axial' || viewportId === 'cpr-axial';
+  const [isAxialTransitioning, setIsAxialTransitioning] = useState(() =>
+    isAxialCprViewport ? cprStateService.isAxialTransitioning() : false
+  );
 
   const [loadingProgress, setLoadingProgress] = useState(null);
   const [viewportDialogState] = useViewportDialog();
@@ -440,6 +447,83 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
       eventTarget.removeEventListener(Enums.Events.ELEMENT_ENABLED, elementEnabledHandler);
     };
   }, [viewportId, elementEnabledHandler, cornerstoneViewportService]);
+
+  useLayoutEffect(() => {
+    const element = elementRef.current as HTMLDivElement | null;
+    if (!element) {
+      return;
+    }
+
+    element.style.opacity = '';
+    element.style.pointerEvents = '';
+  }, [logicalViewportId]);
+
+  useEffect(() => {
+    if (!isAxialCprViewport) {
+      setIsAxialTransitioning(false);
+      return;
+    }
+
+    setIsAxialTransitioning(cprStateService.isAxialTransitioning());
+
+    return cprStateService.subscribe(() => {
+      setIsAxialTransitioning(cprStateService.isAxialTransitioning());
+    });
+  }, [isAxialCprViewport]);
+
+  const onCrossSectionWheel = useCallback(
+    (evt: WheelEvent) => {
+      if (logicalViewportId !== 'cpr-crosssection') {
+        return;
+      }
+
+      const frames = cprStateService.getFrames();
+      if (!frames.length) {
+        return;
+      }
+
+      const delta = evt.deltaY !== 0 ? evt.deltaY : evt.deltaX;
+      if (!Number.isFinite(delta) || delta === 0) {
+        return;
+      }
+
+      evt.preventDefault();
+      evt.stopPropagation();
+      evt.nativeEvent.stopImmediatePropagation?.();
+
+      const direction = delta > 0 ? 1 : -1;
+      const currentFrameIndex = cprStateService.getCurrentFrameIndex();
+      const nextFrameIndex = Math.max(0, Math.min(currentFrameIndex + direction, frames.length - 1));
+
+      if (nextFrameIndex === currentFrameIndex) {
+        return;
+      }
+
+      cprStateService.setCurrentFrameIndex(nextFrameIndex);
+      emitCPRCrossSectionSync({
+        frameIndex: nextFrameIndex,
+        viewportId: 'cpr-crosssection',
+      });
+    },
+    [logicalViewportId]
+  );
+
+  useEffect(() => {
+    if (logicalViewportId !== 'cpr-crosssection') {
+      return;
+    }
+
+    const element = elementRef.current;
+    if (!element) {
+      return;
+    }
+
+    element.addEventListener('wheel', onCrossSectionWheel, { passive: false });
+
+    return () => {
+      element.removeEventListener('wheel', onCrossSectionWheel);
+    };
+  }, [logicalViewportId, onCrossSectionWheel]);
 
   // =====================================================
   // WebGL CONTEXT LOSS LISTENERS
@@ -729,7 +813,14 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
 
   return (
     <React.Fragment>
-      <div className="viewport-wrapper">
+      <div
+        className="viewport-wrapper"
+        style={
+          isAxialCprViewport && isAxialTransitioning
+            ? { visibility: 'hidden', pointerEvents: 'none' }
+            : undefined
+        }
+      >
         <ReactResizeDetector
           onResize={onResize}
           targetRef={elementRef.current}
@@ -739,14 +830,6 @@ const OHIFCornerstoneViewport = React.memo((props: withAppTypes) => {
           style={{ height: '100%', width: '100%' }}
           onContextMenu={e => e.preventDefault()}
           onMouseDown={e => e.preventDefault()}
-          onWheel={
-            viewportId === 'cpr-crosssection'
-              ? e => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                }
-              : undefined
-          }
           ref={elementRef}
         ></div>
         <CornerstoneOverlays

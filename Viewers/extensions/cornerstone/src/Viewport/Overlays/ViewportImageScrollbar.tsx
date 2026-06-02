@@ -57,6 +57,11 @@ function CornerstoneImageScrollbar({
   };
 
   useEffect(() => {
+    if (isCPRPanoViewport()) {
+      setImageSliceData({ imageIndex: 0, numberOfSlices: 1 });
+      return;
+    }
+
     if (!viewportData) {
       return;
     }
@@ -68,8 +73,16 @@ function CornerstoneImageScrollbar({
     }
 
     if (viewportData.viewportType === Enums.ViewportType.STACK) {
-      if (isCPRPanoViewport()) {
-        setImageSliceData({ imageIndex: 0, numberOfSlices: 1 });
+      if (isCPRCrossSectionViewport() && cprStateService.hasData()) {
+        const viewportImageIds = viewport.getImageIds?.() || [];
+        const frameCount = Math.max(
+          viewportImageIds.length,
+          cprStateService.getFrames().length
+        );
+        setImageSliceData({
+          imageIndex: cprStateService.getCurrentFrameIndex(),
+          numberOfSlices: frameCount,
+        });
         return;
       }
 
@@ -107,20 +120,33 @@ function CornerstoneImageScrollbar({
   }, [viewportId, viewportData]);
 
   useEffect(() => {
+    if (isCPRPanoViewport()) {
+      setImageSliceData({ imageIndex: 0, numberOfSlices: 1 });
+      return;
+    }
+
     if (viewportData?.viewportType !== Enums.ViewportType.STACK) {
       return;
     }
 
-    if (isCPRPanoViewport()) {
+    const viewport = cornerstoneViewportService.getCornerstoneViewport(viewportId);
+    if (!viewport) {
       return;
     }
 
     const updateStackIndex = event => {
       const { newImageIdIndex } = event.detail;
+      if (isCPRCrossSectionViewport() && cprStateService.hasData()) {
+        cprStateService.setCurrentFrameIndex(newImageIdIndex);
+      }
       // find the index of imageId in the imageIds
+      const numberOfSlices =
+        isCPRCrossSectionViewport() && cprStateService.hasData()
+          ? Math.max(viewport.getImageIds?.()?.length || 0, cprStateService.getFrames().length)
+          : viewportData.data[0].imageIds.length;
       setImageSliceData({
         imageIndex: newImageIdIndex,
-        numberOfSlices: viewportData.data[0].imageIds.length,
+        numberOfSlices,
       });
     };
 
@@ -132,6 +158,11 @@ function CornerstoneImageScrollbar({
   }, [viewportData, element]);
 
   useEffect(() => {
+    if (isCPRPanoViewport()) {
+      setImageSliceData({ imageIndex: 0, numberOfSlices: 1 });
+      return;
+    }
+
     if (viewportData?.viewportType !== Enums.ViewportType.ORTHOGRAPHIC) {
       return;
     }

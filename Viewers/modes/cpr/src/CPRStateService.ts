@@ -6,17 +6,48 @@ interface CPRArchData {
   sourceVolumeId: string;
   archAnnotationUID?: string | null;
   currentFrameIndex: number;
+  crossSectionVerticalCenterOffsetMm: number;
+  crossSectionVerticalCenterOffsetsMm: number[];
 }
 
 class CPRStateService {
   private archData: CPRArchData | null = null;
+  private axialTransitioning = false;
+  private listeners = new Set<() => void>();
+
+  private notify(): void {
+    this.listeners.forEach(listener => {
+      try {
+        listener();
+      } catch (error) {
+        console.warn('[CPR] Failed to notify CPR state listener.', error);
+      }
+    });
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
 
   setArchData(
     controlPoints: Point3[],
     frames: CPRFrame[],
     sourceVolumeId: string,
-    archAnnotationUID: string | null = null
+    archAnnotationUID: string | null = null,
+    crossSectionVerticalCenterOffsetMm = 0,
+    crossSectionVerticalCenterOffsetsMm: number[] = []
   ): void {
+    const safeCrossSectionVerticalCenterOffsetMm = Number.isFinite(crossSectionVerticalCenterOffsetMm)
+      ? Number(crossSectionVerticalCenterOffsetMm)
+      : 0;
+    const safeCrossSectionVerticalCenterOffsetsMm = frames.map((_, index) => {
+      const offset = Number(crossSectionVerticalCenterOffsetsMm[index]);
+      return Number.isFinite(offset) ? offset : safeCrossSectionVerticalCenterOffsetMm;
+    });
+
     this.archData = {
       controlPoints: controlPoints.map(p => [p[0], p[1], p[2]]),
       frames: frames.map(frame => ({
@@ -30,6 +61,8 @@ class CPRStateService {
       sourceVolumeId,
       archAnnotationUID,
       currentFrameIndex: Math.max(0, Math.floor(frames.length / 2)),
+      crossSectionVerticalCenterOffsetMm: safeCrossSectionVerticalCenterOffsetMm,
+      crossSectionVerticalCenterOffsetsMm: safeCrossSectionVerticalCenterOffsetsMm,
     };
   }
 
@@ -39,6 +72,21 @@ class CPRStateService {
 
   clear(): void {
     this.archData = null;
+    this.setAxialTransitioning(false);
+  }
+
+  isAxialTransitioning(): boolean {
+    return this.axialTransitioning;
+  }
+
+  setAxialTransitioning(nextValue: boolean): void {
+    const safeNextValue = Boolean(nextValue);
+    if (this.axialTransitioning === safeNextValue) {
+      return;
+    }
+
+    this.axialTransitioning = safeNextValue;
+    this.notify();
   }
 
   getControlPoints(): Point3[] {
@@ -88,6 +136,35 @@ class CPRStateService {
 
     const maxIndex = Math.max(0, this.archData.frames.length - 1);
     this.archData.currentFrameIndex = Math.max(0, Math.min(Math.round(frameIndex), maxIndex));
+  }
+
+  getCrossSectionVerticalCenterOffsetMm(frameIndex?: number): number {
+    if (
+      this.archData &&
+      typeof frameIndex === 'number' &&
+      Number.isFinite(frameIndex) &&
+      this.archData.crossSectionVerticalCenterOffsetsMm.length > 0
+    ) {
+      const maxIndex = Math.max(0, this.archData.crossSectionVerticalCenterOffsetsMm.length - 1);
+      const safeIndex = Math.max(0, Math.min(Math.round(frameIndex), maxIndex));
+      const localOffset = this.archData.crossSectionVerticalCenterOffsetsMm[safeIndex];
+      if (Number.isFinite(localOffset)) {
+        return Number(localOffset);
+      }
+    }
+
+    const offset = this.archData?.crossSectionVerticalCenterOffsetMm;
+    return Number.isFinite(offset) ? Number(offset) : 0;
+  }
+
+  getCrossSectionVerticalCenterOffsetsMm(): number[] {
+    if (!this.archData) {
+      return [];
+    }
+
+    return this.archData.crossSectionVerticalCenterOffsetsMm.map(offset =>
+      Number.isFinite(offset) ? Number(offset) : 0
+    );
   }
 }
 

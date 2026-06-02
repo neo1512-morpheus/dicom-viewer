@@ -40,6 +40,7 @@ const reuseCachedLayout = (
     ...syncState.hangingProtocolStageIndexMap,
   };
   const { rows, columns } = stage.viewportStructure.properties;
+  const shouldSkipCprStageOneCache = protocolId === 'cpr' && stageIndex === 1;
   const custom =
     stage.viewports.length !== state.viewports.size ||
     state.layout.numRows !== rows ||
@@ -47,7 +48,9 @@ const reuseCachedLayout = (
 
   hangingProtocolStageIndexMap[cacheId] = hpInfo;
 
-  if (storeId && custom) {
+  if (storeId && shouldSkipCprStageOneCache) {
+    delete viewportGridStore[storeId];
+  } else if (storeId && custom) {
     viewportGridStore[storeId] = { ...state };
   }
 
